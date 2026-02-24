@@ -3,6 +3,7 @@
 # Copyright (c) 2025 -2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import hmac
 import time
 import requests
 from typing import Any, Mapping, Callable
@@ -238,6 +239,16 @@ def _is_debug() -> bool:
         return bool(rt.get("debug") or rt.get("debug_mods"))
     except Exception:
         return False
+
+
+def _verify_webhook_secret(headers: Mapping[str, str], secret: str) -> bool:
+    """Check X-CW-Webhook-Secret header against configured secret."""
+    if not secret:
+        return True
+    header_val = headers.get("X-CW-Webhook-Secret") or headers.get("x-cw-webhook-secret") or ""
+    if not header_val:
+        return False
+    return hmac.compare_digest(header_val.strip(), secret.strip())
 
 
 def _emit(logger: Callable[..., None] | Any | None, msg: str, level: str = "INFO") -> None:
@@ -1027,10 +1038,13 @@ def process_webhook(
     logger: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     
-    _ = (headers, raw)
-
     try:
         cfg = _ensure_scrobble(_load_config())
+
+        secret = ((cfg.get("jellyfin") or {}).get("webhook_secret") or "").strip()
+        if not _verify_webhook_secret(headers, secret):
+            _emit(logger, "invalid X-CW-Webhook-Secret", "WARN")
+            return {"ok": False, "error": "invalid_webhook_secret"}
 
         sc = cfg.get("scrobble") or {}
         if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "webhook":

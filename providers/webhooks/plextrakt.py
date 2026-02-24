@@ -988,8 +988,16 @@ def _map_event(event: str) -> str | None:
     return None
 
 
-def _verify_signature(raw: bytes | None, headers: Mapping[str, str], secret: str) -> bool:
+_PLEX_SECRET_WARNED = False
+
+
+def _verify_signature(raw: bytes | None, headers: Mapping[str, str], secret: str, logger: Callable[..., None] | None = None) -> bool:
+    global _PLEX_SECRET_WARNED
     if not secret:
+        if not _PLEX_SECRET_WARNED:
+            _PLEX_SECRET_WARNED = True
+            _emit(logger, "plex.webhook_secret is empty — signature verification disabled. "
+                          "Set a webhook_secret in config for payload authentication.", "WARN")
         return True
     if not raw:
         return False
@@ -1086,7 +1094,7 @@ def process_webhook(
         return {"ok": True, "ignored": True}
 
     secret = ((cfg.get("plex") or {}).get("webhook_secret") or "").strip()
-    if not _verify_signature(raw, headers, secret):
+    if not _verify_signature(raw, headers, secret, logger=logger):
         _emit(logger, "invalid X-Plex-Signature", "WARN")
         return {"ok": False, "error": "invalid_signature"}
 
