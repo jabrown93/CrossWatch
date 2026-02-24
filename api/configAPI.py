@@ -157,7 +157,7 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         if isinstance(inc, dict) and leaf in inc and _blank(inc[leaf]):
             dst[leaf] = (cur or {}).get(leaf, "")
 
-    providers_with_instances = {"plex","simkl","trakt","tmdb","mdblist","jellyfin","emby","anilist","tautulli"}
+    providers_with_instances = {"plex","simkl","trakt","tmdb","tmdb_sync","mdblist","jellyfin","emby","anilist","tautulli"}
 
     for path in secrets:
         if len(path) == 2 and path[0] in providers_with_instances:
