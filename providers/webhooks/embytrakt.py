@@ -215,7 +215,7 @@ def _verify_webhook_secret(headers: Mapping[str, str], secret: str) -> bool:
     header_val = headers.get("X-CW-Webhook-Secret") or headers.get("x-cw-webhook-secret") or ""
     if not header_val:
         return False
-    return hmac.compare_digest(header_val.strip(), secret.strip())
+    return hmac.compare_digest(header_val, secret)
 
 
 def _emit(logger: Any | None, msg: str, level: str = "INFO") -> None:
