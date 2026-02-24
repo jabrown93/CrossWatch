@@ -38,7 +38,9 @@ def validate_server_url(url: str, field_name: str = "server_url") -> list[str]:
             "— this is almost certainly unintended"
         )
 
-    if parsed.path and ".." in parsed.path:
-        warnings.append(f"{field_name}: URL path contains '..' (path traversal)")
+    if parsed.path:
+        from urllib.parse import unquote
+        if ".." in unquote(parsed.path):
+            warnings.append(f"{field_name}: URL path contains '..' (path traversal)")
 
     return warnings
