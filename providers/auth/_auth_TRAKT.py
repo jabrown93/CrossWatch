@@ -9,7 +9,7 @@ from typing import Any
 
 import requests
 
-from cw_platform.config_base import load_config, save_config
+from cw_platform.config_base import config_path, load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
 
 try:
@@ -55,7 +55,7 @@ def _load_config() -> dict[str, Any]:
         return dict(cfg)
     except Exception:
         try:
-            with open("config.json", "r", encoding="utf-8") as f:
+            with open(config_path(), "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -66,7 +66,7 @@ def _save_config(cfg: dict[str, Any]) -> None:
         save_config(cfg)
     except Exception:
         try:
-            with open("config.json", "w", encoding="utf-8") as f:
+            with open(config_path(), "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
         except Exception:
             pass

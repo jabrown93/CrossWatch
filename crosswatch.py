@@ -346,6 +346,16 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
 # API
 app = FastAPI()
 
+# CORS: deny all cross-origin requests by default
+from starlette.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=[],
+)
+
 @app.middleware("http")
 async def conditional_access_logger(request: Request, call_next):
     _apply_debug_env_from_config()
@@ -638,6 +648,12 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
     wm_available = False
     try:
         cfg = load_config() or {}
+
+        if not app_auth_required(cfg):
+            LOG.child("BOOT").warn(
+                "app_auth is disabled — all API endpoints are unauthenticated. "
+                "Enable app_auth in config for access control."
+            )
         sc = (cfg.get("scrobble") or {}) or {}
         watch = (sc.get("watch") or {}) if isinstance(sc.get("watch"), dict) else {}
         want_autostart = bool(sc.get("enabled")) and str(sc.get("mode") or "").lower() == "watch" and bool(watch.get("autostart"))
