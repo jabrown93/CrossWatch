@@ -54,3 +54,7 @@ pytestdebug.log
 
 # CrossWatch runtime state
 .cw_state/
+
+
+.idea/
+node_modules

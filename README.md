@@ -1,6 +1,5 @@
 
 <img width="1468" height="795" alt="overview (1)" src="https://github.com/user-attachments/assets/d4afb18c-b655-4aa7-ba2b-da10f3cef89a" />
-</center>
 
 <p align="center" style="font-size:14px;">
 <b>⭐ Star this repository to get updates</b><br>

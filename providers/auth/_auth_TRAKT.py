@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from cw_platform.config_base import load_config, save_config
+from cw_platform.config_base import config_path, load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
 
 try:

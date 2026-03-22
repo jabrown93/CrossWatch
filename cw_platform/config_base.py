@@ -186,7 +186,8 @@ DEFAULT_CFG: dict[str, Any] = {
     # --- Providers -----------------------------------------------------------
     "plex": {
         "server_url": "",                               # http(s)://host:32400 (required for sync & watcher).
-        "verify_ssl": False,                            # Verify TLS certificates
+        "verify_ssl": True,                             # Verify TLS certificates
+        "webhook_secret": "",                           # Shared secret for X-Plex-Signature verification
         "account_token": "",                            # Plex token (a.k.a. authentication token).
         "pms_token": "",                                # PMS resource token for the selected server
         "client_id": "",                                # Set by PIN login; reused for headers.
@@ -287,7 +288,7 @@ DEFAULT_CFG: dict[str, Any] = {
      "tautulli": {
          "server_url": "",                              # http(s)://host:8181
          "api_key": "",                                 # Tautulli API key
-         "verify_ssl": False,                           # Verify TLS certificates
+         "verify_ssl": True,                            # Verify TLS certificates
          "timeout": 10.0,                               # HTTP timeout (seconds)
          "max_retries": 3,                              # Retry budget
          "history": {
@@ -358,7 +359,8 @@ DEFAULT_CFG: dict[str, Any] = {
         "device_id": "crosswatch",                      # Client device id
         "username": "",                                 # Optional (login username)
         "user": "",                                     # Optional (display name; hydrated after auth)
-        "verify_ssl": False,                            # Verify TLS certificates
+        "verify_ssl": True,                             # Verify TLS certificates
+        "webhook_secret": "",                           # Shared secret for X-CW-Webhook-Secret verification
         "timeout": 15.0,                                # HTTP timeout (seconds)
         "max_retries": 3,                               # Retry budget for API calls
 
@@ -403,7 +405,8 @@ DEFAULT_CFG: dict[str, Any] = {
         "device_id": "crosswatch",                      # Client device id
         "username": "",                                 # Optional (login username)
         "user": "",                                     # Optional (display name; hydrated after auth)
-        "verify_ssl": False,                            # Verify TLS certificates
+        "verify_ssl": True,                             # Verify TLS certificates
+        "webhook_secret": "",                           # Shared secret for X-CW-Webhook-Secret verification
         "timeout": 15.0,                                # HTTP timeout (seconds)
         "max_retries": 3,                               # Retry budget for API calls
 
@@ -618,75 +621,96 @@ DEFAULT_CFG: dict[str, Any] = {
 }
 
 
+_REDACT = "••••••••"
+
+# Canonical list of secret field paths (each is a tuple of dict keys).
+# Used by redact_config() and configAPI to keep a single source of truth.
+_SECRET_PATHS: list[tuple[str, ...]] = [
+    # Plex
+    ("plex", "account_token"),
+    ("plex", "pms_token"),
+    ("plex", "home_pin"),
+    ("plex", "webhook_secret"),
+    # SIMKL
+    ("simkl", "access_token"),
+    ("simkl", "refresh_token"),
+    ("simkl", "client_secret"),
+    # AniList
+    ("anilist", "access_token"),
+    ("anilist", "client_secret"),
+    # MDBList
+    ("mdblist", "api_key"),
+    # Tautulli
+    ("tautulli", "api_key"),
+    # Trakt
+    ("trakt", "client_secret"),
+    ("trakt", "access_token"),
+    ("trakt", "refresh_token"),
+    ("trakt", "_pending_device", "user_code"),
+    ("trakt", "_pending_device", "device_code"),
+    # TMDb sync
+    ("tmdb_sync", "api_key"),
+    ("tmdb_sync", "session_id"),
+    ("tmdb_sync", "_pending_request_token"),
+    # TMDb metadata
+    ("tmdb", "api_key"),
+    # Jellyfin
+    ("jellyfin", "access_token"),
+    ("jellyfin", "webhook_secret"),
+    # Emby
+    ("emby", "api_key"),
+    ("emby", "access_token"),
+    ("emby", "webhook_secret"),
+    # App auth
+    ("app_auth", "password", "hash"),
+    ("app_auth", "password", "salt"),
+    ("app_auth", "session", "token_hash"),
+]
+
+
+def _redact_path(d: dict[str, Any], path: tuple[str, ...]) -> None:
+    """Walk *path* inside *d* and replace the leaf with _REDACT if truthy."""
+    node: Any = d
+    for key in path[:-1]:
+        if not isinstance(node, dict):
+            return
+        node = node.get(key)
+    if isinstance(node, dict):
+        leaf = path[-1]
+        if node.get(leaf):
+            node[leaf] = _REDACT
+
+
 def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = copy.deepcopy(cfg or {})
-    MASK = "••••••••"
 
-    # Provider-specific secret fields
-    provider_secret_keys: dict[str, set[str]] = {
-        "plex": {"account_token", "pms_token", "home_pin", "webhook_secret"},
-        "simkl": {"access_token", "refresh_token", "client_secret"},
-        "anilist": {"access_token", "client_secret"},
-        "mdblist": {"api_key"},
-        "tautulli": {"api_key"},
-        "trakt": {"access_token", "refresh_token", "client_secret"},
-        "jellyfin": {"access_token", "api_key", "password"},
-        "emby": {"access_token", "api_key", "password"},
-        "tmdb": {"api_key"},
-        "tmdb_sync": {"api_key", "session_id", "_pending_request_token"},
-    }
+    for path in _SECRET_PATHS:
+        _redact_path(out, path)
+        # Also redact secrets in provider instances if they exist
+        prov = path[0]
+        p_cfg = out.get(prov)
+        if isinstance(p_cfg, dict):
+            instances = p_cfg.get("instances")
+            if isinstance(instances, dict):
+                for inst_cfg in instances.values():
+                    if isinstance(inst_cfg, dict):
+                        _redact_path(inst_cfg, path[1:])
 
-    def _mask_leaf(d: dict[str, Any], key: str) -> None:
-        v = d.get(key)
-        if v is None:
-            return
-        s = str(v).strip()
-        if not s or s == MASK:
-            return
-        d[key] = MASK
+    # Variable-length sessions array in app_auth
+    sessions = (out.get("app_auth") or {}).get("sessions")
+    if isinstance(sessions, list):
+        for s in sessions:
+            if isinstance(s, dict) and s.get("token_hash"):
+                s["token_hash"] = _REDACT
 
-    for provider, keys in provider_secret_keys.items():
-        blk = out.get(provider)
-        if not isinstance(blk, dict):
-            continue
-
-        for k in keys:
-            _mask_leaf(blk, k)
-
-        insts = blk.get("instances")
-        if isinstance(insts, dict):
-            for inst in insts.values():
-                if isinstance(inst, dict):
-                    for k in keys:
-                        _mask_leaf(inst, k)
-
-    # App UI auth secrets.
-    a = out.get("app_auth")
-    if isinstance(a, dict):
-        pwd = a.get("password")
-        if isinstance(pwd, dict):
-            if pwd.get("hash"):
-                pwd["hash"] = MASK
-            if pwd.get("salt"):
-                pwd["salt"] = MASK
-
-        sess = a.get("session")
-        if isinstance(sess, dict) and sess.get("token_hash"):
-            sess["token_hash"] = MASK
-
-        sessions = a.get("sessions")
-        if isinstance(sessions, list):
-            for s in sessions:
-                if isinstance(s, dict) and s.get("token_hash"):
-                    s["token_hash"] = MASK
-
-    # Webhook URL tokens
+    # Webhook URL tokens (variable keys)
     sec = out.get("security")
     if isinstance(sec, dict):
         wh = sec.get("webhook_ids")
         if isinstance(wh, dict):
             for k in list(wh.keys()):
-                _mask_leaf(wh, k)
+                if wh.get(k):
+                    wh[k] = _REDACT
 
     return out
 

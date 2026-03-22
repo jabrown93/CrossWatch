@@ -82,6 +82,13 @@ def _active_providers(cfg: dict[str, Any]) -> list[str]:
         pid = str(it.get("id") or "").strip().upper()
         if pid and pid != "ALL" and bool(it.get("configured")) and pid not in out:
             out.append(pid)
+
+    # The internal CROSSWATCH provider should always participate in unified
+    # watchlist operations (e.g., delete-across-providers flows) even if the
+    # manifest does not report it as configured.
+    if "CROSSWATCH" not in out:
+        out.insert(0, "CROSSWATCH")
+
     return out
 
 

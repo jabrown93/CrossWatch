@@ -333,6 +333,35 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     cfg: dict[str, Any] = dict(merged or {})
 
+    # Warn on suspicious server URLs (SSRF guard — log only, don't reject)
+    try:
+        from cw_platform.url_validation import validate_server_url
+        _url_checks = [
+            ((cfg.get("plex") or {}).get("server_url", ""), "plex.server_url"),
+            ((cfg.get("jellyfin") or {}).get("server", ""), "jellyfin.server"),
+            ((cfg.get("emby") or {}).get("server", ""), "emby.server"),
+            ((cfg.get("tautulli") or {}).get("server_url", ""), "tautulli.server_url"),
+        ]
+        for _url_val, _url_field in _url_checks:
+            for _w in validate_server_url(_url_val, _url_field):
+                try:
+                    from _logging import log as _log
+                    _log(_w, level="WARN", module="CONFIG")
+                except Exception:
+                    pass
+    except Exception as e:
+        try:
+            from _logging import log as _log
+            _log(f"Error during URL validation: {e}", level="WARN", module="CONFIG")
+        except Exception:
+            pass
+
+    # Scrobble watcher: ensure routes exist when legacy fields are used
+    try:
+        from providers.scrobble.routes import ensure_routes
+        cfg, _ = ensure_routes(cfg)
+    except Exception:
+        pass
 
     sc = cfg.setdefault("scrobble", {})
     sc_enabled = bool(sc.get("enabled", False))
