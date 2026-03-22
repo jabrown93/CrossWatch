@@ -1,197 +1,287 @@
-// assets/js/modals/about.js
-const get = async (url) => { try { const r = await fetch(url,{cache:"no-store"}); return r.ok ? r.json() : null; } catch { return null; } };
-const ABOUT_TTL_MS = 60_000;
-let _aboutCacheAt = 0;
-let _aboutCache = null;
-let _aboutInflight = null;
+/* assets/js/modals/about.js */
+/* CrossWatch - about modal component */
+/* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
-async function loadAboutData(force=false){
-  const now = Date.now();
-  if(!force && _aboutCache && (now - _aboutCacheAt) < ABOUT_TTL_MS) return _aboutCache;
-  if(_aboutInflight) return _aboutInflight;
+const UPDATE_ENDPOINT = "/api/update";
+const MODULES_ENDPOINT = "/api/modules/versions";
+const RELEASES_URL = "https://github.com/cenodude/CrossWatch/releases";
+const TTL = 60_000;
 
-  _aboutInflight = Promise.all([
-    get("/api/version"),
-    get("/api/modules/versions")
-  ])
-    .then(([ver, mods]) => ({ ver: ver || {}, mods: mods || {} }))
-    .finally(() => { _aboutInflight = null; });
+const _cwV = (() => {
+  try { return new URL(import.meta.url).searchParams.get("v") || window.__CW_VERSION__ || Date.now(); }
+  catch { return window.__CW_VERSION__ || Date.now(); }
+})();
 
-  const data = await _aboutInflight;
-  _aboutCache = data;
-  _aboutCacheAt = Date.now();
-  return data;
+const _cwVer = (u) => u + (u.includes("?") ? "&" : "?") + "v=" + encodeURIComponent(String(_cwV));
+
+const { getJson } = await import(_cwVer("./core/net.js"));
+const { escapeHtml, setModalShellInline } = await import(_cwVer("./core/app-auth-setup.js"));
+
+const cache = { at: 0, data: null, inflight: null };
+
+function _norm(v) {
+  return String(v || "").replace(/^v/i, "").trim();
 }
 
-function isNewer(a,b){ if(!a||!b) return false; const clean=s=>String(s).replace(/^v/i,"").split("-")[0];
-  const A=clean(a).split(".").map(n=>parseInt(n,10)||0), B=clean(b).split(".").map(n=>parseInt(n,10)||0);
-  for(let i=0;i<Math.max(A.length,B.length);i++){ const da=A[i]||0, db=B[i]||0; if(da!==db) return da>db; } return false; }
+function _cmp(a, b) {
+  const pa = _norm(a).split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = _norm(b).split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const da = pa[i] || 0;
+    const db = pb[i] || 0;
+    if (da !== db) return da > db ? 1 : -1;
+  }
+  return 0;
+}
 
-function rowsFromGroup(obj){
-  const entries=Object.entries(obj||{});
-  if(!entries.length) return `<div class="k">No providers</div><div class="key">—</div><div class="ver">—</div>`;
-  const toName=(key)=>{ const last=String(key).split("_").pop()||key; return last?(last[0]+last.slice(1).toLowerCase()):last; };
-  return entries.map(([key,ver])=>`
-    <div class="k">${toName(key)}</div>
-    <div class="key">${key}</div>
-    <div class="ver">${ver||"—"}</div>
+function _providerName(key) {
+  const tail = String(key || "").split("_").pop() || key || "-";
+  return tail ? tail.charAt(0).toUpperCase() + tail.slice(1).toLowerCase() : "-";
+}
+
+function _providerRows(group) {
+  const rows = Object.entries(group || {});
+  if (!rows.length) {
+    return `
+      <div class="r">
+        <b>No providers</b>
+        <span>-</span>
+        <em>-</em>
+      </div>
+    `;
+  }
+  return rows.map(([key, value]) => `
+    <div class="r">
+      <b>${escapeHtml(_providerName(key))}</b>
+      <span>${escapeHtml(key)}</span>
+      <em>${escapeHtml(value || "-")}</em>
+    </div>
   `).join("");
 }
 
-function foldCard(id,title,rowsHTML){
+function _fold(title, body, open = false) {
   return `
-    <div class="card fold" id="${id}">
-      <button class="fold-head" type="button">
-        <span class="dot" aria-hidden="true"></span>
-        <span class="title">${title}</span>
-        <span class="chev" aria-hidden="true">expand_more</span>
-      </button>
-      <div class="fold-body"><div class="rows">${rowsHTML||""}</div></div>
-    </div>
+    <details class="card fold"${open ? " open" : ""}>
+      <summary>
+        <span>${escapeHtml(title)}</span>
+        <i class="material-symbols-rounded" aria-hidden="true">expand_more</i>
+      </summary>
+      <div class="rows">${body}</div>
+    </details>
   `;
 }
 
-function wireHostedFolds(root){
-  root.querySelectorAll(".fold").forEach(f=>{
-    const head=f.querySelector(".fold-head"), body=f.querySelector(".fold-body");
-    const setH=(open)=>{ if(!body) return;
-      if(open){ body.style.height="auto"; const h=body.getBoundingClientRect().height; body.style.height="0px"; requestAnimationFrame(()=>{ body.style.height=h+"px"; }); }
-      else { body.style.height=body.getBoundingClientRect().height+"px"; requestAnimationFrame(()=>{ body.style.height="0px"; }); }
-    };
-    f.classList.remove("open"); body.style.height="0px";
-    head?.addEventListener("click",()=>{ const willOpen=!f.classList.contains("open"); f.classList.toggle("open",willOpen); setH(willOpen); });
-  });
+async function loadAbout(force = false) {
+  const now = Date.now();
+  if (!force && cache.data && now - cache.at < TTL) return cache.data;
+  if (cache.inflight) return cache.inflight;
+
+  cache.inflight = Promise.all([
+    getJson(UPDATE_ENDPOINT, { cache: "no-store" }).catch(() => ({})),
+    getJson(MODULES_ENDPOINT, { cache: "no-store" }).catch(() => ({})),
+  ])
+    .then(([update, mods]) => ({ update: update || {}, mods: mods || {} }))
+    .finally(() => {
+      cache.inflight = null;
+    });
+
+  cache.data = await cache.inflight;
+  cache.at = Date.now();
+  return cache.data;
 }
 
-async function renderHostedAbout(hostEl){
-  // Parallel fetch + TTL cache
-  const { ver, mods } = await loadAboutData(false);
+function _versionInfo(update = {}) {
+  const current = _norm(update.current_version || update.current || window.__CW_VERSION__ || "0.0.0");
+  const latest = _norm(update.latest_version || update.latest || current);
+  const hasUpdate = typeof update.update_available === "boolean"
+    ? update.update_available
+    : (_cmp(latest, current) > 0);
+  const htmlUrl = String(update.html_url || update.url || RELEASES_URL).trim() || RELEASES_URL;
+  const publishedAt = String(update.published_at || "").trim();
+  return { current, latest, hasUpdate, htmlUrl, publishedAt };
+}
 
-  const info = { current: ver.current||ver.version, latest: ver.latest, html_url: ver.html_url || "https://github.com/cenodude/CrossWatch/releases" };
-  const hasUpdate = isNewer(info.latest, info.current);
+function view(info, mods, logo) {
+  const latestChip = info.latest ? `Latest v${escapeHtml(info.latest)}` : "Latest unavailable";
+  const publishedChip = info.publishedAt
+    ? `<span class="chip subtle">${escapeHtml(info.publishedAt.slice(0, 10))}</span>`
+    : "";
 
-  hostEl.innerHTML = `
-  <style>
-    /* shell */
-    #about-host{--w:760px;position:relative;display:flex;flex-direction:column;align-items:stretch;min-width:min(var(--w),92vw);color:#eaf1ff;background:rgba(13,17,23,.45);border:1px solid rgba(255,255,255,.08);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.04);backdrop-filter:saturate(140%) blur(8px)}
-    #about-host .cx-body{padding:12px 14px;max-height:65vh;overflow:auto}
-    #about-host .foot{flex-shrink:0}
-    /* head */
-    #about-host .ab-head{display:flex;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02))}
-    #about-host .title-wrap{display:flex;gap:10px;align-items:center}
-    #about-host .app-name{font-weight:800;letter-spacing:.3px}
-    #about-host .app-sub{opacity:.75;font-size:12px}
-    #about-host .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    #about-host .badge{display:inline-flex;gap:6px;align-items:center;padding:4px 9px;border-radius:999px;font-weight:700;background:linear-gradient(135deg,#7c4dff,#39c2ff);border:1px solid #7c4dff66;box-shadow:0 0 0 1px rgba(0,0,0,.2) inset}
-    #about-host .badge .m{font-family:"Material Symbols Rounded"}
-    #about-host .pill{display:inline-flex;gap:6px;align-items:center;padding:4px 9px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);font-weight:600}
-    #about-host .ghost{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);padding:6px 10px;border-radius:10px;color:#fff;text-decoration:none}
-    #about-host .ghost:hover{border-color:#ffffff40}
-    /* update banner */
-    #about-host .update-banner{display:flex;align-items:center;gap:10px;padding:8px 10px;margin:10px 14px 0;border-radius:10px;border:1px solid rgba(82,255,175,.35);background:linear-gradient(180deg,rgba(46,213,115,.16),rgba(46,213,115,.06));font-size:13px}
-    #about-host .update-banner .m{font-family:"Material Symbols Rounded";flex:0 0 auto}
-    #about-host .update-banner .t{font-weight:700}
-    #about-host .update-banner .a{margin-left:auto}
-    /* cards */
-    #about-host .cards{display:grid;gap:10px}
-    #about-host .card{background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.10);border-radius:12px;overflow:hidden;box-shadow:0 6px 24px rgba(0,0,0,.25)}
-    #about-host .intro{padding:12px 14px}
-    #about-host .intro .lead{font-weight:800;margin-bottom:6px}
-    /* folds */
-    #about-host .fold-head{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;font-weight:800;text-transform:uppercase;background:rgba(255,255,255,.03);border:0;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer}
-    #about-host .fold-head .dot{width:8px;height:8px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#7affc1,#39c2ff)}
-    #about-host .fold-head .title{flex:1}
-    #about-host .fold-head .chev{font-family:"Material Symbols Rounded";transition:transform .18s ease}
-    #about-host .fold.open .fold-head .chev{transform:rotate(180deg)}
-    #about-host .fold-body{height:0;overflow:hidden;opacity:0;transform:translateY(-2px);transition:height .18s ease,opacity .18s ease,transform .18s ease}
-    #about-host .fold.open .fold-body{opacity:1;transform:none}
-    #about-host .rows{display:grid;grid-template-columns:minmax(160px,1fr) minmax(140px,1fr) auto;gap:6px 10px;padding:8px 10px}
-    #about-host .rows>*{padding:4px 0;border-bottom:1px dashed rgba(255,255,255,.06)}
-    #about-host .rows>*:nth-last-child(-n+3){border-bottom:0}
-    #about-host .k{opacity:.95}.key{opacity:.6}.ver{justify-self:end;font-variant-numeric:tabular-nums;opacity:.95}
-    #about-host .note{padding:10px 12px;font-size:12.5px;opacity:.9}
-    #about-host .foot{display:flex;justify-content:flex-end;padding:10px 14px;border-top:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01))}
-    #about-host .btn{appearance:none;border:1px solid #7aa0ff66;border-radius:12px;padding:9px 14px;font-weight:800;background:linear-gradient(135deg,#4c7dff,#8ab0ff);color:#fff}
-    /* Buy Me A Coffee */
-    #about-host .bmc{position:absolute;left:12px;bottom:12px;z-index:5}
-    #about-host .bmc a{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:12px;font-weight:700;font-size:12px;letter-spacing:.2px;background:linear-gradient(135deg,#1f2937,#0b1220);border:1px solid rgba(255,255,255,.10);box-shadow:0 4px 14px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,255,255,.05);color:#f8fafc;position:relative;overflow:hidden;text-decoration:none}
-    #about-host .bmc a:hover{transform:translateY(-1px);box-shadow:0 8px 18px rgba(0,0,0,.45),inset 0 0 0 1px rgba(255,255,255,.08)}
-    #about-host .bmc .sheen:after{content:"";position:absolute;inset:-40% -20% auto auto;width:110%;height:110%;transform:rotate(15deg) translateX(-60%);background:linear-gradient(110deg,transparent 40%,rgba(255,255,255,.10) 55%,transparent 70%);animation:abSheen 3.2s ease-in-out infinite}
-    #about-host .bmc svg{width:16px;height:16px;display:block;filter:drop-shadow(0 2px 3px rgba(0,0,0,.35))}
-    #about-host .bmc .txt{white-space:nowrap}
-    #about-host .bmc .sub{opacity:.75;font-weight:600;margin-left:6px}
-    #about-host .bmc .pulse{position:absolute;inset:-8px;border-radius:999px;pointer-events:none;box-shadow:0 0 0 0 rgba(255,193,7,.16);animation:abPulse 2.6s ease-out infinite}
-    @keyframes abSheen{0%{transform:rotate(15deg) translateX(-80%)}100%{transform:rotate(15deg) translateX(40%)}}
-    @keyframes abPulse{0%{box-shadow:0 0 0 0 rgba(255,193,7,.20)}100%{box-shadow:0 0 0 22px rgba(255,193,7,0)}}
-    @media (max-width:980px){#about-host .bmc a{padding:6px 9px;font-size:11px;border-radius:11px} #about-host .bmc .sub{display:none}}
-    @media (max-width:760px){#about-host .rows{grid-template-columns:1fr auto}}
-    @media (max-width:560px){#about-host .bmc .txt{display:none}}
-  </style>
-
-  <div id="about-host">
-    <div class="ab-head">
-      <div class="title-wrap">
-        <span class="material-symbols-rounded" aria-hidden="true">info</span>
-        <div><div class="app-name">ABOUT</div><div class="app-sub">Version & modules</div></div>
-      </div>
-      <div class="actions">
-        <span class="badge"><span class="m">bolt</span>v${info.current||"—"}</span>
-        <span class="pill">Latest: ${info.latest||"—"}</span>
-        <a id="about-releases" class="ghost" href="${info.html_url}" target="_blank" rel="noopener">Releases</a>
-      </div>
-    </div>
-
-    ${hasUpdate?`
-    <div class="update-banner">
-      <span class="m" aria-hidden="true">new_releases</span>
-      <div class="t">New version available: v${info.latest}</div>
-      <a class="ghost a" href="${info.html_url}" target="_blank" rel="noopener">Get update</a>
-    </div>`:""}
-
-    <div class="cx-body">
-      <div class="cards">
-        <div class="card intro">
-          <div class="lead">CrossWatch in a nutshell</div>
-          <div class="p">A fast, local-first sync engine for Plex, Jellyfin, Emby, MDBList, AniList Tautulli, TMDB, SIMKL, and Trakt. Clean UI, solid planner, reliable runs.</div>
+  return `
+    <style>
+      #about-host{--w:760px;position:relative;overflow:hidden;min-width:min(var(--w),94vw);max-width:94vw;color:#eaf0ff;border-radius:18px;
+        border:1px solid rgba(255,255,255,.08);
+        background:
+          radial-gradient(900px circle at 18% 18%, rgba(150,70,255,.22), transparent 55%),
+          radial-gradient(900px circle at 92% 10%, rgba(60,140,255,.18), transparent 55%),
+          radial-gradient(800px circle at 55% 110%, rgba(60,255,215,.08), transparent 60%),
+          rgba(7,8,11,.92);
+        box-shadow:0 30px 90px rgba(0,0,0,.70), inset 0 1px 0 rgba(255,255,255,.04);
+        backdrop-filter:saturate(135%) blur(10px)
+      }
+      #about-host:before{content:"";position:absolute;inset:-120px;pointer-events:none;
+        background:conic-gradient(from 180deg at 50% 50%, rgba(150,70,255,0), rgba(150,70,255,.28), rgba(60,140,255,.22), rgba(60,255,215,.08), rgba(150,70,255,0));
+        filter:blur(90px);opacity:.34;transform:translate3d(0,0,0)
+      }
+      #about-host *{box-sizing:border-box}
+      #about-host a,#about-host button{font:inherit}
+      #about-host .head{position:relative;display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.08);
+        background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.01))
+      }
+      #about-host .logoWrap{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;flex:0 0 auto;
+        background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+        box-shadow:0 12px 30px rgba(0,0,0,.40), inset 0 1px 0 rgba(255,255,255,.04)
+      }
+      #about-host .logo{width:30px;height:30px;opacity:.95;filter:drop-shadow(0 10px 16px rgba(0,0,0,.45))}
+      #about-host .title{font-weight:950;letter-spacing:.2px;font-size:15px;line-height:1.1;text-transform:uppercase;opacity:.90}
+      #about-host .sub{opacity:.72;font-size:12px;margin-top:2px}
+      #about-host .actions{margin-left:auto;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+      #about-host .chip,#about-host .link,#about-host .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:34px;padding:0 12px;border-radius:999px;text-decoration:none;white-space:nowrap}
+      #about-host .chip{font-weight:900;font-size:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04)}
+      #about-host .chip.accent{border-color:rgba(150,70,255,.35);background:linear-gradient(135deg,rgba(150,70,255,.28),rgba(60,140,255,.18))}
+      #about-host .chip.subtle{opacity:.76}
+      #about-host .link,#about-host .btn{color:#eaf0ff;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);transition:transform .16s ease,filter .16s ease,border-color .16s ease}
+      #about-host .link:hover,#about-host .btn:hover{transform:translateY(-1px);filter:brightness(1.06);border-color:rgba(150,70,255,.28)}
+      #about-host .body{position:relative;padding:16px 16px 8px 16px;max-height:72vh;overflow:auto;scrollbar-width:thin;scrollbar-color:rgba(150,70,255,.88) rgba(255,255,255,.08)}
+      #about-host .body::-webkit-scrollbar{width:12px}
+      #about-host .body::-webkit-scrollbar-track{background:rgba(255,255,255,.06);border-radius:999px}
+      #about-host .body::-webkit-scrollbar-thumb{background:linear-gradient(180deg,rgba(170,92,255,.96),rgba(120,72,255,.88));border-radius:999px;border:2px solid rgba(10,12,20,.42)}
+      #about-host .body::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,rgba(184,112,255,.98),rgba(136,86,255,.92))}
+      #about-host .card{display:block;padding:12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 30px rgba(0,0,0,.32);margin-bottom:10px}
+      #about-host .badge{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
+      #about-host .badge .dot{width:8px;height:8px;border-radius:999px;background:rgba(150,70,255,.90);box-shadow:0 0 0 4px rgba(150,70,255,.18)}
+      #about-host .headline{font-weight:950;font-size:20px;line-height:1.15;margin:10px 0 8px}
+      #about-host .lede{opacity:.84;max-width:72ch;line-height:1.5}
+      #about-host .eyebrow{margin:0 0 6px;color:rgba(228,234,255,.54);font-size:11px;font-weight:900;letter-spacing:.14em;text-transform:uppercase}
+      #about-host .update{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px;border-color:rgba(150,70,255,.22);
+        background:linear-gradient(135deg,rgba(150,70,255,.14),rgba(60,140,255,.08))
+      }
+      #about-host .update .material-symbols-rounded{font-size:24px}
+      #about-host .update .h{font-weight:950}
+      #about-host .update .p{opacity:.82;margin-top:4px;line-height:1.45}
+      #about-host .fold{padding:0;overflow:hidden}
+      #about-host .fold summary{cursor:pointer;list-style:none;padding:14px 16px;font-weight:950;display:flex;align-items:center;justify-content:space-between;gap:8px;background:rgba(255,255,255,.02)}
+      #about-host .fold summary::-webkit-details-marker{display:none}
+      #about-host .fold summary span{font-size:12.5px;letter-spacing:.08em;text-transform:uppercase}
+      #about-host .fold i{font-size:18px;opacity:.82;transition:transform .18s ease,opacity .18s ease}
+      #about-host .fold[open] i{transform:rotate(180deg);opacity:1}
+      #about-host .rows{padding:2px 16px 12px}
+      #about-host .r{display:grid;grid-template-columns:minmax(110px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:center;min-height:34px;border-top:1px solid rgba(255,255,255,.06)}
+      #about-host .r:first-child{border-top:0}
+      #about-host .r b{font-size:12.5px}
+      #about-host .r span{color:rgba(214,223,246,.56);font:11.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+      #about-host .r em{justify-self:end;font-style:normal;font-size:12.5px;opacity:.88}
+      #about-host .discBody{opacity:.84;line-height:1.5}
+      #about-host ul{display:grid;gap:7px;padding-left:18px;margin:10px 0 0}
+      #about-host .helpLink{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:10px;padding:14px 16px;border-radius:14px;text-decoration:none;color:#eef3ff;
+        background:linear-gradient(135deg,rgba(150,70,255,.18),rgba(60,140,255,.14));border:1px solid rgba(150,70,255,.22);
+        box-shadow:0 14px 34px rgba(0,0,0,.24), inset 0 1px 0 rgba(255,255,255,.04);transition:transform .16s ease,filter .16s ease,border-color .16s ease
+      }
+      #about-host .helpLink:hover{transform:translateY(-1px);filter:brightness(1.06);border-color:rgba(150,70,255,.32)}
+      #about-host .helpCopy{display:grid;gap:4px}
+      #about-host .helpEyebrow{font-size:11px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;opacity:.72}
+      #about-host .helpTitle{font-size:16px;font-weight:950;line-height:1.15}
+      #about-host .helpSub{font-size:12.5px;line-height:1.4;opacity:.8}
+      #about-host .helpIcon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;flex:0 0 auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08)}
+      #about-host .helpIcon .material-symbols-rounded{font-size:22px}
+      #about-host .foot{position:relative;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;border-top:1px solid rgba(255,255,255,.08);
+        background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01))
+      }
+      #about-host .support{color:#eef3ff}
+      #about-host .btn.primary{border-color:rgba(150,70,255,.35);background:linear-gradient(135deg,rgba(150,70,255,.92),rgba(60,140,255,.82));box-shadow:0 16px 50px rgba(0,0,0,.38)}
+      @media (max-width:760px){
+        #about-host .head,#about-host .foot{flex-direction:column;align-items:stretch}
+        #about-host .actions{margin-left:0;justify-content:flex-start}
+        #about-host .update{grid-template-columns:1fr}
+      }
+      @media (max-width:560px){
+        #about-host .actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+        #about-host .actions>*:last-child{grid-column:1 / -1}
+        #about-host .chip,#about-host .link,#about-host .btn{width:100%}
+        #about-host .r{grid-template-columns:minmax(0,1fr) auto}
+        #about-host .r span{display:none}
+      }
+    </style>
+    <div id="about-host" role="dialog" aria-label="About CrossWatch">
+      <div class="head">
+        <div class="logoWrap" aria-hidden="true"><img class="logo" src="${escapeHtml(logo)}" alt="" /></div>
+        <div>
+          <div class="title">About CrossWatch</div>
+          <div class="sub">Version, modules, and useful project info</div>
         </div>
-        ${foldCard("fold-auth","Authentication Providers", rowsFromGroup(mods.groups?.AUTH))}
-        ${foldCard("fold-sync","Synchronization Providers", rowsFromGroup(mods.groups?.SYNC))}
-        <div class="card">
-          <div class="note">
-            <b>Disclaimer.</b> This is an independent, community-maintained project and is not affiliated with, endorsed by, or sponsored by Plex, Emby, Jellyfin, Trakt, SIMKL, TMDb, Tautulli, AniList or MDBList. Use at your own risk.
-            <ul style="margin:.5em 0 0 1.25em;">
-              <li>All product names, logos, and brands are property of their respective owners and used for identification only.</li>
-              <li>Interacts with third-party services; you are responsible for complying with their Terms of Use and API rules.</li>
-              <li>Provided “as is,” without warranties or guarantees.</li>
+        <div class="actions">
+          <span class="chip accent"><span class="material-symbols-rounded" aria-hidden="true">bolt</span>Engine v${escapeHtml(info.current || "-")}</span>
+          <span class="chip">${latestChip}</span>
+          ${publishedChip}
+          <a class="link" href="${escapeHtml(info.htmlUrl)}" target="_blank" rel="noopener noreferrer">Releases</a>
+        </div>
+      </div>
+      <div class="body">
+        ${info.hasUpdate ? `
+          <section class="card update">
+            <span class="material-symbols-rounded" aria-hidden="true">new_releases</span>
+            <div>
+              <div class="h">Update available: v${escapeHtml(info.latest || info.current || "-")}</div>
+              <div class="p">You are on v${escapeHtml(info.current || "-")}. Open the latest release notes when you are ready to update.</div>
+            </div>
+            <a class="link" href="${escapeHtml(info.htmlUrl)}" target="_blank" rel="noopener noreferrer">Open release</a>
+          </section>
+        ` : ""}
+        <section class="card">
+          <div class="badge"><span class="dot" aria-hidden="true"></span><span style="font-weight:900">Local-first sync</span></div>
+          <div class="headline">Fast runs with good controls</div>
+          <div class="lede">CrossWatch syncs Plex, Jellyfin, Emby, MDBList, AniList, Tautulli, TMDb, SIMKL, and Trakt. Keep it behind your network edge and avoid exposing it directly to the internet.</div>
+        </section>
+        ${_fold("Authentication providers", _providerRows(mods.groups?.AUTH))}
+        ${_fold("Synchronization providers", _providerRows(mods.groups?.SYNC))}
+        <section class="card">
+          <div class="eyebrow">Disclaimer</div>
+          <div class="discBody">
+            <div>Independent community project. Not affiliated with, endorsed by, or sponsored by Plex, Emby, Jellyfin, Trakt, SIMKL, TMDb, Tautulli, AniList, or MDBList.</div>
+            <ul>
+              <li>Names, logos, and brands belong to their owners and are used for identification only.</li>
+              <li>Third-party APIs have their own rules. Use them without getting yourself banned.</li>
+              <li>Provided as-is, without any warranties. Backups still beat regret.</li>
             </ul>
           </div>
-        </div>
+        </section>
+        <section class="card">
+          <div class="eyebrow">Need Help?</div>
+          <a class="helpLink" href="https://wiki.crosswatch.app/" target="_blank" rel="noopener noreferrer">
+            <span class="helpCopy">
+              <span class="helpEyebrow">Documentation</span>
+              <span class="helpTitle">Open the CrossWatch Wiki</span>
+              <span class="helpSub">Setup guides, upgrade notes, and troubleshooting in one place.</span>
+            </span>
+            <span class="helpIcon" aria-hidden="true"><span class="material-symbols-rounded">menu_book</span></span>
+          </a>
+        </section>
+      </div>
+      <div class="foot">
+        <a class="link support" href="https://buymeacoffee.com/cenodude" target="_blank" rel="noopener noreferrer">Buy me a coffee / cenodude</a>
+        <button class="btn primary" type="button" data-close>Close</button>
       </div>
     </div>
-
-    <div class="foot"><button class="btn" data-x="close">OK</button></div>
-
-    <div class="bmc">
-      <a href="https://buymeacoffee.com/cenodude" target="_blank" rel="noopener" aria-label="Buy me a coffee">
-        <span class="sheen"></span><span class="pulse"></span>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#FCD34D" d="M5 10h11a3 3 0 0 0 0-6H5v6Zm13-4a1 1 0 0 1 0 2h-2V6h2Z"/><path fill="#D97706" d="M4 10h13c-.2 3.9-1.9 7-6.5 7S4.2 13.9 4 10Z"/><path fill="#0EA5E9" d="M3 19.5a.5.5 0 0 1 .5-.5h14a.5.5 0 0 1 0 1h-14a.5.5 0 0 1-.5-.5Z"/><path fill="#F59E0B" d="M9 3c0 .8-.6 1.2-.9 1.7S8 5.4 8 6h-1c0-.8.6-1.2.9-1.7S8 3.6 8 3h1Zm3 0c0 .8-.6 1.2-.9 1.7S11 5.4 11 6h-1c0-.8.6-1.2.9-1.7S11 3.6 11 3h1Zm3 0c0 .8-.6 1.2-.9 1.7S14 5.4 14 6h-1c0-.8.6-1.2.9-1.7S14 3.6 14 3h1Z"/></svg>
-        <span class="txt">Buy me a coffee</span><span class="sub">/ cenodude</span>
-      </a>
-    </div>
-  </div>
   `;
+}
 
-  const shell = hostEl.closest(".cx-modal-shell");
-  if(shell){ shell.style.height="auto"; shell.style.minHeight="0"; shell.style.maxHeight="none"; shell.style.width="auto"; shell.style.maxWidth="none"; shell.style.display="inline-block"; }
+async function render(host) {
+  const { update, mods } = await loadAbout();
+  const info = _versionInfo(update);
+  const crossWatchLogo = window.CW?.ProviderMeta?.logoPath?.("crosswatch") || "/assets/img/CROSSWATCH.svg";
 
-  wireHostedFolds(hostEl);
-  hostEl.querySelector(".ab-head")?.addEventListener("pointerdown",e=>e.stopPropagation(),true);
-  hostEl.querySelector(".cx-body")?.addEventListener("pointerdown",e=>e.stopPropagation(),true);
-  hostEl.querySelector("#about-releases")?.addEventListener("pointerdown",e=>e.stopPropagation(),true);
-  hostEl.querySelector('[data-x="close"]')?.addEventListener("click",()=>window.cxCloseModal?.());
+  host.innerHTML = view(info, mods, crossWatchLogo);
+
+  const shell = host.closest(".cx-modal-shell");
+  setModalShellInline(shell);
+
+  host.addEventListener("pointerdown", (e) => e.stopPropagation(), true);
+  host.querySelector("[data-close]")?.addEventListener("click", () => window.cxCloseModal?.());
 }
 
 export default {
-  async mount(hostEl){ if(!hostEl) return; await renderHostedAbout(hostEl); },
-  unmount(){ /* noop */ }
+  async mount(host) {
+    if (host) await render(host);
+  },
+  unmount() {},
 };

@@ -11,6 +11,8 @@ from typing import Any, Callable, Iterable, Mapping
 from ._log import log as cw_log
 
 from ._mod_common import (
+    HitSession,
+    SimpleRateLimiter,
     build_session,
     request_with_retries,
     parse_rate_limit,
@@ -72,7 +74,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "4.0.0"
+__VERSION__ = "4.1.1"
 __all__ = ["get_manifest", "MDBLISTModule", "OPS"]
 
 def _health(status: str, ok: bool, latency_ms: int) -> None:
@@ -162,7 +164,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "unrate": True,
-                "from_date": False,
+                "from_date": True,
             },
         },
     }
@@ -173,6 +175,8 @@ class MDBLISTConfig:
     api_key: str
     timeout: float = 15.0
     max_retries: int = 3
+    rate_get_per_sec: float = 10.0
+    rate_post_per_sec: float = 1.0
 
 
 class MDBLISTError(RuntimeError):
@@ -189,7 +193,21 @@ class MDBLISTClient:
     def __init__(self, cfg: MDBLISTConfig, raw_cfg: Mapping[str, Any]):
         self.cfg = cfg
         self.raw_cfg = raw_cfg
-        self.session = build_session("MDBLIST", ctx, feature_label=_label_mdblist)
+        self.session: HitSession = build_session("MDBLIST", ctx, feature_label=_label_mdblist)
+
+        try:
+            self.session._rate_limiter = SimpleRateLimiter(
+                rates_per_sec={
+                    "GET": float(cfg.rate_get_per_sec or 0.0),
+                    "POST": float(cfg.rate_post_per_sec or 0.0),
+                }
+            )
+            self.session._rate_limiter_meta = {
+                "get_per_sec": float(cfg.rate_get_per_sec or 0.0),
+                "post_per_sec": float(cfg.rate_post_per_sec or 0.0),
+            }
+        except Exception:
+            pass
 
     def connect(self) -> MDBLISTClient:
         if not self.cfg.api_key:
@@ -239,10 +257,24 @@ class MDBLISTClient:
 class MDBLISTModule:
     def __init__(self, cfg: Mapping[str, Any]):
         m = dict(cfg.get("mdblist") or {})
+        rl = m.get("rate_limit")
+        if not isinstance(rl, dict):
+            rl = {}
+        try:
+            get_rps = float(rl.get("get_per_sec", 10.0))
+        except Exception:
+            get_rps = 10.0
+        try:
+            post_rps = float(rl.get("post_per_sec", 1.0))
+        except Exception:
+            post_rps = 1.0
+
         self.cfg = MDBLISTConfig(
             api_key=str(m.get("api_key") or "").strip(),
             timeout=float(m.get("timeout", cfg.get("timeout", 15.0))),
             max_retries=int(m.get("max_retries", cfg.get("max_retries", 3))),
+            rate_get_per_sec=get_rps,
+            rate_post_per_sec=post_rps,
         )
         if not self.cfg.api_key:
             raise MDBLISTAuthError("Missing MDBList api_key")
@@ -303,133 +335,74 @@ class MDBLISTModule:
         sess = self.client.session
         start = time.perf_counter()
 
-        def hit(path: str, *, params: dict[str, Any]) -> tuple[bool, int | None, int | None, dict[str, int | None], str | None]:
-            ok = False
-            code: int | None = None
-            retry_after: int | None = None
-            rate: dict[str, int | None] = {"limit": None, "remaining": None, "reset": None}
-            err: str | None = None
-            try:
-                r = request_with_retries(
-                    sess,
-                    "GET",
-                    f"{base}{path}",
-                    params=params,
-                    timeout=tmo,
-                    max_retries=hr,
-                )
-                code = r.status_code
-                if 200 <= r.status_code < 300:
-                    ok = True
-                elif r.status_code == 429:
-                    ra = r.headers.get("Retry-After")
-                    if ra:
-                        try:
-                            retry_after = int(ra)
-                        except Exception:
-                            pass
-                rate = parse_rate_limit(r.headers)
-            except Exception as e:
-                err = f"{type(e).__name__}: {e}"
-            return ok, code, retry_after, rate, err
-
-        user_ok, user_code, user_ra, user_rate, user_err = hit("/user", params={"apikey": self.cfg.api_key})
-
-        wl_ok = False
-        wl_code: int | None = None
-        wl_ra: int | None = None
-        wl_rate: dict[str, int | None] = user_rate
-        wl_err: str | None = None
-        if enabled.get("watchlist"):
-            wl_ok, wl_code, wl_ra, wl_rate, wl_err = hit(
-                "/watchlist/items",
-                params={"apikey": self.cfg.api_key, "limit": 1, "offset": 0},
-            )
-
-        rt_ok = False
-        rt_code: int | None = None
-        rt_ra: int | None = None
-        rt_rate: dict[str, int | None] = user_rate
-        rt_err: str | None = None
-        if enabled.get("ratings"):
-            rt_ok, rt_code, rt_ra, rt_rate, rt_err = hit(
-                "/sync/ratings",
-                params={"apikey": self.cfg.api_key, "page": 1, "limit": 1},
-            )
-
-        hs_ok = False
-        hs_code: int | None = None
-        hs_ra: int | None = None
-        hs_rate: dict[str, int | None] = user_rate
-        hs_err: str | None = None
-        if enabled.get("history"):
-            hs_ok, hs_code, hs_ra, hs_rate, hs_err = hit(
-                "/sync/last_activities",
+        user_ok = False
+        user_code: int | None = None
+        user_ra: int | None = None
+        user_rate: dict[str, int | None] = {"limit": None, "remaining": None, "reset": None}
+        user_err: str | None = None
+        user_reason: str | None = None
+        try:
+            r = request_with_retries(
+                sess,
+                "GET",
+                f"{base}/user",
                 params={"apikey": self.cfg.api_key},
+                timeout=tmo,
+                max_retries=hr,
             )
-            if (not hs_ok) and hs_code in (404, 405):
-                hs_ok, hs_code, hs_ra, hs_rate, hs_err = hit(
-                    "/sync/watched",
-                    params={"apikey": self.cfg.api_key, "page": 1, "limit": 1, "since": "1970-01-01T00:00:00Z"},
-                )
+            user_code = r.status_code
+            if 200 <= r.status_code < 300:
+                user_ok = True
+            elif r.status_code in (401, 403):
+                user_reason = "unauthorized"
+            else:
+                user_reason = f"http:{r.status_code}"
+            if r.status_code == 429:
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        user_ra = int(ra)
+                    except Exception:
+                        pass
+            user_rate = parse_rate_limit(r.headers)
+        except Exception as e:
+            user_err = f"{type(e).__name__}: {e}"
+            user_reason = f"exception:{type(e).__name__}"
 
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         features = {
-            "watchlist": wl_ok if enabled.get("watchlist") else False,
-            "ratings": rt_ok if enabled.get("ratings") else False,
-            "history": hs_ok if enabled.get("history") else False,
+            "watchlist": bool(enabled.get("watchlist") and user_ok),
+            "ratings": bool(enabled.get("ratings") and user_ok),
+            "history": bool(enabled.get("history") and user_ok),
             "playlists": False,
         }
 
-        checks = [features[k] for k in ("watchlist", "ratings", "history") if enabled.get(k)]
-        if not checks:
+        if not need_any:
             status = "ok"
-        elif all(checks):
+        elif user_ok:
             status = "ok"
-        elif any(checks):
-            status = "degraded"
         else:
-            status = "down"
+            status = "auth_failed" if user_code in (401, 403) else "down"
 
-        ok = status in ("ok", "degraded")
+        ok = status == "ok"
 
         details: dict[str, Any] = {}
         disabled = [k for k, v in enabled.items() if not v]
         if disabled:
             details["disabled"] = disabled
-        errs: dict[str, str] = {}
         if user_err:
-            errs["user"] = user_err
-        if wl_err:
-            errs["watchlist"] = wl_err
-        if rt_err:
-            errs["ratings"] = rt_err
-        if hs_err:
-            errs["history"] = hs_err
-        if errs:
-            details["errors"] = errs
+            details["errors"] = {"user": user_err}
+        if need_any and not user_ok:
+            details["reason"] = f"user:{user_reason or 'down'}"
+        if user_ra is not None:
+            details["retry_after_s"] = user_ra
 
         api = {
             "user": {
                 "status": user_code,
                 "retry_after": user_ra,
                 "rate": user_rate,
-            },
-            "watchlist": {
-                "status": wl_code,
-                "retry_after": wl_ra,
-                "rate": wl_rate,
-            },
-            "ratings": {
-                "status": rt_code,
-                "retry_after": rt_ra,
-                "rate": rt_rate,
-            },
-            "history": {
-                "status": hs_code,
-                "retry_after": hs_ra,
-                "rate": hs_rate,
             },
         }
 
@@ -531,7 +504,7 @@ class _MDBLISTOPS:
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "unrate": True,
-                "from_date": False,
+                "from_date": True,
             },
         }
 
@@ -552,7 +525,29 @@ class _MDBLISTOPS:
             if ent and (now - float(ent[0])) < 10.0:
                 return dict(ent[1])
 
-            sess = build_session("MDBLIST", ctx, feature_label=_label_mdblist)
+            sess: HitSession = build_session("MDBLIST", ctx, feature_label=_label_mdblist)
+            # Apply provider rate limits
+            rl = m.get("rate_limit")
+            if not isinstance(rl, dict):
+                rl = {}
+            try:
+                get_rps = float(rl.get("get_per_sec", 10.0))
+            except Exception:
+                get_rps = 10.0
+            try:
+                post_rps = float(rl.get("post_per_sec", 1.0))
+            except Exception:
+                post_rps = 1.0
+            try:
+                sess._rate_limiter = SimpleRateLimiter(
+                    rates_per_sec={
+                        "GET": float(get_rps or 0.0),
+                        "POST": float(post_rps or 0.0),
+                    }
+                )
+                sess._rate_limiter_meta = {"get_per_sec": float(get_rps or 0.0), "post_per_sec": float(post_rps or 0.0)}
+            except Exception:
+                pass
             try:
                 sess.trust_env = False
             except Exception:
@@ -581,7 +576,24 @@ class _MDBLISTOPS:
             acts = dict(raw)
             watch = acts.get("watchlisted_at") or acts.get("watchlist") or acts.get("updated_at")
             rated = acts.get("rated_at") or acts.get("ratings") or acts.get("updated_at")
-            hist = acts.get("watched_at") or acts.get("history") or acts.get("updated_at")
+            hist_candidates = [
+                acts.get("watched_at"),
+                acts.get("season_watched_at"),
+                acts.get("episode_watched_at"),
+                acts.get("history"),
+                acts.get("updated_at"),
+            ]
+            hist: Any = None
+            for candidate in hist_candidates:
+                if not candidate:
+                    continue
+                if not hist:
+                    hist = candidate
+                    continue
+                try:
+                    hist = candidate if str(candidate) > str(hist) else hist
+                except Exception:
+                    hist = hist or candidate
             updated = acts.get("updated_at") or hist or rated or watch
 
             out = {

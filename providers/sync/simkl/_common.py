@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 
-START_OF_TIME_ISO = "1970-01-01T00:00:00Z"
+START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 DEFAULT_DATE_FROM = START_OF_TIME_ISO
 UA = os.getenv("CW_UA", "CrossWatch/3.2.1 (SIMKL)")
 
@@ -24,6 +24,13 @@ def _pair_scope() -> str | None:
         if v and str(v).strip():
             return str(v).strip()
     return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def _safe_scope(value: str) -> str:
@@ -63,7 +70,7 @@ def _legacy_path(path: Path) -> Path | None:
 def _migrate_legacy_json(path: Path) -> None:
     if path.exists():
         return
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
     if not legacy or not legacy.exists():
@@ -78,7 +85,7 @@ def _migrate_legacy_json(path: Path) -> None:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     _migrate_legacy_json(path)
     try:
@@ -100,7 +107,7 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
 
 
 def load_watermarks() -> dict[str, str]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     data = _read_json(_watermark_path())
     return {k: str(v) for k, v in (data or {}).items() if isinstance(v, str) and v.strip()}

@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypeGuard
 
@@ -14,7 +14,7 @@ from .._log import log as cw_log
 
 STATE_DIR = Path("/config/.cw_state")
 WATERMARK_PATH = STATE_DIR / "mdblist.watermarks.json"
-START_OF_TIME_ISO = "1970-01-01T00:00:00Z"
+START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -25,6 +25,13 @@ def _pair_scope() -> str | None:
         if v and str(v).strip():
             return str(v).strip()
     return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def _safe_scope(value: str) -> str:
@@ -107,7 +114,7 @@ def _legacy_path(path: Path) -> Path | None:
 def _migrate_legacy_json(path: Path) -> None:
     if path.exists():
         return
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
     if not legacy or not legacy.exists():
@@ -122,7 +129,7 @@ def _migrate_legacy_json(path: Path) -> None:
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode():
         return {}
     _migrate_legacy_json(path)
     try:
@@ -132,7 +139,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, data: Mapping[str, Any], *, indent: int | None = 2, sort_keys: bool = True) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode():
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +188,9 @@ def as_epoch(iso: str) -> int | None:
 
 
 def as_iso(ts: int) -> str:
-    return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    dt = epoch + timedelta(seconds=int(ts))
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def max_iso(a: str | None, b: str | None) -> str | None:
@@ -200,12 +209,10 @@ def pad_since_iso(iso_ts: str, *, seconds: int = 2) -> str:
     ts = as_epoch(iso_ts)
     if ts is None:
         return iso_ts
-    return as_iso(max(0, ts - max(0, int(seconds))))
+    return as_iso(ts - max(0, int(seconds)))
 
 
 def get_watermark(feature: str, *, path: Path = WATERMARK_PATH) -> str | None:
-    if _pair_scope() is None:
-        return None
     p = _scoped_watermark_path(path)
     data = read_json(p)
     v = data.get(feature)
@@ -213,8 +220,6 @@ def get_watermark(feature: str, *, path: Path = WATERMARK_PATH) -> str | None:
 
 
 def save_watermark(feature: str, iso_ts: str, *, path: Path = WATERMARK_PATH) -> None:
-    if _pair_scope() is None:
-        return
     p = _scoped_watermark_path(path)
     data = read_json(p)
     data[feature] = iso_z(iso_ts)

@@ -32,11 +32,7 @@ def _load_config() -> dict[str, Any]:
         from cw_platform.config_base import load_config as _load_cfg
         return _load_cfg()
     except Exception:
-        p = Path("/config/config.json")
-        try:
-            return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-        except Exception:
-            return {}
+        return {}
 
 
 def _i(x: Any) -> int | None:
@@ -70,6 +66,19 @@ def _ids_from_meta(meta: dict[str, Any]) -> dict[str, str]:
             if v:
                 ids[k] = v
     return ids
+
+
+def _norm_user(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def mask_account(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return "unknown"
+    if len(s) <= 2:
+        return s[0] + "*"
+    return s[:2] + "***"
 
 
 def _normalize_units(offset: int, duration: int) -> tuple[int, int]:
@@ -339,33 +348,21 @@ class Dispatcher:
             sink.send(ev, cfg)
 
     def _passes_filters(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> bool:
-        if ev.session_key and str(ev.session_key) in self._session_ok:
-            return True
+        cache_key: str | None = None
+        if ev.session_key:
+            cache_key = f"{ev.session_key}|{_norm_user(ev.account or '')}|{str(ev.server_uuid or '').strip().lower()}"
+            if cache_key in self._session_ok:
+                return True
+
         filt = (((cfg.get("scrobble") or {}).get("watch") or {}).get("filters") or {})
+        if not isinstance(filt, dict):
+            filt = {}
+
         wl = filt.get("username_whitelist")
-        want_server = (filt.get("server_uuid") or (cfg.get("plex") or {}).get("server_uuid"))
+        want_server = filt.get("server_uuid")
+        want_user = str(filt.get("user_id") or "").strip().lower()
         if want_server and ev.server_uuid and str(ev.server_uuid) != str(want_server):
             return False
-
-        def _allow() -> bool:
-            if ev.session_key:
-                self._session_ok.add(str(ev.session_key))
-            return True
-
-        if not wl:
-            return _allow()
-
-        def norm(s: str) -> str:
-            return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-        wl_list = wl if isinstance(wl, list) else [wl]
-
-        if any(
-            not str(x).lower().startswith(("id:", "uuid:"))
-            and norm(str(x)) == norm(ev.account or "")
-            for x in wl_list
-        ):
-            return _allow()
 
         def find_user_id(o: Any) -> str:
             if isinstance(o, dict):
@@ -403,6 +400,32 @@ class Dispatcher:
         acc_id = str(n.get("accountID") or "")
         acc_uuid = str(n.get("accountUUID") or "").lower()
         user_id = find_user_id(ev.raw or {})
+
+        def _allow() -> bool:
+            if cache_key:
+                self._session_ok.add(cache_key)
+            return True
+
+        if want_user:
+            if not user_id:
+                return False
+            if want_user != user_id:
+                return False
+
+        if not wl:
+            return _allow()
+
+        def norm(s: str) -> str:
+            return _norm_user(s)
+
+        wl_list = wl if isinstance(wl, list) else [wl]
+
+        if any(
+            not str(x).lower().startswith(("id:", "uuid:"))
+            and norm(str(x)) == norm(ev.account or "")
+            for x in wl_list
+        ):
+            return _allow()
 
         for e in wl_list:
             s = str(e).strip().lower()
@@ -444,17 +467,24 @@ class Dispatcher:
             return True
         return False
 
-    def dispatch(self, ev: ScrobbleEvent) -> None:
+    def accepts(self, ev: ScrobbleEvent) -> bool:
+        cfg = self._cfg_provider() or {}
+        return self._passes_filters(ev, cfg)
+
+    def dispatch(self, ev: ScrobbleEvent) -> bool:
         cfg = self._cfg_provider() or {}
         if not self._passes_filters(ev, cfg):
-            return
+            return False
         if not self._should_send(ev, cfg):
-            return
+            return False
+        sent = False
         for s in self._sinks:
             try:
                 self._send_sink(s, ev, cfg)
+                sent = True
             except Exception as e:
                 _log(f"Sink error: {e}", "ERROR")
+        return sent or not self._sinks
 
 
 __all__ = (

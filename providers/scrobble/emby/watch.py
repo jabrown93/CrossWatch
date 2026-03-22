@@ -14,8 +14,8 @@ except Exception:
     BASE_LOG = None
 
 from cw_platform.config_base import load_config
-from providers.scrobble.scrobble import Dispatcher, ScrobbleSink, ScrobbleEvent, MediaType
-from providers.scrobble.currently_watching import update_from_event as _cw_update
+from providers.scrobble.scrobble import Dispatcher, ScrobbleSink, ScrobbleEvent, MediaType, mask_account as _mask_account
+from providers.scrobble.currently_watching import update_from_event as _cw_update, update_from_payload as _cw_update_payload
 
 TRAKT_API = "https://api.trakt.tv"
 _HTTP = requests.Session()
@@ -189,6 +189,16 @@ def _ticks_to_pct(pos_ticks: Any, dur_ticks: Any) -> int:
         return 0
 
 
+def _ticks_to_ms(v: Any) -> int | None:
+    try:
+        iv = int(v or 0)
+        if iv <= 0:
+            return None
+        return max(0, int(round(iv / 10_000.0)))
+    except Exception:
+        return None
+
+
 def _map_provider_ids(item: dict[str, Any]) -> dict[str, Any]:
     ids: dict[str, Any] = {}
     prov = item.get("ProviderIds") or {}
@@ -300,7 +310,7 @@ def _guid_search_episode(epi_hint: dict[str, Any], cfg: dict[str, Any], logger=N
         t = _trakt_tokens(cfg)
         if not t.get("client_id"):
             return {}
-        q = {k: epi_hint.get(k) for k in ("imdb", "tmdb", "tvdb") if epi_hint.get(k)}
+        q = {k: epi_hint.get(k) for k in ("tmdb", "imdb", "tvdb") if epi_hint.get(k)}
         if not q:
             return {}
         r = _HTTP.get(
@@ -419,7 +429,7 @@ def _enrich_episode_ids(
                     if logger and _is_debug():
                         logger(f"Emby series lookup failed: {e}", "DEBUG")
 
-    for key in ("imdb", "tmdb", "tvdb"):
+    for key in ("tmdb", "imdb", "tvdb"):
         val = show_ids.get(key)
         if val is not None and f"{key}_show" not in cw_ids:
             cw_ids[f"{key}_show"] = val
@@ -433,7 +443,7 @@ def _enrich_episode_ids(
                 pass
             try:
                 base_ids = ids_all or {}
-                for key in ("imdb", "tmdb", "tvdb"):
+                for key in ("tmdb", "imdb", "tvdb"):
                     val = base_ids.get(key)
                     if val is not None and key not in hint:
                         hint[key] = val
@@ -441,7 +451,7 @@ def _enrich_episode_ids(
                 pass
             if hint:
                 extra = _show_ids_from_episode_hint(hint, cfg, logger=logger) or {}
-                for key in ("imdb", "tmdb", "tvdb"):
+                for key in ("tmdb", "imdb", "tvdb"):
                     val = extra.get(key)
                     if val is not None and f"{key}_show" not in cw_ids:
                         cw_ids[f"{key}_show"] = val
@@ -465,15 +475,10 @@ def _server_id(base: str, tok: str, cfg: dict[str, Any]) -> str | None:
         return None
 
 
-def _cfg_for_dispatch(server_id: str | None) -> dict[str, Any]:
-    cfg = _cfg()
+def _cfg_for_dispatch(cfg: dict[str, Any], server_id: str | None) -> dict[str, Any]:
     if not server_id:
         return cfg
     cfg = dict(cfg)
-
-    px = dict(cfg.get("plex") or {})
-    px["server_uuid"] = server_id
-    cfg["plex"] = px
 
     s = dict(cfg.get("scrobble") or {})
     w = dict(s.get("watch") or {})
@@ -493,7 +498,7 @@ def _cfg_for_dispatch(server_id: str | None) -> dict[str, Any]:
 
 def _ids_desc(ids: dict[str, Any] | None) -> str:
     d = ids or {}
-    for k in ("trakt", "imdb", "tmdb", "tvdb"):
+    for k in ("trakt", "tmdb", "imdb", "tvdb"):
         if d.get(k):
             return f"{k}:{d[k]}"
     for k in ("trakt_show", "imdb_show", "tmdb_show", "tvdb_show"):
@@ -535,7 +540,8 @@ class EmbyWatchService:
         instance_id: Any = None,
         quiet_startup: bool = False,
     ) -> None:
-        cfg = _cfg()
+        self._cfg_provider = cfg_provider or _cfg
+        cfg = self._active_cfg()
         self._base, self._tok = _emby_bt(cfg)
         self._disabled = False
         if not self._base or not self._tok:
@@ -546,8 +552,10 @@ class EmbyWatchService:
         self._sinks = list(sinks or [])
         self._instance_id = str(instance_id or 'default').strip() or 'default'
         self._quiet_startup = bool(quiet_startup)
-        _ = cfg_provider
-        self._dispatch = cast(Any, dispatcher) if dispatcher is not None else Dispatcher(self._sinks, cfg_provider=lambda: _cfg_for_dispatch(self._server_id))
+        self._dispatch = cast(Any, dispatcher) if dispatcher is not None else Dispatcher(
+            self._sinks,
+            cfg_provider=lambda: _cfg_for_dispatch(self._active_cfg(), self._server_id),
+        )
         self._poll = max(0.5, float(poll_secs))
         self._idle_steps = 0
         self._max_idle_sleep = 6.0
@@ -558,7 +566,10 @@ class EmbyWatchService:
         self._last_emit: dict[str, tuple[str, int]] = {}
         self._allowed_sessions: set[str] = set()
         self._filtered_sessions: set[str] = set()
+        self._route_filtered_ts: dict[str, float] = {}
         self._cw_last_heartbeat: dict[str, float] = {}
+        self._best_offset: dict[str, tuple[int, int, float]] = {}
+        self._last_seek_emit: dict[str, float] = {}
         self._view_roots_cache: dict[str, tuple[float, set[str]]] = {}
         self._item_root_cache: dict[str, str | None] = {}
 
@@ -580,6 +591,45 @@ class EmbyWatchService:
 
     def _dbg(self, msg: str) -> None:
         self._log(msg, "DEBUG")
+
+    def _update_best_offset(self, session_key: str, off_ms: int, dur_ms: int) -> None:
+        if not session_key or dur_ms <= 0:
+            return
+        o = max(0, int(off_ms))
+        d = int(dur_ms)
+        if o > d:
+            o = d
+        self._best_offset[str(session_key)] = (o, d, time.time())
+
+    def _is_seek_jump(self, prev: tuple[int, int, float] | None, off_ms: int, dur_ms: int, now: float) -> tuple[bool, int, float]:
+        if not prev:
+            return False, 0, 0.0
+        try:
+            po, pd, pts = int(prev[0]), int(prev[1]), float(prev[2])
+            o, d = int(off_ms), int(dur_ms)
+            dt = float(now) - pts
+        except Exception:
+            return False, 0, 0.0
+        if d <= 0 or pd <= 0:
+            return False, 0, dt
+        if dt <= 0.2 or dt > 120.0:
+            return False, 0, dt
+        if abs(d - pd) > max(2000, int(pd * 0.05)):
+            return False, 0, dt
+        jump = abs(o - po)
+        dt_ms = dt * 1000.0
+        if jump >= 20_000 and jump > (dt_ms * 1.6 + 8_000):
+            return True, int(jump), dt
+        return False, int(jump), dt
+
+    def _active_cfg(self) -> dict[str, Any]:
+        try:
+            cfg = self._cfg_provider() or {}
+            if isinstance(cfg, dict) and cfg:
+                return cfg
+        except Exception:
+            pass
+        return _cfg()
 
     def sinks_count(self) -> int:
         try:
@@ -678,36 +728,6 @@ class EmbyWatchService:
         if sk and sk in self._allowed_sessions:
             return True
 
-        filt = (((cfg.get("scrobble") or {}).get("watch") or {}).get("filters") or {})
-        wl = filt.get("username_whitelist")
-        wl_list = wl if isinstance(wl, list) else ([wl] if wl else [])
-
-        def norm(s: str) -> str:
-            return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-        user_ok = True
-        if wl_list:
-            user_ok = False
-            if any(
-                not str(x).lower().startswith(("id:", "uuid:"))
-                and norm(str(x)) == norm(ev.account or "")
-                for x in wl_list
-            ):
-                user_ok = True
-            else:
-                raw = ev.raw or {}
-                uid = str(raw.get("UserId") or "").strip().lower()
-                for e in wl_list:
-                    s = str(e).strip().lower()
-                    if s.startswith("id:") and uid and s.split(":", 1)[1].strip().lower() == uid:
-                        user_ok = True
-                        break
-                    if s.startswith("uuid:") and uid and s.split(":", 1)[1].strip().lower() == uid:
-                        user_ok = True
-                        break
-        if not user_ok:
-            return False
-
         libs = self._scrobble_whitelist(cfg)
         if libs:
             view_id = self._session_view_id(ev.raw or {}, cfg)
@@ -758,15 +778,11 @@ class EmbyWatchService:
 
     def _current_sessions(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         try:
-            e = (cfg.get("emby") or {})
-            uid = str(e.get("user_id") or "").strip().lower()
             q = "/Sessions?ActiveWithinSeconds=15"
             all_sessions = _get_json(self._base, self._tok, q, cfg=cfg) or []
             playing: list[dict[str, Any]] = []
             for s in all_sessions:
                 if not (s.get("NowPlayingItem") or {}):
-                    continue
-                if uid and str(s.get("UserId") or "").strip().lower() != uid:
                     continue
                 playing.append(s)
             return playing
@@ -785,11 +801,77 @@ class EmbyWatchService:
             "account": ev.account,
         }
 
+    def _emit_seek_update(self, sess: dict[str, Any], pct: int, cfg: dict[str, Any], src: str) -> bool:
+        sk = str(sess.get("Id") or "").strip()
+        if not sk:
+            return False
+        try:
+            pct_i = int(pct)
+        except Exception:
+            return False
+        if pct_i < 0 or pct_i > 100:
+            return False
+        now = time.time()
+        last_ts = float(self._last_seek_emit.get(sk, 0.0) or 0.0)
+        if (now - last_ts) < 1.0:
+            return False
+        try:
+            suppress_start_at = int((((cfg.get("scrobble") or {}).get("watch") or {}).get("suppress_start_at") or 0))
+        except Exception:
+            suppress_start_at = 0
+        if suppress_start_at and pct_i >= suppress_start_at:
+            return False
+
+        ev = self._build_event(sess, "playing", pct_i)
+        if not ev:
+            return False
+
+        last = self._last_emit.get(sk)
+        if last and last[0] == "start" and abs(int(last[1]) - pct_i) < 1:
+            return False
+
+        raw = dict(ev.raw or {})
+        raw["_cw_seek"] = True
+        raw["_cw_seek_src"] = str(src or "poll")
+        raw["_cw_seek_ts"] = now
+        ev2 = ScrobbleEvent(**{**ev.__dict__, "progress": pct_i, "raw": raw})
+
+        if not self._passes_filters(ev2, cfg):
+            if sk and sk not in self._filtered_sessions:
+                self._dbg(f"seek update filtered: user={_mask_account(ev2.account)} server={ev2.server_uuid} sess={ev2.session_key}")
+                self._filtered_sessions.add(sk)
+            return False
+
+        if sk and sk in self._filtered_sessions:
+            try:
+                self._filtered_sessions.remove(sk)
+            except Exception:
+                pass
+
+        accepted = bool(self._dispatch.dispatch(ev2))
+        if not accepted:
+            self._throttled_route_filtered_log(ev2, "seek update")
+            self._clear_currently_watching(ev2)
+            return False
+
+        try:
+            _cw_update("emby", ev2, provider_instance=str(self._instance_id or "default"))
+        except Exception:
+            pass
+
+        self._last_seek_emit[sk] = now
+        self._last_emit[sk] = ("start", pct_i)
+        last_meta = self._last.get(sk) or {}
+        last_meta["meta"] = self._meta_from_event(ev2)
+        self._last[sk] = last_meta
+        self._log(f"seek update p={pct_i}% sess={sk}", "DEBUG")
+        return True
+
     def _emit(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> None:
         sk = str(ev.session_key or "")
         if not self._passes_filters(ev, cfg):
             if sk and sk not in self._filtered_sessions:
-                self._dbg(f"event filtered: user={ev.account} server={ev.server_uuid}")
+                self._dbg(f"event filtered: user={_mask_account(ev.account)} server={ev.server_uuid} sess={sk}")
                 self._filtered_sessions.add(sk)
             return
 
@@ -802,22 +884,28 @@ class EmbyWatchService:
         if sk:
             last = self._last_emit.get(sk)
             if last and last[0] == ev.action and last[1] == ev.progress:
-                self._dbg(f"suppress duplicate {ev.action} sess={sk} p={ev.progress}")
+                if ev.action == "stop":
+                    self._dbg(f"suppress duplicate stop sess={sk} p={ev.progress}")
                 return
 
+        accepted = bool(self._dispatch.dispatch(ev))
+        if not accepted:
+            self._throttled_route_filtered_log(ev)
+            self._clear_currently_watching(ev)
+            return
+
         try:
-            _cw_update("emby", ev)
+            _cw_update("emby", ev, provider_instance=str(self._instance_id or "default"))
         except Exception:
             pass
 
         act = "playing" if ev.action == "start" else ("paused" if ev.action == "pause" else "stop")
         self._log(
-            f"incoming '{act}' user='{ev.account}' server='{ev.server_uuid}' media='{_media_name(ev)}'",
+            f"incoming '{act}' user='{_mask_account(ev.account)}' server='{ev.server_uuid}' media='{_media_name(ev)}'",
             "DEBUG",
         )
         self._log(f"ids resolved: {_media_name(ev)} -> {_ids_desc(ev.ids)}", "DEBUG")
-        self._log(f"event {ev.action} {ev.media_type} user={ev.account} p={ev.progress} sess={sk}")
-        self._dispatch.dispatch(ev)
+        self._log(f"event {ev.action} {ev.media_type} user={_mask_account(ev.account)} p={ev.progress} sess={sk}")
 
         if sk:
             last_meta = self._last.get(sk) or {}
@@ -825,9 +913,38 @@ class EmbyWatchService:
             self._last[sk] = last_meta
             self._last_emit[sk] = (ev.action, ev.progress)
 
+    def _throttled_route_filtered_log(self, ev: ScrobbleEvent, kind: str = "event") -> None:
+        sk = str(ev.session_key or "")
+        key = f"{kind}|{ev.account}|{ev.server_uuid}|{sk or '?'}"
+        now = time.time()
+        last = self._route_filtered_ts.get(key, 0.0)
+        if now - last >= 30.0:
+            self._dbg(f"{kind} filtered by route dispatcher: user={_mask_account(ev.account)} server={ev.server_uuid} sess={sk}")
+            self._route_filtered_ts[key] = now
+
+    def _clear_currently_watching(self, ev: ScrobbleEvent) -> None:
+        try:
+            _cw_update_payload(
+                "emby",
+                ev.media_type,
+                ev.title or "",
+                ev.year,
+                ev.season,
+                ev.number,
+                ev.progress,
+                True,
+                state="stopped",
+                clear_on_stop=True,
+                ids=ev.ids,
+                session_key=ev.session_key,
+                provider_instance=str(self._instance_id or "default"),
+            )
+        except Exception:
+            pass
+
     def _tick(self) -> bool:
         now = time.time()
-        cfg = _cfg()
+        cfg = self._active_cfg()
         cur = self._current_sessions(cfg)
         seen: set[str] = set()
 
@@ -862,6 +979,8 @@ class EmbyWatchService:
             pos = ps.get("PositionTicks") if isinstance(ps, dict) else None
             state = "paused" if (ps.get("IsPaused") if isinstance(ps, dict) else False) else "playing"
             p = _ticks_to_pct(pos or 0, dur or 0)
+            off_ms = _ticks_to_ms(pos)
+            dur_ms = _ticks_to_ms(dur)
 
             key = f"{item.get('Id') or item.get('InternalId') or item.get('Name')}-{mhash(dur)}"
             last = self._last.get(sid) or {}
@@ -871,6 +990,16 @@ class EmbyWatchService:
 
             emit_action: str | None = None
             did_emit = False
+            seek_emitted = False
+
+            if off_ms is not None and dur_ms is not None and dur_ms > 0:
+                prev = self._best_offset.get(sid)
+                if state == "playing":
+                    is_seek, _jump, _dt = self._is_seek_jump(prev, off_ms, dur_ms, now)
+                    if is_seek:
+                        seek_emitted = self._emit_seek_update(s, p, cfg, "poll")
+                        did_emit = did_emit or seek_emitted
+                self._update_best_offset(sid, off_ms, dur_ms)
 
             if key != last_key:
                 emit_action = "start"
@@ -895,7 +1024,7 @@ class EmbyWatchService:
                         self._emit(ev, cfg)
                         state_ts = now
                         did_emit = True
-            elif state == "playing" and sid in self._last_emit:
+            elif state == "playing" and sid in self._last_emit and not seek_emitted:
                 last_em = self._last_emit.get(sid)
                 last_prog: int | None = None
 
@@ -933,11 +1062,19 @@ class EmbyWatchService:
                     self._cw_last_heartbeat[sid] = now
                 elif now - last_hb >= heartbeat_secs:
                     ev_hb = self._build_event(s, "playing", p)
+                    route_ok = False
                     if ev_hb and self._passes_filters(ev_hb, cfg):
                         try:
-                            _cw_update("emby", ev_hb)
+                            route_ok = bool(getattr(self._dispatch, "accepts")(ev_hb))
+                        except Exception:
+                            route_ok = False
+                    if ev_hb and route_ok:
+                        try:
+                            _cw_update("emby", ev_hb, provider_instance=str(self._instance_id or "default"))
                         except Exception:
                             pass
+                    elif ev_hb:
+                        self._clear_currently_watching(ev_hb)
                     self._cw_last_heartbeat[sid] = now
             else:
                 try:
@@ -965,10 +1102,26 @@ class EmbyWatchService:
                     self._cw_last_heartbeat.pop(sid, None)
                 except Exception:
                     pass
+                try:
+                    self._best_offset.pop(sid, None)
+                except Exception:
+                    pass
+                try:
+                    self._last_seek_emit.pop(sid, None)
+                except Exception:
+                    pass
                 continue
 
             if last_p >= force_at or dt >= 2.0:
-                fake = {"Id": sid, "UserName": meta.get("account"), "NowPlayingItem": {}, "PlayState": {}}
+                preserve_stop = str(memo.get("state") or "").strip().lower() == "playing" and dt <= 5.0
+                fake = {
+                    "Id": sid,
+                    "UserName": meta.get("account"),
+                    "NowPlayingItem": {},
+                    "PlayState": {},
+                    "_cw_preserve_stop": preserve_stop,
+                    "_cw_stop_src": "poll-disappear",
+                }
                 mt_raw = str(meta.get("media_type") or "").strip().lower()
                 mt: MediaType = "episode" if mt_raw == "episode" else "movie"
 
@@ -1001,12 +1154,20 @@ class EmbyWatchService:
                     self._cw_last_heartbeat.pop(sid, None)
                 except Exception:
                     pass
+                try:
+                    self._best_offset.pop(sid, None)
+                except Exception:
+                    pass
+                try:
+                    self._last_seek_emit.pop(sid, None)
+                except Exception:
+                    pass
 
         return bool(cur)
 
     def start(self) -> None:
         self._stop.clear()
-        cfg = _cfg() or {}
+        cfg = self._active_cfg() or {}
         sc = (cfg.get("scrobble") or {})
         if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "watch":
             self._log("Watcher disabled by config; not starting", "INFO")

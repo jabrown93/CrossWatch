@@ -17,6 +17,7 @@ except Exception:
 
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
+from providers.scrobble.scrobble import mask_account as _mask_account
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
 except Exception:
@@ -554,7 +555,7 @@ def _resolve_trakt_movie_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger
     c = _cache_get(key)
     if c is not None:
         return c
-    for k in ("imdb", "tmdb", "tvdb"):
+    for k in ("tmdb", "imdb", "tvdb"):
         val = ids_all.get(k)
         if not val:
             continue
@@ -585,7 +586,7 @@ def _resolve_trakt_show_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger:
     c = _cache_get(key)
     if c is not None:
         return c
-    for k in ("imdb", "tmdb", "tvdb"):
+    for k in ("tmdb", "imdb", "tvdb"):
         val = ids_all.get(k)
         if not val:
             continue
@@ -638,7 +639,7 @@ def _trakt_show_ids_from_imdb_show(imdb_show: str, cfg: dict[str, Any], logger: 
             _cache_put(key, None)
             return {}
         ids = (((arr[0] or {}).get("show") or {}).get("ids") or {})
-        out = {k: ids[k] for k in ("trakt", "imdb", "tmdb", "tvdb") if ids.get(k)}
+        out = {k: ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if ids.get(k)}
         _cache_put(key, out if out else None)
         if out:
             _emit(logger, f"trakt show ids from imdb_show {imdb_show}: {out}", "DEBUG")
@@ -691,7 +692,7 @@ def _resolve_trakt_episode_id(
 
 
 def _best_id_key_order(media_type: str) -> tuple[str, ...]:
-    return ("imdb", "tmdb", "tvdb") if media_type == "movie" else ("tmdb", "imdb", "tvdb")
+    return ("tmdb", "imdb", "tvdb") if media_type == "movie" else ("tmdb", "imdb", "tvdb")
 
 
 def _series_ids_from_payload(md: Mapping[str, Any], root: Mapping[str, Any]) -> dict[str, Any]:
@@ -788,7 +789,7 @@ def _cw_ids_for_payload(
     except Exception:
         show_ids = {}
 
-    for key in ("imdb", "tmdb", "tvdb"):
+    for key in ("tmdb", "imdb", "tvdb"):
         val = show_ids.get(key)
         if val is not None:
             cw_ids.setdefault(f"{key}_show", val)
@@ -799,14 +800,14 @@ def _cw_ids_for_payload(
         except Exception:
             hint = dict(ids_all or {})
         extra = _show_ids_from_episode_hint(hint, cfg, logger=logger) or {}
-        for key in ("imdb", "tmdb", "tvdb"):
+        for key in ("tmdb", "imdb", "tvdb"):
             val = extra.get(key)
             if val is not None:
                 cw_ids.setdefault(f"{key}_show", val)
 
     if "tmdb_show" not in cw_ids and cw_ids.get("imdb_show"):
         extra2 = _trakt_show_ids_from_imdb_show(str(cw_ids["imdb_show"]), cfg, logger=logger)
-        for key in ("imdb", "tmdb", "tvdb"):
+        for key in ("tmdb", "imdb", "tvdb"):
             val = extra2.get(key)
             if val is not None:
                 cw_ids.setdefault(f"{key}_show", val)
@@ -1014,7 +1015,7 @@ def _session_media_key(md: Mapping[str, Any], ids_all: Mapping[str, Any], root: 
     v = md.get("Id")
     if v:
         return str(v)
-    for k in ("imdb", "tmdb", "tvdb", "trakt"):
+    for k in ("tmdb", "imdb", "tvdb", "trakt"):
         vv = ids_all.get(k)
         if vv:
             return f"{k}:{vv}"
@@ -1118,10 +1119,10 @@ def process_webhook(
             except Exception:
                 pass
 
-        _emit(logger, f"incoming '{event}' user='{acc_title}' media='{media_name_dbg}'", "DEBUG")
+        _emit(logger, f"incoming '{event}' user='{_mask_account(acc_title)}' media='{media_name_dbg}'", "DEBUG")
 
         if allow_users and acc_title and acc_title not in allow_users:
-            _emit(logger, f"ignored user '{acc_title}'", "DEBUG")
+            _emit(logger, f"ignored user '{_mask_account(acc_title)}'", "DEBUG")
             return {"ok": True, "ignored": True}
 
         if not md or media_type not in ("movie", "episode"):
@@ -1556,7 +1557,7 @@ def process_webhook(
                     action_name = intended.rsplit("/", 1)[-1]
                 except Exception:
                     action_name = intended
-                _emit(logger, f"user='{acc_title}' {action_name} {prog:.1f}% • {media_name_dbg}", "INFO")
+                _emit(logger, f"user='{_mask_account(acc_title)}' {action_name} {prog:.1f}% • {media_name_dbg}", "INFO")
             except Exception:
                 pass
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any, Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import json
 import re
 import threading
@@ -136,6 +136,34 @@ def _parse_pairs_raw(pairs_raw: str | None) -> list[str]:
     return out
 
 
+def _legacy_state_token(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    posix = PurePosixPath(raw)
+    win = PureWindowsPath(raw)
+    if posix.name != raw or win.name != raw:
+        return None
+    if posix.is_absolute() or win.is_absolute() or win.drive or win.root:
+        return None
+    if raw in (".", ".."):
+        return None
+    return raw
+
+
+def _resolve_analyzer_path(path: Path) -> Path:
+    candidate = path.resolve()
+    roots = [CONFIG_DIR.resolve(), CWS_DIR.resolve()]
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise HTTPException(400, "Invalid analyzer path")
+
+
 def _state_candidates(token: str) -> list[Path]:
     return [
         CONFIG_DIR / f"state.{token}.json",
@@ -145,14 +173,18 @@ def _state_candidates(token: str) -> list[Path]:
 
 def _pick_existing(paths: list[Path]) -> Path | None:
     for p in paths:
-        if p.exists():
-            return p
+        try:
+            candidate = _resolve_analyzer_path(p)
+        except HTTPException:
+            continue
+        if candidate.exists():
+            return candidate
     return None
 
 
 def _load_state_at(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_resolve_analyzer_path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise HTTPException(404, f"{path.name} not found")
     except Exception:
@@ -166,8 +198,9 @@ def _load_state_handles(pairs_raw: str | None) -> list[dict[str, Any]]:
         for pid in pairs:
             safe = _safe_scope(pid)
             cand = _state_candidates(safe)
-            if safe != str(pid):
-                cand += _state_candidates(str(pid))
+            legacy = _legacy_state_token(pid)
+            if legacy and legacy != safe:
+                cand += _state_candidates(legacy)
             path = _pick_existing(cand)
             if path is None:
                 continue
@@ -255,6 +288,7 @@ def _load_state(pairs_raw: str | None = None) -> dict[str, Any]:
 
 
 def _save_state_at(path: Path, s: dict[str, Any]) -> None:
+    path = _resolve_analyzer_path(path)
     with _LOCK:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -481,7 +515,7 @@ def _alias_keys(obj: dict[str, Any]) -> list[str]:
     if obj.get("_key"):
         out.append(obj["_key"])
 
-    for ns in ("imdb", "tmdb", "tvdb", "mal", "anilist", "trakt", "simkl", "plex", "emby", "guid", "mdblist"):
+    for ns in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mal", "anilist", "plex", "emby", "guid", "mdblist"):
         v = ids.get(ns)
         if v:
             vs = str(v)
@@ -965,7 +999,7 @@ def _history_show_sets(s: dict[str, Any]) -> tuple[dict[str, set[str]], dict[str
     def pick_sig(obj: Any) -> str | None:
         if not isinstance(obj, dict):
             return None
-        for idk in ("imdb", "tmdb", "tvdb", "slug"):
+        for idk in ("tmdb", "imdb", "tvdb", "slug"):
             v = obj.get(idk)
             if v:
                 return f"{idk}:{str(v).lower()}"
@@ -994,7 +1028,7 @@ def _history_show_sets(s: dict[str, Any]) -> tuple[dict[str, set[str]], dict[str
         for s0 in sigs:
             ns = s0.split(":", 1)[0] if ":" in s0 else ""
             by_ns.setdefault(ns, set()).add(s0)
-        order = {"imdb": 0, "tmdb": 1, "tvdb": 2, "slug": 3}
+        order = {"tmdb": 0, "imdb": 1, "tvdb": 2, "slug": 3}
         best = None
         best_p = 999
         for s0 in sigs:
@@ -1008,7 +1042,7 @@ def _history_show_sets(s: dict[str, Any]) -> tuple[dict[str, set[str]], dict[str
     def sig_prio(sig: str | None) -> int:
         if not sig or ":" not in sig:
             return 999
-        order = {"imdb": 0, "tmdb": 1, "tvdb": 2, "slug": 3}
+        order = {"tmdb": 0, "imdb": 1, "tvdb": 2, "slug": 3}
         return order.get(sig.split(":", 1)[0], 999)
 
     def show_id_sig(rec: dict[str, Any]) -> str | None:
@@ -1196,7 +1230,7 @@ def _history_show_signature(rec: dict[str, Any]) -> str | None:
     show_ids = (rec.get("show_ids") or {}) or {}
 
     def pick(obj: dict[str, Any]) -> str | None:
-        for idk in ("imdb", "tmdb", "tvdb", "slug"):
+        for idk in ("tmdb", "imdb", "tvdb", "slug"):
             v = obj.get(idk)
             if v:
                 return f"{idk}:{str(v).lower()}"
@@ -1298,7 +1332,7 @@ def _missing_peer_show_hints(
 
 def _problems(s: dict[str, Any], allowed_scopes: set[str] | None = None) -> list[dict[str, Any]]:
     probs: list[dict[str, Any]] = []
-    core = ("imdb", "tmdb", "tvdb")
+    core = ("tmdb", "imdb", "tvdb")
 
     cfg = _cfg()
     pairs = _pair_map(cfg, s)
@@ -1538,7 +1572,7 @@ def _rekey(b: dict[str, Any], old_key: str, it: dict[str, Any]) -> str:
     ns = parts[0]
     base = ids.get(ns) or ""
     if not base:
-        for cand in ("imdb", "tmdb", "tvdb"):
+        for cand in ("tmdb", "imdb", "tvdb"):
             if ids.get(cand):
                 ns = cand
                 base = ids[cand]

@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import time
@@ -567,10 +568,26 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
 
         wm_key = _wm_key(acct_id, uname)
         wm = _load_watermark(wm_key) if (since is None or int(since or 0) <= 0) else None
-        eff_since = int(since) if (since is not None and int(since or 0) > 0) else (int(wm) if wm else None)
+                # Treat cursors as *exclusive* to avoid re-reading the boundary event forever.
+        if since is not None and int(since or 0) > 0:
+            eff_since = int(since) + 1
+        elif wm:
+            eff_since = int(wm) + 1
+        else:
+            eff_since = None
 
         allow = _allowed_history_sec_ids(adapter)
         explicit_user = bool(cfg_acct_id or cfg_uname)
+
+        # Optional cursor debugging (helps diagnose 1-item re-add loops).
+        if str(os.environ.get("CW_PLEX_HISTORY_DEBUG_CURSOR", "")).strip().lower() in ("1", "true", "yes"):
+            _dbg(
+                "cursor",
+                since_arg=int(since or 0) if since is not None else None,
+                wm=int(wm or 0) if wm else None,
+                eff_since=int(eff_since or 0) if eff_since else None,
+                wm_key=wm_key,
+            )
 
         base_kwargs: dict[str, Any] = {}
         if cfg_acct_id and (not cli_acct_id or int(cfg_acct_id) != int(cli_acct_id)):
@@ -630,54 +647,99 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
                 max_seen = ts
 
         total = len(rows)
+        workers = _get_workers(adapter, "history_workers", "CW_PLEX_HISTORY_WORKERS", 12)
+
+        # Optional cursor debugging: show the rows that are considered "new" for this run.
+        if eff_since is not None and str(os.environ.get("CW_PLEX_HISTORY_DEBUG_CURSOR", "")).strip().lower() in ("1", "true", "yes"):
+            try:
+                new_rows = []
+                for rr in rows:
+                    ts_i = _epoch_from_history_entry(rr) or 0
+                    if ts_i and ts_i >= int(eff_since):
+                        new_rows.append(rr)
+                sample = []
+                for rr in new_rows[:5]:
+                    try:
+                        sample.append({
+                            "type": getattr(rr, "type", None),
+                            "title": getattr(rr, "title", None),
+                            "ratingKey": getattr(rr, "ratingKey", None),
+                            "ts": _epoch_from_history_entry(rr),
+                        })
+                    except Exception:
+                        continue
+                _dbg("cursor.new_rows", count=len(new_rows), sample=sample)
+            except Exception:
+                pass
         if prog:
             prog.tick(0, total=total, force=True)
 
         out: dict[str, dict[str, Any]] = {}
-        for i, raw in enumerate(rows, start=1):
-            if prog:
-                prog.tick(i, total=total)
-
+        def _process_history_row(raw: Any) -> tuple[str, dict[str, Any]] | None:
             ts = _epoch_from_history_entry(raw)
             if not ts:
-                continue
+                return None
             ts_i = int(ts)
 
             if eff_since is not None and ts_i < int(eff_since):
-                continue
+                return None
 
             if allow:
                 sid = _row_section_id(raw)
                 if sid and sid not in allow:
-                    continue
+                    return None
 
             aid = _account_id_from_history_entry(raw)
             if cfg_acct_id and aid is not None and int(aid) != int(cfg_acct_id):
-                continue
+                return None
             if cfg_uname:
                 u = (_username_from_history_entry(raw) or "").strip().lower()
                 if u and u != cfg_uname:
-                    continue
+                    return None
             if not explicit_user and cli_acct_id and aid is not None and int(aid) != int(cli_acct_id):
-                continue
+                return None
 
             meta = minimal_from_history_row(raw, token=None, allow_discover=False)
             if not meta and fallback_guid:
                 meta = minimal_from_history_row(raw, token=None, allow_discover=True)
             if not meta:
-                continue
+                return None
             if not _keep_in_snapshot(adapter, meta):
-                continue
+                return None
 
             row = dict(meta)
             _force_episode_title(row)
             row["watched"] = True
             row["watched_at"] = _iso(ts_i)
+            return f"{canonical_key(row)}@{ts_i}", row
 
-            key = f"{canonical_key(row)}@{ts_i}"
-            out[key] = row
-            if limit and len(out) >= int(limit):
-                break
+        row_iter: Iterable[tuple[str, dict[str, Any]] | None]
+        if workers > 1 and len(rows) > 1:
+            executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="plex-history")
+            try:
+                row_iter = executor.map(_process_history_row, rows)
+                for i, result in enumerate(row_iter, start=1):
+                    if prog:
+                        prog.tick(i, total=total)
+                    if not result:
+                        continue
+                    key, row = result
+                    out[key] = row
+                    if limit and len(out) >= int(limit):
+                        break
+            finally:
+                executor.shutdown(wait=True, cancel_futures=False)
+        else:
+            for i, raw in enumerate(rows, start=1):
+                if prog:
+                    prog.tick(i, total=total)
+                result = _process_history_row(raw)
+                if not result:
+                    continue
+                key, row = result
+                out[key] = row
+                if limit and len(out) >= int(limit):
+                    break
 
         include_marked = bool(_history_cfg_get(adapter, "include_marked_watched", True))
         include_shadow = bool(_history_cfg_get(adapter, "include_shadow", True))
@@ -794,6 +856,7 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         _info(
             "index_done",
             count=len(out),
+            workers=workers,
             include_marked=include_marked,
             scanned=total,
             token_acct_id=(cli_acct_id or 0),

@@ -94,6 +94,7 @@
 
     const sel = document.createElement("select");
     sel.id = "emby_instance";
+sel.name = "emby_instance";
     sel.className = "input";
     sel.style.minWidth = "160px";
 
@@ -389,7 +390,12 @@
     const msg = Q("#emby_msg");
     setMsgBanner(msg, "warn", "Deleting…");
     try {
-      const r = await fetch(embyApi("/api/emby/token"), { method: "DELETE" });
+      const r = await fetch(embyApi("/api/emby/token/delete"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        cache: "no-store",
+      });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || j?.ok === false) throw new Error(String(j?.error || `HTTP ${r.status}`));
       setMsgBanner(msg, "ok", "Deleted.");

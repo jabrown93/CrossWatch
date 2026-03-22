@@ -7,6 +7,7 @@ from .._log import log as cw_log
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
@@ -20,6 +21,7 @@ from ._common import (
     resolve_item_id,
     sleep_ms,
     _pair_scope,
+    _is_capture_mode,
 )
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 
@@ -53,7 +55,7 @@ def _warn(msg: str, **fields: Any) -> None:
 
 # unresolved
 def _unres_load() -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     try:
         with open(_unresolved_path(), "r", encoding="utf-8") as f:
@@ -63,7 +65,7 @@ def _unres_load() -> dict[str, Any]:
 
 
 def _unres_save(obj: Mapping[str, Any]) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         path = _unresolved_path()
@@ -99,26 +101,41 @@ def _thaw_if_present(keys: Iterable[str]) -> None:
 
 
 # shadow
-def _shadow_load() -> dict[str, int]:
-    if _pair_scope() is None:
+def _shadow_load() -> dict[str, dict[str, Any]]:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     try:
         with open(_shadow_path(), "r", encoding="utf-8") as f:
             raw = json.load(f) or {}
-            return {str(k): int(v) for k, v in raw.items()}
+            out: dict[str, dict[str, Any]] = {}
+            if isinstance(raw, Mapping):
+                for k, v in raw.items():
+                    key = str(k)
+                    if isinstance(v, Mapping):
+                        cnt = int(v.get("count") or v.get("c") or v.get("n") or 0)
+                        iid = str(v.get("iid") or v.get("item_id") or "").strip() or None
+                        upd = str(v.get("updated") or v.get("ts") or "").strip() or None
+                        hint = v.get("hint") if isinstance(v.get("hint"), Mapping) else None
+                        out[key] = {"count": max(0, cnt), "iid": iid, "updated": upd, "hint": hint}
+                    else:
+                        try:
+                            out[key] = {"count": max(0, int(v))}
+                        except Exception:
+                            out[key] = {"count": 0}
+            return out
     except Exception:
         return {}
 
 
-def _shadow_save(d: Mapping[str, int]) -> None:
-    if _pair_scope() is None:
+def _shadow_save(d: Mapping[str, Mapping[str, Any]]) -> None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         path = _shadow_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(dict(d or {}), f, ensure_ascii=False, indent=2, sort_keys=True)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -126,7 +143,7 @@ def _shadow_save(d: Mapping[str, int]) -> None:
 
 # blackbox
 def _bb_load() -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     try:
         with open(_blackbox_path(), "r", encoding="utf-8") as f:
@@ -136,7 +153,7 @@ def _bb_load() -> dict[str, Any]:
 
 
 def _bb_save(d: Mapping[str, Any]) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         path = _blackbox_path()
@@ -159,6 +176,20 @@ def _history_limit(adapter: Any) -> int:
         return max(1, int(v))
     except Exception:
         return 1000
+
+def _history_page_size(adapter: Any) -> int:
+    env = (os.environ.get("CW_JELLYFIN_HISTORY_PAGE_SIZE") or "").strip()
+    if env:
+        try:
+            v = int(env)
+            return max(50, min(2000, v))
+        except Exception:
+            pass
+
+    base = int(_history_limit(adapter) or 25)
+    if base < 100:
+        return 500
+    return max(50, min(2000, base))
 
 
 def _history_delay_ms(adapter: Any) -> int:
@@ -315,23 +346,8 @@ def _unmark_played(http: Any, uid: str, item_id: str) -> bool:
 
 
 def _dst_user_state(http: Any, uid: str, iid: str) -> tuple[bool, int]:
-    try:
-        r = http.get(f"/Users/{uid}/Items/{iid}", params={"Fields": "UserData"})
-        if getattr(r, "status_code", 0) != 200:
-            return False, 0
-        data = r.json() or {}
-        ud = data.get("UserData") or {}
-        played = bool(ud.get("Played") or ud.get("IsPlayed"))
-        ts = 0
-        for k in ("LastPlayedDate", "DateLastPlayed", "LastPlayed"):
-            v = ud.get(k) or data.get(k)
-            if v:
-                ts = _parse_iso_to_epoch(v) or 0
-                if ts:
-                    break
-        return played, ts
-    except Exception:
-        return False, 0
+    # Delegate to batch variant to keep parsing consistent
+    return _dst_user_states(http, uid, [str(iid)]).get(str(iid), (False, 0))
 
 
 
@@ -393,12 +409,11 @@ def build_index(
 ) -> dict[str, dict[str, Any]]:
     prog_mk = getattr(adapter, "progress_factory", None)
     prog = prog_mk("history") if callable(prog_mk) else None
-
     http = adapter.client
     uid = adapter.cfg.user_id
     _SERIES_META_CACHE.clear()
-    page_size = _history_limit(adapter)
-
+    page_size = _history_page_size(adapter)
+    allow_deep = (os.environ.get("CW_JELLYFIN_HISTORY_DEEP_LOOKUP") or "").strip().lower() == "true"
     since_epoch = 0
     if isinstance(since, (int, float)):
         since_epoch = int(since)
@@ -422,8 +437,10 @@ def build_index(
 
     start = 0
     events: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    page = 0
 
     while True:
+        t0 = time.monotonic()
         params: dict[str, Any] = {
             "UserId": uid,
             "SortBy": "DatePlayed",
@@ -432,10 +449,11 @@ def build_index(
             "Recursive": "true",
             "Filters": "IsPlayed",
             "Fields": (
-                "ProviderIds,MediaSources,Path,Overview,"
-                "ParentId,LibraryId,AncestorIds,"
-                "SeriesName,SeriesId,IndexNumber,ParentIndexNumber,DateLastMediaAdded"
+                "ProviderIds,Path,ParentId,LibraryId,AncestorIds,"
+                "Name,SeriesName,SeriesId,IndexNumber,ParentIndexNumber,UserData"
             ),
+            "EnableImages": "false",
+            "EnableTotalRecordCount": "false",
             "StartIndex": start,
             "Limit": page_size,
         }
@@ -446,6 +464,16 @@ def build_index(
         r = http.get(f"/Users/{uid}/Items", params=params)
         body = r.json() or {}
         rows = body.get("Items") or []
+        page += 1
+        took_ms = int((time.monotonic() - t0) * 1000)
+        _dbg(
+            "index page",
+            page=page,
+            start=start,
+            got=len(rows),
+            limit=page_size,
+            latency_ms=took_ms,
+        )
         if not rows:
             break
 
@@ -469,7 +497,13 @@ def build_index(
                 break
 
             m = jelly_normalize(row)
-            lib_id = jf_resolve_library_id(row, roots, scope_libs, http)
+            lib_id = jf_resolve_library_id(
+                row,
+                roots,
+                scope_libs,
+                http,
+                allow_deep_lookup=allow_deep,
+            )
 
             m = dict(m)
             m["library_id"] = lib_id
@@ -515,11 +549,17 @@ def build_index(
             if lib_id:
                 event["library_id"] = lib_id
 
-            ev_key = f"{canonical_key(m)}@{ts}"
+            base_key = canonical_key(m)
+            event.setdefault("_cw_key", base_key)
+            jf_iid = m.get("jellyfin_item_id")
+            if jf_iid:
+                event.setdefault("jellyfin_item_id", str(jf_iid))
+
+            ev_key = f"{base_key}@{ts}"
             out_ev = dict(event)
             if lib_id:
                 out_ev["library_id"] = lib_id
-            events.append((ts, {"key": ev_key, "base": m}, out_ev))
+            events.append((ts, {"key": ev_key}, out_ev))
 
         start += len(body.get("Items") or [])
         if isinstance(limit, int) and limit > 0 and len(events) >= int(limit):
@@ -545,10 +585,22 @@ def build_index(
     shadow = _shadow_load()
     if shadow:
         added = 0
-        for k in list(shadow.keys()):
+        for k, meta in shadow.items():
             if k in event_bases or k in out:
                 continue
-            out.setdefault(k, {"watched": True})
+            rec = out.setdefault(k, {"watched": True})
+            if isinstance(rec, dict):
+                rec.setdefault("_cw_key", k)
+                rec.setdefault("_cw_presence", True)
+                if isinstance(meta, Mapping):
+                    iid = meta.get("iid")
+                    if iid:
+                        rec.setdefault("jellyfin_item_id", str(iid))
+                    hint = meta.get("hint")
+                    if isinstance(hint, Mapping):
+                        for hk in ("type", "title", "year", "season", "episode", "series_title", "ids", "show_ids"):
+                            if hk in hint and rec.get(hk) in (None, ""):
+                                rec[hk] = hint.get(hk)
             added += 1
         if added:
             _dbg("shadow merged", added=added)
@@ -564,7 +616,13 @@ def build_index(
             if isinstance(meta, dict) and str(meta.get("reason", "")).startswith("presence:"):
                 since_ep = _parse_iso_to_epoch(meta.get("since")) or 0
                 if since_ep and (now_ep - since_ep) <= ttl:
-                    out.setdefault(k, {"watched": True})
+                    rec = out.setdefault(k, {"watched": True})
+                    if isinstance(rec, dict):
+                        rec.setdefault("_cw_key", k)
+                        rec.setdefault("_cw_presence", True)
+                        iid = meta.get("iid")
+                        if iid:
+                            rec.setdefault("jellyfin_item_id", str(iid))
                     added += 1
         if added:
             _dbg("blackbox presence merged", added=added)
@@ -590,6 +648,89 @@ def build_index(
     _info("index done", count=len(out), mode="events+presence")
     return out
 
+# shared write helpers
+_COPY_OVER_KEYS: tuple[str, ...] = (
+    "type",
+    "title",
+    "year",
+    "watch_type",
+    "watched_at",
+    "library_id",
+    "season",
+    "episode",
+    "series_title",
+    "show_ids",
+    "series_year",
+)
+
+
+def _coerce_anime_type(m: dict[str, Any]) -> None:
+    t_raw = str(m.get("type") or "").strip().lower()
+    if t_raw != "anime":
+        return
+    if m.get("season") not in (None, "", 0) and m.get("episode") not in (None, "", 0):
+        m["type"] = "episode"
+    else:
+        m["type"] = "show"
+
+
+def _try_resolve_iid(adapter: Any, m: Mapping[str, Any]) -> str | None:
+    try:
+        iid = resolve_item_id(adapter, m)
+        return str(iid) if iid else None
+    except Exception as e:
+        _warn("resolve exception", err=repr(e))
+        return None
+
+
+def _prepare_want(
+    base: Mapping[str, Any],
+    *,
+    raw_key: str | None = None,
+    raw_iid: str | None = None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    base_d: dict[str, Any] = dict(base or {})
+    base_ids_raw = base_d.get("ids")
+    base_ids = dict(base_ids_raw) if isinstance(base_ids_raw, Mapping) else {}
+    has_ids = bool(base_ids) and any(v not in (None, "", 0) for v in base_ids.values())
+
+    nm = jelly_normalize(base_d)
+    m: dict[str, Any] = dict(nm)
+
+    if raw_key:
+        m["_cw_key"] = raw_key
+    if raw_iid:
+        m["jellyfin_item_id"] = raw_iid
+
+    if has_ids:
+        for key in _COPY_OVER_KEYS:
+            if base_d.get(key) not in (None, ""):
+                m[key] = base_d[key]
+
+        ids = dict(nm.get("ids") or {})
+        for k_id, v_id in base_ids.items():
+            if v_id not in (None, "", 0):
+                ids[k_id] = v_id
+        if ids:
+            m["ids"] = ids
+
+    _coerce_anime_type(m)
+
+    key_opt: str | None
+    if raw_key:
+        key_opt = raw_key
+    else:
+        try:
+            key_opt = canonical_key(m) or canonical_key(base_d)
+        except Exception:
+            key_opt = None
+
+    if not key_opt:
+        _freeze(base_d, reason="missing_ids_for_key")
+        return None, None, {"item": id_minimal(base_d), "hint": "missing_ids_for_key"}
+
+    return str(key_opt), m, None
+
 
 # writes
 def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
@@ -602,59 +743,12 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     wants: dict[str, dict[str, Any]] = {}
 
     for it in (items or []):
-        base: dict[str, Any] = dict(it or {})
-        base_ids_raw = base.get("ids")
-        if isinstance(base_ids_raw, Mapping):
-            base_ids: dict[str, Any] = dict(base_ids_raw)
-        else:
-            base_ids = {}
-        has_ids = bool(base_ids) and any(v not in (None, "", 0) for v in base_ids.values())
-
-        nm = jelly_normalize(base)
-        m: dict[str, Any] = dict(nm)
-
-        if has_ids:
-            for key in (
-                "type",
-                "title",
-                "year",
-                "watch_type",
-                "watched_at",
-                "library_id",
-                "season",
-                "episode",
-                "series_title",
-                "show_ids",
-                "series_year",
-            ):
-                if base.get(key) not in (None, ""):
-                    m[key] = base[key]
-
-            ids = dict(nm.get("ids") or {})
-            for k_id, v_id in base_ids.items():
-                if v_id not in (None, "", 0):
-                    ids[k_id] = v_id
-            if ids:
-                m["ids"] = ids
-
-        t_raw = str(m.get("type") or "").strip().lower()
-        if t_raw == "anime":
-            if m.get("season") not in (None, "", 0) and m.get("episode") not in (None, "", 0):
-                m["type"] = "episode"
-            else:
-                m["type"] = "show"
-
-        try:
-            k = canonical_key(m) or canonical_key(base)
-        except Exception:
-            k = None
-
-        if not k:
-            pre_unresolved.append({"item": id_minimal(base), "hint": "missing_ids_for_key"})
-            _freeze(base, reason="missing_ids_for_key")
+        key, m, err = _prepare_want(it or {})
+        if err:
+            pre_unresolved.append(err)
             continue
-
-        wants[k] = m
+        assert key and m
+        wants[key] = m
 
     mids: list[tuple[str, str]] = []
     unresolved: list[dict[str, Any]] = []
@@ -662,12 +756,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         unresolved.extend(pre_unresolved)
 
     for k, m in wants.items():
-        try:
-            iid = resolve_item_id(adapter, m)
-        except Exception as e:
-            _warn("resolve exception", err=repr(e))
-            iid = None
-
+        iid = _try_resolve_iid(adapter, m)
         if iid:
             mids.append((k, iid))
         else:
@@ -707,7 +796,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             played, dst_ts = states.get(iid, (False, 0))
 
             if played and dst_ts and src_ts and dst_ts >= src_ts:
-                bb[k] = {"reason": "presence:existing_newer", "since": _now_iso_z()}
+                bb[k] = {"reason": "presence:existing_newer", "since": _now_iso_z(), "iid": iid}
                 stats["skip_newer"] += 1
                 processed += 1
                 if (processed % 25) == 0:
@@ -715,8 +804,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 sleep_ms(delay)
                 continue
 
-            if played and not dst_ts and not src_ts:
-                bb[k] = {"reason": "presence:existing_untimed", "since": _now_iso_z()}
+            if played and not dst_ts:
+                bb[k] = {"reason": "presence:existing_untimed", "since": _now_iso_z(), "iid": iid}
                 stats["skip_played_untimed"] += 1
                 processed += 1
                 if (processed % 25) == 0:
@@ -726,8 +815,15 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
 
             if _mark_played(http, uid, iid, date_played_iso=src_iso):
                 ok += 1
-                shadow[k] = int(shadow.get(k, 0)) + 1
-                bb[k] = {"reason": "presence:shadow", "since": _now_iso_z()}
+                ent = shadow.get(k) or {}
+                cur_cnt = int(ent.get("count") or 0) if isinstance(ent, Mapping) else 0
+                shadow[k] = {
+                    "count": max(0, cur_cnt) + 1,
+                    "iid": iid,
+                    "updated": _now_iso_z(),
+                    "hint": id_minimal(wants[k]),
+                }
+                bb[k] = {"reason": "presence:shadow", "since": _now_iso_z(), "iid": iid}
                 stats["wrote"] += 1
             else:
                 unresolved.append({"item": wants[k], "hint": "mark_played_failed"})
@@ -752,64 +848,23 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     uid = adapter.cfg.user_id
     qlim = int(_history_limit(adapter) or 25)
     delay = _history_delay_ms(adapter)
-
+    force_clear = str(os.getenv("CW_TOOL_CLEAR") or "").strip().lower() in ("1", "true", "yes", "on")
+    shadow = _shadow_load()
     pre_unresolved: list[dict[str, Any]] = []
     wants: dict[str, dict[str, Any]] = {}
 
     for it in (items or []):
         base: dict[str, Any] = dict(it or {})
-        base_ids_raw = base.get("ids")
-        if isinstance(base_ids_raw, Mapping):
-            base_ids: dict[str, Any] = dict(base_ids_raw)
-        else:
-            base_ids = {}
-        has_ids = bool(base_ids) and any(v not in (None, "", 0) for v in base_ids.values())
-
-        nm = jelly_normalize(base)
-        m: dict[str, Any] = dict(nm)
-
-        if has_ids:
-            for key in (
-                "type",
-                "title",
-                "year",
-                "watch_type",
-                "watched_at",
-                "library_id",
-                "season",
-                "episode",
-                "series_title",
-                "show_ids",
-                "series_year",
-            ):
-                if base.get(key) not in (None, ""):
-                    m[key] = base[key]
-
-            ids = dict(nm.get("ids") or {})
-            for k_id, v_id in base_ids.items():
-                if v_id not in (None, "", 0):
-                    ids[k_id] = v_id
-            if ids:
-                m["ids"] = ids
-
-        t_raw = str(m.get("type") or "").strip().lower()
-        if t_raw == "anime":
-            if m.get("season") not in (None, "", 0) and m.get("episode") not in (None, "", 0):
-                m["type"] = "episode"
-            else:
-                m["type"] = "show"
-
-        try:
-            k = canonical_key(m) or canonical_key(base)
-        except Exception:
-            k = None
-
-        if not k:
-            pre_unresolved.append({"item": id_minimal(base), "hint": "missing_ids_for_key"})
-            _freeze(base, reason="missing_ids_for_key")
+        if base.get("_cw_tool_clear") or base.get("_cw_force_clear"):
+            force_clear = True
+        raw_key = str(base.get("_cw_key") or base.get("key") or "").strip() or None
+        raw_iid = str(base.get("jellyfin_item_id") or base.get("_jellyfin_item_id") or "").strip() or None
+        key, m, err = _prepare_want(base, raw_key=raw_key, raw_iid=raw_iid)
+        if err:
+            pre_unresolved.append(err)
             continue
-
-        wants[k] = m
+        assert key and m
+        wants[key] = m
 
     mids: list[tuple[str, str]] = []
     unresolved: list[dict[str, Any]] = []
@@ -817,34 +872,62 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         unresolved.extend(pre_unresolved)
 
     for k, m in wants.items():
-        try:
-            iid = resolve_item_id(adapter, m)
-        except Exception as e:
-            _warn("resolve exception", err=repr(e))
-            iid = None
+        ent = shadow.get(k) or {}
+        iid = (m.get("jellyfin_item_id") or (ent.get("iid") if isinstance(ent, Mapping) else None))
+
+        if not iid:
+            iid = _try_resolve_iid(adapter, m)
 
         if iid:
-            mids.append((k, iid))
+            mids.append((k, str(iid)))
         else:
             unresolved.append({"item": id_minimal(m), "hint": "resolve_failed"})
             _freeze(m, reason="resolve_failed")
-
-    shadow = _shadow_load()
     ok = 0
     for chunk in chunked(mids, qlim):
         for k, iid in chunk:
-            cur = int(shadow.get(k, 0))
-            nxt = max(0, cur - 1)
-            shadow[k] = nxt
-            if nxt == 0:
-                if _unmark_played(http, uid, iid):
-                    ok += 1
-                else:
-                    unresolved.append({"item": id_minimal(wants[k]), "hint": "unmark_played_failed"})
-                    _freeze(wants[k], reason="write_failed")
+            ent = shadow.get(k) or {}
+            cur_cnt = int(ent.get("count") or 0) if isinstance(ent, Mapping) else 0
+            tracked = (k in shadow) and cur_cnt > 0
+
+            if tracked and cur_cnt > 1 and not force_clear:
+                shadow[k] = {
+                    **(dict(ent) if isinstance(ent, Mapping) else {}),
+                    "count": cur_cnt - 1,
+                    "iid": str(ent.get("iid") or iid),
+                    "updated": _now_iso_z(),
+                }
+                sleep_ms(delay)
+                continue
+
+            # Force mode (tools/clear) always attempts to unmark.
+            if _unmark_played(http, uid, iid):
+                ok += 1
+                if tracked:
+                    
+                    if force_clear or cur_cnt <= 1:
+                        shadow.pop(k, {})
+                    else:
+                        shadow[k] = {
+                            **(dict(ent) if isinstance(ent, Mapping) else {}),
+                            "count": cur_cnt - 1,
+                            "iid": str(ent.get("iid") or iid),
+                            "updated": _now_iso_z(),
+                        }
+            else:
+                unresolved.append({"item": id_minimal(wants[k]), "hint": "unmark_played_failed"})
+                _freeze(wants[k], reason="write_failed")
+
+                if tracked:
+                    shadow[k] = {
+                        **(dict(ent) if isinstance(ent, Mapping) else {}),
+                        "count": max(1, cur_cnt),
+                        "iid": str(ent.get("iid") or iid),
+                        "updated": _now_iso_z(),
+                    }
             sleep_ms(delay)
 
-    shadow = {k: v for k, v in shadow.items() if v > 0}
+    shadow = {k: v for k, v in shadow.items() if int((v or {}).get("count") or 0) > 0}
     _shadow_save(shadow)
     if ok:
         _thaw_if_present([k for k, _ in mids])

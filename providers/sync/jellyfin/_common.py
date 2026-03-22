@@ -31,6 +31,13 @@ def _pair_scope() -> str | None:
     return None
 
 
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _safe_scope(value: str) -> str:
     s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
     s = s.strip("_ ")
@@ -299,6 +306,8 @@ def jf_resolve_library_id(
     roots: Mapping[str, Mapping[str, Any]],
     scope_libs: list[str] | None = None,
     http: Any | None = None,
+    *,
+    allow_deep_lookup: bool = True,
 ) -> str | None:
     if scope_libs and len(scope_libs) == 1:
         return str(scope_libs[0])
@@ -322,11 +331,6 @@ def jf_resolve_library_id(
         if cid in roots:
             return cid
 
-    if http and row.get("Id"):
-        deep = _jf_lib_id_via_ancestors(http, str(row["Id"]), roots)
-        if deep:
-            return deep
-
     path = (row.get("Path") or "").strip()
     if path and roots:
         best: str | None = None
@@ -343,6 +347,12 @@ def jf_resolve_library_id(
                     best_len = len(rp)
         if best:
             return best
+
+    # Deep ancestor lookup is expensive
+    if allow_deep_lookup and http and row.get("Id"):
+        deep = _jf_lib_id_via_ancestors(http, str(row["Id"]), roots)
+        if deep:
+            return deep
 
     want: str | None = None
     ctype = (row.get("CollectionType") or "").strip().lower()
@@ -405,6 +415,18 @@ def _ids_from_provider_ids(pids: Mapping[str, Any] | None) -> dict[str, str]:
         if m:
             out["tvdb"] = m.group(1)
 
+    v = low.get("mal") or low.get("myanimelist") or low.get("myanimelistid")
+    if v is not None:
+        m = _NUM_PAT.search(str(v).strip())
+        if m:
+            out["mal"] = m.group(1)
+
+    v = low.get("anilist") or low.get("anilistid")
+    if v is not None:
+        m = _NUM_PAT.search(str(v).strip())
+        if m:
+            out["anilist"] = m.group(1)
+
     jf = low.get("jellyfin")
     if jf:
         out["jellyfin"] = str(jf)
@@ -413,7 +435,11 @@ def _ids_from_provider_ids(pids: Mapping[str, Any] | None) -> dict[str, str]:
 
 def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(obj, Mapping) and "ids" in obj and "type" in obj:
-        return id_minimal(obj)
+        out = id_minimal(obj)
+        raw = obj.get("jellyfin_item_id") or obj.get("_jellyfin_item_id") or obj.get("Id")
+        if raw:
+            out["jellyfin_item_id"] = str(raw)
+        return out
     t = _norm_type(obj.get("Type") or obj.get("BaseItemKind") or obj.get("type"))
     title = (obj.get("Name") or obj.get("title") or "").strip() or None
     year = obj.get("ProductionYear") if isinstance(obj.get("ProductionYear"), int) else obj.get("year")
@@ -423,6 +449,9 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
     if jf_id:
         ids["jellyfin"] = str(jf_id)
     row: dict[str, Any] = {"type": t, "title": title, "year": year, "ids": ids}
+    
+    if jf_id:
+        row["jellyfin_item_id"] = str(jf_id)
     if t == "episode":
         series_title = (
             obj.get("SeriesName")
@@ -456,7 +485,10 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
                 row["episode"] = int(e)
         except Exception:
             pass
-    return id_minimal(row)
+    out = id_minimal(row)
+    if jf_id:
+        out["jellyfin_item_id"] = str(jf_id)
+    return out
 
 
 def key_of(item: Mapping[str, Any]) -> str:
@@ -912,6 +944,15 @@ def _pick_from_candidates(
 def resolve_item_id(adapter: Any, it: Mapping[str, Any]) -> str | None:
     http = adapter.client
     uid = adapter.cfg.user_id
+
+    # Prefer native Jellyfin item id when present.
+    raw_iid = it.get("jellyfin_item_id") or it.get("_jellyfin_item_id")
+    if raw_iid:
+        s = str(raw_iid).strip()
+        if s and not looks_like_bad_id(s):
+            _trc('resolve hit', kind='direct_field', item_id=s)
+            return s
+
     ids = dict(it.get("ids") or {})
     show_ids = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else None
 
@@ -1098,6 +1139,153 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any]) -> str | None:
 
     _trc('resolve miss', kind='episode', title=title, series_title=series_title, season=season, episode=episode)
     return None
+
+
+def resolve_item_ids(adapter: Any, it: Mapping[str, Any]) -> list[str]:
+    http = getattr(adapter, "client", None)
+    uid = getattr(getattr(adapter, "cfg", None), "user_id", None)
+    if not http or not uid:
+        return []
+
+    # Prefer native Jellyfin item id when present
+    raw_iid = it.get("jellyfin_item_id") or it.get("_jellyfin_item_id")
+    if raw_iid:
+        s = str(raw_iid).strip()
+        if s and not looks_like_bad_id(s):
+            return [s]
+
+    one = resolve_item_id(adapter, it)
+
+    ids = dict(it.get("ids") or {})
+    show_ids = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else None
+
+    t = _norm_type(it.get("type"))
+    title = (it.get("title") or "").strip()
+    year = it.get("year")
+    season = it.get("season")
+    episode = it.get("episode")
+    series_title = (it.get("series_title") or "").strip()
+
+    strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
+
+    prio = guid_priority_from_cfg(getattr(getattr(adapter, "cfg", None), "watchlist_guid_priority", None))
+    pairs = all_ext_pairs(ids, prio)
+    if show_ids:
+        spairs = all_ext_pairs(show_ids, prio)
+        for p in spairs:
+            if p not in pairs:
+                pairs.append(p)
+
+    idx = build_provider_index(adapter)
+
+    def _valid(iid: Any) -> str | None:
+        s = str(iid or "").strip()
+        return s if s and not looks_like_bad_id(s) else None
+
+    found: list[str] = []
+
+    # Movies
+    if t == "movie":
+        for pref in pairs:
+            rows = idx.get(pref) or []
+            cands = [row for row in rows if (row.get("Type") or "") == "Movie"]
+            if isinstance(year, int):
+                yr = int(year)
+                cands_yr = [
+                    r for r in cands
+                    if isinstance(r.get("ProductionYear"), int) and abs(int(r["ProductionYear"]) - yr) <= 1
+                ]
+                if cands_yr:
+                    cands = cands_yr
+            for row in cands:
+                iid = _valid(row.get("Id"))
+                if iid and iid not in found:
+                    found.append(iid)
+            if found:
+                return found
+
+        if title and not strict:
+            try:
+                q: dict[str, Any] = {
+                    "userId": uid,
+                    "recursive": True,
+                    "includeItemTypes": "Movie",
+                    "SearchTerm": title,
+                    "Fields": "ProviderIds,ProductionYear,Type",
+                    "Limit": 50,
+                }
+                q.update(jf_scope_any(adapter.cfg))
+                r = http.get("/Items", params=q)
+                t_l = title.lower()
+                for row in (r.json() or {}).get("Items") or []:
+                    if (row.get("Type") or "") != "Movie":
+                        continue
+                    nm = (row.get("Name") or "").strip().lower()
+                    yr = row.get("ProductionYear")
+                    if nm != t_l:
+                        continue
+                    if (year is not None) and not (isinstance(yr, int) and abs(int(yr) - int(year)) <= 1):
+                        continue
+                    iid = _valid(row.get("Id"))
+                    if iid and iid not in found:
+                        found.append(iid)
+            except Exception:
+                pass
+
+    # Episodes
+    if t == "episode":
+        for pref in pairs:
+            rows = idx.get(pref) or []
+            cands = [row for row in rows if (row.get("Type") or "") == "Episode"]
+            for row in cands:
+                try:
+                    s_ok = (season is None) or (int(row.get("ParentIndexNumber") or 0) == int(season))
+                    e_ok = (episode is None) or (int(row.get("IndexNumber") or 0) == int(episode))
+                except Exception:
+                    s_ok, e_ok = True, True
+                if not (s_ok and e_ok):
+                    continue
+                iid = _valid(row.get("Id"))
+                if iid and iid not in found:
+                    found.append(iid)
+            if found:
+                return found
+
+        if series_title and not strict:
+            try:
+                q: dict[str, Any] = {
+                    "userId": uid,
+                    "recursive": True,
+                    "includeItemTypes": "Episode",
+                    "SearchTerm": series_title,
+                    "Fields": "ProviderIds,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesName",
+                    "Limit": 200,
+                }
+                q.update(jf_scope_any(adapter.cfg))
+                r = http.get("/Items", params=q)
+                st_l = series_title.lower()
+                for row in (r.json() or {}).get("Items") or []:
+                    if (row.get("Type") or "") != "Episode":
+                        continue
+                    sn = (row.get("SeriesName") or "").strip().lower()
+                    if sn != st_l:
+                        continue
+                    try:
+                        s_ok = (season is None) or (int(row.get("ParentIndexNumber") or 0) == int(season))
+                        e_ok = (episode is None) or (int(row.get("IndexNumber") or 0) == int(episode))
+                    except Exception:
+                        s_ok, e_ok = True, True
+                    if not (s_ok and e_ok):
+                        continue
+                    iid = _valid(row.get("Id"))
+                    if iid and iid not in found:
+                        found.append(iid)
+            except Exception:
+                pass
+
+    if found:
+        return found
+    return [one] if one else []
 
 
 # utilities

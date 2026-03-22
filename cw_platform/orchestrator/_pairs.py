@@ -111,7 +111,10 @@ def _collect_health_for_run(ctx) -> dict[str, Any]:
             try:
                 h = ops.health(cfg_view, emit=emit) or {}
             except TypeError:
-                h = ops.health(cfg_view) or {}
+                try:
+                    h = ops.health(cfg_view) or {}
+                except Exception as e:
+                    h = {"ok": False, "status": "down", "details": f"health exception: {e}"}
             except Exception as e:
                 h = {"ok": False, "status": "down", "details": f"health exception: {e}"}
 
@@ -159,7 +162,7 @@ def _feature_list_for_pair(pair: Mapping[str, Any]) -> list[str]:
             else:
                 out.append(str(fname))
         return out
-    return ["watchlist", "ratings", "history", "playlists"]
+    return ["watchlist", "ratings", "history", "progress", "playlists"]
 
 
 
@@ -248,10 +251,15 @@ def run_pairs(ctx) -> dict[str, Any]:
     )
 
     added_total = 0
+    added_provider_total = 0
     removed_total = 0
+    updated_total = 0
     unresolved_total = 0
     skipped_total = 0
+    skipped_exact_total = 0
+    skipped_inferred_total = 0
     errors_total = 0
+    attempted_add_duplicate_keys_total = 0
 
     pairs = [p for p in (cfg.get("pairs") or []) if p.get("enabled", True)]
     provs = ctx.providers or {}
@@ -354,33 +362,45 @@ def run_pairs(ctx) -> dict[str, Any]:
 
                     features_ran.add(feature)
 
-                    if mode == "two-way":
-                        res = run_two_way_feature(ctx, src, dst, feature=feature, fcfg=fcfg, health_map=health_map)
-                        added_total += int(res.get("adds_to_A", 0)) + int(res.get("adds_to_B", 0))
-                        removed_total += int(res.get("rem_from_A", 0)) + int(res.get("rem_from_B", 0))
-                        unresolved_total += (
-                            int(res.get("unresolved", 0))
-                            + int(res.get("unresolved_to_A", 0))
-                            + int(res.get("unresolved_to_B", 0))
-                        )
-                        skipped_total += (
-                            int(res.get("skipped", 0))
-                            + int(res.get("skipped_to_A", 0))
-                            + int(res.get("skipped_to_B", 0))
-                        )
-                        errors_total += (
-                            int(res.get("errors", 0))
-                            + int(res.get("errors_to_A", 0))
-                            + int(res.get("errors_to_B", 0))
-                        )
-                    else:
-                        res = run_one_way_feature(ctx, src, dst, feature=feature, fcfg=fcfg, health_map=health_map)
-                        added_total += int(res.get("added", 0))
-                        removed_total += int(res.get("removed", 0))
-                        unresolved_total += int(res.get("unresolved", 0))
-                        skipped_total += int(res.get("skipped", 0))
-                        errors_total += int(res.get("errors", 0))
+                    try:
+                        if mode == "two-way":
+                            res = run_two_way_feature(ctx, src, dst, feature=feature, fcfg=fcfg, health_map=health_map)
+                            updated_total += int(res.get("upd_to_A", 0)) + int(res.get("upd_to_B", 0))
+                            added_total += int(res.get("adds_to_A", 0)) + int(res.get("adds_to_B", 0))
+                            removed_total += int(res.get("rem_from_A", 0)) + int(res.get("rem_from_B", 0))
+                            unresolved_total += (
+                                int(res.get("unresolved", 0))
+                                + int(res.get("unresolved_to_A", 0))
+                                + int(res.get("unresolved_to_B", 0))
+                            )
+                            skipped_total += (
+                                int(res.get("skipped", 0))
+                                + int(res.get("skipped_to_A", 0))
+                                + int(res.get("skipped_to_B", 0))
+                            )
+                            errors_total += (
+                                int(res.get("errors", 0))
+                                + int(res.get("errors_to_A", 0))
+                                + int(res.get("errors_to_B", 0))
+                            )
+                        else:
+                            res = run_one_way_feature(ctx, src, dst, feature=feature, fcfg=fcfg, health_map=health_map)
+                            updated_total += int(res.get("updated", 0))
+                            added_total += int(res.get("added", 0))
+                            added_provider_total += int(res.get("added_provider_reported", res.get("added", 0)))
+                            removed_total += int(res.get("removed", 0))
+                            unresolved_total += int(res.get("unresolved", 0))
+                            skipped_total += int(res.get("skipped", 0))
+                            skipped_exact_total += int(res.get("skipped_exact", 0))
+                            skipped_inferred_total += int(res.get("skipped_inferred", 0))
+                            attempted_add_duplicate_keys_total += int(res.get("attempted_add_duplicate_keys", 0))
+                            errors_total += int(res.get("errors", 0))
 
+                    except Exception as e:
+                        import traceback as _tb
+                        emit("feature:error", src=src, dst=dst, feature=feature, error=str(e), traceback=_tb.format_exc())
+                        errors_total += 1
+                        continue
                 finally:
                     ctx.config = prev_cfg
     if "watchlist" in features_ran:
@@ -418,9 +438,14 @@ def run_pairs(ctx) -> dict[str, Any]:
                 "started_at": now,
                 "finished_at": now,
                 "result": {
+                    "updated": updated_total,
                     "added": added_total,
+                    "added_provider_reported": added_provider_total,
                     "removed": removed_total,
                     "skipped": skipped_total,
+                    "skipped_exact": skipped_exact_total,
+                    "skipped_inferred": skipped_inferred_total,
+                    "attempted_add_duplicate_keys": attempted_add_duplicate_keys_total,
                     "unresolved": unresolved_total,
                     "errors": errors_total,
                 },
@@ -469,9 +494,14 @@ def run_pairs(ctx) -> dict[str, Any]:
 
     emit(
         "run:done",
+        updated=updated_total,
         added=added_total,
+        added_provider_reported=added_provider_total,
         removed=removed_total,
         skipped=skipped_total,
+        skipped_exact=skipped_exact_total,
+        skipped_inferred=skipped_inferred_total,
+        attempted_add_duplicate_keys=attempted_add_duplicate_keys_total,
         unresolved=unresolved_total,
         errors=errors_total,
         pairs=len(pairs),
@@ -479,6 +509,7 @@ def run_pairs(ctx) -> dict[str, Any]:
     )
     return {
         "ok": True,
+        "updated": updated_total,
         "added": added_total,
         "removed": removed_total,
         "skipped": skipped_total,

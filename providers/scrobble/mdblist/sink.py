@@ -21,13 +21,21 @@ except Exception:
 
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 try:
-    from providers.scrobble.scrobble import ScrobbleSink, ScrobbleEvent  # type: ignore
+    from providers.scrobble.scrobble import ScrobbleSink, ScrobbleEvent, mask_account as _mask_account  # type: ignore
 except ImportError:
     class ScrobbleSink:
         def send(self, event: Any) -> None: ...
 
     class ScrobbleEvent:  # pragma: no cover
         ...
+
+    def _mask_account(value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return "unknown"
+        if len(s) <= 2:
+            return s[0] + "*"
+        return s[:2] + "***"
 
 
 MDBLIST_API = "https://api.mdblist.com"
@@ -228,8 +236,15 @@ def _norm_type(s: str) -> str:
 
 def _cfg_delete_enabled(cfg: dict[str, Any], media_type: str) -> bool:
     s = cfg.get("scrobble") or {}
-    if not s.get("delete_plex"):
+    watch = s.get("watch") or {}
+    route_opts_raw = watch.get("route_options")
+    route_opts: dict[str, Any] = route_opts_raw if isinstance(route_opts_raw, dict) else {}
+    route_mode = str(route_opts.get("auto_remove_watchlist") or "inherit").strip().lower()
+    if route_mode == "off":
         return False
+    if not s.get("delete_plex"):
+        if route_mode != "on":
+            return False
     types = s.get("delete_plex_types") or []
     mt = _norm_type(media_type)
     if isinstance(types, str):
@@ -293,9 +308,9 @@ def _show_ids(ev: Any) -> dict[str, Any]:
 def _best_ids_for_scrobble(ids: dict[str, Any], media_type: str) -> dict[str, Any]:
     mt = _norm_type(media_type)
     if mt == "show":
-        order = ("imdb", "trakt", "tmdb", "tvdb", "mdblist")
+        order = ("tmdb", "trakt", "imdb", "tvdb", "mdblist")
     else:
-        order = ("imdb", "tmdb", "trakt", "mdblist")
+        order = ("tmdb", "imdb", "trakt", "mdblist")
 
     out: dict[str, Any] = {}
     for k in order:
@@ -316,9 +331,9 @@ def _best_ids_for_scrobble(ids: dict[str, Any], media_type: str) -> dict[str, An
         out[k] = str(v)
 
     return out
-def _ar_key(ids: dict[str, Any], media_type: str) -> str:
-    parts = [media_type]
-    for k in ("imdb", "tmdb", "tvdb", "trakt", "kitsu", "mdblist"):
+def _ar_key(ids: dict[str, Any], media_type: str, scope: str = "") -> str:
+    parts = [scope, media_type]
+    for k in ("tmdb", "imdb", "tvdb", "trakt", "kitsu", "mdblist"):
         if ids.get(k):
             parts.append(f"{k}:{ids[k]}")
     return "|".join(parts)
@@ -356,7 +371,7 @@ def _ar_seen(key: str) -> bool:
     return False
 
 
-def _auto_remove_across(ev: Any, cfg: dict[str, Any]) -> None:
+def _auto_remove_across(ev: Any, cfg: dict[str, Any], scope: str = "") -> None:
     mt = _norm_type(str(getattr(ev, "media_type", "") or ""))
     if not _cfg_delete_enabled(cfg, mt):
         return
@@ -365,11 +380,11 @@ def _auto_remove_across(ev: Any, cfg: dict[str, Any]) -> None:
         ids = _ids(ev)
     if not ids:
         return
-    key = _ar_key(ids, mt)
+    key = _ar_key(ids, mt, scope=scope)
     if _ar_seen(key):
         return
     try:
-        _rm_across(ids, mt)
+        _rm_across(ids, mt, scope=scope)
     except Exception:
         pass
 
@@ -394,12 +409,18 @@ def _bodies(ev: Any, progress: float) -> list[dict[str, Any]]:
         number = int(getattr(ev, "number", 0) or 0)
         show: dict[str, Any] = {"ids": sh_ids} if sh_ids else {}
         if not sh_ids:
-            title = getattr(ev, "title", None)
-            year = getattr(ev, "year", None)
-            if title:
-                show["title"] = title
-            if year:
-                show["year"] = int(year)
+            series_title = (
+                getattr(ev, "series_title", None)
+                or getattr(ev, "show_title", None)
+                or getattr(ev, "series", None)
+                or getattr(ev, "show", None)
+                or getattr(ev, "title", None)
+            )
+            series_year = getattr(ev, "series_year", None) if getattr(ev, "series_year", None) is not None else getattr(ev, "year", None)
+            if series_title:
+                show["title"] = series_title
+            if series_year:
+                show["year"] = int(series_year)
         show["season"] = {"number": season, "episode": {"number": number}}
         return [{"show": show, "progress": progress}]
 
@@ -435,10 +456,10 @@ def _extract_skeleton_from_body(b: dict[str, Any]) -> dict[str, Any]:
 def _body_ids_desc(b: dict[str, Any]) -> str:
     if "show" in b:
         ids = ((b.get("show") or {}).get("ids") or {})
-        order = ("imdb", "trakt", "tmdb", "tvdb", "mdblist")
+        order = ("tmdb", "trakt", "imdb", "tvdb", "mdblist")
     elif "movie" in b:
         ids = ((b.get("movie") or {}).get("ids") or {})
-        order = ("imdb", "tmdb", "trakt", "mdblist")
+        order = ("tmdb", "imdb", "trakt", "mdblist")
     else:
         ids = (
             (b.get("movie") or {}).get("ids")
@@ -446,7 +467,7 @@ def _body_ids_desc(b: dict[str, Any]) -> str:
             or (b.get("episode") or {}).get("ids")
             or {}
         )
-        order = ("imdb", "tmdb", "trakt", "tvdb", "mdblist")
+        order = ("tmdb", "imdb", "trakt", "tvdb", "mdblist")
     return _ids_desc_map(ids if isinstance(ids, dict) else {}, order)
 
 
@@ -467,7 +488,7 @@ class MDBListSink(ScrobbleSink):
     def _mkey(self, ev: Any) -> str:
         ids = getattr(ev, "ids", {}) or {}
         parts: list[str] = []
-        for k in ("imdb", "tmdb", "trakt", "kitsu", "mdblist"):
+        for k in ("tmdb", "imdb", "trakt", "kitsu", "mdblist"):
             if ids.get(k):
                 parts.append(f"{k}:{ids[k]}")
         if getattr(ev, "media_type", "") == "episode":
@@ -592,6 +613,7 @@ class MDBListSink(ScrobbleSink):
         mk = self._mkey(ev)
         p_now = _clamp(getattr(ev, "progress", 0) or 0)
         force_seek = bool((getattr(ev, 'raw', None) or {}).get('_cw_seek'))
+        preserve_stop = bool((getattr(ev, 'raw', None) or {}).get('_cw_preserve_stop'))
         tol = _regress_tolerance_percent(cfg)
         p_sess = self._p_sess.get((sk, mk), -1)
         p_glob = self._p_glob.get(mk, -1)
@@ -648,7 +670,7 @@ class MDBListSink(ScrobbleSink):
         if action_in == "stop":
             if p_send >= _force_stop_at(cfg) or (comp and p_send >= comp):
                 action = "stop"
-            elif p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
+            elif (not preserve_stop) and p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
                 _log(f"Demote STOP→PAUSE (jump {last_sess}%→{p_send}%, thr={thr})", "DEBUG")
                 action = "pause"
                 p_send = last_sess
@@ -697,7 +719,7 @@ class MDBListSink(ScrobbleSink):
         if best_skel is not None:
             b0 = {"progress": float(p_payload), **best_skel, **_app_meta(cfg)}
             if self._should_log_intent(key, path, int(float(b0.get("progress") or p_send))):
-                _log(f"mdblist intent {path} using cached {best_desc}, prog={b0.get('progress')}", "DEBUG")
+                _log(f"intent path={path} ids={best_desc} p={b0.get('progress')}", "DEBUG")
             bodies = [b0] + [b for b in bodies if _body_ids_desc(b) != best_desc]
 
         sent_ok = False
@@ -705,7 +727,7 @@ class MDBListSink(ScrobbleSink):
             if not (best_skel is not None and i == 0):
                 intent_prog = int(float(body.get("progress") or p_send))
                 if self._should_log_intent(key, path, intent_prog):
-                    _log(f"mdblist intent {path} using {_body_ids_desc(body)}, prog={body.get('progress')}", "DEBUG")
+                    _log(f"intent path={path} ids={_body_ids_desc(body)} p={body.get('progress')}", "DEBUG")
 
             res = self._send_http(path, body, api_key, cfg)
             if not res.get("ok"):
@@ -725,13 +747,13 @@ class MDBListSink(ScrobbleSink):
                 act = (res.get("resp") or {}).get("action") or path.rsplit("/", 1)[-1]
             except Exception:
                 act = path.rsplit("/", 1)[-1]
-            _log(f"mdblist {path} -> {res.get('status')} action={act}", "DEBUG")
+            _log(f"send path={path} status={res.get('status')} action={act}", "DEBUG")
             try:
                 acc = getattr(ev, "account", None)
                 prog_val = float(body.get("progress") or p_send)
-                _log(f"user='{acc}' {act} {prog_val:.1f}% • {name}", "INFO")
+                _log(f"scrobble {act} user='{_mask_account(acc)}' p={prog_val:.1f}% media='{name}'", "INFO")
             except Exception:
                 pass
 
         if sent_ok and action == "stop" and int(p_send) >= comp_thr:
-            _auto_remove_across(ev, cfg)
+            _auto_remove_across(ev, cfg, scope=f"mdblist:{self._instance_id}")

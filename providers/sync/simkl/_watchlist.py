@@ -24,6 +24,7 @@ from ._common import (
     save_watermark,
     state_file,
     _pair_scope,
+    _is_capture_mode,
 )
 
 BASE = "https://api.simkl.com"
@@ -61,7 +62,7 @@ def _legacy_path(path: Path) -> Path | None:
 def _migrate_legacy_json(path: Path) -> None:
     if path.exists():
         return
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
     if not legacy or not legacy.exists():
@@ -77,7 +78,7 @@ def _migrate_legacy_json(path: Path) -> None:
 
 
 def _load_unresolved() -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     p = _unresolved_path()
     _migrate_legacy_json(p)
@@ -88,7 +89,7 @@ def _load_unresolved() -> dict[str, Any]:
 
 
 def _save_unresolved(data: Mapping[str, Any]) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         _unresolved_path().parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +142,7 @@ def _unfreeze_if_present(keys: Iterable[str]) -> None:
 
 
 def _shadow_load() -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {"ts": None, "items": {}, "buckets_seen": {}}
     p = _shadow_path()
     _migrate_legacy_json(p)
@@ -164,7 +165,7 @@ def _shadow_save(
     items: Mapping[str, Any],
     buckets_seen: Mapping[str, Any] | None = None,
 ) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         _shadow_path().parent.mkdir(parents=True, exist_ok=True)
@@ -1065,39 +1066,46 @@ def remove(
         )
         if 200 <= resp.status_code < 300:
             processed = _sum_processed_from_body(resp_body)
-            if processed == 0:
-                for item in items_list:
-                    ids = dict(item.get("ids") or {})
-                    body_ids = {
-                        k: v for k, v in ids.items() if k in _ALLOWED_ID_KEYS and v
-                    }
-                    if body_ids:
-                        unresolved.append(
-                            {"item": id_minimal(item), "hint": "not_removed"},
-                        )
-                        _freeze(
-                            item,
-                            action="remove",
-                            reasons=["not_processed"],
-                            ids_sent=body_ids,
-                        )
-                _log(
-                    f"REMOVE 2xx but no items processed; body={(str(resp_body)[:180] if resp_body else '∅')}",
-                )
-            ok = int(processed)
-            if ok > 0:
-                sigs = _sigs_from_write_resp(resp_body)
-                if sigs:
-                    rm_keys: list[str] = []
-                    for item in items_list:
-                        sig = _id_sig(_ids_filter(item.get("ids") or {}))
-                        if sig and sig in sigs:
-                            rm_keys.append(_mk_shadow_item(item)[0])
-                    if rm_keys:
-                        _shadow_remove_keys(rm_keys)
-                elif ok == len(items_list):
-                    _shadow_remove_keys([_mk_shadow_item(item)[0] for item in items_list])
+            empty_success = not str(resp.text or "").strip()
+            if processed == 0 and empty_success:
+                ok = len(items_list)
+                _shadow_remove_keys([_mk_shadow_item(item)[0] for item in items_list])
                 _unfreeze_if_present([simkl_key_of(id_minimal(it)) for it in items_list])
+                _log("REMOVE 2xx with empty body; assuming requested items were removed")
+            else:
+                if processed == 0:
+                    for item in items_list:
+                        ids = dict(item.get("ids") or {})
+                        body_ids = {
+                            k: v for k, v in ids.items() if k in _ALLOWED_ID_KEYS and v
+                        }
+                        if body_ids:
+                            unresolved.append(
+                                {"item": id_minimal(item), "hint": "not_removed"},
+                            )
+                            _freeze(
+                                item,
+                                action="remove",
+                                reasons=["not_processed"],
+                                ids_sent=body_ids,
+                            )
+                    _log(
+                        f"REMOVE 2xx but no items processed; body={(str(resp_body)[:180] if resp_body else '∅')}",
+                    )
+                ok = int(processed)
+                if ok > 0:
+                    sigs = _sigs_from_write_resp(resp_body)
+                    if sigs:
+                        rm_keys: list[str] = []
+                        for item in items_list:
+                            sig = _id_sig(_ids_filter(item.get("ids") or {}))
+                            if sig and sig in sigs:
+                                rm_keys.append(_mk_shadow_item(item)[0])
+                        if rm_keys:
+                            _shadow_remove_keys(rm_keys)
+                    elif ok == len(items_list):
+                        _shadow_remove_keys([_mk_shadow_item(item)[0] for item in items_list])
+                    _unfreeze_if_present([simkl_key_of(id_minimal(it)) for it in items_list])
         else:
             _log(f"REMOVE failed {resp.status_code}: {(resp.text or '')[:180]}")
             for item in items_list:

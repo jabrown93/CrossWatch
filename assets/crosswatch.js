@@ -1,4 +1,7 @@
 /* assets/crosswatch.js */
+/* CrossWatch main JavaScript file: UI utilities, tab handling, PWA install prompt, and bootstrap logic. */
+/* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
+
 (function () {
   'use strict';
 
@@ -274,28 +277,150 @@ window.cwPwaDiag = function () {
   }
 };
 
+
+function _cwGetByPath(obj, path) {
+  try {
+    return String(path || "")
+      .split(".")
+      .filter(Boolean)
+      .reduce((acc, key) => (acc == null ? undefined : acc[key]), obj);
+  } catch {
+    return undefined;
+  }
+}
+
+function _cwHasConfiguredValue(v) {
+  if (v == null) return false;
+  if (typeof v === "string") return v.trim().length > 0;
+  if (typeof v === "number") return Number.isFinite(v) && v > 0;
+  if (typeof v === "boolean") return v === true;
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === "object") return Object.keys(v).length > 0;
+  return false;
+}
+
+  function _cwConfigLooksLikeFirstRun(cfg) {
+  try {
+    if (!cfg || typeof cfg !== "object") return false;
+
+    const pairs = Array.isArray(cfg.pairs) ? cfg.pairs.length : 0;
+    const advancedJobs = Array.isArray(cfg?.scheduling?.advanced?.jobs) ? cfg.scheduling.advanced.jobs.length : 0;
+
+    const configuredPaths = [
+      "plex.server_url",
+      "plex.account_token",
+      "plex.pms_token",
+      "plex.client_id",
+      "plex.machine_id",
+      "plex.username",
+      "plex.account_id",
+      "plex.home_pin",
+      "simkl.access_token",
+      "simkl.refresh_token",
+      "simkl.client_id",
+      "simkl.client_secret",
+      "anilist.client_id",
+      "anilist.client_secret",
+      "anilist.access_token",
+      "mdblist.api_key",
+      "tautulli.server_url",
+      "tautulli.api_key",
+      "tautulli.history.user_id",
+      "trakt.client_id",
+      "trakt.client_secret",
+      "trakt.access_token",
+      "trakt.refresh_token",
+      "tmdb_sync.api_key",
+      "tmdb_sync.session_id",
+      "tmdb_sync.account_id",
+      "tmdb.api_key",
+      "jellyfin.server",
+      "jellyfin.access_token",
+      "jellyfin.user_id",
+      "jellyfin.username",
+      "jellyfin.user",
+      "emby.server",
+      "emby.access_token",
+      "emby.user_id",
+      "emby.username",
+      "emby.user",
+      "app_auth.username",
+      "app_auth.password.hash",
+    ];
+
+    const hasConfiguredProviders = configuredPaths.some(path => _cwHasConfiguredValue(_cwGetByPath(cfg, path)));
+    const hasRoutes = Array.isArray(cfg?.scrobble?.watch?.routes) && cfg.scrobble.watch.routes.length > 0;
+    const hasWebhookFilters = Array.isArray(cfg?.scrobble?.webhook?.filters_plex?.username_whitelist)
+      && cfg.scrobble.webhook.filters_plex.username_whitelist.length > 0;
+
+    return !hasConfiguredProviders && !pairs && !advancedJobs && !hasRoutes && !hasWebhookFilters;
+  } catch {
+    return false;
+  }
+}
+
+async function _cwShouldOpenSetupWizard(meta) {
+  try {
+    if ((!meta?.exists) || !!meta?.first_run || !!meta?.autogen) return true;
+    if (!!meta?.needs_upgrade) return false;
+    if (typeof meta?.setup_wizard_required === "boolean") return meta.setup_wizard_required;
+    if (!!meta?.auth_reset_required) return true;
+    if (!!meta?.auth_configured) return false;
+
+    const r = await fetch('/api/config?ts=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return false;
+
+    const cfg = await r.json();
+    return _cwConfigLooksLikeFirstRun(cfg);
+  } catch (e) {
+    console.warn("[crosswatch] setup wizard config check failed", e);
+    return false;
+  }
+}
+
+async function _cwFetchBootstrapAuthState() {
+  try {
+    const [metaResp, statusResp] = await Promise.all([
+      fetch('/api/config/meta?ts=' + Date.now(), { cache: 'no-store', credentials: 'same-origin' }),
+      fetch('/api/app-auth/status?ts=' + Date.now(), { cache: 'no-store', credentials: 'same-origin' }),
+    ]);
+    const meta = metaResp.ok ? await metaResp.json() : null;
+    const status = statusResp.ok ? await statusResp.json() : null;
+    const blocked = !!(
+      status
+      && !status.authenticated
+      && (status.reset_required || !status.configured || meta?.auth_reset_required || meta?.first_run || meta?.autogen)
+    );
+    window.__cwAuthSetupPending = blocked;
+    window.__cwAuthBootstrapState = { meta, status, blocked };
+    return window.__cwAuthBootstrapState;
+  } catch (e) {
+    window.__cwAuthBootstrapState = { meta: null, status: null, blocked: false, error: String(e?.message || e || "") };
+    window.__cwAuthSetupPending = false;
+    return window.__cwAuthBootstrapState;
+  }
+}
+
+if (typeof window.__cwAuthSetupPending === "undefined") window.__cwAuthSetupPending = true;
+window.__cwAuthBootstrapPromise ||= _cwFetchBootstrapAuthState();
+window.cwIsAuthSetupPending = () => window.__cwAuthSetupPending === true;
+
   // Bootstrap
   window.addEventListener("DOMContentLoaded", () => {
     try { DOM.fixFormLabels?.(); } catch {}
-    try { CW.Providers?.load?.(); } catch {}
-    try { CW.Providers?.mountMetadataProviders?.(); } catch {}
-    try { CW.Pairs?.list?.(); } catch {}
-    try { CW.Scheduling?.load?.(); } catch {}
-    try { CW.Insights?.loadLight?.(); } catch {}
     try { cwInitPwaInstall(); } catch {}
 
     // Setup 
     (async () => {
       try {
-        const r = await fetch('/api/config/meta?ts=' + Date.now(), { cache: 'no-store' });
-        if (!r.ok) return;
-        const meta = await r.json();
+        const boot = await (window.__cwAuthBootstrapPromise || Promise.resolve(null));
+        const meta = boot?.meta || null;
         if (!meta) return;
 
         async function ensureModals() {
           if (typeof window.openUpgradeWarning === "function" || typeof window.openSetupWizard === "function") return true;
           try {
-            const v = encodeURIComponent(String(window.APP_VERSION || window.__CW_VERSION__ || window.__CW_BUILD__ || Date.now()));
+            const v = encodeURIComponent(String(window.APP_VERSION || window.__CW_VERSION__ || Date.now()));
             await import(`/assets/js/modals.js?v=${v}`);
             return true;
           } catch (e) {
@@ -304,7 +429,9 @@ window.cwPwaDiag = function () {
           }
         }
 
-        if (!meta.exists) {
+        const firstRun = await _cwShouldOpenSetupWizard(meta);
+
+        if (firstRun) {
           if (await ensureModals()) { try { await window.openSetupWizard?.(meta); } catch (e) { console.warn(e); } }
           return;
         }

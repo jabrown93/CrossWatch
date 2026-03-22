@@ -64,11 +64,11 @@ class TmdbProvider:
     def _ttl_seconds(self) -> int:
         cfg = self.load_cfg() or {}
         md = cfg.get("metadata") or {}
-        hours = md.get("ttl_hours", 6)
+        hours = md.get("ttl_hours", 72)
         try:
             hours = int(hours)
         except Exception:
-            hours = 6
+            hours = 72
         return max(1, hours) * 3600
 
     def _backoff_params(self) -> tuple[int, float, float]:
@@ -99,6 +99,25 @@ class TmdbProvider:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         lvl = "INFO" if int(status or 0) == 404 else "WARNING"
         log(f"{msg}: {exc}", level=lvl, module="META")
+
+    def _debug_enabled(self) -> bool:
+        try:
+            cfg = self.load_cfg() or {}
+            return bool((cfg.get("runtime") or {}).get("debug"))
+        except Exception:
+            return False
+
+    def _debug_log(self, event: str, **fields: Any) -> None:
+        if not self._debug_enabled():
+            return
+        clean = {
+            str(k): v
+            for k, v in fields.items()
+            if v not in (None, "", [], {})
+        }
+        suffix = " ".join(f"{k}={v}" for k, v in clean.items())
+        msg = event if not suffix else f"{event} {suffix}"
+        log(msg, level="debug", module="META", extra=clean or None)
 
     def _get(self, url: str, params: dict[str, Any] | None = None) -> Any:
         q = dict(params or {})
@@ -149,7 +168,12 @@ class TmdbProvider:
                 retryable = (status == 429) or (status is None) or (500 <= int(status or 0) < 600)
                 if (not retryable) or (attempt >= max_retries):
                     lvl = "INFO" if int(status or 0) == 404 else "WARNING"
-                    log(f"TMDb request failed ({status or 'n/a'}) at {url}", level=lvl, module="META")
+                    log(
+                        f"TMDb request failed ({status or 'n/a'}) at {url}",
+                        level=lvl,
+                        module="META",
+                        extra={"status": status, "url": url},
+                    )
                     raise
                 time.sleep(self._retry_delay(attempt, base_s, max_s))
                 attempt += 1
@@ -413,9 +437,21 @@ class TmdbProvider:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if int(status or 0) == 404:
                 alt = "tv" if kind == "movie" else "movie"
+                self._debug_log(
+                    "tmdb_detail_fallback",
+                    tmdb_id=tmdb_id,
+                    requested=kind,
+                    fallback=alt,
+                    entity=entity,
+                )
                 try:
                     det = _get_details(alt)
                     kind = alt
+                    self._debug_log(
+                        "tmdb_detail_fallback_hit",
+                        tmdb_id=tmdb_id,
+                        resolved=kind,
+                    )
                 except Exception as e2:
                     self._log_exc("TMDb detail fetch failed", e2)
                     return {}
@@ -521,7 +557,7 @@ class TmdbProvider:
             out["genres"] = genres
         if score is not None:
             out["score"] = score
-        if videos:
+        if need.get("videos"):
             out["videos"] = videos
         if certification:
             out["certification"] = certification
@@ -556,8 +592,8 @@ def html() -> str:
   <div class="body">
     <div class="grid2">
       <div style="grid-column:1 / -1">
-        <label>TMDb API key</label>
-        <input id="tmdb_api_key" placeholder="Your TMDb API key" oninput="this.dataset.dirty='1'; updateTmdbHint()">
+        <label for="tmdb_api_key">TMDb API key</label>
+        <input id="tmdb_api_key" name="tmdb_api_key" placeholder="Your TMDb API key" oninput="this.dataset.dirty='1'; updateTmdbHint()">
         <div id="tmdb_hint" class="msg warn hidden">
           TMDb is optional but recommended to enrich posters &amp; metadata in the preview.
           Get an API key at
@@ -572,15 +608,15 @@ def html() -> str:
         <div class="adv-wrap">
 
           <div>
-            <label>Default locale (metadata.locale)</label>
-            <input id="metadata_locale" placeholder="e.g. nl-NL or en-US" oninput="this.dataset.dirty='1'">
+            <label for="metadata_locale">Default locale (metadata.locale)</label>
+            <input id="metadata_locale" name="metadata_locale" placeholder="e.g. nl-NL or en-US" oninput="this.dataset.dirty='1'">
             <div class="sub">Used when a request doesn't pass ?locale=. Falls back to UI locale if empty.</div>
           </div>
 
           <div>
-            <label>TTL hours (metadata.ttl_hours)</label>
-            <input id="metadata_ttl_hours" type="number" min="1" step="1" placeholder="6" oninput="this.dataset.dirty='1'">
-            <div class="sub">Resolver cache freshness (coarse). Default 6h.</div>
+            <label for="metadata_ttl_hours">TTL hours (metadata.ttl_hours)</label>
+            <input id="metadata_ttl_hours" name="metadata_ttl_hours" type="number" min="1" step="1" placeholder="72" oninput="this.dataset.dirty='1'">
+            <div class="sub">Resolver cache freshness (coarse). Default 72h.</div>
           </div>
 
         </div>

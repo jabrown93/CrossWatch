@@ -34,7 +34,7 @@ def log(msg: str, level: str = "INFO", module: str = "AUTH", **_: Any) -> None:
 PLEX_PIN_URL = "https://plex.tv/api/v2/pins"
 UA = "CrossWatch/1.0"
 HTTP_TIMEOUT = 10
-__VERSION__ = "2.0.0"
+__VERSION__ = "2.1.0"
 
 
 class PlexAuth(AuthProvider):
@@ -350,16 +350,16 @@ def html() -> str:
           <div class="cw-subpanel active" data-sub="auth">
             <div class="grid2">
               <div>
-                <label>Current token</label>
+                <label for="plex_token">Current token</label>
                 <div class="inline">
-                  <input id="plex_token" placeholder="empty = not set">
+                  <input id="plex_token" name="plex_token" placeholder="empty = not set">
                   <button class="btn copy" onclick="copyInputValue('plex_token', this)">Copy</button>
                 </div>
               </div>
               <div>
-                <label>Link code (PIN)</label>
+                <label for="plex_pin">Link code (PIN)</label>
                 <div class="inline">
-                  <input id="plex_pin" placeholder="" readonly>
+                  <input id="plex_pin" name="plex_pin" placeholder="" readonly>
                   <button class="btn copy" onclick="copyInputValue('plex_pin', this)">Copy</button>
                 </div>
               </div>
@@ -378,9 +378,9 @@ def html() -> str:
 
           <div class="cw-subpanel" data-sub="settings">
             <div style="max-width:820px">
-              <label>Server URL</label>
+              <label for="plex_server_url">Server URL</label>
               <div class="fieldline">
-                <input id="plex_server_url" placeholder="http://host:32400" list="plex_server_suggestions">
+                <input id="plex_server_url" name="plex_server_url" placeholder="http://host:32400" list="plex_server_suggestions">
                 <datalist id="plex_server_suggestions"></datalist>
                 <label class="sslopt" title="Verify server TLS certificate">
                   <input type="checkbox" id="plex_verify_ssl">
@@ -394,9 +394,9 @@ def html() -> str:
 
               <div class="sub">Leave blank to discover.</div>
 
-              <label style="margin-top:10px">Username</label>
+              <label for="plex_username" style="margin-top:10px">Username</label>
               <div class="fieldline userpick">
-                <input id="plex_username" placeholder="Plex Home profile">
+                <input id="plex_username" name="plex_username" placeholder="Plex Home profile">
                 <button class="btn" id="plex_user_pick_btn" title="Choose from server users">Pick</button>
                 <div id="plex_user_pop" class="userpop hidden">
                   <div class="pophead">
@@ -408,11 +408,11 @@ def html() -> str:
                 </div>
               </div>
 
-              <label style="margin-top:10px">Account_ID</label>
-              <input id="plex_account_id" type="number" min="1" placeholder="e.g. 1">
+              <label for="plex_account_id" style="margin-top:10px">Account_ID</label>
+              <input id="plex_account_id" name="plex_account_id" type="number" min="1" placeholder="e.g. 1">
 
-              <label style="margin-top:10px">Home PIN (optional)</label>
-              <input id="plex_home_pin" type="password" inputmode="numeric" autocomplete="new-password" placeholder="4 digits">
+              <label for="plex_home_pin" style="margin-top:10px">Home PIN (optional)</label>
+              <input id="plex_home_pin" name="plex_home_pin" type="password" inputmode="numeric" autocomplete="new-password" placeholder="4 digits">
               <div class="sub">Only needed if the selected Plex Home user is PIN-protected.</div>
 
               <div class="plex-btnrow">
@@ -464,14 +464,17 @@ def html() -> str:
       return v.toLowerCase() === "default" ? "default" : v;
     }
 
-    function getPlexBlk(cfg){
+    function getPlexBlk(cfg, opts){
       cfg = cfg || {};
-      const base = (cfg.plex && typeof cfg.plex === "object") ? cfg.plex : (cfg.plex = {});
+      opts = opts || {};
+      const createBase = opts.createBase === true;
+      const base = (cfg.plex && typeof cfg.plex === "object") ? cfg.plex : (createBase ? (cfg.plex = {}) : null);
+      if (!base) return null;
       const inst = getInst();
       if (inst === "default") return base;
-      if (!base.instances || typeof base.instances !== "object") base.instances = {};
-      if (!base.instances[inst] || typeof base.instances[inst] !== "object") base.instances[inst] = {};
-      return base.instances[inst];
+      return (base.instances && typeof base.instances === "object" && base.instances[inst] && typeof base.instances[inst] === "object")
+        ? base.instances[inst]
+        : null;
     }
 
     (async ()=>{
@@ -487,7 +490,8 @@ def html() -> str:
     document.addEventListener("settings-collect",(ev)=>{
       try{
         const cfg = ev?.detail?.cfg || (window.__cfg ||= {});
-        const blk = getPlexBlk(cfg);
+        const blk = getPlexBlk(cfg, { createBase: true });
+        if (!blk) return;
         blk.verify_ssl = !!$("plex_verify_ssl")?.checked;
       }catch{}
     }, true);

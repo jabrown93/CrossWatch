@@ -23,6 +23,9 @@ def _pair_scope() -> str | None:
             return str(v).strip()
     return None
 
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 def _safe_scope(value: str) -> str:
     s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
@@ -48,7 +51,7 @@ def state_file(name: str) -> str:
         legacy = _STATE_DIR / name
 
     # Auto-migrate legacy unscoped state to scoped file
-    if not scoped.exists() and legacy.exists():
+    if (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
         try:
             _STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)
@@ -250,25 +253,43 @@ def _ids_from_provider_ids(pids: Mapping[str, Any] | None) -> dict[str, str]:
     if not isinstance(pids, Mapping):
         return out
     low = {str(k).lower(): (v if v is not None else "") for k, v in pids.items()}
+
     v = low.get("imdb")
     if v:
         m = _IMDB_PAT.search(str(v).strip())
         if m:
             out["imdb"] = f"tt{m.group(1)}"
+
     v = low.get("tmdb")
     if v:
         m = _NUM_PAT.search(str(v).strip())
         if m:
             out["tmdb"] = m.group(1)
+
     v = low.get("tvdb")
     if v:
         m = _NUM_PAT.search(str(v).strip())
         if m:
             out["tvdb"] = m.group(1)
+
+    # Anime community IDs
+    v = low.get("mal") or low.get("myanimelist") or low.get("myanimelistid")
+    if v:
+        m = _NUM_PAT.search(str(v).strip())
+        if m:
+            out["mal"] = m.group(1)
+
+    v = low.get("anilist") or low.get("anilistid")
+    if v:
+        m = _NUM_PAT.search(str(v).strip())
+        if m:
+            out["anilist"] = m.group(1)
+
     em = low.get("emby")
     if em:
         out["emby"] = str(em)
     return out
+
 
 
 def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
@@ -344,15 +365,29 @@ def map_provider_key(k: str) -> str | None:
     if not k:
         return None
     kl = str(k).strip().lower()
+
+    # Built-ins / common agents
     if kl.startswith("agent:themoviedb"):
         return "tmdb"
     if kl.startswith("agent:imdb"):
         return "imdb"
     if kl.startswith("agent:tvdb"):
         return "tvdb"
+
+    # Anime community providers (plugins)
+    if kl.startswith("agent:myanimelist") or kl.startswith("agent:mal"):
+        return "mal"
+    if kl.startswith("agent:anilist"):
+        return "anilist"
+
     if kl in ("tmdb", "imdb", "tvdb"):
         return kl
+    if kl in ("mal", "myanimelist", "myanimelistid"):
+        return "mal"
+    if kl in ("anilist", "anilistid"):
+        return "anilist"
     return None
+
 
 
 def format_provider_pair(k: str, v: Any) -> str | None:
@@ -410,7 +445,8 @@ def all_ext_pairs(it_ids: Mapping[str, Any], priority: Iterable[str]) -> list[st
         if p and p not in seen:
             out.append(p)
             seen.add(p)
-    for k in ("tmdb", "imdb", "tvdb"):
+
+    for k in ("tmdb", "imdb", "tvdb", "mal", "anilist"):
         v = (it_ids or {}).get(k)
         p = format_provider_pair(k, v) if v else None
         if p and p not in seen:
@@ -457,6 +493,16 @@ def build_provider_index(adapter: Any) -> dict[str, list[dict[str, Any]]]:
                 m = _NUM_PAT.search(low["tvdb"])
                 if m:
                     out.setdefault(f"tvdb.{int(m.group(1))}", []).append(row)
+            v_mal = low.get("mal") or low.get("myanimelist") or low.get("myanimelistid")
+            if v_mal:
+                m = _NUM_PAT.search(v_mal)
+                if m:
+                    out.setdefault(f"mal.{int(m.group(1))}", []).append(row)
+            v_al = low.get("anilist") or low.get("anilistid")
+            if v_al:
+                m = _NUM_PAT.search(v_al)
+                if m:
+                    out.setdefault(f"anilist.{int(m.group(1))}", []).append(row)
         start += len(items)
         if not items or (total is not None and start >= total):
             break
@@ -1425,6 +1471,156 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any]) -> str | None:
         f"resolve miss: type={t} title='{title}' year={year} S{season}E{episode} series='{series_title}'"
     )
     return None
+
+def resolve_item_ids(adapter: Any, it: Mapping[str, Any]) -> list[str]:
+    http = getattr(adapter, "client", None)
+    uid = getattr(getattr(adapter, "cfg", None), "user_id", None)
+    if not http or not uid:
+        return []
+
+    raw_iid = it.get("emby_item_id") or it.get("_emby_item_id")
+    if raw_iid:
+        s = str(raw_iid).strip()
+        if s and not looks_like_bad_id(s):
+            return [s]
+
+    one = resolve_item_id(adapter, it)
+
+    ids = dict(it.get("ids") or {})
+    show_ids = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else None
+
+    t = _norm_type(it.get("type"))
+    title = (it.get("title") or "").strip()
+    year = it.get("year")
+    season = it.get("season")
+    episode = it.get("episode")
+    series_title = (it.get("series_title") or "").strip()
+
+    strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
+    prio = guid_priority_from_cfg(getattr(getattr(adapter, "cfg", None), "watchlist_guid_priority", None))
+    pairs = all_ext_pairs(ids, prio)
+    if show_ids:
+        spairs = all_ext_pairs(show_ids, prio)
+        for p in spairs:
+            if p not in pairs:
+                pairs.append(p)
+
+    idx = build_provider_index(adapter)
+
+    def _valid(iid: Any) -> str | None:
+        s = str(iid or "").strip()
+        return s if s and not looks_like_bad_id(s) else None
+
+    def _items(resp: Any) -> list[Mapping[str, Any]]:
+        try:
+            body = resp.json() or {}
+            rows = body.get("Items") or []
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
+
+    found: list[str] = []
+
+    if t == "movie":
+        for pref in pairs:
+            rows = idx.get(pref) or []
+            cands = [row for row in rows if (row.get("Type") or "") == "Movie"]
+            if isinstance(year, int):
+                yr = int(year)
+                cands_yr = [
+                    r for r in cands
+                    if isinstance(r.get("ProductionYear"), int) and abs(int(r["ProductionYear"]) - yr) <= 1
+                ]
+                if cands_yr:
+                    cands = cands_yr
+            for row in cands:
+                iid = _valid(row.get("Id"))
+                if iid and iid not in found:
+                    found.append(iid)
+            if found:
+                return found
+
+        if title and not strict:
+            try:
+                q: dict[str, Any] = {
+                    "userId": uid,
+                    "recursive": True,
+                    "includeItemTypes": "Movie",
+                    "SearchTerm": title,
+                    "Fields": "ProviderIds,ProductionYear,Type",
+                    "Limit": 50,
+                }
+                q.update(emby_scope_any(adapter.cfg))
+                r = http.get("/Items", params=q)
+                t_l = title.lower()
+                for row in _items(r):
+                    if (row.get("Type") or "") != "Movie":
+                        continue
+                    nm = (row.get("Name") or "").strip().lower()
+                    yr = row.get("ProductionYear")
+                    if nm != t_l:
+                        continue
+                    if (year is not None) and not (isinstance(yr, int) and abs(int(yr) - int(year)) <= 1):
+                        continue
+                    iid = _valid(row.get("Id"))
+                    if iid and iid not in found:
+                        found.append(iid)
+            except Exception:
+                pass
+
+    if t == "episode":
+        for pref in pairs:
+            rows = idx.get(pref) or []
+            cands = [row for row in rows if (row.get("Type") or "") == "Episode"]
+            for row in cands:
+                try:
+                    s_ok = (season is None) or (int(row.get("ParentIndexNumber") or 0) == int(season))
+                    e_ok = (episode is None) or (int(row.get("IndexNumber") or 0) == int(episode))
+                except Exception:
+                    s_ok, e_ok = True, True
+                if not (s_ok and e_ok):
+                    continue
+                iid = _valid(row.get("Id"))
+                if iid and iid not in found:
+                    found.append(iid)
+            if found:
+                return found
+
+        if series_title and not strict:
+            try:
+                q: dict[str, Any] = {
+                    "userId": uid,
+                    "recursive": True,
+                    "includeItemTypes": "Episode",
+                    "SearchTerm": series_title,
+                    "Fields": "ProviderIds,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesName",
+                    "Limit": 200,
+                }
+                q.update(emby_scope_any(adapter.cfg))
+                r = http.get("/Items", params=q)
+                st_l = series_title.lower()
+                for row in _items(r):
+                    if (row.get("Type") or "") != "Episode":
+                        continue
+                    sn = (row.get("SeriesName") or "").strip().lower()
+                    if sn != st_l:
+                        continue
+                    try:
+                        s_ok = (season is None) or (int(row.get("ParentIndexNumber") or 0) == int(season))
+                        e_ok = (episode is None) or (int(row.get("IndexNumber") or 0) == int(episode))
+                    except Exception:
+                        s_ok, e_ok = True, True
+                    if not (s_ok and e_ok):
+                        continue
+                    iid = _valid(row.get("Id"))
+                    if iid and iid not in found:
+                        found.append(iid)
+            except Exception:
+                pass
+
+    if found:
+        return found
+    return [one] if one else []
 
 
 # utils

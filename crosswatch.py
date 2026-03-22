@@ -2,33 +2,21 @@
 # CrossWatch main application entry point
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from collections.abc import AsyncIterator
 
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timedelta, timezone
-from functools import lru_cache
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, quote
-from importlib import import_module
+from urllib.parse import parse_qsl, urlencode, quote
 
 import sys
 sys.modules.setdefault("crosswatch", sys.modules[__name__])
-import traceback
-import json
 import os
 import re
-import secrets
-import shutil
 import socket
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
-import shlex
-import requests
 import uvicorn
 import asyncio
 
@@ -41,9 +29,6 @@ from api import (
     register as register_api,
     _is_sync_running,
     _load_state,
-    _compute_lanes_from_stats,
-    _lane_is_empty,
-    _parse_epoch,
     api_run_sync,
 )
 
@@ -51,6 +36,7 @@ from api.appAuthAPI import (
     COOKIE_NAME as APP_AUTH_COOKIE,
     auth_required as app_auth_required,
     is_authenticated as app_is_authenticated,
+    setup_lock_required as app_auth_setup_lock_required,
     register_app_auth,
 )
 
@@ -61,74 +47,33 @@ def _c(text: str, color: str) -> str:
 
 from api.versionAPI import CURRENT_VERSION
 from services import register as register_services
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from fastapi import Body, FastAPI, Query, Request, Path as FPath
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
-    Response,
     StreamingResponse,
 )
-from fastapi.staticfiles import StaticFiles
 
-try:
-    from plexapi.myplex import MyPlexAccount
-    HAVE_PLEXAPI = True
-except Exception:
-    HAVE_PLEXAPI = False
-
-try:
-    from api.wallAPI import _load_wall_snapshot, refresh_wall
-except Exception:
-    _load_wall_snapshot = lambda: []
-    refresh_wall = lambda: None
-
-from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
-
-from providers.scrobble.scrobble import Dispatcher, from_plex_webhook
-from providers.scrobble.trakt.sink import TraktSink
-from providers.scrobble.simkl.sink import SimklSink
-from providers.scrobble.mdblist.sink import MDBListSink
-
-
-# Webhook: Plex
-try:
-    from providers.webhooks.plextrakt import process_webhook as process_webhook
-except Exception:
-    process_webhook = None
-
-# JelWEbhook: Jellyfin
-try:
-    from providers.webhooks.jellyfintrakt import process_webhook as process_webhook_jellyfin
-except Exception:
-    process_webhook_jellyfin = None
+from api.wallAPI import _load_wall_snapshot
+from providers.webhooks.plextrakt import process_webhook as process_webhook
+from providers.webhooks.jellyfintrakt import process_webhook as process_webhook_jellyfin
 
 __all__ = ["process_webhook", "process_webhook_jellyfin"]
 
 from ui_frontend import (
-    get_index_html,
     register_assets_and_favicons,
     register_ui_root,
 )
 from services.scheduling import SyncScheduler
 from services.statistics import Stats
-from services.watchlist import build_watchlist, delete_watchlist_item
 
 from cw_platform.orchestrator import Orchestrator, minimal
-from cw_platform.modules_registry import MODULES as _MODULES
 from cw_platform.config_base import load_config, save_config, CONFIG as CONFIG_DIR
 from cw_platform.tls import ensure_self_signed_cert, resolve_tls_paths
 from cw_platform.orchestrator import canonical_key
-from cw_platform import config_base
 
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+from zoneinfo import ZoneInfo
 
 # Paths and globals
 ROOT = Path(__file__).resolve().parent
@@ -145,13 +90,11 @@ LAST_SYNC_PATH  = (STATE_DIR / "last_sync.json").resolve()
 REPORT_DIR = (CONFIG_DIR / "sync_reports"); REPORT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR  = (CONFIG_DIR / "cache");        CACHE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATHS = [CONFIG_DIR / "state.json", ROOT / "state.json"]
-HIDE_PATH   = (CONFIG_DIR / "watchlist_hide.json")
 CW_STATE_DIR = (CONFIG_DIR / ".cw_state"); CW_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 _METADATA: Any = None
-WATCH: Optional[Any] = None
-DISPATCHER: Optional[Dispatcher] = None
 scheduler: Optional[SyncScheduler] = None
+_AUTH_RESET_ENV_APPLIED = False
 
 STATS = Stats()
 
@@ -185,6 +128,73 @@ def _is_debug_enabled() -> bool:
     except Exception:
         return False
 
+
+def _resolve_config_scoped_path(raw_path: str) -> Path:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        raise ValueError("Missing path")
+
+    cfg_root = CONFIG_DIR.resolve()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = cfg_root / candidate
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(cfg_root)
+    except ValueError as e:
+        raise ValueError("Invalid path") from e
+    return candidate
+
+
+def _env_truthy(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_auth_reset_env_once() -> None:
+    global _AUTH_RESET_ENV_APPLIED
+    if _AUTH_RESET_ENV_APPLIED:
+        return
+    _AUTH_RESET_ENV_APPLIED = True
+
+    if not _env_truthy("CW_RESET_AUTH_ONCE"):
+        return
+
+    cfg_path = CONFIG_DIR / "config.json"
+    if not cfg_path.exists():
+        print("[BOOT] CW_RESET_AUTH_ONCE ignored: no existing config.json found.")
+        return
+
+    try:
+        cfg = load_config() or {}
+        a = cfg.setdefault("app_auth", {})
+        if not isinstance(a, dict):
+            a = {}
+            cfg["app_auth"] = a
+
+        pwd = a.setdefault("password", {})
+        if not isinstance(pwd, dict):
+            pwd = {}
+            a["password"] = pwd
+
+        sess = a.setdefault("session", {})
+        if not isinstance(sess, dict):
+            sess = {}
+            a["session"] = sess
+
+        a["enabled"] = False
+        a["username"] = ""
+        a["reset_required"] = True
+        pwd["salt"] = ""
+        pwd["hash"] = ""
+        sess["token_hash"] = ""
+        sess["expires_at"] = 0
+        a["sessions"] = []
+        a["last_login_at"] = 0
+        save_config(cfg)
+        print("[BOOT] CW_RESET_AUTH_ONCE detected: app authentication was reset. Remove the env var and set a new username/password in the UI.")
+    except Exception as exc:
+        print(f"[BOOT] CW_RESET_AUTH_ONCE failed: {exc}")
+
 def _is_static_noise(path: str, status: int) -> bool:
     if path.startswith("/assets/") or path.startswith("/favicon"):
         return True
@@ -201,14 +211,75 @@ def _is_static_noise(path: str, status: int) -> bool:
         "/placeholder" in path
     ):
         return True
-
-    if request_method := None:
-        try:
-            pass
-        except Exception:
-            pass
-
     return False
+
+_SENSITIVE_QUERY_KEYS = {
+    "token", "access_token", "refresh_token", "client_secret",
+    "api_key", "apikey", "code", "state", "password", "secret",
+    "session_id", "x-plex-token",
+}
+
+_APP_AUTH_SETUP_ALLOWED_PATHS = {
+    "/",
+    "/healthz",
+    "/login",
+    "/logout",
+    "/api/health",
+    "/api/config/meta",
+    "/api/app-auth/status",
+    "/api/app-auth/credentials",
+}
+
+_PUBLIC_HEALTH_PATHS = {
+    "/api/health",
+    "/healthz",
+}
+
+def _redact_query_string(query: str) -> str:
+    q = (query or "").strip()
+    if not q:
+        return ""
+    try:
+        pairs = parse_qsl(q, keep_blank_values=True)
+    except Exception:
+        return ""
+    redacted: list[tuple[str, str]] = []
+    for k, v in pairs:
+        if str(k).strip().lower() in _SENSITIVE_QUERY_KEYS:
+            redacted.append((k, "••••"))
+        else:
+            redacted.append((k, v))
+    try:
+        return urlencode(redacted, doseq=True)
+    except Exception:
+        return ""
+
+_SECRET_KV_RE = re.compile(
+    r"(?i)(\b(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token|password)\b\s*[=:]\s*)([^\s,;&]+)"
+)
+_URL_QS_RE = re.compile(
+    r"(?i)([?&](?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token)=)([^&\s]+)"
+)
+_AUTH_BEARER_RE = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+([^\s,;]+)")
+_JSON_DQ_RE = re.compile(
+    r'(?i)("(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token|password|hash|salt)"\s*:\s*")([^"]*)(")'
+)
+_JSON_SQ_RE = re.compile(
+    r"(?i)('(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token|password|hash|salt)'\s*:\s*')([^']*)(')"
+)
+
+def _redact_secrets_in_text(s: str) -> str:
+    if not s:
+        return s
+    out = s
+    out = _AUTH_BEARER_RE.sub(r"\1••••", out)
+    out = _BEARER_RE.sub("Bearer ••••", out)
+    out = _URL_QS_RE.sub(r"\1••••", out)
+    out = _SECRET_KV_RE.sub(r"\1••••", out)
+    out = _JSON_DQ_RE.sub(r"\1••••\3", out)
+    out = _JSON_SQ_RE.sub(r"\1••••\3", out)
+    return out
 
 def _is_mods_debug_enabled() -> bool:
     try:
@@ -228,84 +299,6 @@ def _apply_debug_env_from_config() -> None:
     elif not on and os.environ.get("CW_DEBUG"):
         os.environ.pop("CW_DEBUG", None)
 
-# Watcher: Sink builder
-def _build_sinks_from_config(cfg) -> list:
-    sc = cfg.get("scrobble") or {}
-    watch_cfg = (sc.get("watch") or {}) if isinstance(sc.get("watch"), dict) else {}
-    sink_cfg = str(watch_cfg.get("sink") or "").strip()
-    if not sink_cfg or sink_cfg.lower() in ("none", "off", "disabled", "false", "0"):
-        return []
-    raw = sink_cfg
-
-    names = [s.strip().lower() for s in re.split(r"[,&+]", raw) if s and s.strip()]
-    added, sinks = set(), []
-    for name in names:
-        if name == "trakt" and "trakt" not in added:
-            try:
-                sinks.append(TraktSink()); added.add("trakt")
-            except Exception:
-                pass
-        elif name == "simkl" and "simkl" not in added:
-            try:
-                sinks.append(SimklSink()); added.add("simkl")
-            except Exception:
-                pass
-        elif name == "mdblist" and "mdblist" not in added:
-            try:
-                sinks.append(MDBListSink()); added.add("mdblist")
-            except Exception:
-                pass
-
-    return sinks
-
-# Watcher: Autostart watch service from config
-def autostart_from_config():
-    cfg = load_config()
-    sc = cfg.get("scrobble")
-    if not isinstance(sc, dict):
-        sc = {}; cfg["scrobble"] = sc
-
-    if not (sc.get("enabled") and (sc.get("mode") or "").lower() == "watch"):
-        return None
-
-    watch_cfg = sc.get("watch")
-    if not isinstance(watch_cfg, dict):
-        watch_cfg = {}; sc["watch"] = watch_cfg
-
-    if watch_cfg.get("autostart") is False:
-        return None
-
-    provider = (watch_cfg.get("provider") or "plex").lower().strip()
-    filters = (watch_cfg.get("filters") or {}) if isinstance(watch_cfg, dict) else {}
-    sinks = _build_sinks_from_config(cfg)
-
-
-    try:
-        if provider == "emby":
-            from providers.scrobble.emby.watch import make_default_watch as _mk
-        elif provider == "jellyfin":
-            from providers.scrobble.jellyfin.watch import make_default_watch as _mk
-        else:
-            from providers.scrobble.plex.watch import make_default_watch as _mk
-
-    except Exception:
-        return None
-
-    try:
-        w = _mk(sinks=sinks)
-        if isinstance(filters, dict) and hasattr(w, "set_filters"):
-            try:
-                getattr(w, "set_filters")(filters)
-            except Exception:
-                pass
-        if hasattr(w, "start_async"):
-            w.start_async()
-        else:
-            threading.Thread(target=w.start, daemon=True).start()
-        return w
-    except Exception:
-        return None
-
 # Scheduler: Next run computation
 _SCHED_HINT: Dict[str, int] = {"next_run_at": 0, "last_saved_at": 0}
 
@@ -317,9 +310,22 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
 
     mode = str(scfg.get("mode") or "every_n_hours").lower()
 
+    if mode == "hourly":
+        base = datetime.fromtimestamp(now)
+        target = base.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return int(target.timestamp())
+
     if mode == "every_n_hours":
         n = max(1, int(scfg.get("every_n_hours") or 1))
+        if n <= 1:
+            base = datetime.fromtimestamp(now)
+            target = base.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            return int(target.timestamp())
         return now + n * 3600
+
+    if mode == "custom_interval":
+        minutes = max(15, int(scfg.get("custom_interval_minutes", 60) or 60))
+        return now + minutes * 60
 
     if mode == "daily_time":
         hh, mm = ("03", "30")
@@ -331,7 +337,7 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
         tz = None
         try:
             tzname = scfg.get("timezone")
-            if tzname and ZoneInfo:
+            if tzname:
                 tz = ZoneInfo(tzname)
         except Exception:
             tz = None
@@ -344,6 +350,7 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
     return now + 3600
 
 # API
+_apply_auth_reset_env_once()
 app = FastAPI()
 
 # CORS: deny all cross-origin requests by default
@@ -381,7 +388,8 @@ async def conditional_access_logger(request: Request, call_next):
                 if should_log:
                     dt_ms = int((time.time() - t0) * 1000)
                     host = f"{client.host}:{client.port}" if client else "-"
-                    path_qs = path + (f"?{request.url.query}" if request.url.query else "")
+                    qs = _redact_query_string(request.url.query)
+                    path_qs = path + (f"?{qs}" if qs else "")
                     proto = f"HTTP/{request.scope.get('http_version','1.1')}"
                     print(f'{host} - "{request.method} {path_qs} {proto}" {status} ({dt_ms} ms)')
 
@@ -395,10 +403,10 @@ async def app_auth_gate(request: Request, call_next):
     try:
         cfg = load_config()
     except Exception:
-        return await call_next(request)
-
-    if not app_auth_required(cfg):
-        return await call_next(request)
+        # Fail closed if config can't be loaded 
+        if (request.url.path or "").startswith("/api/"):
+            return JSONResponse({"ok": False, "error": "Service unavailable"}, status_code=503, headers={"Cache-Control": "no-store"})
+        return PlainTextResponse("Service unavailable", status_code=503, headers={"Cache-Control": "no-store"})
 
     path = request.url.path or "/"
     if path.startswith("/assets/"):
@@ -410,6 +418,9 @@ async def app_auth_gate(request: Request, call_next):
     if path in {"/manifest.webmanifest", "/sw.js"}:
         return await call_next(request)
     
+    if path in _PUBLIC_HEALTH_PATHS:
+        return await call_next(request)
+    
     if path.startswith("/api/app-auth/") or path in {"/login", "/logout"}:
         return await call_next(request)
     
@@ -419,6 +430,20 @@ async def app_auth_gate(request: Request, call_next):
 
     # exclude callback paths
     if path == "/callback" or path.startswith("/callback/"):
+        return await call_next(request)
+
+    if app_auth_setup_lock_required(cfg):
+        if path in _APP_AUTH_SETUP_ALLOWED_PATHS:
+            return await call_next(request)
+        if path.startswith("/api/"):
+            return JSONResponse(
+                {"ok": False, "error": "Authentication setup required"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+        return RedirectResponse(url="/", status_code=302)
+
+    if not app_auth_required(cfg):
         return await call_next(request)
 
     token = request.cookies.get(APP_AUTH_COOKIE)
@@ -537,7 +562,8 @@ def ansi_to_html(line: str) -> str:
 
 def _append_log(tag: str, raw_line: str) -> None:
     t = _norm_log_tag(tag)
-    html = ansi_to_html(raw_line.rstrip("\n"))
+    safe_line = _redact_secrets_in_text(raw_line)
+    html = ansi_to_html(safe_line.rstrip("\n"))
     buf = _get_log_buf(t)
     buf.append(html)
     LOG_NEXT_SEQ[t] = int(LOG_NEXT_SEQ.get(t, 1)) + 1
@@ -612,40 +638,15 @@ def _get_orchestrator() -> Orchestrator:
     cfg = load_config()
     return Orchestrator(config=cfg)
 
-def _json_safe(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(x) for x in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    return str(obj)
-
 # Startup sequence
 @asynccontextmanager
 async def _lifespan(app: Any) -> AsyncIterator[None]:
-    app.state.watch = None
     app.state.watch_groups = {}
     app.state.watch_manager = None
     _apply_debug_env_from_config()
     _install_ui_log_forwarder()
 
-    try:
-        fn = globals().get("_on_startup")
-        if callable(fn):
-            res = fn()
-            try:
-                import inspect
-                if inspect.iscoroutine(res):
-                    await res
-            except Exception:
-                pass
-    except Exception as e:
-        try: _UIHostLogger("WATCH", "WATCH")(f"startup hook error: {e}", level="ERROR")
-        except Exception: pass
-
     started = False
-    wm_available = False
     try:
         cfg = load_config() or {}
 
@@ -661,7 +662,6 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         if want_autostart:
             try:
                 from providers.scrobble.watch_manager import start_from_config as _wm_start
-                wm_available = True
                 res = _wm_start(app)
                 if isinstance(res, dict):
                     started = any(bool(g.get("running")) for g in (res.get("groups") or []))
@@ -685,42 +685,18 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         except Exception:
             pass
 
-    if not wm_available:
-        try:
-            w = autostart_from_config()
-            if w:
-                app.state.watch = w
-                globals()["WATCH"] = w
-                alive = bool(getattr(w, "is_alive", lambda: True)())
-                started = True
-                _UIHostLogger(
-                    "WATCH",
-                    "WATCH",
-                )(
-                    "watch autostarted" if alive else "watch autostarted (initializing)",
-                    level="INFO",
-                )
-            else:
-                cfg2 = load_config() or {}
-                sc2 = (cfg2.get("scrobble") or {})
-                watch2 = (sc2.get("watch") or {}) if isinstance(sc2.get("watch"), dict) else {}
-                if watch2.get("autostart") is False:
-                    _UIHostLogger("WATCH", "WATCH")("Autostart is disabled", level="INFO")
-                else:
-                    _UIHostLogger("WATCH", "WATCH")("autostart_from_config() returned None", level="INFO")
-        except Exception as e:
-            try:
-                _UIHostLogger("WATCH", "WATCH")(f"autostart_from_config failed: {e}", level="ERROR")
-            except Exception:
-                pass
-
 
     try:
         global scheduler
         if scheduler is not None:
-            scheduler.start()  # idempotent
-            if hasattr(scheduler, "refresh"):
-                scheduler.refresh()
+            cfg_sched = (load_config() or {}).get("scheduling") or {}
+            effective_enabled = bool(
+                cfg_sched.get("enabled") or ((cfg_sched.get("advanced") or {}).get("enabled"))
+            )
+            if effective_enabled:
+                scheduler.start()
+                if hasattr(scheduler, "refresh"):
+                    scheduler.refresh()
     except Exception as e:
         try:
             _UIHostLogger("SYNC")(f"scheduler startup error: {e}", level="ERROR")
@@ -730,36 +706,10 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         yield
     finally:
         try:
-            fn2 = globals().get("_on_shutdown")
-            if callable(fn2):
-                res2 = fn2()
-                try:
-                    import inspect
-                    if inspect.iscoroutine(res2):
-                        await res2
-                except Exception:
-                    pass
-        except Exception as e:
-            try: _UIHostLogger("WATCH", "WATCH")(f"shutdown hook error: {e}", level="ERROR")
-            except Exception: pass
-
-        try:
             from providers.scrobble.watch_manager import stop_all as _wm_stop
             _wm_stop(app)
         except Exception:
             pass
-
-        try:
-            w = getattr(app.state, "watch", None) or (WATCH if 'WATCH' in globals() else None)
-            if w:
-                w.stop()
-                _UIHostLogger("WATCH", "WATCH")("watch stopped", level="INFO")
-            app.state.watch = None
-            if 'WATCH' in globals():
-                globals()['WATCH'] = None
-        except Exception as e:
-            try: _UIHostLogger("WATCH", "WATCH")(f"watch stop failed: {e}", level="ERROR")
-            except Exception: pass
 
 app.router.lifespan_context = _lifespan
 
@@ -784,21 +734,12 @@ async def cache_headers_for_api(request: Request, call_next):
 def api_list_files(
     path: str = Query(..., description="Directory path (absolute or config-relative)")
 ) -> List[Dict[str, Any]]:
-    raw = (path or "").strip()
-    if not raw:
+    try:
+        p = _resolve_config_scoped_path(path)
+    except ValueError:
         return []
 
-    p = Path(raw)
-    if not p.is_absolute():
-        p = (CONFIG_DIR / raw).resolve()
     try:
-        try:
-            cfg_root = CONFIG_DIR.resolve()
-            if not str(p).startswith(str(cfg_root)):
-                return []
-        except Exception:
-            pass
-
         if not p.exists() or not p.is_dir():
             return []
         out: List[Dict[str, Any]] = []
@@ -854,7 +795,17 @@ async def api_logs_stream_initial(request: Request, tag: str = Query("SYNC")):
                 last = time.time()
             await asyncio.sleep(0.25)
 
-    return StreamingResponse(agen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+    return StreamingResponse(
+        agen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 @app.get("/api/logs/watcher", tags=["logging"])
 async def api_logs_watcher(
@@ -870,13 +821,21 @@ async def api_logs_watcher(
         sc = cfg.get("scrobble") or {}
         if isinstance(sc, dict) and isinstance(sc.get("watch"), dict):
             watch_cfg = sc.get("watch") or {}
-        if not watch_cfg and isinstance(cfg.get("watch"), dict):
-            watch_cfg = cfg.get("watch") or {}
-
-        provider = _norm_log_tag(str(watch_cfg.get("provider") or "plex"))
-        sinks_raw = str(watch_cfg.get("sink") or "")
-        sinks = [_norm_log_tag(s) for s in re.split(r"[,&+]", sinks_raw) if s and str(s).strip()]
-        sel = [provider, *sinks]
+        routes = watch_cfg.get("routes") if isinstance(watch_cfg, dict) else None
+        if isinstance(routes, list) and routes:
+            providers = [
+                _norm_log_tag(str((r or {}).get("provider") or ""))
+                for r in routes
+                if isinstance(r, dict) and bool((r or {}).get("enabled", True))
+            ]
+            sinks = [
+                _norm_log_tag(str((r or {}).get("sink") or ""))
+                for r in routes
+                if isinstance(r, dict) and bool((r or {}).get("enabled", True))
+            ]
+            sel = [*providers, *sinks]
+        else:
+            sel = ["WATCH"]
 
     out: List[str] = []
     for t in sel:
@@ -925,69 +884,77 @@ async def api_logs_watcher(
 
             await asyncio.sleep(0.25)
 
-    return StreamingResponse(agen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
-
-# Sync runner (orchestrator)
-def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
-    overrides = overrides or {}
-
-    def _log(msg: str):
-        _append_log("SYNC", msg)
-
-    _log(f"> SYNC start: orchestrator pairs run_id={run_id}")
-
-    try:
-        import importlib
-        orch_mod = importlib.import_module("cw_platform.orchestrator")
-        try:
-            orch_mod = importlib.reload(orch_mod)
-        except Exception:
-            pass
-
-        OrchestratorClass = getattr(orch_mod, "Orchestrator")
-        _log(f"[i] Orchestrator module: {getattr(orch_mod, '__file__', '?')}")
-
-        cfg = load_config()
-        mgr = OrchestratorClass(config=cfg)
-        dry_cfg = bool(((cfg.get("sync") or {}).get("dry_run") or False))
-        dry_ovr = bool(overrides.get("dry_run"))
-        dry = dry_cfg or dry_ovr
-
-        result = mgr.run_pairs(
-            dry_run=dry,
-            progress=_append_log.__get__(None, type(_append_log)) if False else _append_log,
-            write_state_json=True,
-            state_path=STATE_PATH,
-            use_snapshot=True,
-            overrides=overrides,
-        )
-
-        added = int(result.get("added", 0))
-        removed = int(result.get("removed", 0))
-
-        try:
-            state = _load_state()
-            if state:
-                STATS.refresh_from_state(state)
-                STATS.record_summary(added, removed)
-            else:
-                _append_log("SYNC", "[!] No state found after sync; stats not updated.")
-        except Exception as e:
-            _append_log("SYNC", f"[!] Stats update failed: {e}")
-
-        _log(f"[i] Done. Total added: {added}, Total removed: {removed}")
-        _log("[SYNC] exit code: 0")
-
-    except Exception as e:
-        _append_log("SYNC", f"[!] Sync error: {e}")
-        _append_log("SYNC", "[SYNC] exit code: 1")
-    finally:
-        RUNNING_PROCS.pop("SYNC", None)
+    return StreamingResponse(
+        agen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 # Scheduler sync starter
 def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
+    p = dict(payload or {})
+    raw_capture = p.get("capture")
+    capture: dict[str, Any] = raw_capture if isinstance(raw_capture, dict) else {}
+    capture_job_id = str(p.get("capture_job_id") or "").strip()
+    scheduler_mode = str(p.get("scheduler_mode") or "").strip().lower()
+    if capture_job_id or scheduler_mode == "advanced_capture" or capture:
+        try:
+            from services.snapshots import create_snapshot, enforce_capture_retention, render_capture_label_template
+
+            provider = str(capture.get("provider") or "").strip().upper()
+            instance = str(capture.get("instance") or capture.get("instance_id") or "default").strip() or "default"
+            feature = str(capture.get("feature") or "").strip().lower()
+            label_template = str(capture.get("label_template") or capture.get("labelTemplate") or "").strip()
+            try:
+                retention_days = max(0, int(capture.get("retention_days") or 0))
+            except Exception:
+                retention_days = 0
+            try:
+                max_captures = max(0, int(capture.get("max_captures") or 0))
+            except Exception:
+                max_captures = 0
+            auto_delete_old = capture.get("auto_delete_old") is True
+            if not provider or not feature:
+                _append_log("SYNC", "[!] Scheduler capture: missing provider or feature")
+                return False
+
+            label = render_capture_label_template(
+                label_template,
+                provider=provider,
+                instance=instance,
+                feature=feature,
+            )
+            res = create_snapshot(provider, feature, label=label, instance_id=instance) or {}
+            _append_log(
+                "SYNC",
+                f"[i] Scheduler capture: saved {provider} {feature} ({instance}) -> {res.get('path') or 'capture created'}",
+            )
+            if auto_delete_old:
+                cleanup = enforce_capture_retention(
+                    provider,
+                    feature,
+                    instance_id=instance,
+                    retention_days=retention_days,
+                    max_captures=max_captures,
+                    auto_delete_old=True,
+                ) or {}
+                deleted = cleanup.get("deleted") or []
+                if deleted:
+                    _append_log("SYNC", f"[i] Scheduler capture cleanup: removed {len(deleted)} older capture(s)")
+                if cleanup.get("errors"):
+                    _append_log("SYNC", f"[!] Scheduler capture cleanup issues: {', '.join(map(str, cleanup.get('errors') or []))}")
+            return True
+        except Exception as e:
+            _append_log("SYNC", f"[!] Scheduler capture failed: {e}")
+            return False
+
     try:
-        p = dict(payload or {})
         p.setdefault("source", "scheduler")
         res = api_run_sync(p) or {}
     except Exception as e:
@@ -1002,6 +969,52 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
 
     return True
 
+
+def scheduler_handle_event(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        if scheduler is None or not hasattr(scheduler, "handle_event"):
+            return {"ok": False, "reason": "scheduler_unavailable"}
+        return scheduler.handle_event(payload or None)  # type: ignore[union-attr]
+    except Exception as e:
+        try:
+            _append_log("SYNC", f"[!] Scheduler event bridge failed: {e}")
+        except Exception:
+            pass
+        return {"ok": False, "reason": "bridge_error"}
+
+
+def scheduler_event_from_scrobble(
+    ev: Any,
+    *,
+    source: str = "watcher",
+    route_id: str = "",
+    provider: str = "",
+    provider_instance: str = "",
+) -> dict[str, Any]:
+    ids = {}
+    try:
+        ids = dict(getattr(ev, "ids", {}) or {})
+    except Exception:
+        ids = {}
+    progress = getattr(ev, "progress", None)
+    event_name = str(getattr(ev, "action", "") or "").strip().lower()
+    finished = bool(event_name == "stop" and isinstance(progress, int) and progress >= 95)
+    return {
+        "source": str(source or "").strip().lower(),
+        "route_id": str(route_id or "").strip(),
+        "provider": str(provider or "").strip().lower(),
+        "provider_instance": str(provider_instance or "").strip(),
+        "event": event_name,
+        "account": str(getattr(ev, "account", "") or "").strip(),
+        "media_type": str(getattr(ev, "media_type", "") or "").strip().lower(),
+        "progress": progress if isinstance(progress, int) else None,
+        "finished": finished,
+        "session_key": str(getattr(ev, "session_key", "") or "").strip(),
+        "title": str(getattr(ev, "title", "") or "").strip(),
+        "ids": ids,
+        "ts": int(time.time()),
+    }
+
 scheduler = SyncScheduler(
     load_config, save_config,
     run_sync_fn=_start_sync_from_scheduler,
@@ -1009,20 +1022,10 @@ scheduler = SyncScheduler(
     log_fn=_UIHostLogger("SYNC", "SCHED"),
 )
 
-# Platform and metadata managers
-try:
-    from cw_platform.manager import PlatformManager as _PlatformMgr
-    _PLATFORM = _PlatformMgr(load_config, save_config)
-except Exception as _e:
-    _PLATFORM = None
-    print("PlatformManager not available:", _e)
+from cw_platform.metadata import MetadataManager as _MetadataMgr
 
-try:
-    from cw_platform.metadata import MetadataManager as _MetadataMgr
-    _METADATA = _MetadataMgr(load_config, save_config)
-except Exception as _e:
-    _METADATA = None
-    print("MetadataManager not available:", _e)
+# Metadata manager
+_METADATA = _MetadataMgr(load_config, save_config)
 
 # Entry point
 def main(host: str = "0.0.0.0", port: int = 8787) -> None:

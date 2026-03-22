@@ -96,6 +96,7 @@
 
     var sel = document.createElement('select');
     sel.id = 'tautulli_instance';
+sel.name = 'tautulli_instance';
     sel.className = 'input';
     sel.style.minWidth = '160px';
 
@@ -255,6 +256,15 @@
     function mkField(labelText, inputEl) {
       const w = document.createElement("div");
       const lab = document.createElement("label");
+      if (inputEl) {
+        if (!inputEl.id) {
+          inputEl.id = "tautulli_field_" + String(labelText || "field")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "_")
+            .replace(/^_+|_+$/g, "");
+        }
+        lab.htmlFor = inputEl.id;
+      }
       lab.textContent = labelText;
       w.appendChild(lab);
       w.appendChild(inputEl);

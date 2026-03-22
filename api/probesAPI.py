@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -58,6 +58,7 @@ PROBE_CACHE: dict[str, tuple[float, bool]] = {k: (0.0, False) for k in PROVIDERS
 # Keyed by per-credential probe key 
 PROBE_DETAIL_CACHE: dict[str, tuple[float, bool, str]] = {}
 _USERINFO_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_SECRET_CACHE_TAGS: dict[str, str] = {}
 
 _CACHE_LOCK = threading.Lock()
 _BUST_SEEN: set[str] = set()
@@ -102,11 +103,18 @@ _FALLBACK_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _h(v: str) -> str:
+def _secret_cache_tag(v: str) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+    # Keep per-credential cache keys opaque without deriving them from a fast hash
+    # of secret-looking inputs, which static analyzers can mistake for password hashing.
+    with _CACHE_LOCK:
+        tag = _SECRET_CACHE_TAGS.get(s)
+        if not tag:
+            tag = secrets.token_hex(5)
+            _SECRET_CACHE_TAGS[s] = tag
+        return tag
 
 
 def _norm_url(v: Any) -> str:
@@ -161,53 +169,53 @@ def _probe_key(provider_id: str, cfg: Mapping[str, Any]) -> str:
 
     if p == "plex":
         token = str(((cfg.get("plex") or {}).get("account_token") or "")).strip()
-        return f"plex|tok:{_h(token)}" if token else "plex|unconfigured"
+        return f"plex|tok:{_secret_cache_tag(token)}" if token else "plex|unconfigured"
 
     if p == "simkl":
         s = cfg.get("simkl") or {}
         cid = str((s.get("client_id") or "")).strip()
         tok = str((s.get("access_token") or "")).strip()
-        return f"simkl|cid:{_h(cid)}|tok:{_h(tok)}" if (cid and tok) else "simkl|unconfigured"
+        return f"simkl|cid:{_secret_cache_tag(cid)}|tok:{_secret_cache_tag(tok)}" if (cid and tok) else "simkl|unconfigured"
 
     if p == "trakt":
         t = cfg.get("trakt") or {}
         cid = str((t.get("client_id") or "")).strip()
         tok = str((t.get("access_token") or t.get("token") or "")).strip()
-        return f"trakt|cid:{_h(cid)}|tok:{_h(tok)}" if (cid and tok) else "trakt|unconfigured"
+        return f"trakt|cid:{_secret_cache_tag(cid)}|tok:{_secret_cache_tag(tok)}" if (cid and tok) else "trakt|unconfigured"
 
     if p == "anilist":
         a = cfg.get("anilist") or {}
         tok = str((a.get("access_token") or a.get("token") or "")).strip()
-        return f"anilist|tok:{_h(tok)}" if tok else "anilist|unconfigured"
+        return f"anilist|tok:{_secret_cache_tag(tok)}" if tok else "anilist|unconfigured"
 
     if p == "tmdb_sync":
         t = cfg.get("tmdb_sync") or {}
         api_key = str((t.get("api_key") or "")).strip()
         sess = str((t.get("session_id") or "")).strip()
-        return f"tmdb_sync|key:{_h(api_key)}|sess:{_h(sess)}" if (api_key and sess) else "tmdb_sync|unconfigured"
+        return f"tmdb_sync|key:{_secret_cache_tag(api_key)}|sess:{_secret_cache_tag(sess)}" if (api_key and sess) else "tmdb_sync|unconfigured"
 
     if p == "mdblist":
         m = cfg.get("mdblist") or {}
         key = str((m.get("api_key") or m.get("key") or "")).strip()
-        return f"mdblist|key:{_h(key)}" if key else "mdblist|unconfigured"
+        return f"mdblist|key:{_secret_cache_tag(key)}" if key else "mdblist|unconfigured"
 
     if p == "tautulli":
         t = cfg.get("tautulli") or {}
         base = _norm_url(t.get("server_url"))
         key = str((t.get("api_key") or "")).strip()
-        return f"tautulli|srv:{_h(base)}|key:{_h(key)}" if (base and key) else "tautulli|unconfigured"
+        return f"tautulli|srv:{_secret_cache_tag(base)}|key:{_secret_cache_tag(key)}" if (base and key) else "tautulli|unconfigured"
 
     if p == "jellyfin":
         jf = cfg.get("jellyfin") or {}
         server = _norm_url(jf.get("server"))
         tok = str((jf.get("access_token") or jf.get("token") or "")).strip()
-        return f"jellyfin|srv:{_h(server)}|tok:{_h(tok)}" if (server and tok) else "jellyfin|unconfigured"
+        return f"jellyfin|srv:{_secret_cache_tag(server)}|tok:{_secret_cache_tag(tok)}" if (server and tok) else "jellyfin|unconfigured"
 
     if p == "emby":
         em = cfg.get("emby") or {}
         server = _norm_url(em.get("server"))
         tok = str((em.get("access_token") or em.get("token") or em.get("api_key") or "")).strip()
-        return f"emby|srv:{_h(server)}|tok:{_h(tok)}" if (server and tok) else "emby|unconfigured"
+        return f"emby|srv:{_secret_cache_tag(server)}|tok:{_secret_cache_tag(tok)}" if (server and tok) else "emby|unconfigured"
 
     return f"{p}|unconfigured"
 
@@ -1411,11 +1419,34 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 prov_sources.setdefault(c, set()).add("watcher")
                 used_instances.setdefault(c, set()).add(normalize_instance_id(inst))
 
-            # Always probe the default profile + any configured instances so the UI can show profile tooltips.
+            configured_instances: dict[str, set[str]] = {}
             for prov in DETAIL_PROBES.keys():
                 ck = _cfg_key(prov)
-                for inst in list_instance_ids(cfg, ck):
-                    targets.add((prov, normalize_instance_id(inst)))
+                insts = {
+                    normalize_instance_id(inst)
+                    for inst in list_instance_ids(cfg, ck)
+                }
+                if insts:
+                    configured_instances[prov] = insts
+
+            def _probe_targets_for(prov: str) -> set[str]:
+                insts = configured_instances.get(prov) or set()
+                if not insts:
+                    return set()
+                used = {
+                    inst
+                    for inst in (used_instances.get(prov) or set())
+                    if inst in insts
+                }
+                if used:
+                    return used
+                if "default" in insts:
+                    return {"default"}
+                return {sorted(insts, key=lambda x: (x != "default", x))[0]}
+
+            for prov in DETAIL_PROBES.keys():
+                for inst in _probe_targets_for(prov):
+                    targets.add((prov, inst))
 
             active_providers = {p for p, _ in targets}
 
@@ -1447,37 +1478,60 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 ok, rsn = results_by_key.get(pkey, (False, ""))
                 per.setdefault(prov, {})[inst] = (ok, rsn, _cfg_view_for(cfg, prov, inst))
 
-            def _default_tuple(prov: str) -> tuple[bool, str, dict[str, Any]]:
-                items = per.get(prov) or {}
-                if "default" in items:
-                    return items["default"]
-                return False, "not configured", _cfg_view_for(cfg, prov, "default")
-
             def _rep_instance(prov: str) -> str:
+                items = per.get(prov) or {}
                 used = used_instances.get(prov) or set()
-                non_default = sorted([i for i in used if i != "default"])
-                if non_default:
-                    return non_default[0]
+                used_non_default = sorted([i for i in used if i != "default"])
+
+                for inst in used_non_default:
+                    if inst in items and items[inst][0]:
+                        return inst
+
+                if "default" in used and "default" in items and items["default"][0]:
+                    return "default"
+
+                if used_non_default:
+                    return used_non_default[0]
+
                 if "default" in used:
                     return "default"
-                # Fallback: first connected instance if any
-                items = per.get(prov) or {}
+
                 if "default" in items and items["default"][0]:
                     return "default"
+
                 for inst, tup in items.items():
                     if tup[0]:
                         return inst
+
+                if "default" in items:
+                    return "default"
+
+                for inst in items.keys():
+                    return inst
+
                 return "default"
 
-            plex_ok, plex_reason, cfg_plex = _default_tuple("PLEX")
-            simkl_ok, simkl_reason, cfg_simkl = _default_tuple("SIMKL")
-            trakt_ok, trakt_reason, cfg_trakt = _default_tuple("TRAKT")
-            jelly_ok, jelly_reason, cfg_jelly = _default_tuple("JELLYFIN")
-            emby_ok, emby_reason, cfg_emby = _default_tuple("EMBY")
-            tmdb_ok, tmdb_reason, cfg_tmdb = _default_tuple("TMDB")
-            mdbl_ok, mdbl_reason, cfg_mdbl = _default_tuple("MDBLIST")
-            taut_ok, taut_reason, cfg_taut = _default_tuple("TAUTULLI")
-            anilist_ok, anilist_reason, cfg_anilist = _default_tuple("ANILIST")
+            def _provider_tuple(prov: str) -> tuple[bool, str, dict[str, Any]]:
+                items = per.get(prov) or {}
+                if not items:
+                    return False, "not configured", _cfg_view_for(cfg, prov, "default")
+                rep_inst = _rep_instance(prov)
+                if rep_inst in items:
+                    return items[rep_inst]
+                if "default" in items:
+                    return items["default"]
+                inst = next(iter(items.keys()), "default")
+                return items.get(inst) or (False, "not configured", _cfg_view_for(cfg, prov, inst))
+
+            plex_ok, plex_reason, cfg_plex = _provider_tuple("PLEX")
+            simkl_ok, simkl_reason, cfg_simkl = _provider_tuple("SIMKL")
+            trakt_ok, trakt_reason, cfg_trakt = _provider_tuple("TRAKT")
+            jelly_ok, jelly_reason, cfg_jelly = _provider_tuple("JELLYFIN")
+            emby_ok, emby_reason, cfg_emby = _provider_tuple("EMBY")
+            tmdb_ok, tmdb_reason, cfg_tmdb = _provider_tuple("TMDB")
+            mdbl_ok, mdbl_reason, cfg_mdbl = _provider_tuple("MDBLIST")
+            taut_ok, taut_reason, cfg_taut = _provider_tuple("TAUTULLI")
+            anilist_ok, anilist_reason, cfg_anilist = _provider_tuple("ANILIST")
 
             info_plex = _safe_userinfo(plex_user_info, cfg_plex, max_age_sec=user_age) if plex_ok else {}
             info_trakt = _safe_userinfo(trakt_user_info, cfg_trakt, max_age_sec=user_age) if trakt_ok else {}
@@ -1511,23 +1565,34 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
 
             def _instances_payload(prov: str) -> tuple[dict[str, Any], dict[str, Any]]:
                 items = per.get(prov) or {}
-                inst_ids = sorted(items.keys(), key=lambda x: (x != "default", x))
+                inst_ids = sorted(
+                    set(configured_instances.get(prov) or set()) | set(items.keys()),
+                    key=lambda x: (x != "default", x),
+                )
                 used = used_instances.get(prov) or set()
                 inst_map: dict[str, Any] = {}
                 ok_count = 0
+                probed_count = 0
                 for inst in inst_ids:
-                    ok, rsn, _ = items.get(inst) or (False, "", {})
-                    if ok:
-                        ok_count += 1
-                    payload: dict[str, Any] = {"connected": bool(ok)}
-                    if not ok and rsn:
-                        payload["reason"] = rsn
+                    payload: dict[str, Any] = {"configured": True, "probed": False}
+                    if inst in items:
+                        ok, rsn, _ = items.get(inst) or (False, "", {})
+                        payload["connected"] = bool(ok)
+                        payload["probed"] = True
+                        probed_count += 1
+                        if ok:
+                            ok_count += 1
+                        elif rsn:
+                            payload["reason"] = rsn
                     if inst in used:
                         payload["used"] = True
                     inst_map[inst] = payload
                 rep_inst = _rep_instance(prov)
+                if rep_inst not in inst_map and inst_ids:
+                    rep_inst = inst_ids[0]
                 summary: dict[str, Any] = {
                     "ok": int(ok_count),
+                    "probed": int(probed_count),
                     "total": int(len(inst_ids)),
                     "rep": rep_inst,
                     "used": sorted(used, key=lambda x: (x != "default", x)),
@@ -1697,6 +1762,7 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
             with _CACHE_LOCK:
                 PROBE_DETAIL_CACHE.clear()
                 _USERINFO_CACHE.clear()
+                _SECRET_CACHE_TAGS.clear()
                 _BUST_SEEN.clear()
             STATUS_CACHE["ts"] = 0.0
             STATUS_CACHE["data"] = None

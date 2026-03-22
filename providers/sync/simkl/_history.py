@@ -5,16 +5,17 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from itertools import chain
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, cast
 
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
 from ._common import (
+    START_OF_TIME_ISO,
     build_headers,
     coalesce_date_from,
     fetch_activities,
@@ -26,6 +27,7 @@ from ._common import (
     update_watermark_if_new,
     state_file,
     _pair_scope,
+    _is_capture_mode,
 )
 
 BASE = "https://api.simkl.com"
@@ -48,13 +50,13 @@ def _show_map_path() -> str:
     return str(state_file("simkl.show.map.json"))
 
 
-ID_KEYS = ("simkl", "tmdb", "imdb", "tvdb")
+ID_KEYS = ("simkl", "tmdb", "imdb", "tvdb", "trakt", "mal", "anilist", "kitsu", "anidb")
 
 _EP_LOOKUP_MEMO: dict[str, dict[tuple[int, int], dict[str, Any]]] = {}
 
 _ANIME_TVDB_MAP_MEMO: dict[str, str] | None = None
 _ANIME_TVDB_MAP_TTL_SEC = 24 * 3600
-_ANIME_TVDB_MAP_DATE_FROM = "1970-01-01T00:00:00Z"
+_ANIME_TVDB_MAP_DATE_FROM = "1900-01-01T00:00:00Z"
 
 
 def _anime_tvdb_map_path() -> str:
@@ -62,6 +64,8 @@ def _anime_tvdb_map_path() -> str:
 
 
 def _load_anime_tvdb_map() -> tuple[dict[str, str], int]:
+    if _is_capture_mode():
+        return {}, 0
     try:
         raw = json.loads(Path(_anime_tvdb_map_path()).read_text("utf-8"))
         mp = dict(raw.get("map") or {})
@@ -72,6 +76,8 @@ def _load_anime_tvdb_map() -> tuple[dict[str, str], int]:
 
 
 def _save_anime_tvdb_map(mp: Mapping[str, str]) -> None:
+    if _is_capture_mode():
+        return
     try:
         payload = {"updated_at": int(time.time()), "map": dict(mp)}
         Path(_anime_tvdb_map_path()).write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
@@ -228,11 +234,26 @@ def _as_epoch(value: Any) -> int | None:
 
 
 def _as_iso(ts: int) -> str:
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     return (
-        datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        (epoch + timedelta(seconds=int(ts)))
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _rewind_iso(value: str | None, *, seconds: int = 2) -> str | None:
+    ts = _as_epoch(value)
+    if ts is None:
+        return value
+    return _as_iso(max(ts - max(0, int(seconds)), _as_epoch(START_OF_TIME_ISO) or ts))
+
+
+def _history_activity_markers(acts: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
+    movie_latest = extract_latest_ts(acts, (("movies", "all"), ("movies", "completed")))
+    show_latest = extract_latest_ts(acts, (("tv_shows", "all"), ("shows", "all"), ("tv_shows", "watching"), ("shows", "watching"), ("tv_shows", "completed"), ("shows", "completed")))
+    anime_latest = extract_latest_ts(acts, (("anime", "all"), ("anime", "watching"), ("anime", "completed")))
+    return movie_latest, show_latest, anime_latest
 
 
 def _headers(adapter: Any, *, force_refresh: bool = False) -> dict[str, str]:
@@ -382,6 +403,15 @@ def _show_ids_of_episode(item: Mapping[str, Any]) -> dict[str, Any]:
     return {k: show_ids[k] for k in ID_KEYS if show_ids.get(k)}
 
 
+def _scope_ids_for_freeze(item: Mapping[str, Any]) -> dict[str, Any]:
+    typ = str(item.get("type") or "").lower()
+    if typ in ("season", "episode"):
+        scoped = _show_ids_of_episode(item)
+        if scoped:
+            return scoped
+    return _ids_of(item)
+
+
 def _legacy_path(path: Path) -> Path | None:
     parts = path.stem.split(".")
     if len(parts) < 2:
@@ -394,7 +424,7 @@ def _legacy_path(path: Path) -> Path | None:
 def _migrate_legacy_json(path: Path) -> None:
     if path.exists():
         return
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
     if not legacy or not legacy.exists():
@@ -409,7 +439,7 @@ def _migrate_legacy_json(path: Path) -> None:
 
 
 def _load_json(path: str) -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     p = Path(path)
     _migrate_legacy_json(p)
@@ -420,7 +450,7 @@ def _load_json(path: str) -> dict[str, Any]:
 
 
 def _save_json(path: str, data: Mapping[str, Any]) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         p = Path(path)
@@ -588,7 +618,7 @@ def _save_show_map(obj: Mapping[str, Any]) -> None:
 
 
 def _persist_show_map(key: str, ids: Mapping[str, Any]) -> None:
-    ok = {k: str(v) for k, v in ids.items() if k in ("tvdb", "tmdb", "imdb", "simkl") and v}
+    ok = {k: str(v) for k, v in ids.items() if k in ("tmdb", "imdb", "tvdb", "simkl") and v}
     if not ok:
         return
     data = _load_show_map()
@@ -643,7 +673,7 @@ def _slug_to_title(slug: str | None) -> str:
 
 def _best_ids(obj: Mapping[str, Any]) -> dict[str, str]:
     ids = dict(obj.get("ids") or obj or {})
-    return {k: str(ids[k]) for k in ("tvdb", "tmdb", "imdb", "simkl") if ids.get(k)}
+    return {k: str(ids[k]) for k in ("tmdb", "imdb", "tvdb", "simkl") if ids.get(k)}
 
 def _simkl_resolve_show_via_ids(adapter: Any, ids: Mapping[str, Any]) -> dict[str, str]:
     return {}
@@ -705,7 +735,7 @@ def _simkl_resolve_show_via_episode_id(adapter: Any, item: Mapping[str, Any]) ->
 
 
 def _resolve_show_ids(adapter: Any, item: Mapping[str, Any], raw_show_ids: Mapping[str, Any]) -> dict[str, str]:
-    have = {k: raw_show_ids[k] for k in ("tvdb", "tmdb", "imdb", "simkl") if raw_show_ids.get(k)}
+    have = {k: raw_show_ids[k] for k in ("tmdb", "imdb", "tvdb", "simkl") if raw_show_ids.get(k)}
     return {k: str(v) for k, v in have.items()} if have else {}
 
 def _fetch_kind(
@@ -713,6 +743,7 @@ def _fetch_kind(
     headers: Mapping[str, str],
     *,
     kind: str,
+    status: str | None = None,
     since_iso: str,
     timeout: float,
 ) -> list[dict[str, Any]]:
@@ -720,9 +751,12 @@ def _fetch_kind(
     params = {"extended": ext, "episode_watched_at": "yes", "date_from": since_iso}
     if kind in {"shows", "anime"}:
         params["include_all_episodes"] = "yes"
-    resp = session.get(f"{URL_ALL_ITEMS}/{kind}", headers=headers, params=params, timeout=timeout)
+    url = f"{URL_ALL_ITEMS}/{kind}"
+    if status:
+        url = f"{url}/{status}"
+    resp = session.get(url, headers=headers, params=params, timeout=timeout)
     if not resp.ok:
-        _log(f"GET {URL_ALL_ITEMS}/{kind} -> {resp.status_code}")
+        _log(f"GET {url} -> {resp.status_code}")
         return []
     try:
         body = resp.json() or []
@@ -735,9 +769,6 @@ def _fetch_kind(
         if isinstance(arr, list):
             return [x for x in arr if not _is_null_env(x)]
     return []
-
-
-
 
 
 def _apply_since_limit(
@@ -785,13 +816,11 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
 
     if isinstance(acts, Mapping):
         wm = get_watermark("history") or ""
-        lm = extract_latest_ts(acts, (("movies", "playback"), ("movies", "all")))
-        ls = extract_latest_ts(acts, (("tv_shows", "playback"), ("shows", "playback"), ("tv_shows", "all"), ("shows", "all")))
-        la = extract_latest_ts(acts, (("anime", "playback"), ("anime", "all")))
+        lm, ls, la = _history_activity_markers(acts)
         candidates = [t for t in (lm, ls, la) if isinstance(t, str) and t]
         act_latest = max(candidates) if candidates else None
 
-        unchanged = (lm is None or lm <= wm) and (ls is None or ls <= wm) and (la is None or la <= wm)
+        unchanged = bool(wm) and (lm is None or lm <= wm) and (ls is None or ls <= wm) and (la is None or la <= wm)
         if unchanged:
             _log(f"activities unchanged; history from shadow (m={lm} s={ls} a={la})", level="info")
             _shadow_merge_into(out, thaw)
@@ -812,17 +841,21 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
     latest_ts_anime: int | None = None
     cfg_iso = _as_iso(since) if since else None
     df_iso = coalesce_date_from("history", cfg_date_from=cfg_iso)
+    fetch_from_iso = _rewind_iso(df_iso) or df_iso
     if since:
         since_iso = _as_iso(int(since))
         try:
-            sm = max(_as_epoch(df_iso) or 0, _as_epoch(since_iso) or 0)
-            ss = max(_as_epoch(df_iso) or 0, _as_epoch(since_iso) or 0)
-            df_iso = _as_iso(sm)
-            df_iso = _as_iso(ss)
+            sm = max(_as_epoch(fetch_from_iso) or 0, _as_epoch(since_iso) or 0)
+            fetch_from_iso = _as_iso(sm)
         except Exception:
             pass
 
-    movie_rows = _fetch_kind(session, headers, kind="movies", since_iso=df_iso, timeout=timeout)
+    movie_rows = _fetch_kind(session, headers, kind="movies", since_iso=fetch_from_iso, timeout=timeout)
+    show_rows = _fetch_kind(session, headers, kind="shows", status="watching", since_iso=fetch_from_iso, timeout=timeout)
+    show_rows.extend(_fetch_kind(session, headers, kind="shows", status="completed", since_iso=fetch_from_iso, timeout=timeout))
+    anime_rows = _fetch_kind(session, headers, kind="anime", status="watching", since_iso=fetch_from_iso, timeout=timeout)
+    anime_rows.extend(_fetch_kind(session, headers, kind="anime", status="completed", since_iso=fetch_from_iso, timeout=timeout))
+
     movies_cnt = 0
     for row in movie_rows:
         if not isinstance(row, Mapping):
@@ -831,7 +864,8 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         ts = _as_epoch(watched_at)
         if not ts:
             continue
-        movie_norm = simkl_normalize(row)
+        movie_media = {"movie": row.get("movie")} if isinstance(row.get("movie"), Mapping) else row
+        movie_norm = simkl_normalize(cast(Mapping[str, Any], movie_media))
         if not movie_norm or str(movie_norm.get("type") or "").lower() != "movie":
             continue
         movie_norm["watched"] = True
@@ -850,8 +884,6 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
             break
 
     if not limit or added < limit:
-        show_rows = _fetch_kind(session, headers, kind="shows", since_iso=df_iso, timeout=timeout)
-        anime_rows = _fetch_kind(session, headers, kind="anime", since_iso=df_iso, timeout=timeout)
         eps_cnt = 0
         for row, row_kind in chain(((r, "shows") for r in show_rows), ((r, "anime") for r in anime_rows)):
             if not isinstance(row, Mapping):
@@ -918,6 +950,7 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
                                 break
                     continue
 
+            row_added = False
             for season in row.get("seasons") or []:
                 season = season if isinstance(season, Mapping) else {}
                 s_num_internal = int((season.get("number") or season.get("season") or 0))
@@ -957,6 +990,7 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
                     if event_key in out:
                         continue
                     out[event_key] = ep
+                    row_added = True
                     thaw.add(bucket_key)
                     eps_cnt += 1
                     added += 1
@@ -971,23 +1005,26 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         _shadow_merge_into(out, thaw)
         _dedupe_history_movies(out)
         _log(
-            f"movies={movies_cnt} episodes={eps_cnt} from={df_iso}",
+            f"movies={movies_cnt} episodes={eps_cnt} from={fetch_from_iso}",
             level="info",
         )
     else:
         _shadow_merge_into(out, thaw)
         _dedupe_history_movies(out)
         _log(
-            f"movies={movies_cnt} episodes=0 from={df_iso}",
+            f"movies={movies_cnt} episodes=0 from={fetch_from_iso}",
             level="info",
         )
-
-    if act_latest:
-        update_watermark_if_new("history", act_latest)
 
     latest_any = max([t for t in (latest_ts_movies, latest_ts_shows, latest_ts_anime) if isinstance(t, int)], default=None)
     if latest_any is not None:
         update_watermark_if_new("history", _as_iso(latest_any))
+    elif act_latest:
+        _log(
+            "activity advanced without fetched watched rows; history watermark unchanged",
+            activity=act_latest,
+            watermark=get_watermark("history") or "",
+        )
 
     _unfreeze(thaw)
     try:
@@ -1030,19 +1067,10 @@ def _show_add_entry(adapter: Any, item: Mapping[str, Any]) -> dict[str, Any] | N
     return entry
 
 
-def _episode_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, Any], int, int, str] | None:
-    show_ids_raw = _show_ids_of_episode(item)
-    if not show_ids_raw:
-        return None
-    show_ids = {k: str(show_ids_raw[k]) for k in ID_KEYS if show_ids_raw.get(k)}
+def _show_scope_entry(adapter: Any, item: Mapping[str, Any], raw_show_ids: Mapping[str, Any]) -> dict[str, Any] | None:
+    show_ids = {k: str(raw_show_ids[k]) for k in ID_KEYS if raw_show_ids.get(k)}
     show_ids = _maybe_map_tvdb(adapter, show_ids)
     if not show_ids:
-        return None
-
-    s_num = _safe_int(item.get("season") or item.get("season_number"))
-    e_num = _safe_int(item.get("episode") or item.get("episode_number"))
-    watched_at = item.get("watched_at") or item.get("watchedAt")
-    if not s_num or not e_num or not isinstance(watched_at, str) or not watched_at:
         return None
 
     show: dict[str, Any] = {"ids": show_ids}
@@ -1053,13 +1081,74 @@ def _episode_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str,
     if isinstance(show_title, str) and show_title.strip():
         show["title"] = show_title.strip()
 
-    series_year = item.get("series_year")
+    series_year = item.get("series_year") or item.get("year")
     if isinstance(series_year, int):
         show["year"] = series_year
     elif isinstance(series_year, str) and series_year.isdigit():
         show["year"] = int(series_year)
 
+    return show
+
+
+def _season_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, Any], int, str] | None:
+    show_ids_raw = _raw_show_ids(item)
+    if not show_ids_raw:
+        return None
+    show = _show_scope_entry(adapter, item, show_ids_raw)
+    if not show:
+        return None
+
+    s_num = _safe_int(item.get("season") or item.get("season_number"))
+    watched_at = item.get("watched_at") or item.get("watchedAt")
+    if not s_num or not isinstance(watched_at, str) or not watched_at:
+        return None
+    return show, s_num, watched_at
+
+
+def _episode_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, Any], int, int, str] | None:
+    show_ids_raw = _show_ids_of_episode(item)
+    if not show_ids_raw:
+        return None
+    show = _show_scope_entry(adapter, item, show_ids_raw)
+    if not show:
+        return None
+
+    s_num = _safe_int(item.get("season") or item.get("season_number"))
+    e_num = _safe_int(item.get("episode") or item.get("episode_number"))
+    watched_at = item.get("watched_at") or item.get("watchedAt")
+    if not s_num or not e_num or not isinstance(watched_at, str) or not watched_at:
+        return None
+
     return show, s_num, e_num, watched_at
+
+
+def _merge_show_group(groups: dict[str, dict[str, Any]], show_entry: Mapping[str, Any]) -> dict[str, Any]:
+    ids_key = json.dumps(show_entry.get("ids") or {}, sort_keys=True)
+    group = groups.setdefault(ids_key, {"ids": dict(show_entry.get("ids") or {}), "seasons": []})
+    for key in ("title", "year", "use_tvdb_anime_seasons"):
+        value = show_entry.get(key)
+        if value not in (None, "", False):
+            group[key] = value
+    return group
+
+
+def _merge_show_season(group: dict[str, Any], season_number: int, *, watched_at: str | None = None) -> dict[str, Any]:
+    # Ensure seasons list exists and is well-typed for analyzers.
+    seasons_obj = group.setdefault("seasons", [])
+    if not isinstance(seasons_obj, list):
+        seasons_obj = []
+        group["seasons"] = seasons_obj
+    seasons = cast(list[dict[str, Any]], seasons_obj)
+    season: dict[str, Any] | None = next(
+        (s for s in seasons if isinstance(s, dict) and s.get("number") == season_number),
+        None,
+    )
+    if season is None:
+        season = {"number": season_number}
+        seasons.append(season)
+    if isinstance(watched_at, str) and watched_at and not season.get("watched_at"):
+        season["watched_at"] = watched_at
+    return season
 
 def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
     session = adapter.client.session
@@ -1067,7 +1156,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     timeout = adapter.cfg.timeout
     movies: list[dict[str, Any]] = []
     shows_whole: list[dict[str, Any]] = []
-    shows_with_eps: dict[str, dict[str, Any]] = {}
+    shows_scoped: dict[str, dict[str, Any]] = {}
     unresolved: list[dict[str, Any]] = []
     thaw_keys: list[str] = []
     shadow_events: list[dict[str, Any]] = []
@@ -1123,6 +1212,24 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 unresolved.append({"item": id_minimal(item), "hint": "missing_ids_or_watched_at"})
             continue
 
+        if typ == "season":
+            packed = _season_add_entry(adapter, item)
+            if not packed:
+                unresolved.append(
+                    {"item": id_minimal(item), "hint": "missing_show_ids_or_season_or_watched_at"},
+                )
+                continue
+
+            show_entry, s_num, watched_at = packed
+            group = _merge_show_group(shows_scoped, show_entry)
+            _merge_show_season(group, s_num, watched_at=watched_at)
+
+            thaw_keys.append(_thaw_key(item))
+            ev = dict(id_minimal(item))
+            ev["watched_at"] = watched_at
+            shadow_events.append(ev)
+            continue
+
         if typ == "episode":
             packed = _episode_add_entry(adapter, item)
             if not packed:
@@ -1133,21 +1240,9 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 continue
 
             show_entry, s_num, e_num, watched_at = packed
-            ids_key = json.dumps(show_entry["ids"], sort_keys=True)
-            group = shows_with_eps.setdefault(
-                ids_key,
-                {
-                    "ids": show_entry["ids"],
-                    "title": show_entry.get("title"),
-                    "year": show_entry.get("year"),
-                    "seasons": [],
-                },
-            )
-            season = next((s for s in group["seasons"] if s.get("number") == s_num), None)
-            if not season:
-                season = {"number": s_num, "episodes": []}
-                group["seasons"].append(season)
-            season["episodes"].append({"number": e_num, "watched_at": watched_at})
+            group = _merge_show_group(shows_scoped, show_entry)
+            season = _merge_show_season(group, s_num)
+            season.setdefault("episodes", []).append({"number": e_num, "watched_at": watched_at})
 
             thaw_keys.append(_thaw_key(item))
             ev = dict(item)
@@ -1164,7 +1259,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             unresolved.append({"item": id_minimal(item), "hint": "missing_ids"})
 
     _log(
-        f"prepared movies={len(movies)} shows_whole={len(shows_whole)} shows_with_eps={len(shows_with_eps)} "
+        f"prepared movies={len(movies)} shows_whole={len(shows_whole)} shows_scoped={len(shows_scoped)} "
         f"unresolved_eps_missing={unresolved_eps_missing}",
     )
 
@@ -1175,8 +1270,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     shows_payload: list[dict[str, Any]] = []
     if shows_whole:
         shows_payload.extend(shows_whole)
-    if shows_with_eps:
-        shows_payload.extend(list(shows_with_eps.values()))
+    if shows_scoped:
+        shows_payload.extend(list(shows_scoped.values()))
     if shows_payload:
         body["shows"] = shows_payload
 
@@ -1189,12 +1284,52 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             _unfreeze(thaw_keys)
             eps_count = sum(
                 len(season.get("episodes", []))
-                for group in shows_with_eps.values()
+                for group in shows_scoped.values()
                 for season in group.get("seasons", [])
             )
-            ok = len(movies) + eps_count + len(shows_whole)
+            seasons_count = sum(
+                1
+                for group in shows_scoped.values()
+                for season in group.get("seasons", [])
+                if season.get("watched_at")
+            )
+
+            added_new = {"movies": 0, "shows": 0, "episodes": 0}
+            not_found = {"movies": [], "shows": [], "episodes": []}
+            try:
+                payload = resp.json() if (resp.text or '').strip() else {}
+                if isinstance(payload, dict):
+                    a = payload.get("added")
+                    if isinstance(a, dict):
+                        added_new["movies"] = int(a.get("movies") or 0)
+                        added_new["shows"] = int(a.get("shows") or 0)
+                        added_new["episodes"] = int(a.get("episodes") or 0)
+                    nf = payload.get("not_found")
+                    if isinstance(nf, dict):
+                        not_found["movies"] = list(nf.get("movies") or [])
+                        not_found["shows"] = list(nf.get("shows") or [])
+                        not_found["episodes"] = list(nf.get("episodes") or [])
+            except Exception as exc:
+                _log(f"add response parse skipped: {exc}")
+
+            nf_total = len(not_found["movies"]) + len(not_found["shows"]) + len(not_found["episodes"])
+            if nf_total:
+                _log(
+                    f"add not_found: movies={len(not_found['movies'])} shows={len(not_found['shows'])} episodes={len(not_found['episodes'])}",
+                )
+
+                for bucket_name in ("movies", "shows", "episodes"):
+                    for obj in not_found[bucket_name][:50]:
+                        if isinstance(obj, dict):
+                            unresolved.append({"item": obj, "hint": f"simkl_not_found:{bucket_name}"})
+                        else:
+                            unresolved.append({"item": {"raw": obj}, "hint": f"simkl_not_found:{bucket_name}"})
+
+            ok = max(0, len(thaw_keys) - nf_total)
             _log(
-                f"add done http:{resp.status_code} movies={len(movies)} shows={len(shows_payload)} episodes={eps_count}",
+                f"add done http:{resp.status_code} sent={len(thaw_keys)} added_new(m/s/e)="
+                f"{added_new['movies']}/{added_new['shows']}/{added_new['episodes']} "
+                f"movies={len(movies)} shows_payload={len(shows_payload)} seasons={seasons_count} episodes={eps_count} not_found={nf_total}",
             )
             try:
                 _shadow_put_all(shadow_events)
@@ -1207,7 +1342,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         _log(f"ADD error: {exc}")
 
     for item in items_list:
-        ids = _ids_of(item) or _show_ids_of_episode(item)
+        ids = _scope_ids_for_freeze(item)
         watched_at = item.get("watched_at") or item.get("watchedAt") or None
         watched_str = watched_at if isinstance(watched_at, str) else None
         if ids:
@@ -1226,7 +1361,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     timeout = adapter.cfg.timeout
     movies: list[dict[str, Any]] = []
     shows_whole: list[dict[str, Any]] = []
-    shows_with_eps: dict[str, dict[str, Any]] = {}
+    shows_scoped: dict[str, dict[str, Any]] = {}
     unresolved: list[dict[str, Any]] = []
     thaw_keys: list[str] = []
     items_list: list[Mapping[str, Any]] = list(items or [])
@@ -1249,6 +1384,19 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
             movies.append({"ids": ids})
             thaw_keys.append(_thaw_key(item))
             continue
+        if typ == "season":
+            show_ids = _raw_show_ids(item)
+            show_entry = _show_scope_entry(adapter, item, show_ids) if show_ids else None
+            s_num = int(item.get("season") or item.get("season_number") or 0)
+            if not show_entry or not s_num:
+                unresolved.append(
+                    {"item": id_minimal(item), "hint": "missing_show_ids_or_season"},
+                )
+                continue
+            group = _merge_show_group(shows_scoped, show_entry)
+            _merge_show_season(group, s_num)
+            thaw_keys.append(_thaw_key(item))
+            continue
         if typ == "episode":
             show_ids = _show_ids_of_episode(item)
             s_num = int(item.get("season") or item.get("season_number") or 0)
@@ -1258,13 +1406,15 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                     {"item": id_minimal(item), "hint": "missing_show_ids_or_s/e"},
                 )
                 continue
-            ids_key = json.dumps(show_ids, sort_keys=True)
-            group = shows_with_eps.setdefault(ids_key, {"ids": show_ids, "seasons": []})
-            season = next((s for s in group["seasons"] if s.get("number") == s_num), None)
-            if not season:
-                season = {"number": s_num, "episodes": []}
-                group["seasons"].append(season)
-            season["episodes"].append({"number": e_num})
+            show_entry = _show_scope_entry(adapter, item, show_ids)
+            if not show_entry:
+                unresolved.append(
+                    {"item": id_minimal(item), "hint": "missing_show_ids_or_s/e"},
+                )
+                continue
+            group = _merge_show_group(shows_scoped, show_entry)
+            season = _merge_show_season(group, s_num)
+            season.setdefault("episodes", []).append({"number": e_num})
             thaw_keys.append(_thaw_key(item))
             continue
         ids = _ids_of(item)
@@ -1279,8 +1429,8 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     shows_payload: list[dict[str, Any]] = []
     if shows_whole:
         shows_payload.extend(shows_whole)
-    if shows_with_eps:
-        shows_payload.extend(list(shows_with_eps.values()))
+    if shows_scoped:
+        shows_payload.extend(list(shows_scoped.values()))
     if shows_payload:
         body["shows"] = shows_payload
     if not body:
@@ -1289,16 +1439,16 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         resp = session.post(URL_REMOVE, headers=headers, json=body, timeout=timeout)
         if 200 <= resp.status_code < 300:
             _unfreeze(thaw_keys)
-            ok = len(movies) + len(shows_payload)
+            ok = len(thaw_keys)
             _log(
-                f"remove done http:{resp.status_code} movies={len(movies)} shows={len(shows_payload)}",
+                f"remove done http:{resp.status_code} sent={len(thaw_keys)} movies={len(movies)} shows_payload={len(shows_payload)}",
             )
             return ok, unresolved
         _log(f"REMOVE failed {resp.status_code}: {(resp.text or '')[:200]}")
     except Exception as exc:
         _log(f"REMOVE error: {exc}")
     for item in items_list:
-        ids = _ids_of(item) or _show_ids_of_episode(item)
+        ids = _scope_ids_for_freeze(item)
         if ids:
             _freeze(
                 item,

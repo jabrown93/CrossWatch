@@ -21,9 +21,52 @@ from services.watchlist import (
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
 
+def _public_error(message: str = "operation_failed") -> str:
+    return str(message or "operation_failed")
+
+
+def _sanitize_response_errors(value: Any, default_error: str = "operation_failed") -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if str(k) == "error" and v:
+                out[str(k)] = _public_error(default_error)
+            else:
+                out[str(k)] = _sanitize_response_errors(v, default_error)
+        return out
+    if isinstance(value, list):
+        return [_sanitize_response_errors(v, default_error) for v in value]
+    return value
+
+
 def _norm_key(x: Any) -> str:
     s = str((x.get("key") if isinstance(x, dict) else x) or "").strip()
     return urllib.parse.unquote(s) if "%" in s else s
+
+
+def _norm_key_spec(x: Any) -> dict[str, Any]:
+    key = _norm_key(x)
+    aliases_raw = x.get("aliases") if isinstance(x, dict) else []
+    alias_values = aliases_raw if isinstance(aliases_raw, list) else []
+    aliases = [
+        alias
+        for alias in dict.fromkeys([key, *(_norm_key(v) for v in alias_values)])
+        if alias
+    ]
+    return {"key": key, "aliases": aliases}
+
+
+def _resolve_key_spec_for_provider(
+    state: dict[str, Any],
+    provider: str,
+    spec: dict[str, Any],
+    *,
+    instance_id: str | None = None,
+) -> str | None:
+    for alias in spec.get("aliases") or []:
+        if _find_item_in_state_for_provider(state, str(alias), provider, instance_id=instance_id):
+            return str(alias)
+    return None
 
 
 def _active_providers(cfg: dict[str, Any]) -> list[str]:
@@ -37,11 +80,8 @@ def _active_providers(cfg: dict[str, Any]) -> list[str]:
         if not isinstance(it, dict):
             continue
         pid = str(it.get("id") or "").strip().upper()
-        if pid and pid != "ALL" and (bool(it.get("configured")) or pid == "CROSSWATCH") and pid not in out:
+        if pid and pid != "ALL" and bool(it.get("configured")) and pid not in out:
             out.append(pid)
-
-    if "CROSSWATCH" not in out:
-        out.insert(0, "CROSSWATCH")
     return out
 
 
@@ -92,7 +132,7 @@ def _item_label(state: dict[str, Any], key: str, prov: str) -> tuple[str, str]:
 
 def _candidate_keys_from_ids(ids: dict[str, Any]) -> list[str]:
     keys: list[str] = []
-    for k in ("imdb", "tmdb", "tvdb", "trakt", "simkl", "anilist", "mal"):
+    for k in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "anilist", "mal"):
         v = ids.get(k)
         if v is None:
             continue
@@ -122,8 +162,14 @@ def _bulk_delete(provider: str, keys_raw: list[Any], provider_instance: str | No
     if not isinstance(keys_raw, list) or not keys_raw:
         return {"ok": False, "error": "keys must be a non-empty array"}
 
-    keys = [k for k in (_norm_key(k) for k in keys_raw) if k]
-    keys = list(dict.fromkeys(keys))
+    specs: list[dict[str, Any]] = []
+    seen_specs: set[str] = set()
+    for spec in (_norm_key_spec(k) for k in keys_raw):
+        key = str(spec.get("key") or "")
+        if not key or key in seen_specs:
+            continue
+        seen_specs.add(key)
+        specs.append(spec)
 
     cfg = load_config()
     state = _load_state() or {}
@@ -147,15 +193,17 @@ def _bulk_delete(provider: str, keys_raw: list[Any], provider_instance: str | No
         try:
             per_key: list[dict[str, Any]] = []
             deleted = 0
-            for k in keys:
-                if not _find_item_in_state_for_provider(state, k, p, instance_id=inst_p):
-                    per_key.append({"key": k, "deleted": 0, "attempted": False, "reason": "not_in_state"})
+            for spec in specs:
+                primary_key = str(spec.get("key") or "")
+                resolved_key = _resolve_key_spec_for_provider(state, p, spec, instance_id=inst_p)
+                if not resolved_key:
+                    per_key.append({"key": primary_key, "deleted": 0, "attempted": False, "reason": "not_in_state"})
                     continue
-                kind, label = _item_label(state, k, p)
+                kind, label = _item_label(state, resolved_key, p)
                 safe_label = (label or "").replace("'", "’")
-                r = delete_watchlist_batch([k], p, state, cfg, provider_instance=inst_p) or {}
+                r = delete_watchlist_batch([resolved_key], p, state, cfg, provider_instance=inst_p) or {}
                 d = int(r.get("deleted", 0)) if isinstance(r, dict) else 0
-                per_key.append({"key": k, "deleted": d, "attempted": True})
+                per_key.append({"key": primary_key, "resolved_key": resolved_key, "deleted": d, "attempted": True})
                 deleted += d
                 _append_log(
                     "SYNC",
@@ -171,7 +219,7 @@ def _bulk_delete(provider: str, keys_raw: list[Any], provider_instance: str | No
             )
             deleted_sum += deleted
         except Exception as e:
-            results.append({"provider": p, "ok": False, "error": str(e)})
+            results.append({"provider": p, "ok": False, "error": _public_error("delete_failed")})
             _append_log("SYNC", f"[WL] delete on {p} failed: {e}")
 
     try:
@@ -189,7 +237,7 @@ def _bulk_delete(provider: str, keys_raw: list[Any], provider_instance: str | No
         "provider": prov,
         "targets": targets,
         "deleted_ok": deleted_sum,
-        "deleted_total": len(keys),
+        "deleted_total": len(specs),
         "results": results,
     }
 
@@ -256,7 +304,7 @@ def remove_across_providers_by_ids(
                 f"[WL] auto-remove by ids: {kind} '{safe_label}' on {prov}: {'OK' if ok else 'NOOP'}",
             )
         except Exception as e:
-            results.append({"provider": prov, "ok": False, "error": str(e)})
+            results.append({"provider": prov, "ok": False, "error": _public_error("delete_failed")})
             _append_log("SYNC", f"[WL] auto-remove on {prov} failed: {e}")
 
     any_ok = any(r.get("ok") for r in results)
@@ -309,7 +357,7 @@ def remove_from_provider_by_ids(
         return {"ok": ok, "deleted": deleted, "provider": prov, "key": found_key}
     except Exception as e:
         _append_log("SYNC", f"[WL] remove_by_ids on {prov} failed: {e}")
-        return {"ok": False, "error": str(e), "provider": prov}
+        return {"ok": False, "error": _public_error("delete_failed"), "provider": prov}
 
 
 def remove_from_plex_by_ids(
@@ -350,8 +398,8 @@ def api_watchlist(
         from crosswatch import CACHE_DIR
         from .metaAPI import _shorten, get_meta
         from .syncAPI import _load_state
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"server import failed: {e}"}, status_code=200)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "server import failed"}, status_code=200)
 
     cfg = load_config()
     st = _load_state()
@@ -366,9 +414,9 @@ def api_watchlist(
 
     try:
         items = build_watchlist(st, tmdb_ok=has_key) or []
-    except Exception as e:
+    except Exception:
         return JSONResponse(
-            {"ok": False, "error": f"{e.__class__.__name__}: {e}", "missing_tmdb_key": not has_key},
+            {"ok": False, "error": "watchlist build failed", "missing_tmdb_key": not has_key},
             status_code=200,
         )
 
@@ -479,6 +527,7 @@ def api_watchlist_delete(
 
     res.setdefault("provider", prov)
     
+    res = _sanitize_response_errors(res, "delete_failed")
     return JSONResponse(res, status_code=(200 if res.get("ok") else 400))
 
 @router.post("/delete")

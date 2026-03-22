@@ -75,6 +75,7 @@ def replan_now() -> dict[str, Any]:
     load_config, _, scheduler, hint, compute_next, log = _env()
     cfg = load_config() or {}
     scfg = (cfg.get("scheduling") or {}) or {}
+    effective_enabled = bool((scfg or {}).get("enabled") or ((scfg or {}).get("advanced") or {}).get("enabled"))
 
     try:
         nxt = int(compute_next(scfg) or 0)
@@ -90,12 +91,13 @@ def replan_now() -> dict[str, Any]:
 
     try:
         if scheduler is not None:
-            if hasattr(scheduler, "stop"):
+            if effective_enabled:
+                if hasattr(scheduler, "refresh"):
+                    scheduler.refresh()
+                elif hasattr(scheduler, "start"):
+                    scheduler.start()
+            elif hasattr(scheduler, "stop"):
                 scheduler.stop()
-            if hasattr(scheduler, "start"):
-                scheduler.start()
-            if hasattr(scheduler, "refresh"):
-                scheduler.refresh()
     except Exception as e:
         try:
             log("SYNC", "SCHED")(f"replan_now worker refresh failed: {e}", level="ERROR")
@@ -133,7 +135,7 @@ def trigger_now(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
             log("SYNC", "SCHED")(f"trigger_now failed: {e}", level="ERROR")
         except Exception:
             pass
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "trigger_failed"}
 
     try:
         st = scheduler.status()  # type: ignore[union-attr]
@@ -141,6 +143,39 @@ def trigger_now(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
         st = {}
 
     return {"ok": True, "triggered": ok, **st}
+
+
+@router.post("/stop")
+def sched_stop() -> dict[str, Any]:
+    _, _, scheduler, hint, _, log = _env()
+    try:
+        log("SYNC", "SCHED")("stop: request received", level="INFO")
+    except Exception:
+        pass
+
+    try:
+        if scheduler is not None and hasattr(scheduler, "stop"):
+            scheduler.stop()
+    except Exception as e:
+        try:
+            log("SYNC", "SCHED")(f"stop failed: {e}", level="ERROR")
+        except Exception:
+            pass
+        return {"ok": False, "error": "stop_failed"}
+
+    try:
+        if isinstance(hint, dict):
+            hint["next_run_at"] = 0
+    except Exception:
+        pass
+
+    try:
+        st = scheduler.status()  # type: ignore[union-attr]
+    except Exception:
+        st = {}
+
+    return {"ok": True, "stopped": True, **st}
+
 
 @router.get("")
 def sched_get() -> dict[str, Any]:

@@ -40,7 +40,7 @@ def _norm_ids(ids: dict[str, Any] | None) -> dict[str, str]:
     out: dict[str, str] = {}
     if not isinstance(ids, dict):
         return out
-    for k in ("imdb", "tmdb", "tvdb", "trakt", "slug", "jellyfin", "emby"):
+    for k in ("tmdb", "imdb", "tvdb", "trakt", "slug", "jellyfin", "emby"):
         v = ids.get(k)
         if v is None:
             continue
@@ -53,9 +53,9 @@ def _norm_ids(ids: dict[str, Any] | None) -> dict[str, str]:
     return out
 
 
-def _dedupe_key(ids: dict[str, str], media_type: str | None) -> str:
-    parts = [media_type or ""]
-    for k in ("imdb", "tmdb", "tvdb", "trakt", "slug", "jellyfin", "emby"):
+def _dedupe_key(ids: dict[str, str], media_type: str | None, scope: str | None = None) -> str:
+    parts = [str(scope or "").strip(), media_type or ""]
+    for k in ("tmdb", "imdb", "tvdb", "trakt", "slug", "jellyfin", "emby"):
         if ids.get(k):
             parts.append(f"{k}:{ids[k]}")
     return "|".join(parts)
@@ -105,12 +105,13 @@ def _cfg_delete_enabled(cfg: dict[str, Any], media_type: str) -> bool:
 def remove_across_providers_by_ids(
     ids: dict[str, Any] | None,
     media_type: str | None = None,
+    scope: str | None = None,
 ) -> dict[str, Any]:
     norm = _norm_ids(ids)
     if not norm:
         _log("auto-remove skipped: no usable IDs in payload", "DEBUG")
         return {"ok": False, "skipped": "no-ids"}
-    dkey = _dedupe_key(norm, media_type)
+    dkey = _dedupe_key(norm, media_type, scope=scope)
     if not _once_per_ttl(dkey):
         _log(f"auto-remove deduped (TTL) for {dkey}", "DEBUG")
         return {"ok": True, "skipped": "ttl"}
@@ -134,7 +135,7 @@ def remove_across_providers_by_ids(
             cfg = load_config()
             st = _load_state() or {}
             keys: list[str] = []
-            for k in ("imdb", "tmdb", "tvdb", "trakt"):
+            for k in ("tmdb", "imdb", "tvdb", "trakt"):
                 v = norm.get(k)
                 if v:
                     keys.append(f"{k}:{v}")

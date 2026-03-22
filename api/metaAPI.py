@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -11,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
-from fastapi import APIRouter, Body, Path as FPath, Query
+from fastapi import APIRouter, Body, Path as FPath, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import (
     FileResponse,
@@ -23,7 +25,54 @@ from pydantic import BaseModel
 
 from cw_platform.config_base import load_config
 
+try:
+    from _logging import log as cw_log
+except Exception:  # pragma: no cover
+    def cw_log(
+        message: str,
+        *,
+        level: str = "INFO",
+        module: str = "META",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        return
+
 router = APIRouter(tags=["metadata"])
+LOG = logging.getLogger(__name__)
+_SAFE_CACHE_PART_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _runtime_debug_enabled() -> bool:
+    try:
+        cfg = load_config() or {}
+        return bool((cfg.get("runtime") or {}).get("debug"))
+    except Exception:
+        return False
+
+
+def _meta_debug(event: str, **fields: Any) -> None:
+    if not _runtime_debug_enabled():
+        return
+    clean = {
+        str(k): v
+        for k, v in fields.items()
+        if v not in (None, "", [], {})
+    }
+    suffix = " ".join(f"{k}={v}" for k, v in clean.items())
+    msg = event if not suffix else f"{event} {suffix}"
+    cw_log(msg, level="debug", module="META", extra=clean or None)
+
+
+def _debug_caller(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    try:
+        referer = str(request.headers.get("referer") or "").strip()
+        if referer:
+            return referer.rsplit("/", 1)[-1] or referer
+    except Exception:
+        pass
+    return str(getattr(request.url, "path", "") or "").strip() or None
 
 try:
     from providers.metadata.registry import (
@@ -65,9 +114,9 @@ def _shorten(txt: str, limit: int = 280) -> str:
 def _cfg_meta_ttl_secs() -> int:
     try:
         md = (load_config() or {}).get("metadata") or {}
-        return max(1, int(md.get("ttl_hours", 6))) * 3600
+        return max(1, int(md.get("ttl_hours", 72))) * 3600
     except Exception:
-        return 6 * 3600
+        return 72 * 3600
 
 
 def _meta_cache_enabled() -> bool:
@@ -85,12 +134,19 @@ def _meta_cache_dir() -> Path:
     return d
 
 
+def _safe_cache_part(value: Any, *, default: str = "x") -> str:
+    txt = _SAFE_CACHE_PART_RE.sub("_", str(value or "").strip())
+    txt = txt.strip("._-")
+    return txt or default
+
+
 def _meta_cache_path(entity: str, tmdb_id: str | int, locale: str | None) -> Path:
     t = "movie" if str(entity).lower() == "movie" else "show"
-    loc = (locale or "en-US").replace("/", "_")
+    safe_id = _safe_cache_part(tmdb_id)
+    loc = _safe_cache_part(locale or "en-US", default="en-US")
     sub = _meta_cache_dir() / t
     sub.mkdir(parents=True, exist_ok=True)
-    return sub / f"{tmdb_id}.{loc}.json"
+    return sub / f"{safe_id}.{loc}.json"
 
 
 def _cfg_ui_locale() -> str | None:
@@ -171,6 +227,40 @@ def _tmdb_size_url(img: dict[str, Any], size_tag: str) -> str | None:
     url = img.get("url") or ""
     return url or None
 
+_TMBD_SIZE_RE = re.compile(r"^w\d{1,4}$", re.IGNORECASE)
+
+def _sanitize_tmdb_size(size: str | None, *, default: str = "w342") -> str:
+    s = (size or "").strip()
+    if not s:
+        return default
+    s = s.lower()
+    if s == "original":
+        return "original"
+    if _TMBD_SIZE_RE.fullmatch(s):
+        try:
+            n = int(s[1:])
+        except Exception:
+            raise ValueError("Invalid size")
+        if 1 <= n <= 2000:
+            return f"w{n}"
+    raise ValueError("Invalid size")
+
+def _ensure_under_root(root: Path, p: Path) -> Path:
+    root_r = root.resolve()
+    p_r = p.resolve()
+    try:
+        p_r.relative_to(root_r)
+    except Exception:
+        raise ValueError("Invalid path")
+    return p_r
+
+
+def _cache_subdir(cache_dir: Path | str, name: str) -> Path:
+    base = Path(cache_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    child = (base / _safe_cache_part(name, default="cache")).resolve()
+    return _ensure_under_root(base, child)
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
@@ -235,6 +325,14 @@ def _need_satisfied(meta: dict[str, Any], need: dict[str, Any] | None) -> bool:
     if not isinstance(meta, dict):
         return False
 
+    optional_fields = {
+        "tagline",
+        "runtime_minutes",
+        "score",
+        "certification",
+        "ids",
+    }
+
     def has_img(k: str) -> bool:
         return bool(((meta.get("images") or {}).get(k) or []))
 
@@ -259,6 +357,8 @@ def _need_satisfied(meta: dict[str, Any], need: dict[str, Any] | None) -> bool:
                 or det.get("release_year")
                 or det.get("first_air_year")
             )
+        if k == "videos":
+            return "videos" in meta
         return bool(meta.get(k))
 
     for k, v in (need or {}).items():
@@ -267,6 +367,8 @@ def _need_satisfied(meta: dict[str, Any], need: dict[str, Any] | None) -> bool:
         if k in {"poster", "backdrop", "logo"}:
             if not has_img(k):
                 return False
+        elif k in optional_fields:
+            continue
         elif not has_nested(k):
             return False
     return True
@@ -300,6 +402,15 @@ def _write_meta_cache(p: Path, payload: dict[str, Any]) -> None:
         tmp.replace(p)
     except Exception:
         pass
+
+
+def _merge_meta_cache_payload(base: dict[str, Any] | None, extra: dict[str, Any]) -> dict[str, Any]:
+    prev = base if isinstance(base, dict) else {}
+    out = {**prev, **extra}
+    out["ids"] = {**(prev.get("ids") or {}), **(extra.get("ids") or {})}
+    out["detail"] = {**(prev.get("detail") or {}), **(extra.get("detail") or {})}
+    out["images"] = {**(prev.get("images") or {}), **(extra.get("images") or {})}
+    return out
 
 
 def _prune_meta_cache_if_needed() -> None:
@@ -375,7 +486,19 @@ def get_meta(
         p = _meta_cache_path(entity, tmdb_id, eff_locale or "en-US")
         cached = _read_meta_cache(p)
         if cached and _need_satisfied(cached, eff_need):
+            _meta_debug(
+                "meta_cache_hit",
+                type=entity,
+                tmdb_id=tmdb_id,
+                locale=eff_locale or "en-US",
+            )
             return cached
+        _meta_debug(
+            "meta_cache_miss",
+            type=entity,
+            tmdb_id=tmdb_id,
+            locale=eff_locale or "en-US",
+        )
 
     ttl_key = _ttl_bucket(_cfg_meta_ttl_secs())
     res = _resolve_tmdb_cached(
@@ -384,7 +507,7 @@ def get_meta(
 
     if res and _meta_cache_enabled():
         try:
-            payload = dict(res)
+            payload = _merge_meta_cache_payload(cached, dict(res))
             payload["locale"] = eff_locale or payload.get("locale") or None
             _write_meta_cache(
                 _meta_cache_path(entity, tmdb_id, eff_locale or "en-US"),
@@ -438,46 +561,92 @@ def _cache_download(
 def _placeholder_poster() -> Path:
     return Path("/app/assets/img/placeholder_poster.svg")
 
-def get_poster_file(
+def _art_candidates(
+    meta: dict[str, Any],
+    kind: str,
+) -> list[dict[str, Any]]:
+    images = meta.get("images") or {}
+    arr = images.get(kind) or images.get(f"{kind}s") or []
+    if isinstance(arr, list):
+        return [x for x in arr if isinstance(x, dict)]
+    if isinstance(arr, dict):
+        return [arr]
+    return []
+
+
+def get_art_file(
     api_key: str,
     typ: str,
     tmdb_id: str | int,
     size: str,
     cache_dir: Path | str,
     locale: str | None = None,
+    *,
+    kind: str = "poster",
 ) -> tuple[str, str]:
-    cache_root = Path(cache_dir) / "art"
+    cache_root = _cache_subdir(cache_dir, "art")
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    meta = get_meta(api_key, typ, str(tmdb_id), cache_dir=cache_dir, need={"poster": True}, locale=locale) or {}
-    eff_locale = locale or meta.get("locale") or None
+    art_kind = "backdrop" if str(kind).strip().lower() == "backdrop" else "poster"
+    eff_locale = locale or _cfg_ui_locale() or None
+    loc_tag = _safe_cache_part(_locale_tag(eff_locale), default="any")
+    safe_typ = _safe_cache_part(typ, default="media")
+    safe_tmdb_id = _safe_cache_part(tmdb_id)
+    safe_kind = _safe_cache_part(art_kind, default="poster")
+    safe_size = _safe_cache_part(_sanitize_tmdb_size(size), default="w342")
+    base = cache_root / f"{safe_typ}_{safe_tmdb_id}_{safe_kind}_{loc_tag}_{safe_size}"
+    meta_path = base.with_suffix(".json")
 
-    images = meta.get("images") or {}
-    posters = images.get("poster") or images.get("posters") or []
-    if not isinstance(posters, list):
-        posters = []
+    cached_art = None
+    if meta_path.exists() and _read_json(meta_path).get("url"):
+        for f in cache_root.glob(base.name + ".*"):
+            if f.suffix.lower() != ".json" and f.exists():
+                cached_art = f
+                break
+    if cached_art:
+        ext = cached_art.suffix.lower()
+        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
+        _meta_debug(
+            "art_cache_hit",
+            type=typ,
+            tmdb_id=tmdb_id,
+            kind=art_kind,
+            size=safe_size,
+            locale=eff_locale or "any",
+        )
+        return str(cached_art), mime
 
-    has_lang = any(_img_lang(p) for p in posters if isinstance(p, dict))
-    if not posters or not has_lang:
+    meta = get_meta(api_key, typ, str(tmdb_id), cache_dir=cache_dir, need={art_kind: True}, locale=eff_locale) or {}
+    eff_locale = eff_locale or meta.get("locale") or None
+
+    art = _art_candidates(meta, art_kind)
+
+    has_lang = any(_img_lang(p) for p in art if isinstance(p, dict))
+    if art_kind == "poster" and (not art or not has_lang):
         posters2 = _tmdb_fetch_posters(api_key, typ, str(tmdb_id), eff_locale)
         if posters2:
-            posters = posters2
+            art = posters2
 
-    best = _pick_best_image(posters, eff_locale)
+    best = _pick_best_image(art, eff_locale)
     if not best:
         return str(_placeholder_poster()), "image/svg+xml"
 
-    size_tag = size or "w342"
+    size_tag = safe_size
     src_url = _tmdb_size_url(best, size_tag) or ""
     if not src_url:
         return str(_placeholder_poster()), "image/svg+xml"
 
-    loc_tag = _locale_tag(eff_locale)
-    base = cache_root / f"{typ}_{tmdb_id}_{loc_tag}_{size_tag}"
+    base = cache_root / f"{safe_typ}_{safe_tmdb_id}_{safe_kind}_{loc_tag}_{safe_size}"
     meta_path = base.with_suffix(".json")
 
-    ext = Path(src_url.split("?", 1)[0]).suffix or ".jpg"
+    ext = Path(src_url.split("?", 1)[0]).suffix.lower() or ".jpg"
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        ext = ".jpg"
     dest = base.with_suffix(ext)
+
+    # Enforce cache paths stay inside the cache root
+    _ensure_under_root(cache_root, meta_path)
+    _ensure_under_root(cache_root, dest)
 
     prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
     if (prev_url and prev_url != src_url) or (not meta_path.exists()):
@@ -488,9 +657,30 @@ def get_poster_file(
                 except Exception:
                     pass
 
+    art_hit = bool(dest.exists() and prev_url == src_url)
+    _meta_debug(
+        "art_cache_hit" if art_hit else "art_cache_miss",
+        type=typ,
+        tmdb_id=tmdb_id,
+        kind=art_kind,
+        size=size_tag,
+        locale=eff_locale or "any",
+    )
+
     path, mime = _cache_download(src_url, dest)
     _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
     return str(path), mime
+
+
+def get_poster_file(
+    api_key: str,
+    typ: str,
+    tmdb_id: str | int,
+    size: str,
+    cache_dir: Path | str,
+    locale: str | None = None,
+) -> tuple[str, str]:
+    return get_art_file(api_key, typ, tmdb_id, size, cache_dir, locale=locale, kind="poster")
 
 def _tmdb_external_ids(entity: str, tmdb_id: str | int) -> dict[str, str]:
     try:
@@ -533,9 +723,11 @@ def api_metadata_providers_html() -> HTMLResponse:
 
 @router.get("/art/tmdb/{typ}/{tmdb_id}", tags=["metadata"])
 def api_tmdb_art(
+    request: Request,
     typ: str = FPath(...),
     tmdb_id: int = FPath(...),
     size: str = Query("w342"),
+    kind: str = Query("poster"),
     locale: str | None = Query(None),
 ):
     t = typ.lower()
@@ -552,7 +744,28 @@ def api_tmdb_art(
     try:
         _, base, _ = _env()
         eff_locale = locale or _cfg_ui_locale()
-        local_path, mime = get_poster_file(api_key, t, tmdb_id, size, base, locale=eff_locale)
+        try:
+            size_tag = _sanitize_tmdb_size(size)
+        except Exception:
+            return PlainTextResponse("Invalid size", status_code=400)
+
+        _meta_debug(
+            "art_request",
+            caller=_debug_caller(request),
+            type=t,
+            tmdb_id=tmdb_id,
+            kind=kind,
+        )
+
+        local_path, mime = get_art_file(
+            api_key,
+            t,
+            tmdb_id,
+            size_tag,
+            base,
+            locale=eff_locale,
+            kind=kind,
+        )
         return FileResponse(
             str(local_path),
             media_type=mime,
@@ -561,10 +774,8 @@ def api_tmdb_art(
             },
         )
     except Exception as e:
-        return PlainTextResponse(
-            f"Poster not available: {e}",
-            status_code=404,
-        )
+        LOG.exception("TMDb poster fetch failed")
+        return PlainTextResponse("Poster not available", status_code=404)
 
 
 class MetadataResolveIn(BaseModel):
@@ -611,11 +822,9 @@ def api_metadata_search(
         r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         data = r.json() or {}
-    except Exception as e:
-        return JSONResponse(
-            {"ok": False, "error": f"search failed: {e}"},
-            status_code=200,
-        )
+    except Exception:
+        LOG.exception("TMDb search failed")
+        return JSONResponse({"ok": False, "error": "search failed"}, status_code=200)
 
     out: list[dict[str, Any]] = []
     for raw in (data.get("results") or [])[:limit]:
@@ -641,7 +850,10 @@ def api_metadata_search(
 
 
 @router.post("/api/metadata/resolve", tags=["metadata"])
-def api_metadata_resolve(payload: MetadataResolveIn = Body(...)) -> JSONResponse:
+def api_metadata_resolve(
+    request: Request,
+    payload: MetadataResolveIn = Body(...),
+) -> JSONResponse:
     _METADATA, _, _ = _env()
     if _METADATA is None:
         return JSONResponse(
@@ -651,6 +863,13 @@ def api_metadata_resolve(payload: MetadataResolveIn = Body(...)) -> JSONResponse
     try:
         entity = _norm_media_type(payload.entity)
         base_ids: dict[str, Any] = payload.ids or {}
+        _meta_debug(
+            "metadata_resolve_request",
+            caller=_debug_caller(request),
+            entity=payload.entity or entity,
+            normalized=entity,
+            tmdb_id=base_ids.get("tmdb"),
+        )
         res = (
             _METADATA.resolve(
                 entity=entity,
@@ -687,15 +906,17 @@ def api_metadata_resolve(payload: MetadataResolveIn = Body(...)) -> JSONResponse
         res["ids"] = ids
 
         return JSONResponse({"ok": True, "result": res})
-    except Exception as e:
+    except Exception:
+        LOG.exception("Metadata resolve failed")
         return JSONResponse(
-            {"ok": False, "error": str(e)},
+            {"ok": False, "error": "metadata_resolve_failed"},
             status_code=500,
         )
 
 
 @router.post("/api/metadata/bulk", tags=["metadata"])
 def api_metadata_bulk(
+    request: Request,
     payload: dict[str, Any] = Body(
         ..., description="items[] with {type|entity|media_type, tmdb}; need{} optional"
     ),
@@ -748,6 +969,16 @@ def api_metadata_bulk(
         requested_workers = default_workers
     workers = max(1, min(requested_workers, 12))
 
+    first = items[0] if items else {}
+    _meta_debug(
+        "metadata_bulk_request",
+        caller=_debug_caller(request),
+        count=len(items),
+        workers=workers,
+        first_type=(first.get("type") or first.get("entity") or first.get("media_type")) if isinstance(first, dict) else None,
+        first_tmdb=(first.get("tmdb") or first.get("id")) if isinstance(first, dict) else None,
+    )
+
     def _fetch_one(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         typ = _norm_media_type(
             item.get("type")
@@ -772,7 +1003,8 @@ def api_metadata_bulk(
                 or {}
             )
         except Exception as e:
-            return key, {"ok": False, "error": f"resolver failed: {e}"}
+            LOG.exception("metadata resolver failed")
+            return key, {"ok": False, "error": "resolver failed"}
         if not meta:
             return key, {"ok": False, "error": "no metadata"}
         keep = {
@@ -824,11 +1056,20 @@ def api_metadata_bulk(
                 except Exception as e:
                     k, v = "unknown:0", {
                         "ok": False,
-                        "error": f"worker error: {e}",
+                        "error": "worker error",
                     }
                 results[k] = v
                 if v.get("ok"):
                     fetched += 1
+
+    failed_keys = [k for k, v in results.items() if not v.get("ok")]
+    _meta_debug(
+        "metadata_bulk_done",
+        caller=_debug_caller(request),
+        count=len(items),
+        fetched=fetched,
+        failed=len(failed_keys),
+    )
 
     return JSONResponse(
         {

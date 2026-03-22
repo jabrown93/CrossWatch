@@ -1,166 +1,24 @@
-/* snapshots.js - Provider snapshots (watchlist/ratings/history) */
+/* snapshots.js - Provider snapshots (watchlist/ratings/history/progress) */
+/* Refactored */
 /* CrossWatch - Snapshots page UI logic */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (function () {
+  const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
 
-  
-  const css = `
-  #page-snapshots .ss-top{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}
-  #page-snapshots .ss-title{font-weight:900;font-size:22px;letter-spacing:.01em}
-  #page-snapshots .ss-sub{opacity:.72;font-size:13px;margin-top:4px;line-height:1.3}
-  #page-snapshots .ss-wrap{display:grid;grid-template-columns:420px minmax(0,1fr) 380px;gap:16px;align-items:start}
-  #page-snapshots .ss-col{display:flex;flex-direction:column;gap:14px}
-  #page-snapshots .ss-card{
-    background:linear-gradient(180deg,rgba(255,255,255,.02),transparent),var(--panel);
-    border:1px solid rgba(255,255,255,.08);
-    border-radius:22px;
-    padding:16px;
-    box-shadow:0 0 40px rgba(0,0,0,.25) inset;
-  }
-  #page-snapshots .ss-card h3{margin:0 0 12px 0;font-size:13px;letter-spacing:.10em;text-transform:uppercase;opacity:.85}
-  #page-snapshots .ss-coll-head{display:flex;align-items:center;gap:10px;cursor:pointer}
-  #page-snapshots .ss-coll-head h3{margin:0}
-  #page-snapshots .ss-coll-head:focus{outline:2px solid rgba(255,255,255,.18);outline-offset:4px;border-radius:14px}
-  #page-snapshots .ss-coll-ico{margin-left:auto;opacity:.7;transition:transform .12s ease}
-  #page-snapshots .ss-card.is-collapsed .ss-coll-ico{transform:rotate(-90deg)}
-  #page-snapshots .ss-coll-body{margin-top:12px}
-
-  #page-snapshots .ss-card.ss-accent{
-    border-color:rgba(111,108,255,.22);
-    box-shadow:0 0 46px rgba(111,108,255,.10), 0 0 40px rgba(0,0,0,.25) inset;
-  }
-  #page-snapshots .ss-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-  #page-snapshots .ss-row > *{flex:0 0 auto}
-  #page-snapshots .ss-row .grow{flex:1 1 auto;min-width:180px}
-  #page-snapshots .ss-note{font-size:12px;opacity:.72;line-height:1.35}
-  #page-snapshots .ss-progress{display:flex;align-items:center;gap:10px;margin-top:12px}
-  #page-snapshots .ss-progress.hidden{display:none}
-  #page-snapshots .ss-pbar{position:relative;flex:1 1 auto;height:8px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}
-  #page-snapshots .ss-pbar::before{content:"";position:absolute;inset:0;width:40%;transform:translateX(-60%);background:linear-gradient(90deg,transparent,var(--pcol,var(--accent)),transparent);animation:ssprog 1.05s ease-in-out infinite}
-  @keyframes ssprog{0%{transform:translateX(-60%)}100%{transform:translateX(220%)}}
-  #page-snapshots .ss-plabel{flex:0 0 auto;font-size:12px;opacity:.72;white-space:nowrap}
-
-  #page-snapshots #ss-refresh.iconbtn{width:36px;height:36px;padding:0;display:inline-flex;align-items:center;justify-content:center}
-  #page-snapshots #ss-refresh-icon{font-size:20px;line-height:1}
-
-  #page-snapshots .ss-muted{opacity:.72}
-  #page-snapshots .ss-small{font-size:12px}
-  #page-snapshots .ss-hr{height:1px;background:rgba(255,255,255,.08);margin:12px 0}
-  #page-snapshots .ss-grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-
-  #page-snapshots .ss-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:6px 10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.10);font-size:12px}
-  #page-snapshots .ss-pill strong{font-weight:900}
-
-  #page-snapshots .ss-list{display:flex;flex-direction:column;gap:10px;max-height:520px;overflow:auto;padding:3px 4px 3px 0}
-  #page-snapshots .ss-item{
-    display:flex;gap:10px;align-items:center;cursor:pointer;
-    padding:12px 12px;border-radius:18px;
-    border:1px solid rgba(255,255,255,.08);
-    background:rgba(0,0,0,.10);
-    transition:transform .08s ease,border-color .12s ease,background .12s ease;
-  }
-  #page-snapshots .ss-item:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.16);background:rgba(255,255,255,.03)}
-  #page-snapshots .ss-item.active{border-color:rgba(111,108,255,.55);box-shadow:inset 0 0 0 2px rgba(111,108,255,.24)}
-  #page-snapshots .ss-item .meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  #page-snapshots .ss-badge{font-size:11px;letter-spacing:.05em;text-transform:uppercase;padding:2px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.12);opacity:.9}
-  #page-snapshots .ss-badge.ok{border-color:rgba(48,255,138,.35)}
-  #page-snapshots .ss-badge.warn{border-color:rgba(255,180,80,.35)}
-  #page-snapshots .ss-item .d{opacity:.72;font-size:12px;margin-top:4px}
-  #page-snapshots .ss-item .chev{opacity:.55;font-size:22px;line-height:1}
-
-  #page-snapshots .ss-empty{padding:18px;border-radius:18px;border:1px dashed rgba(255,255,255,.14);text-align:center;opacity:.75}
-
-  #page-snapshots .ss-actions{display:flex;gap:10px;flex-wrap:wrap}
-  #page-snapshots .ss-actions .btn{display:inline-flex;align-items:center;gap:8px}
-
-
-  #page-snapshots button:disabled{opacity:.42;cursor:not-allowed;filter:saturate(.5)}
-  #page-snapshots .ss-status{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:18px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.12);margin:10px 0}
-  #page-snapshots .ss-status.hidden{display:none}
-  #page-snapshots .ss-status .msg{flex:1 1 auto;min-width:0;opacity:.9;font-size:12px}
-  #page-snapshots .ss-status .chip{font-size:11px;letter-spacing:.04em;text-transform:uppercase;padding:2px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.14);opacity:.9}
-  #page-snapshots .ss-status .chip.ok{border-color:rgba(48,255,138,.35)}
-  #page-snapshots .ss-status .chip.err{border-color:rgba(255,80,80,.35)}
-  #page-snapshots .ss-statusbar{position:relative;flex:0 0 170px;height:8px;border-radius:999px;overflow:hidden;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04)}
-  #page-snapshots .ss-statusfill{position:absolute;inset:0;width:35%;border-radius:999px;background:rgba(111,108,255,.55);animation:ssmove 1.1s linear infinite}
-  @keyframes ssmove{0%{transform:translateX(-120%)}100%{transform:translateX(320%)}}
-
-    #page-snapshots .ss-refresh-icon.ss-spin{animation:ssrot .8s linear infinite}
-  @keyframes ssrot{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
-  #page-snapshots .ss-field{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.03)}
-  #page-snapshots .ss-field .material-symbol{opacity:.85}
-  #page-snapshots .ss-field select,#page-snapshots .ss-field input{flex:1 1 auto;min-width:0;background:transparent;border:0;outline:0;color:inherit;font:inherit}
-  #page-snapshots .ss-field select{appearance:none;color-scheme:dark}
-#page-snapshots .ss-native{display:none !important}
-#page-snapshots .ss-bsel{position:relative;flex:1 1 auto;min-width:0}
-#page-snapshots .ss-bsel-btn{width:100%;display:flex;align-items:center;gap:10px;background:transparent;border:0;outline:0;color:inherit;font:inherit;cursor:pointer;padding:0;text-align:left}
-#page-snapshots .ss-bsel-label{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
-#page-snapshots .ss-bsel-chev{opacity:.6;flex:0 0 auto}
-#page-snapshots .ss-bsel-menu{position:absolute;left:-12px;right:-12px;top:calc(100% + 10px);z-index:50;border:1px solid rgba(255,255,255,.10);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.03),transparent),#0b0b16;box-shadow:0 14px 40px rgba(0,0,0,.55);padding:6px;max-height:320px;overflow:auto}
-#page-snapshots .ss-bsel-menu.hidden{display:none}
-#page-snapshots .ss-bsel-item{width:100%;display:flex;align-items:center;gap:10px;padding:10px 10px;border-radius:12px;border:1px solid transparent;background:transparent;color:inherit;cursor:pointer;text-align:left}
-#page-snapshots .ss-bsel-item:hover{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.10)}
-#page-snapshots .ss-bsel-item:disabled{opacity:.45;cursor:not-allowed}
-#page-snapshots .ss-provico{width:18px;height:18px;flex:0 0 18px;border-radius:7px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.18);background-image:var(--wm);background-repeat:no-repeat;background-position:center;background-size:contain;filter:grayscale(.05) brightness(1.12);opacity:.95}
-#page-snapshots .ss-bsel-menu .ss-provico{width:20px;height:20px;flex-basis:20px}
-#page-snapshots .ss-provico.empty{background-image:none;background:rgba(255,255,255,.05)}
-
-#page-snapshots .ss-field select option{background:#141418;color:#f3f3f5}
-#page-snapshots .ss-field select option:disabled{color:#7b7b86}
-#page-snapshots select{color-scheme:dark}
-
-  #page-snapshots .ss-field .chev{opacity:.6}
-
-#page-snapshots .ss-difflist{display:flex;flex-direction:column;gap:10px;max-height:320px;overflow:auto;padding:3px 4px 3px 0}
-#page-snapshots .ss-diffitem{padding:12px;border-radius:18px;border:1px solid rgba(255,255,255,0.08);background:rgba(0,0,0,0.10)}
-#page-snapshots .ss-diffhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#page-snapshots .ss-diffkey{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:11px;opacity:.72;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#page-snapshots .ss-code{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:11px;line-height:1.35;padding:10px;border-radius:14px;border:1px solid rgba(255,255,255,0.08);background:rgba(0,0,0,0.20);margin-top:8px}
-#page-snapshots .ss-badge.add{border-color:rgba(48,255,138,0.35)}
-#page-snapshots .ss-badge.del{border-color:rgba(255,80,80,0.35)}
-#page-snapshots .ss-badge.upd{border-color:rgba(255,180,80,0.35)}
-
-  @media (max-width: 1200px){
-    #page-snapshots .ss-wrap{grid-template-columns:1fr;gap:14px}
-    #page-snapshots .ss-list{max-height:420px}
-  }
-  
-  /* Compare (captures) */
-  #page-snapshots .ss-right{display:flex;align-items:center;gap:10px}
-  #page-snapshots .ss-chk{width:18px;height:18px;accent-color:#6f6cff}
-  #page-snapshots .ss-comparehint{display:flex;align-items:center;gap:8px;font-size:12px;opacity:.78;margin:10px 0 12px 0}
-  #page-snapshots .ss-comparehint .material-symbol{font-size:18px;opacity:.9}
-  #page-snapshots .ss-ab{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;border-radius:999px;border:1px solid rgba(255,255,255,.14);font-size:11px;font-weight:900;letter-spacing:.03em;opacity:.92}
-  #page-snapshots .ss-ab.a{border-color:rgba(111,108,255,.42)}
-  #page-snapshots .ss-ab.b{border-color:rgba(255,180,80,.38)}
-  #page-snapshots .ss-picked{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  #page-snapshots .ss-pick-card{padding:12px;border-radius:18px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);min-width:0;cursor:grab;user-select:none}
-  #page-snapshots .ss-pick-card:active{cursor:grabbing}
-  #page-snapshots .ss-pick-date{font-weight:900;font-size:18px}
-  #page-snapshots .ss-pick-meta{margin-top:6px;font-size:12px;opacity:.82}
-  #page-snapshots .ss-pick-card.dragging{opacity:.65}
-  #page-snapshots [data-coll-body="compare"]{overflow-x:hidden}
-  #page-snapshots .ss-diffrow{margin-top:10px;padding:12px;border-radius:18px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08)}
-  #page-snapshots .ss-diffhead{display:flex;align-items:center;gap:10px}
-  #page-snapshots .ss-difftitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}
-  @media (max-width: 520px){#page-snapshots .ss-picked{grid-template-columns:1fr}}
-
-  #page-snapshots .ss-diff-summary{display:flex;flex-wrap:nowrap;gap:8px;align-items:center}
-  #page-snapshots .ss-diff-summary .ss-pill{justify-content:center;padding:5px 8px;font-size:11px;gap:5px;flex:0 1 auto;white-space:nowrap}
-  #page-snapshots .ss-diff-summary .lbl{white-space:nowrap}
-`;
+  const css = `#page-snapshots{--ss-shell:linear-gradient(180deg,rgba(5,6,10,.995),rgba(1,2,5,.99));--ss-panel:linear-gradient(180deg,rgba(11,12,18,.94),rgba(3,4,8,.98));--ss-panel-strong:linear-gradient(180deg,rgba(9,10,16,.97),rgba(2,3,7,.995));--ss-border:rgba(255,255,255,.09);--ss-fg:rgba(244,247,255,.97);--ss-muted-fg:rgba(197,206,224,.72);--ss-shadow:0 18px 52px rgba(0,0,0,.36),inset 0 1px 0 rgba(255,255,255,.04);--ss-accent:rgba(92,96,182,.62);--ss-accent-soft:rgba(92,96,182,.10);--ss-accent-rose:rgba(92,96,182,.04)}#page-snapshots .ss-top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:14px;padding:16px 18px;border:1px solid var(--ss-border);border-radius:24px;background:radial-gradient(120% 140% at 0% 0%,rgba(86,90,180,.11),transparent 38%),radial-gradient(90% 120% at 100% 100%,rgba(56,64,132,.06),transparent 48%),var(--ss-shell);box-shadow:var(--ss-shadow);backdrop-filter:blur(16px) saturate(130%);-webkit-backdrop-filter:blur(16px) saturate(130%)}#page-snapshots .ss-top-copy{display:grid;gap:8px;min-width:0}#page-snapshots .ss-kicker{display:inline-flex;align-items:center;width:max-content;max-width:100%;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.05);color:var(--ss-muted-fg);font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}#page-snapshots .ss-title{font-weight:900;font-size:26px;letter-spacing:-.02em;line-height:1.02;color:var(--ss-fg)}#page-snapshots .ss-sub{color:var(--ss-muted-fg);font-size:13px;line-height:1.45;max-width:76ch}#page-snapshots .ss-actions,#page-snapshots .ss-topstats{display:flex;gap:8px;flex-wrap:wrap;align-items:center}#page-snapshots .ss-topstats{margin-left:auto;justify-content:flex-end}#page-snapshots .ss-topstat{display:inline-flex;align-items:center;gap:8px;min-height:38px;padding:0 12px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));color:#f5f7ff;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}#page-snapshots .ss-topstat strong{font-size:15px;font-weight:900}#page-snapshots .ss-topstat span{font-size:12px;color:var(--ss-muted-fg);font-weight:700}#page-snapshots .ss-topstat[data-stat="captures"]{background:linear-gradient(180deg,rgba(88,94,170,.14),rgba(255,255,255,.025));border-color:rgba(102,108,188,.18)}#page-snapshots .ss-wrap{display:grid;grid-template-columns:360px minmax(0,1fr) 390px;gap:14px;align-items:start}#page-snapshots .ss-col{display:flex;flex-direction:column;gap:12px}#page-snapshots .ss-card{position:relative;padding:14px;border-radius:22px;border:1px solid var(--ss-border);background:radial-gradient(120% 120% at 0% 0%,rgba(86,90,180,.07),transparent 38%),radial-gradient(90% 110% at 100% 100%,rgba(44,52,108,.04),transparent 50%),var(--ss-panel);box-shadow:var(--ss-shadow);overflow:hidden}#page-snapshots .ss-card::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.04),transparent 50%)}#page-snapshots .ss-card>*{position:relative;z-index:1}#page-snapshots .ss-card.ss-overflow{overflow:visible;z-index:6}#page-snapshots .ss-card h3{margin:0;font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:rgba(225,232,246,.72)}#page-snapshots .ss-card.ss-accent{background:radial-gradient(120% 130% at 0% 0%,rgba(92,96,182,.12),transparent 36%),radial-gradient(80% 100% at 100% 100%,rgba(50,58,118,.05),transparent 46%),var(--ss-panel-strong)}#page-snapshots .ss-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:12px}#page-snapshots .ss-headcopy{display:grid;gap:5px;min-width:0}#page-snapshots .ss-headtitle{font-size:18px;font-weight:850;letter-spacing:-.02em;color:var(--ss-fg)}#page-snapshots .ss-headsub,#page-snapshots .ss-note,#page-snapshots .ss-muted{color:var(--ss-muted-fg)}#page-snapshots .ss-note,#page-snapshots .ss-small{font-size:12px;line-height:1.45}#page-snapshots .ss-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}#page-snapshots .ss-row>*{flex:0 0 auto}#page-snapshots .ss-row .grow{flex:1 1 auto;min-width:180px}#page-snapshots .ss-grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}#page-snapshots .ss-hero-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}#page-snapshots .ss-hero-stat{padding:12px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(10,11,18,.72),rgba(3,4,8,.86));box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}#page-snapshots .ss-hero-stat .v{font-size:20px;font-weight:900;color:#f7f9ff;line-height:1}#page-snapshots .ss-hero-stat .k{margin-top:6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ss-muted-fg);font-weight:800}#page-snapshots .ss-pill{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.05);font-size:12px;color:#eef3ff}#page-snapshots .ss-pill strong{font-weight:900}#page-snapshots .ss-hr{height:1px;background:rgba(255,255,255,.07);margin:12px 0}#page-snapshots #ss-refresh.iconbtn{width:38px;height:38px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03))}#page-snapshots #ss-refresh-icon{font-size:20px;line-height:1}#page-snapshots .ss-refresh-icon.ss-spin{animation:ssrot .8s linear infinite}@keyframes ssrot{to{transform:rotate(360deg)}}#page-snapshots .ss-progress{display:flex;align-items:center;gap:10px;margin-top:12px}#page-snapshots .ss-progress.hidden{display:none}#page-snapshots .ss-pbar{position:relative;flex:1 1 auto;height:8px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}#page-snapshots .ss-pbar::before{content:"";position:absolute;inset:0;width:40%;transform:translateX(-60%);background:linear-gradient(90deg,transparent,var(--pcol,var(--accent)),transparent);animation:ssprog 1.05s ease-in-out infinite}@keyframes ssprog{0%{transform:translateX(-60%)}100%{transform:translateX(220%)}}#page-snapshots .ss-plabel{flex:0 0 auto;font-size:12px;color:var(--ss-muted-fg);white-space:nowrap}#page-snapshots button:disabled{opacity:.42;cursor:not-allowed;filter:saturate(.55)}#page-snapshots .ss-field{position:relative;display:flex;align-items:center;gap:10px;padding:0 12px;min-height:42px;border-radius:14px;border:1px solid rgba(255,255,255,.09);background:linear-gradient(180deg,rgba(8,10,18,.82),rgba(7,8,15,.92));box-shadow:inset 0 1px 0 rgba(255,255,255,.02)}#page-snapshots .ss-field.ss-open{z-index:34}#page-snapshots .ss-field .material-symbol,#page-snapshots .ss-field .chev{opacity:.72}#page-snapshots .ss-field select,#page-snapshots .ss-field input{flex:1 1 auto;min-width:0;height:40px;background:transparent;border:0;outline:0;color:inherit;font:inherit}#page-snapshots .ss-field select{appearance:none;color-scheme:dark}#page-snapshots .ss-field select option{background:#141418;color:#f3f3f5}#page-snapshots .ss-field select option:disabled{color:#7b7b86}#page-snapshots .ss-native{display:none!important}#page-snapshots .ss-bsel{position:relative;flex:1 1 auto;min-width:0}#page-snapshots .ss-bsel.is-open .ss-bsel-btn{color:#f7f9ff}#page-snapshots .ss-bsel-btn{width:100%;display:flex;align-items:center;gap:10px;background:transparent;border:0;outline:0;color:inherit;font:inherit;cursor:pointer;padding:0;text-align:left}#page-snapshots .ss-bsel-label{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}#page-snapshots .ss-bsel-chev{opacity:.6;flex:0 0 auto}#page-snapshots .ss-bsel-menu{position:absolute;left:-12px;right:-12px;top:calc(100% + 10px);z-index:80;border:1px solid rgba(255,255,255,.10);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.025),transparent),linear-gradient(180deg,rgba(9,10,16,.99),rgba(3,4,8,.995));box-shadow:0 14px 40px rgba(0,0,0,.58);padding:6px;max-height:320px;overflow:auto;pointer-events:auto}#page-snapshots .ss-bsel-menu.hidden{display:none}#page-snapshots .ss-bsel-item{width:100%;display:flex;align-items:center;gap:10px;padding:10px;border-radius:12px;border:1px solid transparent;background:transparent;color:inherit;cursor:pointer;text-align:left}#page-snapshots .ss-bsel-item:hover{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.10)}#page-snapshots .ss-bsel-item:disabled{opacity:.45;cursor:not-allowed}#page-snapshots .ss-provico{width:18px;height:18px;flex:0 0 18px;border-radius:7px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.18);background-image:var(--wm);background-repeat:no-repeat;background-position:center;background-size:contain;filter:grayscale(.05) brightness(1.12);opacity:.95}#page-snapshots .ss-bsel-menu .ss-provico{width:20px;height:20px;flex-basis:20px}#page-snapshots .ss-provico.empty{background-image:none;background:rgba(255,255,255,.05)}#page-snapshots .ss-comparehint{display:flex;align-items:flex-start;gap:10px;padding:11px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.02));font-size:12px;color:var(--ss-muted-fg);margin:12px 0}#page-snapshots .ss-comparehint .material-symbol{font-size:18px;opacity:.9;color:#eef3ff}#page-snapshots .ss-list{display:flex;flex-direction:column;gap:10px;max-height:620px;overflow:auto;padding:2px 2px 2px 0}#page-snapshots .ss-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;cursor:pointer;padding:12px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.02));transition:transform .12s ease,border-color .14s ease,background .14s ease,box-shadow .14s ease}#page-snapshots .ss-item:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.14);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.03))}#page-snapshots .ss-item.active{border-color:rgba(92,96,182,.34);background:linear-gradient(180deg,rgba(92,96,182,.06),rgba(255,255,255,.02));box-shadow:0 0 0 1px rgba(92,96,182,.16),0 14px 28px rgba(0,0,0,.24)}#page-snapshots .ss-item.child{margin-left:16px;background:rgba(255,255,255,.02)}#page-snapshots .ss-item-main{min-width:0;display:grid;gap:8px}#page-snapshots .ss-item-top{display:flex;align-items:center;justify-content:space-between;gap:12px}#page-snapshots .ss-item-title{font-weight:850;color:#f6f8ff;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#page-snapshots .ss-item-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center}#page-snapshots .ss-item .d{font-size:12px;color:var(--ss-muted-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#page-snapshots .ss-path{opacity:.52}#page-snapshots .ss-badge{display:inline-flex;align-items:center;min-height:24px;padding:0 8px;border-radius:999px;border:1px solid rgba(255,255,255,.11);background:rgba(255,255,255,.04);font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#eef3ff}#page-snapshots .ss-badge.ok{border-color:rgba(91,226,173,.24)}#page-snapshots .ss-badge.warn{border-color:rgba(255,181,92,.24)}#page-snapshots .ss-badge.add{border-color:rgba(48,255,138,.35)}#page-snapshots .ss-badge.del{border-color:rgba(255,80,80,.35)}#page-snapshots .ss-badge.upd{border-color:rgba(255,180,80,.35)}#page-snapshots .ss-mini{display:inline-flex;align-items:center;justify-content:center;min-height:24px;padding:0 9px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:#eef3ff;font-size:11px;font-weight:800}#page-snapshots .ss-right{display:flex;align-items:center;gap:10px}#page-snapshots .ss-item-right{display:grid;gap:8px;justify-items:end}#page-snapshots .ss-item-action{display:inline-flex;align-items:center;gap:8px}#page-snapshots .ss-chk{width:18px;height:18px;accent-color:#6f6cff}#page-snapshots .ss-ab{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;border-radius:999px;border:1px solid rgba(255,255,255,.14);font-size:11px;font-weight:900;letter-spacing:.03em;color:#f4f7ff}#page-snapshots .ss-ab.a{border-color:rgba(92,96,182,.30);background:rgba(92,96,182,.08)}#page-snapshots .ss-ab.b{border-color:rgba(255,180,80,.38);background:rgba(255,180,80,.08)}#page-snapshots .ss-item .chev{opacity:.5;font-size:20px;line-height:1}#page-snapshots .ss-empty{padding:24px;border-radius:18px;border:1px dashed rgba(255,255,255,.14);text-align:center;color:var(--ss-muted-fg);background:rgba(255,255,255,.02)}#page-snapshots .ss-picked{display:grid;grid-template-columns:1fr 1fr;gap:10px}#page-snapshots .ss-pick-card{padding:12px;border-radius:18px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);min-width:0;cursor:grab;user-select:none}#page-snapshots .ss-pick-date{font-weight:900;font-size:16px}#page-snapshots .ss-pick-meta{margin-top:6px;font-size:12px;color:var(--ss-muted-fg)}#page-snapshots .ss-pick-card.dragging{opacity:.65}#page-snapshots [data-coll-body="compare"]{overflow-x:hidden}#page-snapshots .ss-difflist{display:flex;flex-direction:column;gap:10px;max-height:360px;overflow:auto;padding:3px 2px 3px 0}#page-snapshots .ss-diffitem,#page-snapshots .ss-diffrow{padding:12px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)}#page-snapshots .ss-diffhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}#page-snapshots .ss-difftitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}#page-snapshots .ss-diffkey,#page-snapshots .ss-code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:11px}#page-snapshots .ss-diffkey{opacity:.72;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#page-snapshots .ss-code{white-space:pre-wrap;word-break:break-word;line-height:1.35;padding:10px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.20);margin-top:8px}#page-snapshots .ss-diff-summary{display:flex;flex-wrap:wrap;gap:8px;align-items:center}#page-snapshots .ss-coll-head{display:flex;align-items:center;gap:10px;cursor:pointer}#page-snapshots .ss-coll-head:focus{outline:2px solid rgba(255,255,255,.18);outline-offset:4px;border-radius:14px}#page-snapshots .ss-coll-ico{margin-left:auto;opacity:.7;transition:transform .12s ease}#page-snapshots .ss-card.is-collapsed .ss-coll-ico{transform:rotate(-90deg)}#page-snapshots .ss-coll-body{margin-top:12px}#page-snapshots .ss-selected-card{padding:12px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(9,10,16,.78),rgba(3,4,8,.88))}#page-snapshots .ss-selected-empty{display:grid;gap:8px;justify-items:start}#page-snapshots .ss-selected-title{font-weight:850;font-size:15px;color:#f4f7ff}@media (max-width:1280px){#page-snapshots .ss-wrap{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}#page-snapshots .ss-col{grid-column:1 / -1}}@media (max-width:900px){#page-snapshots .ss-wrap{grid-template-columns:1fr}#page-snapshots .ss-top{padding:14px}#page-snapshots .ss-topstats{width:100%;justify-content:flex-start}#page-snapshots .ss-hero-grid{grid-template-columns:1fr 1fr}}@media (max-width:640px){#page-snapshots .ss-grid2,#page-snapshots .ss-picked,#page-snapshots .ss-hero-grid{grid-template-columns:1fr}#page-snapshots .ss-item{grid-template-columns:1fr}#page-snapshots .ss-item-right{justify-items:start}#page-snapshots .ss-item.child{margin-left:10px}}`;
+  const cssTuning = `#page-snapshots .ss-wrap{grid-template-columns:320px minmax(0,1fr) 340px}#page-snapshots .ss-toolbar{display:grid;gap:10px;margin-bottom:12px;position:relative;z-index:9}#page-snapshots .ss-list-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap}#page-snapshots .ss-list-head .ss-headsub{max-width:60ch}#page-snapshots .ss-inline-pills{display:flex;gap:8px;flex-wrap:wrap}#page-snapshots .ss-inline-pills .ss-pill{min-height:36px;padding:0 14px;font-size:12px;font-weight:700;border-radius:999px}#page-snapshots .ss-steps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}#page-snapshots .ss-step{padding:10px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(10,11,18,.68),rgba(4,5,9,.88))}#page-snapshots .ss-step-num{font-size:11px;font-weight:900;letter-spacing:.08em;color:#f2f5ff;text-transform:uppercase}#page-snapshots .ss-step-label{margin-top:4px;font-size:12px;color:var(--ss-muted-fg);font-weight:800}#page-snapshots .ss-comparehint{align-items:center;padding:10px 12px;border-radius:14px;margin:0;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.018))}#page-snapshots .ss-card.ss-overflow{z-index:40}#page-snapshots .ss-field.ss-open,#page-snapshots .ss-bsel.is-open{z-index:120}#page-snapshots .cw-icon-select{flex:1 1 auto;min-width:0;width:100%}#page-snapshots .cw-icon-select-btn{width:100%;min-height:40px;padding:0;background:transparent;border:0;border-radius:0;box-shadow:none;color:inherit}#page-snapshots .cw-icon-select-btn:focus-visible{box-shadow:none}#page-snapshots .cw-icon-select-main{gap:10px}#page-snapshots .cw-icon-select-icons{gap:10px}#page-snapshots .cw-icon-select-label{text-align:left}#page-snapshots .cw-icon-select-caret{opacity:.6}#page-snapshots .cw-icon-select-icon{width:18px;height:18px;border-radius:7px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.18)}#page-snapshots .cw-icon-select-menu{z-index:160;background:linear-gradient(180deg,rgba(14,17,28,.99),rgba(7,10,18,.995))!important;box-shadow:0 24px 44px rgba(0,0,0,.52)!important;backdrop-filter:blur(14px) saturate(125%);-webkit-backdrop-filter:blur(14px) saturate(125%)}#page-snapshots .ss-list{gap:8px;max-height:640px}#page-snapshots .ss-list,#page-snapshots .ss-difflist{scrollbar-width:thin;scrollbar-color:#8b5cf6 #10131a}#page-snapshots .ss-list::-webkit-scrollbar,#page-snapshots .ss-difflist::-webkit-scrollbar{width:8px;height:8px}#page-snapshots .ss-list::-webkit-scrollbar-corner,#page-snapshots .ss-difflist::-webkit-scrollbar-corner{background:transparent}#page-snapshots .ss-list::-webkit-scrollbar-track,#page-snapshots .ss-difflist::-webkit-scrollbar-track{background:rgba(255,255,255,.04);border-radius:12px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}#page-snapshots .ss-list::-webkit-scrollbar-thumb,#page-snapshots .ss-difflist::-webkit-scrollbar-thumb{border-radius:12px;background:linear-gradient(180deg,#8b5cf6 0%,#3b82f6 100%);border:2px solid #14161c;box-shadow:inset 0 0 0 1px rgba(139,92,246,.35),0 0 10px rgba(139,92,246,.55),0 0 18px rgba(59,130,246,.4)}#page-snapshots .ss-list::-webkit-scrollbar-thumb:hover,#page-snapshots .ss-difflist::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#a78bfa 0%,#60a5fa 100%);box-shadow:inset 0 0 0 1px rgba(139,92,246,.45),0 0 14px rgba(139,92,246,.7),0 0 26px rgba(59,130,246,.55)}#page-snapshots .ss-item{border-color:rgba(255,255,255,.07);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.018))}#page-snapshots .ss-item:hover{border-color:rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.026))}#page-snapshots .ss-item.active{border-color:rgba(92,96,182,.30);box-shadow:0 0 0 1px rgba(92,96,182,.12),0 12px 24px rgba(0,0,0,.22)}#page-snapshots .ss-item-main{gap:7px}#page-snapshots .ss-file{font-weight:700;color:rgba(236,240,255,.82)}#page-snapshots .ss-path{opacity:.46}#page-snapshots .ss-item .chev{opacity:.45}#page-snapshots .ss-create-actions{display:grid;grid-template-columns:1fr;gap:10px}#page-snapshots #ss-create{min-height:48px;border-color:rgba(82,190,146,.22);background:linear-gradient(180deg,#18815e,#1f936c);color:#f5fff8;box-shadow:0 0 10px rgba(25,195,125,.12);font-weight:900}#page-snapshots #ss-create:hover:not(:disabled){filter:brightness(1.04);transform:translateY(-1px)}#page-snapshots .ss-queue{display:grid;gap:10px;margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.08)}#page-snapshots .ss-queue-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap}#page-snapshots .ss-queue-title{font-size:13px;font-weight:900;color:#f3f6ff}#page-snapshots .ss-queue-note{font-size:12px;line-height:1.45;color:var(--ss-muted-fg);max-width:34ch}#page-snapshots .ss-queue-actions{display:flex;gap:8px;flex-wrap:wrap}#page-snapshots .ss-queue-actions .btn{min-width:120px}#page-snapshots .ss-queue-list{display:grid;gap:8px}#page-snapshots .ss-queue-item{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.018))}#page-snapshots .ss-queue-copy{min-width:0;display:grid;gap:4px}#page-snapshots .ss-queue-main{font-size:12px;font-weight:800;color:#eef3ff;text-transform:uppercase;letter-spacing:.04em}#page-snapshots .ss-queue-sub{font-size:12px;color:var(--ss-muted-fg);word-break:break-word}#page-snapshots .ss-queue-empty{padding:12px;border-radius:16px;border:1px dashed rgba(255,255,255,.12);color:var(--ss-muted-fg);font-size:12px}#page-snapshots .ss-filterbar{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}#page-snapshots .ss-filtermini{position:relative;display:flex;align-items:center;min-height:42px;height:42px;padding:0 14px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));box-shadow:inset 0 1px 0 rgba(255,255,255,.03);flex:1 1 0;min-width:0;transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}#page-snapshots #ss-filter-provider-wrap{flex:1.2 1 0}#page-snapshots #ss-filter-feature-wrap{flex:1.05 1 0}#page-snapshots #ss-filter-kind-wrap{flex:.8 1 0}#page-snapshots .ss-filtermini.active{border-color:rgba(92,96,182,.30);background:linear-gradient(180deg,rgba(92,96,182,.09),rgba(255,255,255,.02));box-shadow:0 0 0 1px rgba(92,96,182,.10),inset 0 1px 0 rgba(255,255,255,.03)}#page-snapshots .ss-filtermini select{width:100%;height:40px;padding:0 24px 0 0;border:0;background:transparent;color:#f3f6ff;font:inherit;outline:0;appearance:none}#page-snapshots .ss-filtermini select option{background:#141418;color:#f3f3f5}#page-snapshots .ss-filterchev{position:absolute;right:14px;opacity:.72;pointer-events:none}#page-snapshots .ss-filterclear{flex:0 0 auto;min-height:42px;height:42px;padding:0 16px;border-radius:999px;white-space:nowrap}#page-snapshots .ss-filterclear.active{border-color:rgba(92,96,182,.30)}#page-snapshots .ss-restore-modebar{display:grid;gap:10px;margin-top:12px}#page-snapshots .ss-restore-modes{display:grid;grid-template-columns:1fr 1fr;gap:8px}#page-snapshots .ss-modebtn{display:grid;gap:2px;justify-items:start;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.025));color:#eef3ff;text-align:left;cursor:pointer}#page-snapshots .ss-modebtn strong{font-size:13px;font-weight:900}#page-snapshots .ss-modebtn span{font-size:12px;color:var(--ss-muted-fg)}#page-snapshots .ss-modebtn.active{border-color:rgba(92,96,182,.34);background:linear-gradient(180deg,rgba(92,96,182,.12),rgba(255,255,255,.03));box-shadow:0 0 0 1px rgba(92,96,182,.12)}#page-snapshots .ss-restore-warning{padding:10px 12px;border-radius:14px;border:1px solid rgba(255,181,92,.18);background:rgba(255,181,92,.06);font-size:12px;line-height:1.45;color:rgba(255,222,181,.94)}#page-snapshots .ss-selected-summary{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap}#page-snapshots .ss-selected-count{display:grid;justify-items:end;gap:2px;padding:8px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)}#page-snapshots .ss-selected-count strong{font-size:24px;line-height:1;color:#f7f9ff}#page-snapshots .ss-selected-count span{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--ss-muted-fg)}#page-snapshots .ss-selected-meta{margin-top:10px;display:grid;gap:6px}#page-snapshots .ss-selected-kv{font-size:12px;color:var(--ss-muted-fg)}#page-snapshots .ss-selected-kv b{color:#eef3ff;font-weight:800;margin-right:6px}#page-snapshots .ss-selected-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px}#page-snapshots .ss-selected-stat{display:grid;gap:3px;padding:10px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.018))}#page-snapshots .ss-selected-stat strong{font-size:18px;line-height:1;color:#f4f7ff}#page-snapshots .ss-selected-stat span{font-size:12px;color:var(--ss-muted-fg);text-transform:lowercase}#page-snapshots .ss-card[data-coll="restore"] .hidden{display:none!important}@media (max-width:900px){#page-snapshots .ss-wrap{grid-template-columns:1fr}#page-snapshots .ss-steps{grid-template-columns:1fr 1fr}#page-snapshots .ss-restore-modes{grid-template-columns:1fr}#page-snapshots .ss-selected-stats{grid-template-columns:1fr 1fr}#page-snapshots .ss-filterbar{flex-wrap:wrap}}@media (max-width:640px){#page-snapshots .ss-steps{grid-template-columns:1fr}#page-snapshots .ss-filterbar{flex-direction:column;align-items:stretch}#page-snapshots .ss-filtermini,#page-snapshots #ss-filter-provider-wrap,#page-snapshots #ss-filter-feature-wrap,#page-snapshots #ss-filter-kind-wrap{min-width:0;flex:1 1 auto}#page-snapshots .ss-filterclear{width:100%}#page-snapshots .ss-queue-item{flex-direction:column;align-items:stretch}#page-snapshots .ss-queue-actions{width:100%}#page-snapshots .ss-queue-actions .btn{flex:1 1 160px}#page-snapshots .ss-selected-stats{grid-template-columns:1fr}}`;
+  const cssCaptureLock = `#page-snapshots .ss-lockable{transition:opacity .14s ease,filter .14s ease,border-color .14s ease}#page-snapshots .ss-lockable.ss-locked{opacity:.56;filter:saturate(.72)}#page-snapshots .ss-lockable.ss-locked .ss-coll-head,#page-snapshots .ss-lockable.ss-locked .ss-coll-body,#page-snapshots .ss-lockable.ss-locked .ss-list,#page-snapshots .ss-lockable.ss-locked #ss-list-footer{pointer-events:none}#page-snapshots .ss-lockmsg{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:14px;border:1px solid rgba(48,255,138,.18);background:rgba(48,255,138,.07);font-size:12px;line-height:1.45;color:rgba(224,255,236,.94);margin:0}#page-snapshots .ss-lockmsg.hidden{display:none}#page-snapshots .ss-lockmsg .material-symbol{font-size:18px;opacity:.9;color:#d8ffe6}#page-snapshots .ss-capture-running .ss-item{cursor:not-allowed}#page-snapshots .ss-capture-running .ss-item:hover{transform:none}`;
 
   function injectCss() {
     if (document.getElementById("cw-snapshots-css")) return;
     const s = document.createElement("style");
     s.id = "cw-snapshots-css";
-    s.textContent = css;
+    s.textContent = css + cssTuning + cssCaptureLock;
     document.head.appendChild(s);
   }
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-
 
 function escapeHtml(s) {
   return String(s || "")
@@ -178,7 +36,6 @@ function escapeHtml(s) {
     if (low === "snapshot" || low === "snapshots" || low === "capture" || low === "captures") return "CAPTURE";
     return t;
   }
-
 
   const API = () => (window.CW && window.CW.API && window.CW.API.j) ? window.CW.API.j : async (u, opt) => {
     const r = await fetch(u, { cache: "no-store", ...(opt || {}) });
@@ -206,170 +63,56 @@ const toast = (msg, ok = true) => {
     try { window.CW?.DOM?.showToast?.(msg, ok); } catch {}
     if (!window.CW?.DOM?.showToast) console.log(msg);
   };
+  const POST_JSON = (url, body, timeoutMs) => apiJson(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, timeoutMs);
+  function diffSelection() {
+    const pick = _diffPickAB();
+    const pa = String(pick.sa?.provider || "").toLowerCase();
+    const pb = String(pick.sb?.provider || "").toLowerCase();
+    const ia = String(pick.sa?.instance || pick.sa?.instance_id || pick.sa?.profile || "default").toLowerCase();
+    const ib = String(pick.sb?.instance || pick.sb?.instance_id || pick.sb?.profile || "default").toLowerCase();
+    const fa = String(pick.sa?.feature || "").toLowerCase();
+    const fb = String(pick.sb?.feature || "").toLowerCase();
+    const sameFeature = fa && fb && fa === fb;
+    const sameBundle = fa === "all" && fb === "all";
+    pick.ok = !!pick.a && !!pick.b && pick.a !== pick.b && !!pick.sa && !!pick.sb && pa === pb && ia === ib && (sameFeature || sameBundle);
+    return pick;
+  }
 
   const state = {
-    providers: [],
-    snapshots: [],
-    selectedPath: "",
-    selectedSnap: null,
-    diffAPath: "",
-    diffBPath: "",
-    diffResult: null,
-    diffKind: "all",
-    diffQ: "",
-    diffLimit: 200,
-    diffExpanded: {},
-    busy: false,
-    lastRefresh: 0,
-    statusHideTimer: null,
-    listLimit: 5,
-    showAll: false,
-    expandedBundles: {},
-    _spinUntil: 0,
+    providers: [], snapshots: [], selectedPath: "", selectedSnap: null, diffPick: [], diffResult: null,
+    diffKind: "all", diffQ: "", diffLimit: 200, diffExpanded: {}, busy: false, captureBusy: false, lastRefresh: 0,
+    listLimit: 5, showAll: false, expandedBundles: {}, scheduleQueue: [], _spinUntil: 0,
   };
 
-  function _provBrand(pid) {
-    const v = String(pid || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
-    return v ? ("brand-" + v) : "";
+  const configuredProviderIds = () => new Set(
+    (Array.isArray(state.providers) ? state.providers : [])
+      .filter((p) => !!p?.configured)
+      .map((p) => String(p.id || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  function _providerMetaById(pid) {
+    const id = String(pid || "").trim().toLowerCase();
+    const meta = window.CW?.ProviderMeta || {};
+    const label = meta.label?.(id) || String(pid || "").trim() || "-";
+    const icon = meta.logLogoPath?.(id) || meta.logoPath?.(id) || "";
+    return { id, label, icon };
   }
 
-  function _closeAllBrandMenus(exceptMenu) {
-    const page = document.getElementById("page-snapshots");
-    if (!page) return;
-    $$(".ss-bsel-menu", page).forEach((m) => {
-      if (exceptMenu && m === exceptMenu) return;
-      m.classList.add("hidden");
+  function _enhanceProviderIconSelect(sel) {
+    const helper = window.CW?.IconSelect?.enhance;
+    if (!sel || typeof helper !== "function") return;
+    helper(sel, {
+      className: "ss-icon-select",
+      getOptionData: (value, option) => {
+        const meta = _providerMetaById(value);
+        return {
+          label: String(option?.textContent || meta.label || "-").trim() || "-",
+          icons: meta.icon && value ? [{ src: meta.icon, alt: meta.label || value }] : [],
+          disabled: !!option?.disabled,
+        };
+      },
     });
-  }
-
-  function _ensureBrandSelect(sel) {
-    if (!sel || !sel.id) return null;
-    const parent = sel.parentElement;
-    if (!parent) return null;
-    const noIcon = String(sel?.dataset?.bselNoicon || "").trim() === "1" || String(sel?.dataset?.bselIcon || "").trim() === "0";
-
-    let wrap = parent.querySelector(`.ss-bsel[data-for="${sel.id}"]`);
-    if (!wrap) {
-      wrap = document.createElement("div");
-      wrap.className = "ss-bsel";
-      wrap.dataset.for = sel.id;
-
-      // Keep only layout classes
-      const keep = String(sel.className || "").split(/\s+/).filter((c) => c === "grow").join(" ");
-      if (keep) wrap.className += " " + keep;
-
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "ss-bsel-btn";
-
-      const ico = noIcon ? null : document.createElement("span");
-      if (ico) ico.className = "ss-provico empty";
-
-      const label = document.createElement("span");
-      label.className = "ss-bsel-label";
-      label.textContent = "-";
-
-      const chev = document.createElement("span");
-      chev.className = "ss-bsel-chev";
-      chev.textContent = "v";
-
-      if (ico) btn.appendChild(ico);
-      btn.appendChild(label);
-      btn.appendChild(chev);
-
-      const menu = document.createElement("div");
-      menu.className = "ss-bsel-menu hidden";
-
-      wrap.appendChild(btn);
-      wrap.appendChild(menu);
-
-      // Hide native select
-      sel.classList.add("ss-native");
-
-      parent.insertBefore(wrap, sel.nextSibling);
-
-      btn.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const isHidden = menu.classList.contains("hidden");
-        _closeAllBrandMenus(menu);
-        if (isHidden) menu.classList.remove("hidden"); else menu.classList.add("hidden");
-      });
-
-      if (!state._brandSelectDocBound) {
-        state._brandSelectDocBound = true;
-        document.addEventListener("click", () => _closeAllBrandMenus(null));
-        document.addEventListener("keydown", (ev) => {
-          if (ev.key === "Escape") _closeAllBrandMenus(null);
-        });
-      }
-
-      sel.addEventListener("change", () => _syncBrandSelectFromNative(sel));
-    }
-
-    return wrap;
-  }
-
-  function _syncBrandSelectFromNative(sel) {
-    const wrap = _ensureBrandSelect(sel);
-    if (!wrap) return;
-    const btn = wrap.querySelector(".ss-bsel-btn");
-    const ico = wrap.querySelector(".ss-provico");
-    const lab = wrap.querySelector(".ss-bsel-label");
-    if (!btn || !lab) return;
-
-    const opt = sel.options && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
-    const value = opt ? String(opt.value || "") : "";
-    const text = opt ? String(opt.textContent || "") : "";
-
-    if (ico) {
-      const brand = _provBrand(value);
-      ico.className = "ss-provico " + (brand ? ("prov-card " + brand) : "empty");
-    }
-    lab.textContent = text || "-";
-  }
-
-  function _rebuildBrandSelectMenu(sel) {
-    const wrap = _ensureBrandSelect(sel);
-    if (!wrap) return;
-    const menu = wrap.querySelector(".ss-bsel-menu");
-    if (!menu) return;
-    const noIcon = String(sel?.dataset?.bselNoicon || "").trim() === "1" || String(sel?.dataset?.bselIcon || "").trim() === "0";
-
-    menu.innerHTML = "";
-    Array.from(sel.options || []).forEach((opt) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "ss-bsel-item";
-      b.disabled = !!opt.disabled;
-
-      const value = String(opt.value || "");
-
-      const ico = noIcon ? null : document.createElement("span");
-      if (ico) {
-        const brand = _provBrand(value);
-        ico.className = "ss-provico " + (brand ? ("prov-card " + brand) : "empty");
-      }
-
-      const lab = document.createElement("span");
-      lab.className = "ss-bsel-label";
-      lab.textContent = String(opt.textContent || "-");
-
-      if (ico) b.appendChild(ico);
-      b.appendChild(lab);
-
-      b.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        sel.value = value;
-        sel.dispatchEvent(new Event("change", { bubbles: true }));
-        menu.classList.add("hidden");
-      });
-
-      menu.appendChild(b);
-    });
-
-    _syncBrandSelectFromNative(sel);
   }
 
   function fmtTsFromStamp(stamp) {
@@ -396,13 +139,6 @@ function _stampEpoch(stamp) {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
 }
 
-function _snapEpoch(s) {
-  if (!s) return 0;
-  if (s.stamp) return _stampEpoch(s.stamp);
-  if (s.mtime) return Number(s.mtime) * 1000;
-  return 0;
-}
-
 function _diffScope() {
   const picks = Array.isArray(state.diffPick) ? state.diffPick.filter(Boolean) : [];
   if (!picks.length) return null;
@@ -410,6 +146,7 @@ function _diffScope() {
   if (!s0) return null;
   return {
     provider: String(s0.provider || "").toLowerCase(),
+    instance: String(s0.instance || s0.instance_id || s0.profile || "default").toLowerCase(),
     feature: String(s0.feature || "").toLowerCase(),
   };
 }
@@ -417,8 +154,9 @@ function _diffScope() {
 function _snapMatchesScope(s, scope) {
   if (!s || !scope) return true;
   const p = String(s.provider || "").toLowerCase();
+  const i = String(s.instance || s.instance_id || s.profile || "default").toLowerCase();
   const f = String(s.feature || "").toLowerCase();
-  return p === scope.provider && f === scope.feature;
+  return p === scope.provider && i === scope.instance && f === scope.feature;
 }
 
 function _diffPickAB() {
@@ -428,25 +166,15 @@ function _diffPickAB() {
   const p1 = String(picks[1] || "");
   const s0 = _findSnapByPath(p0);
   const s1 = _findSnapByPath(p1);
-  if (state.diffManualOrder) return { a: p0, b: p1, sa: s0, sb: s1 };
 
-  const t0 = _snapEpoch(s0);
-  const t1 = _snapEpoch(s1);
-  if (t0 && t1 && t0 > t1) return { a: p1, b: p0, sa: s1, sb: s0 };
-  if (t0 === t1 && p0 > p1) return { a: p1, b: p0, sa: s1, sb: s0 };
+  // Keep explicit UI selection order stable: first checked/dragged card is A, second is B.
   return { a: p0, b: p1, sa: s0, sb: s1 };
 }
 
 function clearDiffPicks() {
   state.diffPick = [];
-  state.diffManualOrder = false;
   state.diffResult = null;
-  state.diffAPath = "";
-  state.diffBPath = "";
-  try { renderList(); } catch {}
-  try { renderDiffPicked(); } catch {}
-  try { renderDiff(); } catch {}
-  try { updateDiffAvailability(); } catch {}
+  try { renderList(); renderDiffPicked(); renderDiff(); updateDiffAvailability(); } catch {}
 }
 
 function toggleDiffPick(path, checked) {
@@ -464,11 +192,9 @@ function toggleDiffPick(path, checked) {
       if (picks.length >= 2) picks.shift();
       picks.push(p);
     }
-    state.diffManualOrder = false;
   } else {
     const ix = picks.indexOf(p);
     if (ix !== -1) picks.splice(ix, 1);
-    if (picks.length < 2) state.diffManualOrder = false;
   }
 
   state.diffPick = picks;
@@ -519,7 +245,6 @@ function bundleKey(s) {
     return { bundlesByKey, childrenByKey };
   }
 
-
   function humanBytes(n) {
     const v = Number(n || 0);
     if (!isFinite(v) || v <= 0) return "0 B";
@@ -529,174 +254,162 @@ function bundleKey(s) {
     return `${x.toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
   }
 
-  
+  function snapFile(path) {
+    return String(path || "").split(/[\\/]/).pop() || "";
+  }
+
+  function snapshotOverview() {
+    const snaps = Array.isArray(state.snapshots) ? state.snapshots.filter(Boolean) : [];
+    const idx = buildBundleIndex(snaps);
+    const hiddenChildPaths = new Set();
+
+    Object.values(idx.childrenByKey || {}).forEach((kids) => {
+      (kids || []).forEach((s) => {
+        if (s && s.path) hiddenChildPaths.add(String(s.path));
+      });
+    });
+
+    const configuredProviders = (Array.isArray(state.providers) ? state.providers : []).filter((p) => p && p.configured !== false);
+    const providerIds = new Set(
+      (configuredProviders.length ? configuredProviders : (Array.isArray(state.providers) ? state.providers : []))
+        .map((p) => String(p?.id || p?.label || "").trim().toUpperCase())
+        .filter(Boolean)
+    );
+
+    if (!providerIds.size) {
+      snaps.forEach((s) => {
+        const prov = String(s?.provider || "").trim().toUpperCase();
+        if (prov) providerIds.add(prov);
+      });
+    }
+
+    const total = snaps.filter((s) => s && !hiddenChildPaths.has(String(s.path || ""))).length;
+    const fullSets = Object.keys(idx.bundlesByKey || {}).length;
+    return { total, providers: providerIds.size, fullSets };
+  }
+
+  function updateTopStats() {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return;
+    const overview = snapshotOverview();
+    const setStat = (name, value) => {
+      const el = page.querySelector(`[data-stat="${name}"] strong`);
+      if (el) el.textContent = String(value);
+    };
+    setStat("captures", overview.total);
+    setStat("providers", overview.providers);
+    setStat("full-sets", overview.fullSets);
+  }
+
   function render() {
     const page = document.getElementById("page-snapshots");
     if (!page) return;
 
-    page.innerHTML = `
-      <div class="ss-top">
-        <div>
-          <div class="ss-title">Captures</div>
-          <div class="ss-sub">Capture and restore provider state (watchlist / ratings / history). <span class="ss-muted">Point-in-time API export - not a full backup.</span> Stored under <span class="ss-muted">/config/snapshots</span>.</div>
-        </div>
-        <div class="ss-actions">
-          <button id="ss-refresh" class="iconbtn" title="Refresh" aria-label="Refresh"><span id="ss-refresh-icon" class="material-symbol ss-refresh-icon">sync</span></button>
-        </div>
-      </div>
+    const overview = snapshotOverview();
+    page.innerHTML = `<div class="ss-top"><div class="ss-top-copy"><div class="ss-title">Captures</div><div class="ss-sub">Create point-in-time provider captures, restore them, and compare changes</div></div><div class="ss-topstats"><div class="ss-topstat" data-stat="captures"><strong>${overview.total}</strong><span>captures</span></div><div class="ss-topstat" data-stat="providers"><strong>${overview.providers}</strong><span>providers</span></div><div class="ss-topstat" data-stat="full-sets" title="Provider-wide captures saved with all supported features"><strong>${overview.fullSets}</strong><span>full sets</span></div><div class="ss-actions"><button id="ss-refresh" class="iconbtn" title="Refresh" aria-label="Refresh"><span id="ss-refresh-icon" class="material-symbol ss-refresh-icon">sync</span></button></div></div></div><div class="ss-wrap"><div class="ss-card ss-accent"><div class="ss-card-head"><div class="ss-headcopy"><h3>Capture state</h3><div class="ss-headsub">Pick a source, choose what to export, add an optional label, and save a clean restore point.</div></div></div><div class="ss-hero-grid"><div class="ss-hero-stat"><div class="v">1</div><div class="k">Provider</div></div><div class="ss-hero-stat"><div class="v">2</div><div class="k">Feature</div></div><div class="ss-hero-stat"><div class="v">3</div><div class="k">Capture</div></div></div><div class="ss-field" style="margin-top:12px"><select id="ss-prov"></select></div><div class="ss-field" style="margin-top:10px"><select id="ss-prov-inst" class="input grow"></select></div><div class="ss-field" style="margin-top:10px"><select id="ss-feature"></select><span class="chev">v</span></div><div class="ss-field" style="margin-top:10px"><input id="ss-label" placeholder="Optional label for this capture" /></div><div class="ss-row" style="margin-top:12px"><button id="ss-create" class="btn primary" style="width:100%">Create capture</button></div><div id="ss-create-progress" class="ss-progress hidden"><div class="ss-pbar"></div><div class="ss-plabel">Working…</div></div></div><div class="ss-card"><div class="ss-card-head"><div class="ss-headcopy"><h3>Capture Browser</h3><div class="ss-headsub">Filter, click once to restore, or tick two matching captures to compare</div></div></div><div class="ss-row"><input id="ss-filter" class="input grow" placeholder="Search provider, feature, label or path..."/></div><div class="ss-row" style="margin-top:10px"><select id="ss-filter-provider" class="input grow"></select><select id="ss-filter-feature" class="input grow"></select></div><div class="ss-comparehint"><span class="material-symbol">compare_arrows</span><div><b>Quick flow</b><br>Click a capture to restore it, or tick two matching ones on the right to compare them side by side.</div></div><div id="ss-list" class="ss-list"></div><div id="ss-list-footer" class="ss-row" style="justify-content:space-between;margin-top:10px"></div></div><div class="ss-col"><div class="ss-card ss-coll" data-coll="restore"><div class="ss-coll-head" data-coll-head="restore" role="button" tabindex="0" aria-expanded="true"><h3>Restore</h3><span class="material-symbol ss-coll-ico">expand_more</span></div><div class="ss-coll-body" data-coll-body="restore"><div class="ss-card-head" style="margin-bottom:0"><div class="ss-headcopy"><div class="ss-headsub">Restore your capture</div></div></div><div id="ss-selected" class="ss-selected-card ss-selected-empty" style="margin-top:12px">Pick a capture from the list.</div><div class="ss-note" style="margin-top:12px"><b>Merge</b> adds missing items only. <b>Clear and restore</b> wipes the provider feature first, then restores the capture exactly.</div><div class="ss-row" style="margin-top:12px"><select id="ss-restore-inst" class="input grow"></select></div><div class="ss-row" style="margin-top:12px"><select id="ss-restore-mode" class="input grow"><option value="merge">Merge</option><option value="clear_restore">Clear and restore</option></select></div><div class="ss-row" style="margin-top:10px"><button id="ss-restore" class="btn danger" style="width:100%">Restore capture</button><button id="ss-delete" class="btn" style="width:100%">Delete capture</button></div><div id="ss-restore-progress" class="ss-progress hidden"><div class="ss-pbar"></div><div class="ss-plabel">Working…</div></div><div id="ss-restore-out" class="ss-small ss-muted" style="margin-top:10px"></div></div></div><div class="ss-card ss-coll is-collapsed" data-coll="compare"><div class="ss-coll-head" data-coll-head="compare" role="button" tabindex="0" aria-expanded="false"><h3>Compare</h3><span class="material-symbol ss-coll-ico">expand_more</span></div><div class="ss-coll-body hidden" data-coll-body="compare"><div class="ss-card-head" style="margin-bottom:0"><div class="ss-headcopy"><div class="ss-headtitle">Compare two captures</div><div class="ss-headsub">See what was added, removed, or changed before you commit to a restore.</div></div></div><div id="ss-diff-picked" class="ss-picked" style="margin-top:12px"></div><div class="ss-row" style="margin-top:10px"><select id="ss-diff-kind" class="input grow"><option value="all">All changes</option><option value="added">Added</option><option value="removed">Deleted</option><option value="updated">Updated</option></select><select id="ss-diff-limit" class="input" style="min-width:110px"><option value="100">100</option><option value="200" selected>200</option><option value="500">500</option><option value="1000">1000</option></select></div><div class="ss-row" style="margin-top:10px"><input id="ss-diff-q" class="input grow" placeholder="Filter compare results..."/></div><div class="ss-row" style="margin-top:10px"><button id="ss-diff-run" class="btn grow">Run compare</button><button id="ss-diff-extend" class="btn grow">Open advanced</button></div><div class="ss-small ss-muted" style="margin-top:8px">Advanced opens the full compare modal, including unchanged records.</div><div id="ss-diff-progress" class="ss-progress hidden"><div class="ss-pbar"></div><div class="ss-plabel">Working…</div></div><div id="ss-diff-out" class="ss-muted ss-small" style="margin-top:10px"></div><div id="ss-diff-list" class="ss-difflist" style="margin-top:10px"></div></div></div><div class="ss-card ss-coll is-collapsed" data-coll="tools"><div class="ss-coll-head" data-coll-head="tools" role="button" tabindex="0" aria-expanded="false"><h3>Tools</h3><span class="material-symbol ss-coll-ico">expand_more</span></div><div class="ss-coll-body hidden" data-coll-body="tools"><div class="ss-card-head" style="margin-bottom:0"><div class="ss-headcopy"><div class="ss-headtitle">Cleanup tools</div><div class="ss-headsub">Destructive actions live here, away from the normal flow. As they should.</div></div></div><div class="ss-row" style="margin-top:12px"><select id="ss-tools-prov" class="input grow"></select></div><div class="ss-row" style="margin-top:10px"><select id="ss-tools-inst" class="input grow"></select></div><div class="ss-grid2" style="margin-top:12px"><button class="btn danger" id="ss-clear-watchlist">Clear watchlist</button><button class="btn danger" id="ss-clear-ratings">Clear ratings</button><button class="btn danger" id="ss-clear-history">Clear history</button><button class="btn danger" id="ss-clear-progress">Clear progress</button><button class="btn danger" id="ss-clear-all">Clear all</button></div><div id="ss-tools-progress" class="ss-progress hidden"><div class="ss-pbar"></div><div class="ss-plabel">Working…</div></div><div class="ss-note" style="margin-top:10px">These actions are destructive. Double-check the target before you use them.</div><div id="ss-tools-out" class="ss-small ss-muted" style="margin-top:10px"></div></div></div></div></div>`;
 
-      <div class="ss-wrap">
-        <div class="ss-card ss-accent">
-          <h3>Create capture</h3>
+    $(".ss-sub", page) && ($(".ss-sub", page).textContent = "Create point-in-time provider captures, restore them, and compare changes.");
+    const createCard = $(".ss-card.ss-accent", page);
+    if (createCard) {
+      const h3 = $("h3", createCard);
+      const sub = $(".ss-headsub", createCard);
+      const hero = $(".ss-hero-grid", createCard);
+      if (h3) h3.textContent = "Create capture";
+      if (sub) sub.textContent = "Pick a source, choose a feature, then save a restore point. Or send the same setup to the scheduler.";
+      if (hero) hero.outerHTML = `<div class="ss-steps"><div class="ss-step"><div class="ss-step-num">Step 1</div><div class="ss-step-label">Provider</div></div><div class="ss-step"><div class="ss-step-num">Step 2</div><div class="ss-step-label">Feature</div></div><div class="ss-step"><div class="ss-step-num">Step 3</div><div class="ss-step-label">Capture</div></div></div>`;
+      const createRow = $("#ss-create", createCard)?.closest(".ss-row");
+      if (createRow && !createRow.classList.contains("ss-create-actions")) {
+        createRow.classList.add("ss-create-actions");
+      }
+      if (createRow && !$("#ss-add-schedule", createRow)) {
+        createRow.insertAdjacentHTML("beforeend", `<button id="ss-add-schedule" class="btn" style="width:100%">Queue for scheduler</button>`);
+      }
+      if (createCard && !$("#ss-schedule-queue-wrap", createCard)) {
+        const progress = $("#ss-create-progress", createCard);
+        progress?.insertAdjacentHTML("afterend", `<div id="ss-schedule-queue-wrap" class="ss-queue"><div class="ss-queue-head"><div><div class="ss-queue-title">Scheduler queue</div><div class="ss-queue-note">Queue multiple capture schedules here, then send them to Advanced Scheduling in one go.</div></div><div class="ss-queue-actions"><button id="ss-send-schedule-queue" class="btn" type="button">Send queue</button><button id="ss-clear-schedule-queue" class="btn" type="button">Clear queue</button></div></div><div id="ss-queue-feedback" class="ss-small ss-muted" style="display:none;padding:9px 10px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)"></div><div id="ss-schedule-queue" class="ss-queue-list"></div></div>`);
+      }
+      const progLabel = $("#ss-create-progress .ss-plabel", createCard);
+      if (progLabel) progLabel.textContent = "Working...";
+    }
+    const browserCard = $$(".ss-card", page)[1];
+    if (browserCard) {
+      browserCard.classList.add("ss-lockable");
+      const head = $(".ss-card-head", browserCard);
+      const h3 = $("h3", browserCard);
+      const sub = $(".ss-headsub", browserCard);
+      const hint = $(".ss-comparehint", browserCard);
+      if (h3) h3.textContent = "Capture browser";
+      if (sub) sub.textContent = "Click a row torestore, or tick two matching captures to compare them.";
+      head?.classList.add("ss-list-head");
+      if (hint) hint.innerHTML = `<span class="material-symbol">compare_arrows</span><div>Two checked captures must share the same provider and instance. Use two feature captures, or two full captures.</div>`;
+      const filterRow = $("#ss-filter", browserCard)?.closest(".ss-row");
+      const filterSelectRow = $("#ss-filter-provider", browserCard)?.closest(".ss-row");
+      if (filterRow && filterSelectRow && hint) {
+        const toolbar = document.createElement("div");
+        toolbar.className = "ss-toolbar";
+        browserCard.insertBefore(toolbar, filterRow);
+        toolbar.appendChild(filterRow);
+        toolbar.appendChild(filterSelectRow);
+        toolbar.appendChild(hint);
+        if (!$("#ss-capture-lock", toolbar)) {
+          const lockMsg = document.createElement("div");
+          lockMsg.id = "ss-capture-lock";
+          lockMsg.className = "ss-lockmsg hidden";
+          lockMsg.innerHTML = `<span class="material-symbol">hourglass_top</span><div>Creating capture... browser, restore, compare, and tools unlock after refresh.</div>`;
+          toolbar.appendChild(lockMsg);
+        }
+        filterSelectRow.classList.add("ss-filterbar");
+        if (!$("#ss-filter-provider-wrap", filterSelectRow)) {
+          filterSelectRow.innerHTML = `
+            <div id="ss-filter-provider-wrap" class="ss-filtermini">
+              <select id="ss-filter-provider" class="input"></select>
+              <span class="chev ss-filterchev">v</span>
+            </div>
+            <div id="ss-filter-feature-wrap" class="ss-filtermini">
+              <select id="ss-filter-feature" class="input"></select>
+              <span class="chev ss-filterchev">v</span>
+            </div>
+            <div id="ss-filter-kind-wrap" class="ss-filtermini">
+              <select id="ss-filter-kind" class="input"></select>
+              <span class="chev ss-filterchev">v</span>
+            </div>
+            <button id="ss-filter-clear" class="btn ss-filterclear" type="button">Clear filters</button>
+          `;
+        }
+      }
+    }
+    const restoreCard = $('[data-coll="restore"]', page);
+    if (restoreCard) {
+      restoreCard.classList.add("ss-lockable");
+      const sub = $(".ss-headsub", restoreCard);
+      const note = $(".ss-note", restoreCard);
+      const modeRow = $("#ss-restore-mode", restoreCard)?.closest(".ss-row");
+      const progLabel = $("#ss-restore-progress .ss-plabel", restoreCard);
+      if (sub) sub.textContent = "Restore the selected capture into a target profile.";
+      if (note) note.outerHTML = `<div class="ss-restore-modebar"><div class="ss-restore-modes"><button class="ss-modebtn active" type="button" data-restore-mode="merge"><strong>Merge</strong><span>Add missing only</span></button><button class="ss-modebtn" type="button" data-restore-mode="clear_restore"><strong>Clear restore</strong><span>Replace exactly</span></button></div><div id="ss-restore-warning" class="ss-restore-warning hidden">Restores the captured data, but the target server or tracker may still interpret it differently.</div></div>`;
+      if (modeRow) modeRow.classList.add("hidden");
+      if (progLabel) progLabel.textContent = "Working...";
+    }
+    const compareCard = $('[data-coll="compare"]', page);
+    if (compareCard) {
+      compareCard.classList.add("ss-lockable");
+      const sub = $(".ss-headsub", compareCard);
+      const progLabel = $("#ss-diff-progress .ss-plabel", compareCard);
+      if (sub) sub.textContent = "Review adds, deletes, and updates before you restore.";
+      if (progLabel) progLabel.textContent = "Working...";
+    }
+    const toolsCard = $('[data-coll="tools"]', page);
+    if (toolsCard) {
+      toolsCard.classList.add("ss-lockable");
+      const sub = $(".ss-headsub", toolsCard);
+      const note = $(".ss-note", toolsCard);
+      const progLabel = $("#ss-tools-progress .ss-plabel", toolsCard);
+      if (sub) sub.textContent = "Destructive actions stay out of the main flow.";
+      if (note) note.textContent = "Double-check the target before you use these.";
+      if (progLabel) progLabel.textContent = "Working...";
+    }
 
-          <div class="ss-field">
-            <select id="ss-prov"></select>
-          </div>
-
-          <div class="ss-field" style="margin-top:10px">
-            <select id="ss-prov-inst" class="input grow"></select>
-          </div>
-
-          <div class="ss-field" style="margin-top:10px">
-            <select id="ss-feature"></select>
-            <span class="chev">v</span>
-          </div>
-
-          <div class="ss-field" style="margin-top:10px">
-            <input id="ss-label" placeholder="Add label..." />
-          </div>
-
-          <div class="ss-row" style="margin-top:12px">
-            <button id="ss-create" class="btn primary" style="width:100%">Create Capture</button>
-          </div>
-          <div id="ss-create-progress" class="ss-progress hidden">
-            <div class="ss-pbar"></div>
-            <div class="ss-plabel">Working…</div>
-          </div>
-        </div>
-
-        <div class="ss-card">
-          <h3>Captures</h3>
-          <div class="ss-row">
-            <input id="ss-filter" class="input grow" placeholder="Filter captures..."/>
-          </div>
-          <div class="ss-row" style="margin-top:10px">
-            <select id="ss-filter-provider" class="input grow"></select>
-            <select id="ss-filter-feature" class="input grow"></select>
-          </div>
-          <div class="ss-hr"></div>
-          <div class="ss-comparehint"><span class="material-symbol">compare_arrows</span><div><b>Compare</b>: tick two boxes on the right (same provider and feature) or <b>click on a capture to restore</b>.</span></div></div>
-          <div id="ss-list" class="ss-list"></div>
-          <div id="ss-list-footer" class="ss-row" style="justify-content:space-between;margin-top:10px"></div>
-        </div>
-
-        <div class="ss-col">
-          <div class="ss-card ss-coll" data-coll="restore">
-  <div class="ss-coll-head" data-coll-head="restore" role="button" tabindex="0" aria-expanded="true">
-    <h3>Restore capture</h3>
-    <span class="material-symbol ss-coll-ico">expand_more</span>
-  </div>
-  <div class="ss-coll-body" data-coll-body="restore">
-<div id="ss-selected" class="ss-muted ss-small">Pick a capture from the list.</div>
-            <div class="ss-hr"></div>
-            <div class="ss-note">
-              <b>Merge</b> adds missing items only. <b>Clear and restore</b> wipes the provider feature first, then restores exactly the capture.
-            </div>
-            <div class="ss-row" style="margin-top:12px">
-              <select id="ss-restore-inst" class="input grow"></select>
-            </div>
-            <div class="ss-row" style="margin-top:12px">
-              <select id="ss-restore-mode" class="input grow">
-                <option value="merge">Merge</option>
-                <option value="clear_restore">Clear and restore</option>
-              </select>
-            </div>
-            <div class="ss-row" style="margin-top:10px">
-              <button id="ss-restore" class="btn danger" style="width:100%">Restore</button>
-              <button id="ss-delete" class="btn" style="width:100%">Delete</button>
-            </div>
-            <div id="ss-restore-progress" class="ss-progress hidden">
-              <div class="ss-pbar"></div>
-              <div class="ss-plabel">Working…</div>
-            </div>
-            <div id="ss-restore-out" class="ss-small ss-muted" style="margin-top:10px"></div>
-  </div>
-</div>
-
-
-<div class="ss-card ss-coll is-collapsed" data-coll="compare">
-  <div class="ss-coll-head" data-coll-head="compare" role="button" tabindex="0" aria-expanded="false">
-    <h3>Compare captures</h3>
-    <span class="material-symbol ss-coll-ico">expand_more</span>
-  </div>
-  <div class="ss-coll-body hidden" data-coll-body="compare">
-  <div class="ss-note">
-    Select two captures and compare what changed: <b>Added</b>, <b>Deleted</b>, and <b>Updated</b> (with old/new values).
-  </div>
-  <div id="ss-diff-picked" class="ss-picked" style="margin-top:12px"></div>
-<div class="ss-row" style="margin-top:10px">
-    <select id="ss-diff-kind" class="input grow">
-      <option value="all">All changes</option>
-      <option value="added">Added</option>
-      <option value="removed">Deleted</option>
-      <option value="updated">Updated</option>
-    </select>
-    <select id="ss-diff-limit" class="input" style="min-width:110px">
-      <option value="100">100</option>
-      <option value="200" selected>200</option>
-      <option value="500">500</option>
-      <option value="1000">1000</option>
-    </select>
-  </div>
-  <div class="ss-row" style="margin-top:10px">
-    <input id="ss-diff-q" class="input grow" placeholder="Filter results..."/>
-  </div>
-  <div class="ss-row" style="margin-top:10px">
-    <button id="ss-diff-run" class="btn grow">Compare</button>
-    <button id="ss-diff-extend" class="btn grow">Advanced</button>
-  </div>
-  <div class="ss-small ss-muted" style="margin-top:8px">Advanced opens a full diff modal (includes unchanged records).</div>
-  <div id="ss-diff-progress" class="ss-progress hidden">
-    <div class="ss-pbar"></div>
-    <div class="ss-plabel">Working…</div>
-  </div>
-  <div id="ss-diff-out" class="ss-muted ss-small" style="margin-top:10px"></div>
-  <div id="ss-diff-list" class="ss-difflist" style="margin-top:10px"></div>
-
-  </div>
-</div>
-          <div class="ss-card ss-coll is-collapsed" data-coll="tools">
-            <div class="ss-coll-head" data-coll-head="tools" role="button" tabindex="0" aria-expanded="false">
-              <h3>Tools</h3>
-              <span class="material-symbol ss-coll-ico">expand_more</span>
-            </div>
-            <div class="ss-coll-body hidden" data-coll-body="tools">
-            <div class="ss-row">
-              <select id="ss-tools-prov" class="input grow"></select>
-            </div>
-            <div class="ss-row" style="margin-top:10px">
-              <select id="ss-tools-inst" class="input grow"></select>
-            </div>
-            <div class="ss-grid2" style="margin-top:12px">
-              <button class="btn danger" id="ss-clear-watchlist">Clear watchlist</button>
-              <button class="btn danger" id="ss-clear-ratings">Clear ratings</button>
-              <button class="btn danger" id="ss-clear-history">Clear history</button>
-              <button class="btn danger" id="ss-clear-all">Clear all</button>
-            </div>
-            <div id="ss-tools-progress" class="ss-progress hidden">
-              <div class="ss-pbar"></div>
-              <div class="ss-plabel">Working…</div>
-            </div>
-            <div class="ss-note" style="margin-top:10px">
-              These are destructive. Use with caution!
-            </div>
-            <div id="ss-tools-out" class="ss-small ss-muted" style="margin-top:10px"></div>
-            </div>
-          </div>
-          </div>
-        </div>
-      </div>
-    `;
+    updateCaptureBusyUI();
 
     wireCollapsible("restore");
     wireCollapsible("compare");
@@ -709,25 +422,57 @@ function bundleKey(s) {
       setTimeout(() => { if (!state.busy) setRefreshSpinning(false); }, 600);
     });
     $("#ss-create", page)?.addEventListener("click", () => onCreate());
+    $("#ss-add-schedule", page)?.addEventListener("click", () => onAddToScheduler());
+    $("#ss-send-schedule-queue", page)?.addEventListener("click", () => onSendScheduleQueue());
+    $("#ss-clear-schedule-queue", page)?.addEventListener("click", () => {
+      state.scheduleQueue = [];
+      renderScheduleQueue();
+      setScheduleQueueFeedback("Queue cleared", true);
+    });
     $("#ss-prov", page)?.addEventListener("change", () => { repopFeatures(); repopCreateInstances(); });
     $("#ss-filter", page)?.addEventListener("input", () => { state.showAll = false; renderList(); });
-    $("#ss-filter-provider", page)?.addEventListener("change", () => { state.showAll = false; renderList(); });
-    $("#ss-filter-feature", page)?.addEventListener("change", () => { state.showAll = false; renderList(); });
+    $("#ss-filter-provider", page)?.addEventListener("change", () => { state.showAll = false; updateBrowserFilterBar(); renderList(); });
+    $("#ss-filter-feature", page)?.addEventListener("change", () => { state.showAll = false; updateBrowserFilterBar(); renderList(); });
+    $("#ss-filter-kind", page)?.addEventListener("change", () => { state.showAll = false; updateBrowserFilterBar(); renderList(); });
+    $("#ss-filter-clear", page)?.addEventListener("click", () => {
+      const provSel = $("#ss-filter-provider", page);
+      const featSel = $("#ss-filter-feature", page);
+      const kindSel = $("#ss-filter-kind", page);
+      const resetSelect = (sel) => {
+        if (!sel) return;
+        sel.selectedIndex = 0;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      resetSelect(provSel);
+      resetSelect(featSel);
+      resetSelect(kindSel);
+      state.showAll = false;
+      updateBrowserFilterBar();
+      renderList();
+    });
 
     $("#ss-restore", page)?.addEventListener("click", () => onRestore());
     $("#ss-delete", page)?.addEventListener("click", () => onDeleteSelected());
     $("#ss-restore-inst", page)?.addEventListener("change", () => updateRestoreAvailability());
+    $("#ss-restore-mode", page)?.addEventListener("change", () => updateRestoreModeUI());
+    $$("[data-restore-mode]", page).forEach((btn) => btn.addEventListener("click", () => {
+      const sel = $("#ss-restore-mode", page);
+      const mode = String(btn.getAttribute("data-restore-mode") || "merge");
+      if (sel) sel.value = mode;
+      updateRestoreModeUI();
+    }));
     updateRestoreAvailability();
+    updateRestoreModeUI();
 
     $("#ss-clear-watchlist", page)?.addEventListener("click", () => onClearTool(["watchlist"]));
     $("#ss-clear-ratings", page)?.addEventListener("click", () => onClearTool(["ratings"]));
     $("#ss-clear-history", page)?.addEventListener("click", () => onClearTool(["history"]));
-    $("#ss-clear-all", page)?.addEventListener("click", () => onClearTool(["watchlist", "ratings", "history"]));
+    $("#ss-clear-progress", page)?.addEventListener("click", () => onClearTool(["progress"]));
+    $("#ss-clear-all", page)?.addEventListener("click", () => onClearTool(getClearableFeatures($("#ss-tools-prov", page)?.value)));
     $("#ss-tools-prov", page)?.addEventListener("change", () => { repopToolsInstances(); updateToolsAvailability(); });
     $("#ss-tools-inst", page)?.addEventListener("change", () => updateToolsAvailability());
+    renderScheduleQueue();
   }
-
-
 
   function setProgress(sel, on, label, tone) {
     const page = document.getElementById("page-snapshots");
@@ -772,12 +517,6 @@ function bundleKey(s) {
     });
   }
 
-
-  function setStatus(kind, msg, busy) {
-    const k = String(kind || "").toLowerCase();
-    if (k === "err") console.warn("[snapshots]", msg);
-  }
-
   function updateRestoreAvailability() {
     const page = document.getElementById("page-snapshots");
     if (!page) return;
@@ -801,9 +540,21 @@ function bundleKey(s) {
     if (instSel) {
       instSel.disabled = state.busy || !state.selectedPath || instSel.options.length <= 1;
     }
+    $$("[data-restore-mode]", page).forEach((btn) => {
+      btn.disabled = state.busy || !state.selectedPath;
+    });
   }
 
-
+  function updateRestoreModeUI() {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return;
+    const mode = String($("#ss-restore-mode", page)?.value || "merge").toLowerCase();
+    $$("[data-restore-mode]", page).forEach((btn) => {
+      btn.classList.toggle("active", String(btn.getAttribute("data-restore-mode") || "") === mode);
+    });
+    const warning = $("#ss-restore-warning", page);
+    if (warning) warning.classList.toggle("hidden", mode !== "clear_restore");
+  }
 
 function repopDiffSelects() {
   renderDiffPicked();
@@ -811,47 +562,24 @@ function repopDiffSelects() {
   renderDiff();
 }
 
-
 function updateDiffAvailability() {
   const page = document.getElementById("page-snapshots");
   if (!page) return;
-
-  const { a, b, sa, sb } = _diffPickAB();
-  const run = $("#ss-diff-run", page);
-  const ext = $("#ss-diff-extend", page);
-
-  const same = !!sa && !!sb
-    && String(sa.provider || "").toLowerCase() === String(sb.provider || "").toLowerCase()
-    && String(sa.feature || "").toLowerCase() === String(sb.feature || "").toLowerCase();
-
-  const ok = !!a && !!b && a !== b && same;
-
-  if (run) {
-    run.disabled = state.busy || !ok;
-    run.title = ok ? "" : "Pick two captures (same provider and feature)";
-  }
-
-  if (ext) {
-    ext.disabled = state.busy || !ok;
-    ext.title = ok ? "Open advanced diff" : "Pick two captures (same provider and feature)";
-  }
+  const { ok } = diffSelection(), hint = "Pick two captures from the same provider and instance";
+  [["#ss-diff-run", hint], ["#ss-diff-extend", ok ? "Open advanced diff" : hint]].forEach(([id, title]) => {
+    const el = $(id, page);
+    if (!el) return;
+    el.disabled = state.busy || !ok;
+    el.title = title;
+  });
 }
 
 async function onDiffExtend() {
   const page = document.getElementById("page-snapshots");
   if (!page) return;
-
-  const { a, b, sa, sb } = _diffPickAB();
-
-  const same = !!sa && !!sb
-    && String(sa.provider || "").toLowerCase() === String(sb.provider || "").toLowerCase()
-    && String(sa.feature || "").toLowerCase() === String(sb.feature || "").toLowerCase();
-
-  if (!a || !b || a === b || !same) return toast("Pick two captures (same provider and feature)", false);
+  const { a, b, ok } = diffSelection();
+  if (!ok) return toast("Pick two captures from the same provider and instance", false);
   if (!window.openCaptureCompare) return toast("Capture Compare modal not available", false);
-
-  state.diffAPath = a;
-  state.diffBPath = b;
   window.openCaptureCompare({ aPath: a, bPath: b });
 }
 
@@ -925,7 +653,6 @@ function renderDiffPicked() {
       arr[from] = arr[to];
       arr[to] = tmp;
       state.diffPick = arr;
-      state.diffManualOrder = true;
       renderList();
       renderDiffPicked();
       updateDiffAvailability();
@@ -935,8 +662,6 @@ function renderDiffPicked() {
   wireDnD(ca);
   wireDnD(cb);
 }
-
-
 
 function _matchesDiffQ(row, q) {
   const s = JSON.stringify(row || {});
@@ -1025,6 +750,7 @@ function renderDiff() {
     const key = String(row.key || "");
     const item = row.item || row.new || row.old || {};
     const head = _diffName(item);
+    const featTag = String(item.feature || "").toLowerCase();
 
     const exp = !!state.diffExpanded[key];
     const btn = (k === "updated")
@@ -1038,6 +764,7 @@ function renderDiff() {
       <div class="ss-diffrow">
         <div class="ss-diffhead">
           ${badge(k)}
+          ${featTag ? `<span class="ss-badge">${escapeHtml(featTag)}</span>` : ``}
           <div class="ss-difftitle">${escapeHtml(head)}</div>
           ${btn}
         </div>
@@ -1061,22 +788,12 @@ function renderDiff() {
 async function onDiffRun() {
   const page = document.getElementById("page-snapshots");
   if (!page) return;
-
-  const { a, b, sa, sb } = _diffPickAB();
+  const { a, b, ok } = diffSelection();
   const kind = String($("#ss-diff-kind", page)?.value || "all");
   const lim = parseInt(String($("#ss-diff-limit", page)?.value || "200"), 10) || 200;
-
-  const same = !!sa && !!sb
-    && String(sa.provider || "").toLowerCase() === String(sb.provider || "").toLowerCase()
-    && String(sa.feature || "").toLowerCase() === String(sb.feature || "").toLowerCase();
-
-  if (!a || !b || a === b || !same) return toast("Pick two captures (same provider and feature)", false);
-
-  state.diffAPath = a;
-  state.diffBPath = b;
+  if (!ok) return toast("Pick two captures from the same provider and instance", false);
   state.diffKind = kind;
   state.diffLimit = lim;
-
   setProgress("#ss-diff-progress", true, "Comparing…", "accent");
   setBusy(true);
   try {
@@ -1096,7 +813,6 @@ async function onDiffRun() {
     updateDiffAvailability();
   }
 }
-
 
   function setBusy(on) {
     state.busy = !!on;
@@ -1119,6 +835,16 @@ async function onDiffRun() {
     }
   }
 
+  function updateCaptureBusyUI() {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return;
+    const on = !!state.captureBusy;
+    page.classList.toggle("ss-capture-running", on);
+    $$(".ss-lockable", page).forEach((card) => card.classList.toggle("ss-locked", on));
+    const lockMsg = $("#ss-capture-lock", page);
+    if (lockMsg) lockMsg.classList.toggle("hidden", !on);
+  }
+
   function repopProviders() {
     const page = document.getElementById("page-snapshots");
     if (!page) return;
@@ -1133,7 +859,8 @@ async function onDiffRun() {
       if (!sel) return;
       const cur = String(sel.value || "");
       sel.innerHTML = "";
-      (addAll ? [{ id: "", label: "All providers", configured: true }] : []).concat(opts).forEach((p) => {
+      const rows = addAll ? [{ id: "", label: "All providers", configured: true }].concat(configured) : opts;
+      rows.forEach((p) => {
         const o = document.createElement("option");
         o.value = p.id || "";
         o.textContent = (p.label || p.id || "-");
@@ -1148,16 +875,16 @@ async function onDiffRun() {
     fill(fProv, true);
 
     // Provider dropdowns with brand icons
-    _rebuildBrandSelectMenu(provSel);
-    _rebuildBrandSelectMenu(toolsSel);
-    _rebuildBrandSelectMenu(fProv);
+    _enhanceProviderIconSelect(provSel);
+    _enhanceProviderIconSelect(toolsSel);
+    _enhanceProviderIconSelect(fProv);
 
     repopFeatures();
     repopCreateInstances();
     repopToolsInstances();
     repopRestoreInstances(state.selectedSnap);
     updateToolsAvailability();
-
+    updateBrowserFilterBar();
 
 // Diff UI
 const diffRun = $("#ss-diff-run", page);
@@ -1212,21 +939,13 @@ repopDiffSelects();
     sel.disabled = sel.options.length <= 1;
   }
 
-  function repopCreateInstances() {
+  function repopInstances(fromSel, toSel) {
     const page = document.getElementById("page-snapshots");
     if (!page) return;
-    const pid = String($("#ss-prov", page)?.value || "").toUpperCase();
-    const sel = $("#ss-prov-inst", page);
-    _fillInstanceSelect(sel, pid, null);
+    _fillInstanceSelect($(toSel, page), String($(fromSel, page)?.value || "").toUpperCase(), null);
   }
-
-  function repopToolsInstances() {
-    const page = document.getElementById("page-snapshots");
-    if (!page) return;
-    const pid = String($("#ss-tools-prov", page)?.value || "").toUpperCase();
-    const sel = $("#ss-tools-inst", page);
-    _fillInstanceSelect(sel, pid, null);
-  }
+  const repopCreateInstances = () => repopInstances("#ss-prov", "#ss-prov-inst");
+  const repopToolsInstances = () => repopInstances("#ss-tools-prov", "#ss-tools-inst");
 
   function repopRestoreInstances(snap) {
     const page = document.getElementById("page-snapshots");
@@ -1256,14 +975,16 @@ repopDiffSelects();
     const feats = (p && p.features) ? p.features : {};
     const fSel = $("#ss-feature", page);
 
+    const featureOptions = ["all", "watchlist", "ratings", "history", "progress"];
+
     if (fSel) {
       const cur = String(fSel.value || "");
       fSel.innerHTML = "";
-      ["all", "watchlist", "ratings", "history"].forEach((k) => {
+      featureOptions.forEach((k) => {
         const o = document.createElement("option");
         o.value = k;
         o.textContent = (k === "all") ? "All features" : k;
-        if (k === "all") o.disabled = !(feats.watchlist || feats.ratings || feats.history);
+        if (k === "all") o.disabled = !featureOptions.slice(1).some((name) => !!feats[name]);
         else o.disabled = !feats[k];
         fSel.appendChild(o);
       });
@@ -1272,18 +993,67 @@ repopDiffSelects();
 
     const fFeat = $("#ss-filter-feature", page);
     if (fFeat && fFeat.options.length === 0) {
-      ["", "watchlist", "ratings", "history"].forEach((k) => {
+      ["", ...featureOptions.slice(1)].forEach((k) => {
         const o = document.createElement("option");
         o.value = k;
-        o.textContent = k ? `Feature: ${k}` : "All features";
+        o.textContent = k || "All features";
         fFeat.appendChild(o);
       });
+    }
+    const fKind = $("#ss-filter-kind", page);
+    if (fKind && fKind.options.length === 0) {
+      [
+        ["", "All types"],
+        ["manual", "Manual"],
+        ["auto", "Auto"],
+      ].forEach(([value, label]) => {
+        const o = document.createElement("option");
+        o.value = value;
+        o.textContent = label;
+        fKind.appendChild(o);
+      });
+    }
+    updateBrowserFilterBar();
+  }
+
+  function isAutoCapture(snap) {
+    const label = String(snap?.label || "").trim().toLowerCase();
+    return label.startsWith("auto-");
+  }
+
+  function updateBrowserFilterBar() {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return;
+
+    const provSel = $("#ss-filter-provider", page);
+    const featSel = $("#ss-filter-feature", page);
+    const kindSel = $("#ss-filter-kind", page);
+    const clearBtn = $("#ss-filter-clear", page);
+    const provWrap = $("#ss-filter-provider-wrap", page);
+    const featWrap = $("#ss-filter-feature-wrap", page);
+    const kindWrap = $("#ss-filter-kind-wrap", page);
+
+    const sync = (sel, wrap) => {
+      if (!sel || !wrap) return false;
+      const hasValue = !!String(sel.value || "").trim();
+      wrap.classList.toggle("active", hasValue);
+      return hasValue;
+    };
+
+    const hasProvider = sync(provSel, provWrap);
+    const hasFeature = sync(featSel, featWrap);
+    const hasKind = sync(kindSel, kindWrap);
+
+    if (clearBtn) {
+      clearBtn.disabled = !hasProvider && !hasFeature && !hasKind;
+      clearBtn.classList.toggle("active", hasProvider || hasFeature || hasKind);
     }
   }
 
   function renderList() {
     const page = document.getElementById("page-snapshots");
     if (!page) return;
+    updateCaptureBusyUI();
 
     const list = $("#ss-list", page);
     if (!list) return;
@@ -1291,6 +1061,7 @@ repopDiffSelects();
     const q = String($("#ss-filter", page)?.value || "").trim().toLowerCase();
     const fp = String($("#ss-filter-provider", page)?.value || "").trim().toLowerCase();
     const ff = String($("#ss-filter-feature", page)?.value || "").trim().toLowerCase();
+    const fk = String($("#ss-filter-kind", page)?.value || "").trim().toLowerCase();
 
     const all = state.snapshots || [];
     const idx = buildBundleIndex(all);
@@ -1310,8 +1081,10 @@ repopDiffSelects();
       const prov = String(s.provider || "").toLowerCase();
       const feat = String(s.feature || "").toLowerCase();
       const lab = String(s.label || "").toLowerCase();
+      const kind = isAutoCapture(s) ? "auto" : "manual";
 
       if (fp && prov !== fp) return false;
+      if (fk && kind !== fk) return false;
 
       if (ff) {
         if (feat === ff) {
@@ -1410,25 +1183,41 @@ const picks = Array.isArray(state.diffPick) ? state.diffPick.filter(Boolean) : [
       const pth = String(s.path || "");
       const ixPick = pth ? picks.indexOf(pth) : -1;
       const abTag = ixPick === 0 ? "A" : (ixPick === 1 ? "B" : "");
-      const showPick = !isBundle && (inScope || ixPick !== -1);
+      const showPick = inScope || ixPick !== -1;
       const pickHtml = showPick
         ? `${abTag ? `<span class="ss-ab ${abTag === "A" ? "a" : "b"}">${abTag}</span>` : ""}` +
-          `<input class="ss-chk" type="checkbox" title="Select for compare" data-act="diffpick" ${ixPick !== -1 ? "checked" : ""} />`
+          `<input class="ss-chk" type="checkbox" name="ss-diffpick" title="Select for compare" data-act="diffpick" ${ixPick !== -1 ? "checked" : ""} />`
         : "";
 
       item.innerHTML = `
-        <div style="flex:1 1 auto;min-width:0">
-          <div class="ss-meta">
+        <div class="ss-item-main">
+          <div class="ss-item-meta">
             <span class="ss-badge ok">${(s.provider || "-").toUpperCase()}</span>
-            ${showInst ? `<span class="ss-badge">${inst}</span>` : ``}
-            <span class="ss-badge">${feat}</span>
+            ${showInst ? `<span class="ss-badge">${escapeHtml(inst)}</span>` : ``}
+            <span class="ss-badge">${escapeHtml(feat)}</span>
             ${s.label ? `<span class="ss-badge warn">${escapeHtml(_uiCaptureLabel(s.label)).slice(0, 40)}</span>` : ``}
             ${extra}
           </div>
-          <div class="d">${when} * ${humanBytes(s.size)} * <span class="ss-muted">${s.path || ""}</span></div>
+          <div class="d">${escapeHtml(when || "-")} · ${humanBytes(s.size)} · <span class="ss-path">${escapeHtml(s.path || "")}</span></div>
         </div>
-        <div class="ss-right">${pickHtml}<div class="chev">></div></div>
+        <div class="ss-item-right">
+          <div class="ss-item-action">${pickHtml || `<span class="ss-small ss-muted">restore</span>`}</div>
+          <div class="chev">›</div>
+        </div>
       `;
+
+      const metaBits = [when || "-", humanBytes(s.size)];
+      if (showInst) metaBits.push(inst);
+      const fileName = snapFile(s.path);
+      const metaEl = $(".ss-item-meta", item);
+      const detailEl = $(".ss-item-main > .d", item);
+      if (metaEl) {
+        const badges = $$(".ss-badge", metaEl);
+        if (showInst && badges[1]) badges[1].remove();
+      }
+      if (detailEl) {
+        detailEl.innerHTML = `${escapeHtml(metaBits.join(" · "))}${fileName ? ` · <span class="ss-file">${escapeHtml(fileName)}</span>` : ""}`;
+      }
 
       const pick = item.querySelector('input[data-act="diffpick"]');
       if (pick) {
@@ -1450,6 +1239,7 @@ const toggleBtn = item.querySelector('[data-act="toggle"]');
       }
 
       item.addEventListener("click", () => {
+        if (state.captureBusy) return;
         clearDiffPicks();
         try { setCollapsed("compare", true); setCollapsed("restore", false); } catch {}
         const p = String(s.path || "");
@@ -1497,8 +1287,9 @@ function renderSelected() {
 
     const s = state.selectedSnap;
     if (!s) {
-      host.classList.add("ss-muted");
-      host.innerHTML = "Pick a capture from the list.";
+      host.classList.add("ss-selected-empty");
+      host.classList.remove("ss-muted");
+      host.innerHTML = `<div class="ss-selected-title">No capture selected</div><div class="ss-small ss-muted">Pick one from the browser to inspect or restore it.</div>`;
       return;
     }
 
@@ -1507,25 +1298,27 @@ function renderSelected() {
     const featStats = stats.features || null;
     const inst = String(s.instance || s.instance_id || s.profile || "default");
     const showInst = inst && String(inst).toLowerCase() !== "default";
-    const pills = featStats ? Object.keys(featStats).slice(0, 6).map((k) =>
-      `<span class="ss-pill"><strong>${featStats[k]}</strong><span class="ss-muted">${k}</span></span>`
-    ).join("")
-    : Object.keys(by).slice(0, 6).map((k) =>
-      `<span class="ss-pill"><strong>${by[k]}</strong><span class="ss-muted">${k}</span></span>`
-    ).join("");
+    const created = s.created_at ? new Date(String(s.created_at)).toLocaleString() : "-";
+    const selectedStats = (featStats ? Object.entries(featStats) : Object.entries(by))
+      .slice(0, 4)
+      .map(([k, v]) => `<div class="ss-selected-stat"><strong>${Number(v || 0)}</strong><span>${escapeHtml(String(k || ""))}</span></div>`)
+      .join("");
 
-    host.classList.remove("ss-muted");
+    host.classList.remove("ss-selected-empty","ss-muted");
     host.innerHTML = `
-      <div class="ss-row" style="gap:8px;flex-wrap:wrap">
-        <span class="ss-badge ok">${String(s.provider || "").toUpperCase()}</span>
-        ${showInst ? `<span class="ss-badge">${inst}</span>` : ``}
-        <span class="ss-badge">${String(s.feature || "").toLowerCase()}</span>
-        ${s.label ? `<span class="ss-badge warn">${escapeHtml(_uiCaptureLabel(s.label)).slice(0, 40)}</span>` : ``}
+      <div class="ss-selected-summary">
+        <div class="ss-item-meta">
+          <span class="ss-badge ok">${String(s.provider || "").toUpperCase()}</span>
+          ${showInst ? `<span class="ss-badge">${escapeHtml(inst)}</span>` : ``}
+          <span class="ss-badge">${String(s.feature || "").toLowerCase()}</span>
+          ${s.label ? `<span class="ss-badge warn">${escapeHtml(_uiCaptureLabel(s.label)).slice(0, 40)}</span>` : ``}
+        </div>
+        <div class="ss-selected-count"><strong>${Number(stats.count || 0)}</strong><span>items</span></div>
       </div>
-      <div class="ss-small ss-muted" style="margin-top:8px">
-        ${s.created_at ? new Date(String(s.created_at)).toLocaleString() : "-"} * <b>${Number(stats.count || 0)}</b> items
+      <div class="ss-selected-meta">
+        <div class="ss-selected-kv"><b>Captured</b> ${escapeHtml(created)}</div>
       </div>
-      ${pills ? `<div class="ss-row" style="margin-top:10px;flex-wrap:wrap">${pills}</div>` : ``}
+      ${selectedStats ? `<div class="ss-selected-stats">${selectedStats}</div>` : ``}
     `;
   }
 
@@ -1540,25 +1333,36 @@ function renderSelected() {
   }
 
   async function refresh(force = false, announce = true) {
+    if (authSetupPending()) return;
     const page = document.getElementById("page-snapshots");
     if (!page) return;
 
     const now = Date.now();
     if (!force && now - state.lastRefresh < 2500) return;
     state.lastRefresh = now;
+    const bust = `_=${now}`;
+    const manifestUrl = `/api/snapshots/manifest?${bust}`;
+    const listUrl = `/api/snapshots/list?${bust}`;
 
     const wasBusy = !!state.busy;
     if (!wasBusy) setBusy(true);
     setRefreshSpinning(true);
     try {
       const [m, l] = await Promise.all([
-        API()("/api/snapshots/manifest"),
-        API()("/api/snapshots/list"),
+        API()(manifestUrl),
+        API()(listUrl),
       ]);
 
       state.providers = (m && m.providers) ? m.providers : [];
-      state.snapshots = (l && l.snapshots) ? l.snapshots : [];
+      {
+        const visibleProviders = configuredProviderIds();
+        const rows = (l && l.snapshots) ? l.snapshots : [];
+        state.snapshots = Array.isArray(rows)
+          ? rows.filter((snap) => visibleProviders.has(String(snap?.provider || "").trim().toLowerCase()))
+          : [];
+      }
 
+      updateTopStats();
       repopProviders();
       renderList();
       try { repopDiffSelects(); } catch {}
@@ -1576,14 +1380,13 @@ function renderSelected() {
       }
     } catch (e) {
       console.warn("[snapshots] refresh failed", e);
-      setStatus("err", `Refresh failed: ${e.message || e}`, false);
+      console.warn("[snapshots]", `Refresh failed: ${e.message || e}`);
       toast(`Snapshots refresh failed: ${e.message || e}`, false);
     } finally {
       setRefreshSpinning(false);
       if (!wasBusy) setBusy(false);
     }
   }
-
 
   async function selectSnapshot(path) {
     if (!path) return;
@@ -1620,15 +1423,13 @@ function renderSelected() {
 
     if (!provider) return toast("Pick a provider first", false);
     if (!feature) return toast("Pick a feature", false);
+    state.captureBusy = true;
+    updateCaptureBusyUI();
 
     setProgress("#ss-create-progress", true, "Creating snapshot…", "accent");
     setBusy(true);
     try {
-      const r = await apiJson("/api/snapshots/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, instance, feature, label }),
-      });
+      const r = await POST_JSON("/api/snapshots/create", { provider, instance, feature, label });
 
       const snap = r && r.snapshot ? r.snapshot : null;
       $("#ss-label", page).value = "";
@@ -1637,6 +1438,8 @@ function renderSelected() {
       if (snap && snap.path) {
         await selectSnapshot(snap.path);
       }
+      setTimeout(() => refresh(true, false), 450);
+      setTimeout(() => refresh(true, false), 1600);
       toast("Capture created", true);
     } catch (e) {
       console.warn("[snapshots] create failed", e);
@@ -1649,11 +1452,157 @@ function renderSelected() {
         toast(`Snapshot create failed: ${msg}`, false);
       }
     } finally {
+      state.captureBusy = false;
+      updateCaptureBusyUI();
       setProgress("#ss-create-progress", false, "", "accent");
       setBusy(false);
     }
   }
 
+  function readScheduleDraft() {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return null;
+    const provider = String($("#ss-prov", page)?.value || "").toUpperCase();
+    const instance = String($("#ss-prov-inst", page)?.value || "default");
+    const feature = String($("#ss-feature", page)?.value || "").toLowerCase();
+    const label = String($("#ss-label", page)?.value || "").trim() || "auto-{provider}-{feature}-{date}";
+    if (!provider) {
+      toast("Pick a provider first", false);
+      return null;
+    }
+    if (!feature) {
+      toast("Pick a feature first", false);
+      return null;
+    }
+    return { provider, instance, feature, label_template: label };
+  }
+
+  function scheduleQueueKey(item) {
+    return [
+      String(item?.provider || "").trim().toUpperCase(),
+      String(item?.instance || "default").trim() || "default",
+      String(item?.feature || "").trim().toLowerCase(),
+      String(item?.label_template || "").trim(),
+    ].join("|");
+  }
+
+  function renderScheduleQueue() {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return;
+    const host = $("#ss-schedule-queue", page);
+    const sendBtn = $("#ss-send-schedule-queue", page);
+    const clearBtn = $("#ss-clear-schedule-queue", page);
+    if (!host) return;
+    const items = Array.isArray(state.scheduleQueue) ? state.scheduleQueue : [];
+    if (sendBtn) sendBtn.disabled = !items.length;
+    if (clearBtn) clearBtn.disabled = !items.length;
+    if (!items.length) {
+      host.innerHTML = `<div class="ss-queue-empty">No queued schedule drafts yet.</div>`;
+      return;
+    }
+    host.innerHTML = items.map((item, index) => {
+      const provider = String(item.provider || "").toUpperCase();
+      const instance = String(item.instance || "default");
+      const feature = String(item.feature || "").toLowerCase();
+      const label = String(item.label_template || "");
+      const showInst = instance && instance.toLowerCase() !== "default";
+      return `<div class="ss-queue-item">
+        <div class="ss-queue-copy">
+          <div class="ss-queue-main">${escapeHtml(provider)}${showInst ? ` • ${escapeHtml(instance)}` : ""} • ${escapeHtml(feature === "all" ? "all features" : feature)}</div>
+          <div class="ss-queue-sub">${escapeHtml(label)}</div>
+        </div>
+        <button class="btn" type="button" data-queue-remove="${index}">Remove</button>
+      </div>`;
+    }).join("");
+    $$("[data-queue-remove]", host).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const ix = parseInt(String(btn.getAttribute("data-queue-remove") || "-1"), 10);
+        if (!Number.isFinite(ix) || ix < 0) return;
+        state.scheduleQueue.splice(ix, 1);
+        renderScheduleQueue();
+        setScheduleQueueFeedback("Removed from queue", true);
+      });
+    });
+  }
+
+  function setScheduleQueueFeedback(message, ok = true, ms = 1800) {
+    const page = document.getElementById("page-snapshots");
+    if (!page) return;
+
+    const feedback = $("#ss-queue-feedback", page);
+    if (feedback) {
+      feedback.textContent = String(message || "");
+      feedback.style.display = message ? "block" : "none";
+      feedback.style.color = ok ? "rgba(224,255,236,.94)" : "rgba(255,232,232,.94)";
+      feedback.style.borderColor = ok ? "rgba(98,238,181,.22)" : "rgba(255,122,122,.22)";
+      feedback.style.background = ok ? "rgba(25,195,125,.08)" : "rgba(255,77,79,.08)";
+    }
+
+    const btn = $("#ss-add-schedule", page);
+    if (!btn || !message) return;
+    btn.dataset.defaultText ||= btn.textContent || "Queue for scheduler";
+    if (btn.__ssQueueFlashTimer) clearTimeout(btn.__ssQueueFlashTimer);
+    btn.textContent = message;
+    btn.style.borderColor = ok ? "rgba(98,238,181,.30)" : "rgba(255,122,122,.26)";
+    btn.style.boxShadow = ok ? "0 0 12px rgba(25,195,125,.18)" : "0 0 12px rgba(255,77,79,.18)";
+    btn.__ssQueueFlashTimer = setTimeout(() => {
+      btn.textContent = btn.dataset.defaultText || "Queue for scheduler";
+      btn.style.borderColor = "";
+      btn.style.boxShadow = "";
+    }, ms);
+  }
+
+  function onQueueScheduleDraft() {
+    const payload = readScheduleDraft();
+    if (!payload) {
+      setScheduleQueueFeedback("Check provider and feature first", false);
+      return;
+    }
+    const key = scheduleQueueKey(payload);
+    if (state.scheduleQueue.some((item) => scheduleQueueKey(item) === key)) {
+      setScheduleQueueFeedback("Already in queue", false);
+      toast("That capture schedule is already queued", false);
+      return;
+    }
+    state.scheduleQueue.push(payload);
+    renderScheduleQueue();
+    setScheduleQueueFeedback("Added to queue", true);
+    toast(`Queued ${state.scheduleQueue.length} capture schedule${state.scheduleQueue.length === 1 ? "" : "s"}`, true);
+  }
+
+  async function onSendScheduleQueue() {
+    const items = Array.isArray(state.scheduleQueue) ? state.scheduleQueue.slice() : [];
+    if (!items.length) return toast("Queue at least one capture schedule first", false);
+
+    try { window.showTab?.("settings"); } catch {}
+    setTimeout(async () => {
+      try {
+        window.cwSettingsSelect?.("scheduling");
+        try { await window.loadScheduling?.(); } catch {}
+        const sec = document.getElementById("sec-scheduling");
+        if (sec && !sec.classList.contains("open")) window.toggleSection?.("sec-scheduling");
+        window.cwSchedSettingsSelect?.("advanced");
+        let applied = false;
+        for (let attempt = 0; attempt < 6 && !applied; attempt += 1) {
+          applied = !!window.prefillCaptureSchedules?.(items.slice());
+          if (!applied) await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+        if (!applied) throw new Error("Unable to add queued capture schedules.");
+        state.scheduleQueue = [];
+        renderScheduleQueue();
+        sec?.scrollIntoView({ behavior: "smooth", block: "start" });
+        toast(`Added ${items.length} capture schedule${items.length === 1 ? "" : "s"} to Scheduling. Pick times, then save settings.`, true);
+      } catch (e) {
+        console.warn("[snapshots] queued scheduler prefill failed", e);
+        const msg = String(e && e.message ? e.message : e) || "Unable to add queued capture schedules";
+        toast(`Queue send failed: ${msg}`, false);
+      }
+    }, 80);
+  }
+
+  async function onAddToScheduler() {
+    onQueueScheduleDraft();
+  }
 
   async function onDeleteSelected() {
     if (!state.selectedPath) return;
@@ -1682,7 +1631,7 @@ function renderSelected() {
       const ok = res ? !!res.ok : !!(r && r.ok);
       if (!ok) {
         const err = (res && res.errors && res.errors.length) ? res.errors.join(" | ") : (r && r.error) ? r.error : "Delete failed";
-        setStatus("err", err, false);
+      console.warn("[snapshots]", err);
         toast(err, false);
         return;
       }
@@ -1695,7 +1644,7 @@ function renderSelected() {
       await refresh(true, false);
       toast("Snapshot deleted", true);
     } catch (e) {
-      setStatus("err", "Delete failed: " + (e.message || e), false);
+      console.warn("[snapshots]", "Delete failed: " + (e.message || e));
       toast("Delete failed: " + (e.message || e), false);
     } finally {
       setRefreshSpinning(false);
@@ -1719,11 +1668,7 @@ function renderSelected() {
     setProgress("#ss-restore-progress", true, "Restoring snapshot…", "danger");
     setBusy(true);
     try {
-      const r = await apiJson("/api/snapshots/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: state.selectedPath, mode, instance }),
-      });
+      const r = await POST_JSON("/api/snapshots/restore", { path: state.selectedPath, mode, instance });
 
       const res = r && r.result ? r.result : {};
       const out = $("#ss-restore-out", page);
@@ -1752,18 +1697,17 @@ function renderSelected() {
     const instance = String($("#ss-tools-inst", page)?.value || "default");
     if (!provider) return toast("Pick a provider first", false);
 
-    const what = (features || []).join(", ");
+    features = Array.isArray(features) ? features.filter(Boolean) : [];
+    if (!features.length) return toast("Nothing to clear for this provider", false);
+
+    const what = features.join(", ");
     const ok = confirm(`This will clear ${what} on ${provider} (${instance}). Continue?`);
     if (!ok) return;
 
     setProgress("#ss-tools-progress", true, `Clearing ${what}…`, "danger");
     setBusy(true);
     try {
-      const r = await apiJson("/api/snapshots/tools/clear", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, instance, features }),
-      });
+      const r = await POST_JSON("/api/snapshots/tools/clear", { provider, instance, features });
 
       const res = r && r.result ? r.result : {};
       const out = $("#ss-tools-out", page);
@@ -1772,18 +1716,23 @@ function renderSelected() {
           const parts = Object.keys(res.results || {}).map((k) => {
             const x = res.results[k] || {};
             if (x.skipped) return `${k}: skipped (${x.reason || "n/a"})`;
-            return `${k}: removed ${x.removed || 0} (had ${x.count || 0})`;
+
+            const u = (x.unresolved_count != null) ? Number(x.unresolved_count || 0)
+              : (Array.isArray(x.unresolved) ? x.unresolved.length : 0);
+            return u > 0
+              ? `${k}: removed ${x.removed || 0} (had ${x.count || 0}, unresolved ${u})`
+              : `${k}: removed ${x.removed || 0} (had ${x.count || 0})`;
           });
           out.textContent = parts.join(" * ");
         } else {
           out.textContent = `Clear finished with errors.`;
         }
       }
-      if (!res.ok) setStatus("err", "Tool finished with errors.", false);
+      if (!res.ok) console.warn("[snapshots]", "Tool finished with errors.");
       toast(res.ok ? "Clear complete" : "Clear finished with errors", !!res.ok);
     } catch (e) {
       console.warn("[snapshots] clear failed", e);
-      setStatus("err", `Tool failed: ${e.message || e}`, false);
+      console.warn("[snapshots]", `Tool failed: ${e.message || e}`);
       toast(`Clear failed: ${e.message || e}`, false);
       const out = $("#ss-tools-out", page);
       if (out) out.textContent = `Clear failed: ${e.message || e}`;
@@ -1793,7 +1742,6 @@ function renderSelected() {
       setBusy(false);
     }
   }
-
 
   function updateToolsAvailability() {
     const page = document.getElementById("page-snapshots");
@@ -1806,6 +1754,7 @@ function renderSelected() {
     const instMeta = Array.isArray(p?.instances) ? p.instances.find((x) => String(x?.id || "") === inst) : null;
     const instOk = instMeta ? !!instMeta.configured : true;
 
+    const clearable = getClearableFeatures(pid);
     const setBtn = (id, enabled, why) => {
       const b = $(id, page);
       if (!b) return;
@@ -1817,10 +1766,22 @@ function renderSelected() {
     setBtn("#ss-clear-watchlist", !!feats.watchlist, "Watchlist not supported");
     setBtn("#ss-clear-ratings", !!feats.ratings, "Ratings not supported");
     setBtn("#ss-clear-history", !!feats.history, "History not supported");
-    setBtn("#ss-clear-all", !!feats.watchlist || !!feats.ratings || !!feats.history, "Nothing to clear");
+    setBtn("#ss-clear-progress", clearable.includes("progress"), pid === "PLEX" ? "Progress clear not supported for Plex" : "Progress not supported");
+    setBtn("#ss-clear-all", clearable.length > 0, "Nothing to clear");
+  }
+
+  function getClearableFeatures(provider) {
+    const pid = String(provider || "").toUpperCase();
+    const p = (state.providers || []).find((x) => String(x.id || "").toUpperCase() === pid);
+    const feats = (p && p.features) ? p.features : {};
+    return ["watchlist", "ratings", "history", "progress"].filter((feature) => {
+      if (!feats[feature]) return false;
+      return feature !== "progress" || (pid !== "PLEX");
+    });
   }
 
   async function init() {
+    if (authSetupPending()) return;
     injectCss();
     render();
     await refresh(true, false);
@@ -1836,6 +1797,7 @@ function renderSelected() {
     init();
   } else {
     document.addEventListener("tab-changed", (e) => {
+      if (authSetupPending()) return;
       if (e?.detail?.id === "snapshots") {
         try { init(); } catch {}
       }

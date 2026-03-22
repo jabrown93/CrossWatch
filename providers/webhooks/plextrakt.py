@@ -23,6 +23,7 @@ except Exception:
 
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
+from providers.scrobble.scrobble import mask_account as _mask_account
 
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
@@ -498,21 +499,21 @@ def _cw_ids_for_payload(
     except Exception:
         show_ids = {}
 
-    for key in ("imdb", "tmdb", "tvdb"):
+    for key in ("tmdb", "imdb", "tvdb"):
         val = show_ids.get(key)
         if val is not None:
             cw_ids.setdefault(f"{key}_show", val)
 
     if "tmdb_show" not in cw_ids:
         extra = _plex_show_ids_from_metadata(cfg, md, logger=logger)
-        for key in ("imdb", "tmdb", "tvdb"):
+        for key in ("tmdb", "imdb", "tvdb"):
             val = extra.get(key)
             if val is not None:
                 cw_ids.setdefault(f"{key}_show", val)
 
     if "tmdb_show" not in cw_ids and cw_ids.get("imdb_show"):
         extra2 = _trakt_show_ids_from_imdb_show(str(cw_ids["imdb_show"]), cfg, logger=logger)
-        for key in ("imdb", "tmdb", "tvdb"):
+        for key in ("tmdb", "imdb", "tvdb"):
             val = extra2.get(key)
             if val is not None:
                 cw_ids.setdefault(f"{key}_show", val)
@@ -632,7 +633,7 @@ def _resolve_trakt_movie_id(
     c = _cache_get(key)
     if c is not None:
         return c
-    for k in ("imdb", "tmdb", "tvdb"):
+    for k in ("tmdb", "imdb", "tvdb"):
         val = ids_all.get(k)
         if not val:
             continue
@@ -667,7 +668,7 @@ def _resolve_trakt_show_id(
     c = _cache_get(key)
     if c is not None:
         return c
-    for k in ("imdb", "tmdb", "tvdb"):
+    for k in ("tmdb", "imdb", "tvdb"):
         val = ids_all.get(k)
         if not val:
             continue
@@ -725,7 +726,7 @@ def _trakt_show_ids_from_imdb_show(
             return {}
 
         ids = (((arr[0] or {}).get("show") or {}).get("ids") or {})
-        out = {k: ids[k] for k in ("trakt", "imdb", "tmdb", "tvdb") if ids.get(k)}
+        out = {k: ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if ids.get(k)}
 
         _cache_put(key, out if out else None)
         if out:
@@ -763,7 +764,7 @@ def _guid_search_episode(
             arr = []
         for hit in arr:
             epi_ids = ((hit.get("episode") or {}).get("ids") or {})
-            out = {k: epi_ids[k] for k in ("trakt", "imdb", "tmdb", "tvdb") if epi_ids.get(k)}
+            out = {k: epi_ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if epi_ids.get(k)}
             if out:
                 _emit(logger, f"guid search resolved episode ids: {out}", "DEBUG")
                 return out
@@ -872,7 +873,7 @@ def _resolve_trakt_episode_id(
 
 
 def _best_id_key_order(media_type: str) -> tuple[str, ...]:
-    return ("imdb", "tmdb", "tvdb") if media_type == "movie" else ("tmdb", "imdb", "tvdb")
+    return ("tmdb", "imdb", "tvdb") if media_type == "movie" else ("tmdb", "imdb", "tvdb")
 
 
 def _build_primary_body(
@@ -1060,7 +1061,7 @@ def _rating_payload(
     if mt == "movie":
         bucket = "movies"
         tid = _resolve_trakt_movie_id(ids_all, cfg, logger=logger)
-        ids = {"trakt": tid} if tid else {k: ids_all.get(k) for k in ("imdb", "tmdb", "tvdb") if ids_all.get(k)}
+        ids = {"trakt": tid} if tid else {k: ids_all.get(k) for k in ("tmdb", "imdb", "tvdb") if ids_all.get(k)}
     elif mt == "show":
         bucket = "shows"
         tid = _resolve_trakt_show_id(ids_all, cfg, logger=logger)
@@ -1144,14 +1145,14 @@ def process_webhook(
         except Exception:
             pass
 
-    _emit(logger, f"incoming '{event}' user='{acc_title}' server='{srv_uuid_evt}' media='{media_name_dbg}'", "DEBUG")
+    _emit(logger, f"incoming '{event}' user='{_mask_account(acc_title)}' server='{srv_uuid_evt}' media='{media_name_dbg}'", "DEBUG")
 
     if srv_uuid_cfg and srv_uuid_evt and srv_uuid_evt != srv_uuid_cfg:
         _emit(logger, f"ignored server '{srv_uuid_evt}' (expect '{srv_uuid_cfg}')", "DEBUG")
         return {"ok": True, "ignored": True}
 
     if not _account_matches(allow_users, payload, logger=logger):
-        _emit(logger, f"ignored user '{acc_title}'", "DEBUG")
+        _emit(logger, f"ignored user '{_mask_account(acc_title)}'", "DEBUG")
         return {"ok": True, "ignored": True}
 
     if not md:
@@ -1224,9 +1225,9 @@ def process_webhook(
         if r.status_code < 400:
             try:
                 if rating_val == 0:
-                    _emit(logger, f"user='{acc_title}' unrated • {media_name_dbg}", "INFO")
+                    _emit(logger, f"user='{_mask_account(acc_title)}' unrated • {media_name_dbg}", "INFO")
                 else:
-                    _emit(logger, f"user='{acc_title}' rated {int(rating_val)} • {media_name_dbg}", "INFO")
+                    _emit(logger, f"user='{_mask_account(acc_title)}' rated {int(rating_val)} • {media_name_dbg}", "INFO")
             except Exception:
                 pass
             return {"ok": True, "status": r.status_code, "action": "rating", "trakt": rj_r}
@@ -1527,7 +1528,7 @@ def process_webhook(
             _LAST_FINISH_BY_ACC[_account_key(payload)] = {"rk": str(rk or ""), "ts": now}
         try:
             action_name = intended.rsplit("/", 1)[-1]
-            _emit(logger, f"user='{acc_title}' {action_name} {prog:.1f}% • {media_name_dbg}", "INFO")
+            _emit(logger, f"user='{_mask_account(acc_title)}' {action_name} {prog:.1f}% • {media_name_dbg}", "INFO")
         except Exception:
             pass
         return {"ok": True, "status": 200, "action": intended, "trakt": rj}

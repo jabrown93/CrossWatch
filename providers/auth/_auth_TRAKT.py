@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -17,13 +18,28 @@ try:
 except ImportError:
     _real_log = None
 
+_SECRET_TEXT_RE = re.compile(
+    r"(?i)(\b(?:access_token|refresh_token|client_secret|authorization|token|code)\b\s*[=:]\s*)([^\s,;]+)"
+)
+_SECRET_JSON_RE = re.compile(
+    r'(?i)("(?:access_token|refresh_token|client_secret|authorization|token|code)"\s*:\s*")([^"]*)(")'
+)
+
+
+def _redact_log_message(msg: Any) -> str:
+    text = str(msg or "")
+    text = _SECRET_JSON_RE.sub(r"\1****\3", text)
+    text = _SECRET_TEXT_RE.sub(r"\1****", text)
+    return text
+
 
 def log(msg: str, level: str = "INFO", module: str = "AUTH", **_: Any) -> None:
+    safe_msg = _redact_log_message(msg)
     try:
         if _real_log is not None:
-            _real_log(msg, level=level, module=module, **_)
+            _real_log(safe_msg, level=level, module=module, **_)
         else:
-            print(f"[{module}] {level}: {msg}")
+            print(f"[{module}] {level}: {safe_msg}")
     except Exception:
         pass
 
@@ -54,22 +70,14 @@ def _load_config() -> dict[str, Any]:
             return cfg
         return dict(cfg)
     except Exception:
-        try:
-            with open(config_path(), "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return {}
 
 
 def _save_config(cfg: dict[str, Any]) -> None:
     try:
         save_config(cfg)
     except Exception:
-        try:
-            with open(config_path(), "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        pass
 
 
 def _blocks(cfg: dict[str, Any], instance_id: Any) -> tuple[str, dict[str, Any], dict[str, Any]]:
@@ -161,14 +169,14 @@ class _TraktProvider:
           <div class="cw-subpanel active" data-sub="auth">
             <div class="grid2">
               <div>
-                <label>Client ID</label>
-                <input id="trakt_client_id" placeholder="Enter your Trakt Client ID"
+                <label for="trakt_client_id">Client ID</label>
+                <input id="trakt_client_id" name="trakt_client_id" placeholder="Enter your Trakt Client ID"
                   oninput="updateTraktHint()"
                   onchange="try{saveSetting('trakt.client_id', this.value); updateTraktHint();}catch(_){}">
               </div>
               <div>
-                <label>Client Secret</label>
-                <input id="trakt_client_secret" type="password" placeholder="Enter your Trakt Client Secret"
+                <label for="trakt_client_secret">Client Secret</label>
+                <input id="trakt_client_secret" name="trakt_client_secret" type="password" placeholder="Enter your Trakt Client Secret"
                   oninput="updateTraktHint()"
                   onchange="try{saveSetting('trakt.client_secret', this.value); updateTraktHint();}catch(_){}">
               </div>
@@ -185,14 +193,14 @@ class _TraktProvider:
 
             <div class="grid2">
               <div>
-                <label>Current token</label>
+                <div class="field-label">Current token</div>
                 <div style="display:flex;gap:8px">
                   <input id="trakt_token" placeholder="empty = not set" readonly>
                   <button id="btn-copy-trakt-token" class="btn copy" onclick="copyInputValue('trakt_token', this)">Copy</button>
                 </div>
               </div>
               <div>
-                <label>Link code (PIN)</label>
+                <div class="field-label">Link code (PIN)</div>
                 <div style="display:flex;gap:8px">
                   <input id="trakt_pin" placeholder="" readonly>
                   <button id="btn-copy-trakt-pin" class="btn copy" onclick="copyInputValue('trakt_pin', this)">Copy</button>

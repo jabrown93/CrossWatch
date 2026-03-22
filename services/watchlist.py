@@ -256,7 +256,7 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
     if len(parts) >= 2:
         k = parts[-2].lower().strip()
         v = parts[-1].strip()
-        if k in {"imdb", "tmdb", "tvdb", "trakt", "slug", "jellyfin", "emby", "anilist", "mal"} and v:
+        if k in {"tmdb", "imdb", "tvdb", "trakt", "slug", "jellyfin", "emby", "anilist", "mal"} and v:
             ids.setdefault(k, v)
     if "thetvdb" in ids and "tvdb" not in ids:
         ids["tvdb"] = ids.get("thetvdb")
@@ -265,11 +265,11 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
         ids["imdb"] = f"tt{imdb}"
     out: dict[str, Any] = {}
     for k in (
-        "simkl",
-        "imdb",
         "tmdb",
+        "imdb",
         "tvdb",
         "trakt",
+        "simkl",
         "slug",
         "jellyfin",
         "emby",
@@ -285,6 +285,77 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_WATCHLIST_ALIAS_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "slug", "anilist", "mal")
+
+
+def _watchlist_alias_tokens(key: str, item: dict[str, Any]) -> set[str]:
+    ids = _ids_from_key_or_item(key, item)
+    out: set[str] = set()
+    for name in _WATCHLIST_ALIAS_ID_KEYS:
+        value = ids.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if name == "imdb" and text.isdigit():
+            text = f"tt{text}"
+        out.add(f"{name}:{text}")
+    return out
+
+
+def _group_watchlist_refs(
+    refs: list[tuple[str, str, str, dict[str, Any]]],
+) -> list[list[tuple[str, str, str, dict[str, Any]]]]:
+    if not refs:
+        return []
+
+    parents = list(range(len(refs)))
+
+    def _find(i: int) -> int:
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parents[rb] = ra
+
+    seen_by_token: dict[str, int] = {}
+    for idx, (key, _prov, _inst, item) in enumerate(refs):
+        for token in _watchlist_alias_tokens(key, item):
+            prev = seen_by_token.get(token)
+            if prev is None:
+                seen_by_token[token] = idx
+                continue
+            _union(idx, prev)
+
+    grouped: dict[int, list[tuple[str, str, str, dict[str, Any]]]] = {}
+    for idx, ref in enumerate(refs):
+        grouped.setdefault(_find(idx), []).append(ref)
+    return list(grouped.values())
+
+
+def _preferred_watchlist_key(alias_keys: list[str], info: dict[str, Any], typ: str) -> str:
+    ids = _ids_from_key_or_item("", info)
+    ordered = ("tmdb", "imdb", "tvdb", "trakt", "slug", "anilist", "mal")
+
+    for name in ordered:
+        value = ids.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if name == "imdb" and text.isdigit():
+            text = f"tt{text}"
+        return f"{name}:{text}"
+
+    return alias_keys[0] if alias_keys else ""
+
+
 def _type_from_item_or_guess(item: dict[str, Any], key: str) -> str:
     typ = (item.get("type") or "").lower().strip()
     if typ == "movie":
@@ -298,7 +369,7 @@ def _type_from_item_or_guess(item: dict[str, Any], key: str) -> str:
     return "tv" if pref in {"tvdb", "thetvdb", "anilist", "mal"} else "movie"
 
 
-_SIMKL_ID_KEYS = ("simkl", "imdb", "tmdb", "tvdb", "slug")
+_SIMKL_ID_KEYS = ("tmdb", "imdb", "tvdb", "simkl", "slug")
 
 
 def _simkl_filter_ids(ids: dict[str, Any]) -> dict[str, Any]:
@@ -357,10 +428,10 @@ def _guid_variants_from_key_or_item(
     prov, ident = prov.lower().strip(), ident.strip()
     if not (prov and ident):
         ids = (item or {}).get("ids") or {}
-        if ids.get("imdb"):
-            prov, ident = "imdb", str(ids["imdb"])
-        elif ids.get("tmdb"):
+        if ids.get("tmdb"):
             prov, ident = "tmdb", str(ids["tmdb"])
+        elif ids.get("imdb"):
+            prov, ident = "imdb", str(ids["imdb"])
         elif ids.get("tvdb") or ids.get("thetvdb"):
             prov, ident = "tvdb", str(ids.get("tvdb") or ids.get("thetvdb"))
     if not (prov and ident):
@@ -775,7 +846,7 @@ def _get_items(state: dict[str, Any], prov: str) -> dict[str, Any]:
 def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]]:
     providers = _registry_sync_providers()
     hidden = _load_hide_set()
-    by_key: dict[str, list[tuple[str, str, dict[str, Any]]]] = {}
+    raw_refs: list[tuple[str, str, str, dict[str, Any]]] = []
 
     for p in providers:
         refs = _get_provider_item_refs(state, p, instance_id="all")
@@ -784,10 +855,15 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
                 continue
             for it in arr or []:
                 inst = str((it or {}).get("_cw_instance") or _DEFAULT_INSTANCE)
-                by_key.setdefault(str(k), []).append((p.lower(), inst, it))
+                raw_refs.append((str(k), p.lower(), inst, it))
 
     out: list[dict[str, Any]] = []
-    for key, candidates in by_key.items():
+    for group in _group_watchlist_refs(raw_refs):
+        if not group:
+            continue
+        alias_keys = sorted({key for key, _, _, _ in group})
+        key = alias_keys[0] if alias_keys else ""
+        candidates = [(prov, inst, it) for _key, prov, inst, it in group]
         if not candidates:
             continue
 
@@ -838,6 +914,8 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
             else:
                 typ = "tv" if ids_.get("tvdb") else "movie"
 
+        key = _preferred_watchlist_key(alias_keys, info, typ)
+
         title = info.get("title") or info.get("name") or ""
         year = info.get("year") or info.get("release_year")
         tmdb_id = (info.get("ids") or {}).get("tmdb") or info.get("tmdb")
@@ -854,6 +932,7 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
         out.append(
             {
                 "key": key,
+                "aliases": alias_keys,
                 "type": typ,
                 "title": title,
                 "year": year,
@@ -1125,7 +1204,7 @@ def _delete_on_trakt_batch(
     for it in items:
         ids = _ids_from_key_or_item(it["key"], it["item"])
         entry = {
-            k: ids[k] for k in ("trakt", "imdb", "tmdb", "tvdb") if ids.get(k)
+            k: ids[k] for k in ("tmdb", "imdb", "tvdb", "trakt") if ids.get(k)
         }
         if not entry:
             continue
@@ -1250,14 +1329,20 @@ def _delete_on_mdblist_batch(
     for it in items or []:
         ids = _ids_from_key_or_item(it["key"], it["item"])
         entry: dict[str, Any] = {}
+        typ = str(it.get("type") or "").strip().lower()
         tmdb = ids.get("tmdb")
         imdb = ids.get("imdb")
+        tvdb = ids.get("tvdb")
         if tmdb and str(tmdb).isdigit():
             entry["tmdb"] = int(str(tmdb))
         elif tmdb:
             entry["tmdb"] = tmdb
         if imdb:
             entry["imdb"] = imdb
+        if typ == "movie" and not entry and tvdb and str(tvdb).isdigit():
+            entry["tvdb"] = int(str(tvdb))
+        elif typ == "movie" and not entry and tvdb:
+            entry["tvdb"] = tvdb
         if not entry:
             continue
         if it.get("type") == "movie":
@@ -1463,16 +1548,6 @@ def detect_available_watchlist_providers(
     except Exception:
         pass
 
-    if providers and not any(counts.values()):
-        try:
-            from cw_platform.orchestrator import Orchestrator
-
-            snaps = Orchestrator(config=cfg).build_snapshots(feature="watchlist") or {}
-            for pid in providers:
-                counts[pid] = len(snaps.get(pid) or {})
-        except Exception:
-            pass
-
     arr: list[dict[str, Any]] = []
     for pid in providers:
         conf = _configured_via_registry(pid, cfg)
@@ -1499,4 +1574,3 @@ def detect_available_watchlist_providers(
         },
     )
     return arr
-

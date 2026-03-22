@@ -19,6 +19,7 @@ from ._common import (
     extract_latest_ts,
     state_file,
     _pair_scope,
+    _is_capture_mode,
 )
 from .._mod_common import request_with_retries
 from cw_platform.id_map import minimal as id_minimal, canonical_key
@@ -31,6 +32,15 @@ URL_ADD = f"{BASE}/sync/history"
 URL_REMOVE = f"{BASE}/sync/history/remove"
 URL_COLL_ADD = f"{BASE}/sync/collection"
 RESOLVE_ENABLE = False
+
+def _int_or_none(x: Any) -> int | None:
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
 
 def _unresolved_path() -> Path:
     return state_file("trakt_history.unresolved.json")
@@ -45,7 +55,7 @@ def _cache_path() -> Path:
 
 
 def _bust_index_cache(reason: str) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         p = _cache_path()
@@ -72,7 +82,7 @@ def _not_found_count(nf: Any) -> int:
     return c
 
 def _record_limit_error(feature: str) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         _last_limit_path().parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +129,7 @@ def _legacy_path(path: Path) -> Path | None:
 def _migrate_legacy_json(path: Path) -> None:
     if path.exists():
         return
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
     if not legacy or not legacy.exists():
@@ -188,6 +198,17 @@ def _as_epoch(iso: str) -> int | None:
         return None
 
 
+def _max_iso(a: str | None, b: str | None) -> str | None:
+    if not a:
+        return b
+    if not b:
+        return a
+    ea = _as_epoch(_iso8601(a) or a) or 0
+    eb = _as_epoch(_iso8601(b) or b) or 0
+    return b if eb >= ea else a
+
+
+
 def _cfg(adapter: Any) -> Any:
     return getattr(adapter, "cfg", None) or getattr(adapter, "config", {})
 
@@ -246,7 +267,7 @@ def _history_collection_types(adapter: Any) -> set[str]:
 
 
 def _load_unresolved() -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     p = _unresolved_path()
     _migrate_legacy_json(p)
@@ -257,7 +278,7 @@ def _load_unresolved() -> dict[str, Any]:
 
 
 def _save_unresolved(data: Mapping[str, Any]) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         _unresolved_path().parent.mkdir(parents=True, exist_ok=True)
@@ -269,7 +290,7 @@ def _save_unresolved(data: Mapping[str, Any]) -> None:
 
 
 def _load_cache_doc() -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     try:
         p = _cache_path()
@@ -282,7 +303,7 @@ def _load_cache_doc() -> dict[str, Any]:
 
 
 def _save_cache_doc(items: Mapping[str, Any], watched_at: str | None) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         _cache_path().parent.mkdir(parents=True, exist_ok=True)
@@ -292,6 +313,64 @@ def _save_cache_doc(items: Mapping[str, Any], watched_at: str | None) -> None:
         os.replace(tmp, _cache_path())
     except Exception as e:
         _warn("cache_save_failed", error=str(e))
+
+
+def _cache_merge_from_source_items(adapter: Any, items: Iterable[Mapping[str, Any]]) -> None:
+    if _is_capture_mode() or _pair_scope() is None:
+        return
+    try:
+        doc = _load_cache_doc()
+        cache_items: dict[str, dict[str, Any]] = dict(doc.get("items") or {})
+        wm_prev = str((doc.get("wm") or {}).get("watched_at") or "").strip() or None
+
+        added = 0
+        wm = wm_prev
+        for it in items or []:
+            if not isinstance(it, Mapping):
+                continue
+            m = id_minimal(it)
+            if not isinstance(m, dict):
+                continue
+            w = _iso8601(m.get("watched_at") or it.get("watched_at"))
+            ts = _as_epoch(w) if w else None
+            if not ts:
+                continue
+
+            typ = str(m.get("type") or "").lower()
+            if typ == "episode" and isinstance(m.get("show_ids"), Mapping) and m.get("season") is not None and m.get("episode") is not None:
+                base_key = canonical_key(
+                    id_minimal(
+                        {
+                            "type": "episode",
+                            "show_ids": dict(m.get("show_ids") or {}),
+                            "season": m.get("season"),
+                            "episode": m.get("episode"),
+                        }
+                    )
+                )
+            else:
+                base_key = canonical_key(m)
+
+            if not base_key:
+                continue
+
+            ek = f"{base_key}@{int(ts)}"
+            if ek not in cache_items:
+                out = dict(m)
+                out["watched"] = True
+                out["watched_at"] = w
+                cache_items[ek] = out
+                added += 1
+
+            wm = _max_iso(wm, w)
+
+        if added:
+            _info("index_cache_merge", added=added, cache_count=len(cache_items))
+
+        _save_cache_doc(cache_items, wm or wm_prev)
+    except Exception as e:
+        _warn("index_cache_merge_failed", error=str(e))
+
 
 
 def _freeze_item_if_enabled(adapter: Any, item: Mapping[str, Any], *, action: str, reasons: list[str]) -> None:
@@ -375,6 +454,14 @@ def _preflight_total(
         return None
 
 
+def _history_params(*, page: int, limit: int, start_at: str | None = None, end_at: str | None = None) -> dict[str, Any]:
+    params: dict[str, Any] = {"page": int(page), "limit": int(limit)}
+    if start_at:
+        params["start_at"] = str(start_at)
+    if end_at:
+        params["end_at"] = str(end_at)
+    return params
+
 def _fetch_history(
     sess: Any,
     headers: Mapping[str, Any],
@@ -384,6 +471,8 @@ def _fetch_history(
     max_pages: int,
     timeout: float,
     max_retries: int,
+    start_at: str | None = None,
+    end_at: str | None = None,
     bump: Callable[[int], None] | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -395,7 +484,7 @@ def _fetch_history(
             "GET",
             url,
             headers=headers,
-            params={"page": page, "limit": per_page},
+            params=_history_params(page=page, limit=per_page, start_at=start_at, end_at=end_at),
             timeout=timeout,
             max_retries=max_retries,
         )
@@ -411,6 +500,7 @@ def _fetch_history(
             break
         added = 0
         for row in rows:
+            hid = row.get("id")
             w = row.get("watched_at")
             if not w:
                 continue
@@ -421,6 +511,8 @@ def _fetch_history(
                     {"type": "movie", "ids": mv.get("ids") or {}, "title": mv.get("title"), "year": mv.get("year")}
                 )
                 m["watched_at"] = w
+                if hid is not None:
+                    m["_trakt_history_id"] = str(hid)
                 out.append(m)
                 added += 1
             elif typ == "episode" and isinstance(row.get("episode"), dict):
@@ -438,6 +530,8 @@ def _fetch_history(
                     }
                 )
                 m["watched_at"] = w
+                if hid is not None:
+                    m["_trakt_history_id"] = str(hid)
                 out.append(m)
                 added += 1
         if bump and added:
@@ -497,6 +591,90 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 100000) -
                 except Exception:
                     pass
             return cached_items
+
+        if a is not None and b is not None and a > b:
+            start_at = _iso8601(cached_wm) or cached_wm
+            end_at = _iso8601(remote_wm) or remote_wm
+            _info("index_cache_delta", start_at=start_at, end_at=end_at, cached=len(cached_items))
+            try:
+                idx: dict[str, dict[str, Any]] = dict(cached_items)
+                announced_total = None
+                if prog:
+                    try:
+                        prog.tick(0, total=len(idx), force=True)
+                    except Exception:
+                        pass
+
+                movies = _fetch_history(
+                    sess,
+                    headers,
+                    URL_HIST_MOV,
+                    per_page=cfg_per_page,
+                    max_pages=cfg_max_pages,
+                    timeout=timeout,
+                    max_retries=retries,
+                    start_at=start_at,
+                    end_at=end_at,
+                )
+                episodes = _fetch_history(
+                    sess,
+                    headers,
+                    URL_HIST_EPI,
+                    per_page=cfg_per_page,
+                    max_pages=cfg_max_pages,
+                    timeout=timeout,
+                    max_retries=retries,
+                    start_at=start_at,
+                    end_at=end_at,
+                )
+
+                base_keys_to_unfreeze: set[str] = set()
+                added = 0
+
+                for m in movies + episodes:
+                    w = _iso8601(m.get("watched_at"))
+                    ts = _as_epoch(w) if w else None
+                    if not ts:
+                        continue
+                    if (
+                        m.get("type") == "episode"
+                        and isinstance(m.get("show_ids"), dict)
+                        and m.get("season") is not None
+                        and m.get("episode") is not None
+                    ):
+                        base_key = canonical_key(
+                            id_minimal(
+                                {
+                                    "type": "episode",
+                                    "show_ids": m["show_ids"],
+                                    "season": m["season"],
+                                    "episode": m["episode"],
+                                }
+                            )
+                        )
+                    else:
+                        base_key = canonical_key(id_minimal(m))
+                    ek = f"{base_key}@{ts}"
+
+                    if ek in idx:
+                        # Already cached; keep existing.
+                        continue
+
+                    idx[ek] = m
+                    base_keys_to_unfreeze.add(base_key)
+                    added += 1
+
+                _unfreeze_keys_if_present(adapter, base_keys_to_unfreeze)
+                if prog:
+                    try:
+                        prog.done(ok=True, total=len(idx))
+                    except Exception:
+                        pass
+                _info("index_cache_delta_done", added=added, count=len(idx))
+                _save_cache_doc(idx, end_at)
+                return idx
+            except Exception as e:
+                _warn("index_cache_delta_failed", error=str(e))
     elif cached_items and not remote_wm:
         _info("index_cache_hit", reason="activities_unavailable", count=len(cached_items))
         if prog:
@@ -594,8 +772,44 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 100000) -
         else:
             base_key = canonical_key(id_minimal(m))
         ek = f"{base_key}@{ts}"
-        idx[ek] = m
-        base_keys_to_unfreeze.add(base_key)
+
+        # Collision guard:
+        if ek in idx:
+            ids = m.get("ids") if isinstance(m.get("ids"), Mapping) else {}
+            trakt_id = str(ids.get("trakt") or "").strip() if isinstance(ids, Mapping) else ""
+            tmdb_id = str(ids.get("tmdb") or "").strip() if isinstance(ids, Mapping) else ""
+            imdb_id = str(ids.get("imdb") or "").strip() if isinstance(ids, Mapping) else ""
+            hid = str(m.get("_trakt_history_id") or "").strip()
+
+            if trakt_id:
+                alt_base = f"trakt:{trakt_id}".lower()
+            elif tmdb_id:
+                alt_base = f"tmdb:{tmdb_id}".lower()
+            else:
+                alt_base = str(base_key or "unknown:").lower()
+
+            suffix = f"~h{hid}" if hid else "~dup"
+            ek2 = f"{alt_base}@{ts}{suffix}"
+            n = 2
+            while ek2 in idx:
+                ek2 = f"{alt_base}@{ts}{suffix}{n}"
+                n += 1
+
+            _warn(
+                "history_key_collision",
+                key=ek,
+                key2=ek2,
+                imdb=imdb_id or None,
+                trakt=trakt_id or None,
+                tmdb=tmdb_id or None,
+                history_id=hid or None,
+            )
+            idx[ek2] = m
+            base_keys_to_unfreeze.add(alt_base)
+        else:
+            idx[ek] = m
+            base_keys_to_unfreeze.add(base_key)
+
     _unfreeze_keys_if_present(adapter, base_keys_to_unfreeze)
     if prog:
         try:
@@ -768,165 +982,413 @@ def _extract_show_ids_for_episode(it: Mapping[str, Any]) -> dict[str, Any]:
     show_ids = dict(it.get("show_ids") or {})
     if not show_ids and (it.get("season") is not None and it.get("episode") is not None):
         show_ids = dict(it.get("ids") or {})
-    return {k: show_ids[k] for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if show_ids.get(k)}
+
+    out: dict[str, Any] = {}
+    for k in ("trakt", "slug", "tmdb", "imdb", "tvdb"):
+        v = show_ids.get(k)
+        if not v:
+            continue
+        if k in ("trakt", "tmdb", "tvdb"):
+            try:
+                out[k] = int(v)
+            except Exception:
+                s = str(v).strip()
+                if s.isdigit():
+                    out[k] = int(s)
+        elif k == "imdb":
+            s = str(v).strip()
+            if s:
+                out[k] = s
+        else:
+            s = str(v).strip()
+            if s:
+                out[k] = s
+    return out
+
+
+def _history_when_for_add(item: Mapping[str, Any], kind: str) -> tuple[str | None, str | None]:
+    raw = item.get("watched_at")
+    if raw is None:
+        return None, None
+    s = str(raw).strip()
+    if not s:
+        return None, None
+    special = s.lower()
+    if kind == "episodes" and special in {"released", "unknown"}:
+        return special, None
+    when = _iso8601(raw)
+    if when:
+        return when, None
+    return None, "invalid watched_at"
+
+
+def _history_item_minimal(kind: str, item: Mapping[str, Any], ids: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    ids = dict(ids or {})
+    if kind == "movies":
+        return id_minimal({"type": "movie", "ids": ids})
+    if kind == "shows":
+        return id_minimal({"type": "show", "ids": ids})
+    if kind == "seasons":
+        out: dict[str, Any] = {"type": "season"}
+        if ids:
+            out["ids"] = ids
+        show_ids = dict(item.get("show_ids") or {})
+        if show_ids:
+            out["show_ids"] = show_ids
+        season_no = item.get("season")
+        if season_no is None:
+            season_no = item.get("number")
+        if season_no is not None:
+            sn = _int_or_none(season_no)
+            if sn is not None:
+                out["season"] = sn
+        return id_minimal(out)
+    out: dict[str, Any] = {"type": "episode"}
+    if ids:
+        out["ids"] = ids
+    show_ids = dict(item.get("show_ids") or {})
+    if show_ids:
+        out["show_ids"] = show_ids
+    season_no = item.get("season")
+    if season_no is None:
+        season_no = item.get("season_number")
+    episode_no = item.get("episode")
+    if episode_no is None:
+        episode_no = item.get("episode_number")
+    if season_no is not None:
+        sn = _int_or_none(season_no)
+        if sn is not None:
+            out["season"] = sn
+    if episode_no is not None:
+        en = _int_or_none(episode_no)
+        if en is not None:
+            out["episode"] = en
+    return id_minimal(out)
+
+
+def _parse_raw_history_id(item: Mapping[str, Any]) -> int | None:
+    raw = item.get("_trakt_history_id")
+    if raw is None:
+        raw = item.get("history_id")
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return int(s) if s.isdigit() else None
 
 
 def _batch_add(
     adapter: Any,
     items: Iterable[Mapping[str, Any]],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[dict[str, Any]], list[str]]:
     movies: list[dict[str, Any]] = []
-    episodes_flat: list[dict[str, Any]] = []
     shows_map: dict[str, dict[str, Any]] = {}
+    seasons: list[dict[str, Any]] = []
+    episodes_flat: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     accepted_keys: list[str] = []
     accepted_minimals: list[dict[str, Any]] = []
 
+    skipped_keys: list[str] = []
+
+    # De-dupe guards (Trakt will 409 on item+watched_at conflicts).
+    seen_movies: set[tuple[str, str]] = set()
+    seen_eps_flat: set[tuple[str, str]] = set()
+    seen_show_eps: dict[tuple[str, int], set[int]] = {}
+
     def _show_key(ids: Mapping[str, Any]) -> str:
         return json.dumps(
-            {k: ids[k] for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if k in ids and ids[k]},
+            {k: str(ids[k]) for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if k in ids and ids[k]},
             sort_keys=True,
         )
+
+    def _accept(m: dict[str, Any]) -> None:
+        accepted_minimals.append(m)
+        accepted_keys.append(key_of(m))
 
     for it in items or []:
         if _is_frozen(adapter, it):
             _dbg("skip_frozen", title=id_minimal(it).get("title"))
             continue
-        when = _iso8601(it.get("watched_at"))
-        if not when:
-            unresolved.append({"item": id_minimal(it), "hint": "missing watched_at"})
-            _freeze_item_if_enabled(adapter, it, action="add", reasons=["missing-watched_at"])
-            continue
+
         kind = (pick_trakt_kind(it) or "movies").lower()
-        if kind == "movies":
-            ids = ids_for_trakt(it)
-            if not ids:
-                unresolved.append({"item": id_minimal(it), "hint": "missing ids"})
-                _freeze_item_if_enabled(adapter, it, action="add", reasons=["missing-ids"])
-                continue
-            movies.append({"ids": ids, "watched_at": when})
-            m_min = id_minimal({"type": "movie", "ids": ids})
-            accepted_minimals.append(m_min)
-            accepted_keys.append(key_of(m_min))
-            continue
-        season = it.get("season") or it.get("season_number")
-        number = it.get("episode") or it.get("episode_number")
-        show_ids = _extract_show_ids_for_episode(it)
         ids = ids_for_trakt(it)
+        show_ids = _extract_show_ids_for_episode(it)
+        season_no = it.get("season")
+        if season_no is None:
+            season_no = it.get("season_number")
+        if season_no is None:
+            season_no = it.get("number")
+        episode_no = it.get("episode")
+        if episode_no is None:
+            episode_no = it.get("episode_number")
 
-        # Prefer show+season+episode payload
-        if show_ids and season is not None and number is not None:
-            skey = _show_key(show_ids)
-            show_entry = shows_map.setdefault(skey, {"ids": show_ids, "seasons": {}})
-            seasons = show_entry["seasons"]  # type: ignore[assignment]
-            season_entry = seasons.setdefault(int(season), {"number": int(season), "episodes": []})
-            season_entry["episodes"].append({"number": int(number), "watched_at": when})
-            e_min = id_minimal({"type": "episode", "show_ids": show_ids, "season": int(season), "episode": int(number)})
-            accepted_minimals.append(e_min)
-            accepted_keys.append(key_of(e_min))
+        when, when_error = _history_when_for_add(it, kind)
+        if when_error:
+            m = _history_item_minimal(kind, it, ids)
+            unresolved.append({"item": m, "hint": when_error})
+            _freeze_item_if_enabled(adapter, m, action="add", reasons=[when_error.replace(" ", "-")])
             continue
 
-        if ids:
-            episodes_flat.append({"ids": ids, "watched_at": when})
-            e_min = id_minimal({"type": "episode", "ids": ids})
-            accepted_minimals.append(e_min)
-            accepted_keys.append(key_of(e_min))
+        if kind == "movies":
+            if not ids:
+                m = _history_item_minimal(kind, it, ids)
+                unresolved.append({"item": m, "hint": "missing ids"})
+                _freeze_item_if_enabled(adapter, m, action="add", reasons=["missing-ids"])
+                continue
+            obj: dict[str, Any] = {"ids": ids}
+            if when:
+                obj["watched_at"] = when
+            sig = (json.dumps(ids, sort_keys=True), str(obj.get("watched_at") or ""))
+            if sig in seen_movies:
+                continue
+            seen_movies.add(sig)
+            movies.append(obj)
+            _accept(_history_item_minimal(kind, it, ids))
             continue
-        unresolved.append({"item": id_minimal(it), "hint": "episode scope or ids missing"})
-        _freeze_item_if_enabled(adapter, it, action="add", reasons=["episode-scope-missing"])
+
+        if kind == "shows":
+            if not ids:
+                m = _history_item_minimal(kind, it, ids)
+                unresolved.append({"item": m, "hint": "missing ids"})
+                _freeze_item_if_enabled(adapter, m, action="add", reasons=["missing-ids"])
+                continue
+            skey = _show_key(ids)
+            entry = shows_map.setdefault(skey, {"ids": ids, "seasons": {}})
+            if when:
+                entry["watched_at"] = when
+            _accept(_history_item_minimal(kind, it, ids))
+            continue
+
+        if kind == "seasons":
+            if ids:
+                obj: dict[str, Any] = {"ids": ids}
+                if when:
+                    obj["watched_at"] = when
+                seasons.append(obj)
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+            if show_ids and season_no is not None:
+                skey = _show_key(show_ids)
+                entry = shows_map.setdefault(skey, {"ids": show_ids, "seasons": {}})
+                season_i = _int_or_none(season_no)
+                if season_i is None:
+                    m = _history_item_minimal(kind, it, ids)
+                    unresolved.append({"item": m, "hint": "invalid season number"})
+                    _freeze_item_if_enabled(adapter, m, action="add", reasons=["season-number-invalid"])
+                    continue
+                season_entry = entry["seasons"].setdefault(season_i, {"number": season_i})
+                if when:
+                    season_entry["watched_at"] = when
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+            m = _history_item_minimal(kind, it, ids)
+            unresolved.append({"item": m, "hint": "season scope or ids missing"})
+            _freeze_item_if_enabled(adapter, m, action="add", reasons=["season-scope-missing"])
+            continue
+        if kind == "episodes":
+            show_scope_ok = bool(show_ids and season_no is not None and episode_no is not None)
+            strong_ids = bool(ids and ("trakt" in ids))
+            use_ids = bool(ids) and (strong_ids or not show_scope_ok)
+            if show_scope_ok and show_ids and not strong_ids:
+                use_ids = False
+
+            # Avoid writing roll-up episodes
+            if not show_scope_ok and (season_no is None or episode_no is None) and not (ids and ("trakt" in ids)):
+                m = _history_item_minimal(kind, it, ids)
+                unresolved.append({"item": m, "hint": "missing season/episode"})
+                _freeze_item_if_enabled(adapter, m, action="add", reasons=["missing-season-episode"])
+                continue
+
+            if use_ids:
+                obj: dict[str, Any] = {"ids": ids}
+                if when:
+                    obj["watched_at"] = when
+                sig = (json.dumps(ids, sort_keys=True), str(obj.get("watched_at") or ""))
+                if sig in seen_eps_flat:
+                    continue
+                seen_eps_flat.add(sig)
+                episodes_flat.append(obj)
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+
+            if show_scope_ok:
+                skey = _show_key(show_ids)
+                entry = shows_map.setdefault(skey, {"ids": show_ids, "seasons": {}})
+                season_i = _int_or_none(season_no)
+                epn = _int_or_none(episode_no)
+                if season_i is None or epn is None:
+                    continue
+                season_entry = entry["seasons"].setdefault(season_i, {"number": season_i, "episodes": []})
+
+                seen = seen_show_eps.setdefault((skey, season_i), set())
+                if epn in seen:
+                    continue
+                seen.add(epn)
+
+                ep_obj: dict[str, Any] = {"number": epn}
+                if when:
+                    ep_obj["watched_at"] = when
+                season_entry.setdefault("episodes", []).append(ep_obj)
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+
+            m = _history_item_minimal(kind, it, ids)
+            unresolved.append({"item": m, "hint": "episode scope or ids missing"})
+            _freeze_item_if_enabled(adapter, m, action="add", reasons=["episode-scope-missing"])
 
     body: dict[str, Any] = {}
     if movies:
         body["movies"] = movies
+    if shows_map:
+        body["shows"] = []
+        for entry in shows_map.values():
+            obj: dict[str, Any] = {"ids": entry["ids"]}
+            if entry.get("watched_at"):
+                obj["watched_at"] = entry["watched_at"]
+            if entry.get("seasons"):
+                obj["seasons"] = list(entry["seasons"].values())
+            body["shows"].append(obj)
+    if seasons:
+        body["seasons"] = seasons
     if episodes_flat:
         body["episodes"] = episodes_flat
-    if shows_map:
-        body["shows"] = [
-            {"ids": v["ids"], "seasons": list(v["seasons"].values())}
-            for v in shows_map.values()
-        ]
-    return body, unresolved, accepted_keys, accepted_minimals
+    return body, unresolved, accepted_keys, accepted_minimals, skipped_keys
 
 
 def _batch_remove(
     adapter: Any,
     items: Iterable[Mapping[str, Any]],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[int, dict[str, Any]]]:
     movies: list[dict[str, Any]] = []
-    episodes_flat: list[dict[str, Any]] = []
     shows_map: dict[str, dict[str, Any]] = {}
+    seasons: list[dict[str, Any]] = []
+    episodes_flat: list[dict[str, Any]] = []
+    raw_ids: list[int] = []
+    raw_id_map: dict[int, dict[str, Any]] = {}
     unresolved: list[dict[str, Any]] = []
     accepted_keys: list[str] = []
     accepted_minimals: list[dict[str, Any]] = []
 
     def _show_key(ids: Mapping[str, Any]) -> str:
         return json.dumps(
-            {k: ids[k] for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if k in ids and ids[k]},
+            {k: str(ids[k]) for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if k in ids and ids[k]},
             sort_keys=True,
         )
+
+    def _accept(m: dict[str, Any]) -> None:
+        accepted_minimals.append(m)
+        accepted_keys.append(key_of(m))
 
     for it in items or []:
         if _is_frozen(adapter, it):
             _dbg("skip_frozen", title=id_minimal(it).get("title"))
             continue
-        when = _iso8601(it.get("watched_at"))
-        if not when:
-            unresolved.append({"item": id_minimal(it), "hint": "missing watched_at"})
-            _freeze_item_if_enabled(adapter, it, action="remove", reasons=["missing-watched_at"])
+
+        raw_history_id = _parse_raw_history_id(it)
+        if raw_history_id is not None:
+            m = id_minimal(it)
+            raw_ids.append(raw_history_id)
+            raw_id_map[raw_history_id] = m
+            _accept(m)
             continue
+
         kind = (pick_trakt_kind(it) or "movies").lower()
-        if kind == "movies":
-            ids = ids_for_trakt(it)
-            if not ids:
-                unresolved.append({"item": id_minimal(it), "hint": "missing ids"})
-                _freeze_item_if_enabled(adapter, it, action="remove", reasons=["missing-ids"])
-                continue
-            movies.append({"ids": ids, "watched_at": when})
-            m_min = id_minimal({"type": "movie", "ids": ids})
-            accepted_minimals.append(m_min)
-            accepted_keys.append(key_of(m_min))
-            continue
-        season = it.get("season") or it.get("season_number")
-        number = it.get("episode") or it.get("episode_number")
-        show_ids = _extract_show_ids_for_episode(it)
         ids = ids_for_trakt(it)
+        show_ids = _extract_show_ids_for_episode(it)
+        season_no = it.get("season")
+        if season_no is None:
+            season_no = it.get("season_number")
+        if season_no is None:
+            season_no = it.get("number")
+        episode_no = it.get("episode")
+        if episode_no is None:
+            episode_no = it.get("episode_number")
 
-        # Prefer show+season+episode payload
-        if show_ids and season is not None and number is not None:
-            skey = _show_key(show_ids)
-            show_entry = shows_map.setdefault(skey, {"ids": show_ids, "seasons": {}})
-            seasons = show_entry["seasons"]  # type: ignore[assignment]
-            season_entry = seasons.setdefault(int(season), {"number": int(season), "episodes": []})
-            season_entry["episodes"].append({"number": int(number), "watched_at": when})
-            e_min = id_minimal({"type": "episode", "show_ids": show_ids, "season": int(season), "episode": int(number)})
-            accepted_minimals.append(e_min)
-            accepted_keys.append(key_of(e_min))
+        if kind == "movies":
+            if not ids:
+                m = _history_item_minimal(kind, it, ids)
+                unresolved.append({"item": m, "hint": "missing ids"})
+                _freeze_item_if_enabled(adapter, m, action="remove", reasons=["missing-ids"])
+                continue
+            movies.append({"ids": ids})
+            _accept(_history_item_minimal(kind, it, ids))
             continue
 
-        if ids:
-            episodes_flat.append({"ids": ids, "watched_at": when})
-            e_min = id_minimal({"type": "episode", "ids": ids})
-            accepted_minimals.append(e_min)
-            accepted_keys.append(key_of(e_min))
+        if kind == "shows":
+            if not ids:
+                m = _history_item_minimal(kind, it, ids)
+                unresolved.append({"item": m, "hint": "missing ids"})
+                _freeze_item_if_enabled(adapter, m, action="remove", reasons=["missing-ids"])
+                continue
+            skey = _show_key(ids)
+            shows_map.setdefault(skey, {"ids": ids, "seasons": {}})
+            _accept(_history_item_minimal(kind, it, ids))
             continue
-        unresolved.append({"item": id_minimal(it), "hint": "episode scope or ids missing"})
-        _freeze_item_if_enabled(adapter, it, action="remove", reasons=["episode-scope-missing"])
+
+        if kind == "seasons":
+            if ids:
+                seasons.append({"ids": ids})
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+            if show_ids and season_no is not None:
+                skey = _show_key(show_ids)
+                entry = shows_map.setdefault(skey, {"ids": show_ids, "seasons": {}})
+                season_i = _int_or_none(season_no)
+                if season_i is None:
+                    m = _history_item_minimal(kind, it, ids)
+                    unresolved.append({"item": m, "hint": "invalid season number"})
+                    _freeze_item_if_enabled(adapter, m, action="remove", reasons=["season-number-invalid"])
+                    continue
+                entry["seasons"].setdefault(season_i, {"number": season_i})
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+            m = _history_item_minimal(kind, it, ids)
+            unresolved.append({"item": m, "hint": "season scope or ids missing"})
+            _freeze_item_if_enabled(adapter, m, action="remove", reasons=["season-scope-missing"])
+            continue
+
+        if kind == "episodes":
+            if show_ids and season_no is not None and episode_no is not None:
+                skey = _show_key(show_ids)
+                entry = shows_map.setdefault(skey, {"ids": show_ids, "seasons": {}})
+                season_i = _int_or_none(season_no)
+                ep_i = _int_or_none(episode_no)
+                if season_i is None or ep_i is None:
+                    m = _history_item_minimal(kind, it, ids)
+                    unresolved.append({"item": m, "hint": "invalid season/episode number"})
+                    _freeze_item_if_enabled(adapter, m, action="remove", reasons=["season-episode-number-invalid"])
+                    continue
+                season_entry = entry["seasons"].setdefault(season_i, {"number": season_i, "episodes": []})
+                season_entry.setdefault("episodes", []).append({"number": ep_i})
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+            if ids:
+                episodes_flat.append({"ids": ids})
+                _accept(_history_item_minimal(kind, it, ids))
+                continue
+            m = _history_item_minimal(kind, it, ids)
+            unresolved.append({"item": m, "hint": "episode scope or ids missing"})
+            _freeze_item_if_enabled(adapter, m, action="remove", reasons=["episode-scope-missing"])
 
     body: dict[str, Any] = {}
     if movies:
         body["movies"] = movies
+    if shows_map:
+        body["shows"] = []
+        for entry in shows_map.values():
+            obj: dict[str, Any] = {"ids": entry["ids"]}
+            if entry.get("seasons"):
+                obj["seasons"] = list(entry["seasons"].values())
+            body["shows"].append(obj)
+    if seasons:
+        body["seasons"] = seasons
     if episodes_flat:
         body["episodes"] = episodes_flat
-    if shows_map:
-        body["shows"] = [
-            {"ids": v["ids"], "seasons": list(v["seasons"].values())}
-            for v in shows_map.values()
-        ]
-    return body, unresolved, accepted_keys, accepted_minimals
-
+    if raw_ids:
+        body["ids"] = sorted(set(raw_ids))
+    return body, unresolved, accepted_keys, accepted_minimals, raw_id_map
 
 def _history_body_to_collection(body: Mapping[str, Any], types: set[str]) -> dict[str, Any]:
-
     out: dict[str, Any] = {}
     if "movies" in types:
         seen_movies: set[str] = set()
@@ -995,9 +1457,80 @@ def _history_body_to_collection(body: Mapping[str, Any], types: set[str]) -> dic
                 out["shows"] = coll_shows
     return out
 
+def _unresolved_from_not_found(nf: Any, raw_id_map: Mapping[int, Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(nf, dict):
+        return out
+
+    for bucket, typ in (("movies", "movie"), ("seasons", "season"), ("episodes", "episode")):
+        for obj in nf.get(bucket) or []:
+            if not isinstance(obj, dict):
+                continue
+            out.append({"item": id_minimal({"type": typ, "ids": obj.get("ids") or {}}), "hint": "not_found"})
+
+    for obj in nf.get("shows") or []:
+        if not isinstance(obj, dict):
+            continue
+        ids = obj.get("ids") or {}
+        seasons = obj.get("seasons") or []
+        if ids and not seasons:
+            out.append({"item": id_minimal({"type": "show", "ids": ids}), "hint": "not_found"})
+
+    out.extend(_unresolved_from_nf_shows(nf.get("shows")))
+
+    if raw_id_map:
+        for raw in nf.get("ids") or []:
+            try:
+                rid = int(raw)
+            except Exception:
+                continue
+            item = raw_id_map.get(rid)
+            if item:
+                out.append({"item": dict(item), "hint": "not_found"})
+
+    return out
 
 
-def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+def _unresolved_from_nf_shows(nf_shows: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(nf_shows, list):
+        return out
+
+    for sh in nf_shows:
+        if not isinstance(sh, dict):
+            continue
+        show_ids = (sh.get("ids") or {})
+        seasons = sh.get("seasons") or []
+        if not isinstance(seasons, list):
+            continue
+        for s in seasons:
+            if not isinstance(s, dict):
+                continue
+            sn = s.get("number")
+            eps = s.get("episodes") or []
+            if sn is None or not isinstance(eps, list):
+                continue
+            for ep in eps:
+                if not isinstance(ep, dict):
+                    continue
+                en = ep.get("number")
+                if en is None:
+                    continue
+                m = id_minimal(
+                    {
+                        "type": "episode",
+                        "show_ids": show_ids,
+                        "season": int(sn),
+                        "episode": int(en),
+                    }
+                )
+                out.append({"item": m, "hint": "not_found"})
+
+    return out
+
+
+
+def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]], list[str]]:
     sess = adapter.client.session
     headers = build_headers(
         {
@@ -1009,42 +1542,95 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     )
     timeout = float(_cfg_num(adapter, "timeout", 10, float))
     retries = int(_cfg_num(adapter, "max_retries", 3, int))
-    body, unresolved, accepted_keys, accepted_minimals = _batch_add(adapter, items)
+    write_timeout = float(_cfg_num(adapter, "history_write_timeout", max(timeout, 60.0), float))
+    items_list = list(items)
+    body, unresolved, accepted_keys, accepted_minimals, skipped_keys = _batch_add(adapter, items_list)
     if not body:
-        return 0, unresolved
+        return 0, unresolved, skipped_keys
     r = request_with_retries(
         sess,
         "POST",
         URL_ADD,
         headers=headers,
         json=body,
-        timeout=timeout,
+        timeout=write_timeout,
         max_retries=retries,
     )
-    ok = 0
+    ok_added = 0
+    ok_total = 0
+    added_total = 0
+    existing_total = 0
     if r.status_code in (200, 201):
         d = r.json() or {}
         added = d.get("added") or {}
         existing = d.get("existing") or {}
-        ok = (
-            int(added.get("movies") or 0)
-            + int(added.get("episodes") or 0)
-            + int(existing.get("movies") or 0)
-            + int(existing.get("episodes") or 0)
-        )
+        added_total = int(added.get("movies") or 0) + int(added.get("episodes") or 0)
+        existing_total = int(existing.get("movies") or 0) + int(existing.get("episodes") or 0)
+        ok_total = added_total + existing_total
+        ok_added = added_total
         nf = d.get("not_found") or {}
-        for t in ("movies", "episodes"):
-            for obj in nf.get(t) or []:
-                m = id_minimal(
-                    {"type": "movie" if t == "movies" else "episode", "ids": obj.get("ids") or {}}
-                )
-                unresolved.append({"item": m, "hint": "not_found"})
-                _freeze_item_if_enabled(adapter, m, action="add", reasons=["not-found"])
-        if _not_found_count(nf) > 0 and ok == 0:
+        nf_count = _not_found_count(nf)
+        
+        idx: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        try:
+            for m in accepted_minimals or []:
+                if not isinstance(m, dict):
+                    continue
+                m_type = str(m.get("type") or "")
+                for id_field in ("ids", "show_ids"):
+                    m_ids = m.get(id_field) or {}
+                    if not isinstance(m_ids, dict):
+                        continue
+                    for k in ("tmdb", "imdb", "tvdb", "trakt", "slug"):
+                        v = m_ids.get(k)
+                        if v:
+                            idx.setdefault((m_type, k, str(v)), []).append(m)
+        except Exception:
+            idx = {}
+
+        nf_unresolved = _unresolved_from_not_found(nf)
+        for u in nf_unresolved:
+            try:
+                it = u.get("item") if isinstance(u, dict) else None
+                mapped: dict[str, Any] | None = None
+                if idx and isinstance(it, dict):
+                    u_type = str(it.get("type") or "")
+                    for id_field in ("ids", "show_ids"):
+                        u_ids = it.get(id_field) or {}
+                        if not isinstance(u_ids, dict):
+                            continue
+                        for k, v in u_ids.items():
+                            if v is None:
+                                continue
+                            cands = idx.get((u_type, str(k), str(v)))
+                            if cands and len(cands) == 1:
+                                mapped = cands[0]
+                                break
+                        if mapped:
+                            break
+
+                if mapped is None and len(accepted_minimals or []) == 1:
+                    only = accepted_minimals[0]
+                    if isinstance(only, dict):
+                        mapped = only
+
+                if mapped is not None:
+                    u["item"] = mapped
+            except Exception:
+                pass
+
+            unresolved.append(u)
+            try:
+                _freeze_item_if_enabled(adapter, u["item"], action="add", reasons=["not-found"])
+            except Exception:
+                pass
+
+        if nf_count > 0 and ok_total == 0:
             _bust_index_cache("write:add:not_found")
-        if ok > 0:
+
+        if ok_total > 0 or nf_count == 0:
             _unfreeze_keys_if_present(adapter, accepted_keys)
-            _bust_index_cache("write:add")
+            _cache_merge_from_source_items(adapter, items_list)
             if _history_collection_enabled(adapter):
                 coll_body = _history_body_to_collection(body, _history_collection_types(adapter))
                 if coll_body:
@@ -1055,7 +1641,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                             URL_COLL_ADD,
                             headers=headers,
                             json=coll_body,
-                            timeout=timeout,
+                            timeout=write_timeout,
                             max_retries=retries,
                         )
                         if rc.status_code == 420:
@@ -1065,19 +1651,37 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                             _warn("collection_add_failed", status=rc.status_code, body=((rc.text or "")[:200]))
                     except Exception as e:
                         _warn("collection_add_exception", error=str(e))
-        elif not unresolved:
+
+        if existing_total > 0 and added_total == 0 and nf_count == 0:
+            try:
+                skipped_keys = list(dict.fromkeys(list(skipped_keys or []) + list(accepted_keys or [])))
+            except Exception:
+                pass
+
+        elif ok_total == 0 and nf_count == 0 and not unresolved:
             _warn("write_noop", action="add")
+    elif r.status_code == 409:
+        _warn("write_duplicate", action="add", status=409, body=((r.text or "")[:200]))
+        ok_total = len(accepted_minimals)
+        ok_added = 0
+        try:
+            skipped_keys = list(dict.fromkeys(list(skipped_keys or []) + list(accepted_keys or [])))
+        except Exception:
+            pass
+        _unfreeze_keys_if_present(adapter, accepted_keys)
+        _bust_index_cache("write:add:duplicate")
     elif r.status_code == 420:
         _warn("write_limit", action="add", status=420)
         _record_limit_error("history")
         for m in accepted_minimals:
             unresolved.append({"item": m, "hint": "trakt_limit"})
-        return 0, unresolved
+        return 0, unresolved, skipped_keys
     else:
         _warn("write_failed", action="add", status=r.status_code, body=((r.text or "")[:200]))
         for m in accepted_minimals:
             _freeze_item_if_enabled(adapter, m, action="add", reasons=[f"http:{r.status_code}"])
-    return ok, unresolved
+            unresolved.append({"item": m, "hint": f"http:{r.status_code}"})
+    return ok_added, unresolved, skipped_keys
 
 
 def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
@@ -1092,7 +1696,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     )
     timeout = float(_cfg_num(adapter, "timeout", 10, float))
     retries = int(_cfg_num(adapter, "max_retries", 3, int))
-    body, unresolved, accepted_keys, accepted_minimals = _batch_remove(adapter, items)
+    body, unresolved, accepted_keys, accepted_minimals, raw_id_map = _batch_remove(adapter, items)
     if not body:
         return 0, unresolved
     r = request_with_retries(
@@ -1104,19 +1708,19 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         timeout=timeout,
         max_retries=retries,
     )
-    ok = 0
+    ok_added = 0
+    ok_total = 0
+    added_total = 0
+    existing_total = 0
     if r.status_code in (200, 201):
         d = r.json() or {}
         deleted = d.get("deleted") or d.get("removed") or {}
         ok = int(deleted.get("movies") or 0) + int(deleted.get("episodes") or 0)
         nf = d.get("not_found") or {}
-        for t in ("movies", "episodes"):
-            for obj in nf.get(t) or []:
-                m = id_minimal(
-                    {"type": "movie" if t == "movies" else "episode", "ids": obj.get("ids") or {}}
-                )
-                unresolved.append({"item": m, "hint": "not_found"})
-                _freeze_item_if_enabled(adapter, m, action="remove", reasons=["not-found"])
+        for u in _unresolved_from_not_found(nf, raw_id_map):
+            unresolved.append(u)
+            _freeze_item_if_enabled(adapter, u["item"], action="remove", reasons=["not-found"])
+
         if ok > 0:
             _unfreeze_keys_if_present(adapter, accepted_keys)
             _bust_index_cache("write:remove")

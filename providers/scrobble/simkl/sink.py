@@ -25,15 +25,36 @@ except ImportError:
     _rm_across_api = None  # type: ignore
 
 try:
-    from providers.scrobble.scrobble import ScrobbleSink  # type: ignore
+    from providers.scrobble.scrobble import ScrobbleSink, mask_account as _mask_account  # type: ignore
 except ImportError:
     class ScrobbleSink:
         def send(self, event: Any) -> None: ...
+
+    def _mask_account(value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return "unknown"
+        if len(s) <= 2:
+            return s[0] + "*"
+        return s[:2] + "***"
 
 
 SIMKL_API = "https://api.simkl.com"
 APP_AGENT = "CrossWatch/Watcher/1.0"
 _AR_TTL = 60
+
+_SIMKL_ID_KEYS = (
+    "tmdb",
+    "imdb",
+    "tvdb",
+    "simkl",
+    "trakt",
+    "mal",
+    "anilist",
+    "kitsu",
+    "anidb",
+)
+_SIMKL_ANIME_ID_KEYS = ("simkl", "tmdb", "tvdb", "mal", "anilist", "kitsu", "anidb", "imdb")
 
 
 def _cfg() -> dict[str, Any]:
@@ -108,7 +129,10 @@ def _post(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> requests.Resp
 def _stop_pause_threshold(cfg: dict[str, Any]) -> int:
     try:
         s = cfg.get("scrobble") or {}
-        return int((s.get("trakt") or {}).get("stop_pause_threshold", 85))
+        src = (s.get("simkl") or {}).get("stop_pause_threshold")
+        if src is None:
+            src = (s.get("trakt") or {}).get("stop_pause_threshold", 85)
+        return int(src)
     except Exception:
         return 85
 
@@ -116,7 +140,10 @@ def _stop_pause_threshold(cfg: dict[str, Any]) -> int:
 def _force_stop_at(cfg: dict[str, Any]) -> int:
     try:
         s = cfg.get("scrobble") or {}
-        return int((s.get("trakt") or {}).get("force_stop_at", 95))
+        src = (s.get("simkl") or {}).get("force_stop_at")
+        if src is None:
+            src = (s.get("trakt") or {}).get("force_stop_at", 95)
+        return int(src)
     except Exception:
         return 95
 
@@ -124,7 +151,10 @@ def _force_stop_at(cfg: dict[str, Any]) -> int:
 def _complete_at(cfg: dict[str, Any]) -> int:
     try:
         s = cfg.get("scrobble") or {}
-        return int((s.get("trakt") or {}).get("complete_at", 0))
+        src = (s.get("simkl") or {}).get("complete_at")
+        if src is None:
+            src = (s.get("trakt") or {}).get("complete_at", 0)
+        return int(src)
     except Exception:
         return 0
 
@@ -132,7 +162,10 @@ def _complete_at(cfg: dict[str, Any]) -> int:
 def _regress_tolerance_percent(cfg: dict[str, Any]) -> int:
     try:
         s = cfg.get("scrobble") or {}
-        return int((s.get("trakt") or {}).get("regress_tolerance_percent", 5))
+        src = (s.get("simkl") or {}).get("regress_tolerance_percent")
+        if src is None:
+            src = (s.get("trakt") or {}).get("regress_tolerance_percent", 5)
+        return int(src)
     except Exception:
         return 5
 
@@ -213,15 +246,17 @@ def _ar_seen(key: str) -> bool:
     return False
 
 
-def _ar_key(ids: dict[str, Any], media_type: str) -> str:
-    for k in ("imdb", "tmdb", "tvdb", "trakt", "simkl"):
+def _ar_key(ids: dict[str, Any], media_type: str, scope: str = "") -> str:
+    for k in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb"):
         v = ids.get(k)
         if v:
-            return f"{media_type}:{k}:{v}"
+            return f"{scope}|{media_type}:{k}:{v}" if scope else f"{media_type}:{k}:{v}"
     try:
-        return f"{media_type}:{json.dumps(ids, sort_keys=True)}"
+        base = f"{media_type}:{json.dumps(ids, sort_keys=True)}"
+        return f"{scope}|{base}" if scope else base
     except Exception:
-        return f"{media_type}:title/year"
+        base = f"{media_type}:title/year"
+        return f"{scope}|{base}" if scope else base
 
 
 def _norm_type(t: str) -> str:
@@ -235,8 +270,15 @@ def _norm_type(t: str) -> str:
 
 def _cfg_delete_enabled(cfg: dict[str, Any], media_type: str) -> bool:
     s = cfg.get("scrobble") or {}
-    if not s.get("delete_plex"):
+    watch = s.get("watch") or {}
+    route_opts_raw = watch.get("route_options")
+    route_opts: dict[str, Any] = route_opts_raw if isinstance(route_opts_raw, dict) else {}
+    route_mode = str(route_opts.get("auto_remove_watchlist") or "inherit").strip().lower()
+    if route_mode == "off":
         return False
+    if not s.get("delete_plex"):
+        if route_mode != "on":
+            return False
     types = s.get("delete_plex_types") or []
     mt = _norm_type(media_type)
     if isinstance(types, str):
@@ -250,19 +292,20 @@ def _cfg_delete_enabled(cfg: dict[str, Any], media_type: str) -> bool:
 
 def _ids(ev: Any) -> dict[str, Any]:
     ids = getattr(ev, "ids", {}) or {}
-    return {k: ids[k] for k in ("imdb", "tmdb", "tvdb", "simkl") if ids.get(k)}
+    return {k: ids[k] for k in _SIMKL_ID_KEYS if ids.get(k)}
 
 
 def _show_ids(ev: Any) -> dict[str, Any]:
     ids = getattr(ev, "ids", {}) or {}
     m: dict[str, Any] = {}
-    for k in ("imdb_show", "tmdb_show", "tvdb_show", "simkl_show"):
-        if ids.get(k):
-            m[k.replace("_show", "")] = ids[k]
+    for key in _SIMKL_ID_KEYS:
+        show_key = f"{key}_show"
+        if ids.get(show_key):
+            m[key] = ids[show_key]
     return m
 
 
-def _auto_remove_across(ev: Any, cfg: dict[str, Any]) -> None:
+def _auto_remove_across(ev: Any, cfg: dict[str, Any], scope: str = "") -> None:
     try:
         mt = _norm_type(str(getattr(ev, "media_type", "") or ""))
         if not _cfg_delete_enabled(cfg, mt):
@@ -272,11 +315,11 @@ def _auto_remove_across(ev: Any, cfg: dict[str, Any]) -> None:
             ids = _ids(ev)
         if not ids:
             return
-        key = _ar_key(ids, mt)
+        key = _ar_key(ids, mt, scope=scope)
         if _ar_seen(key):
             return
         try:
-            _rm_across(ids, mt)
+            _rm_across(ids, mt, scope=scope)
             return
         except Exception:
             pass
@@ -303,7 +346,7 @@ def _media_name(ev: Any) -> str:
 
 
 def _ids_desc_map(ids: dict[str, Any]) -> str:
-    for k in ("simkl", "imdb", "tmdb", "tvdb"):
+    for k in ("simkl", "tmdb", "imdb", "tvdb", "trakt", "mal", "anilist", "kitsu", "anidb"):
         v = ids.get(k)
         if v is not None:
             return f"{k}:{v}"
@@ -322,6 +365,7 @@ def _body_ids_desc(b: dict[str, Any]) -> str:
     ids = (
         (b.get("movie") or {}).get("ids")
         or (b.get("show") or {}).get("ids")
+        or (b.get("anime") or {}).get("ids")
         or (b.get("episode") or {}).get("ids")
         or {}
     )
@@ -346,9 +390,18 @@ def _bodies(ev: Any, p: float) -> list[dict[str, Any]]:
     parent = "anime" if (is_anime_type or has_anime_ids) else "show"
 
     if media_type == "movie":
+        if is_anime_type or has_anime_ids:
+            anime_ids = {k: ids[k] for k in _SIMKL_ANIME_ID_KEYS if ids.get(k)}
+            if anime_ids:
+                return [{"progress": p, "anime": {"ids": anime_ids}}]
+            payload: dict[str, Any] = {"title": getattr(ev, "title", None)}
+            year = getattr(ev, "year", None)
+            if year is not None:
+                payload["year"] = year
+            return [{"progress": p, "anime": payload}]
         if ids:
             return [{"progress": p, "movie": {"ids": ids}}]
-        payload: dict[str, Any] = {"title": getattr(ev, "title", None)}
+        payload = {"title": getattr(ev, "title", None)}
         year = getattr(ev, "year", None)
         if year is not None:
             payload["year"] = year
@@ -368,19 +421,19 @@ def _bodies(ev: Any, p: float) -> list[dict[str, Any]]:
             }
         )
     if has_sn and not show:
-        s_payload: dict[str, Any] = {"title": getattr(ev, "title", None)}
+        series_payload: dict[str, Any] = {"title": getattr(ev, "title", None)}
         year = getattr(ev, "year", None)
         if year is not None:
-            s_payload["year"] = year
+            series_payload["year"] = year
         bodies.append(
             {
                 "progress": p,
-                parent: s_payload,
+                parent: series_payload,
                 "episode": {"season": season, "number": number},
             }
         )
     if ids:
-        bodies.append({"progress": p, parent: {}, "episode": {"ids": ids}})
+        bodies.append({"progress": p, "episode": {"ids": ids}})
 
     if bodies:
         return bodies
@@ -413,13 +466,14 @@ class SimklSink(ScrobbleSink):
     def _mkey(self, ev: Any) -> str:
         ids = getattr(ev, "ids", {}) or {}
         parts: list[str] = []
-        for k in ("imdb", "tmdb", "tvdb", "simkl"):
+        for k in _SIMKL_ID_KEYS:
             if ids.get(k):
                 parts.append(f"{k}:{ids[k]}")
         if getattr(ev, "media_type", "") == "episode":
-            for k in ("imdb_show", "tmdb_show", "tvdb_show", "simkl_show"):
-                if ids.get(k):
-                    parts.append(f"{k}:{ids[k]}")
+            for k in _SIMKL_ID_KEYS:
+                show_key = f"{k}_show"
+                if ids.get(show_key):
+                    parts.append(f"{show_key}:{ids[show_key]}")
             parts.append(f"S{int(getattr(ev, 'season', 0) or 0):02d}E{int(getattr(ev, 'number', 0) or 0):02d}")
         if not parts:
             t = getattr(ev, "title", None) or ""
@@ -485,6 +539,7 @@ class SimklSink(ScrobbleSink):
 
         p_now = _clamp(getattr(ev, "progress", 0) or 0)
         force_seek = bool((getattr(ev, 'raw', None) or {}).get('_cw_seek'))
+        preserve_stop = bool((getattr(ev, 'raw', None) or {}).get('_cw_preserve_stop'))
         tol = _regress_tolerance_percent(cfg)
         p_sess = self._p_sess.get((sk, mk), -1)
         p_glob = self._p_glob.get(mk, -1)
@@ -540,7 +595,7 @@ class SimklSink(ScrobbleSink):
         if action_in == "stop":
             if p_send >= _force_stop_at(cfg) or (comp and p_send >= comp):
                 action = "stop"
-            elif p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
+            elif (not preserve_stop) and p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
                 _log(f"Demote STOP→PAUSE (jump {last_sess}%→{p_send}%, thr={thr})", "DEBUG")
                 action = "pause"
                 p_send = last_sess
@@ -585,7 +640,7 @@ class SimklSink(ScrobbleSink):
         if best_skel is not None:
             b0 = {"progress": float(p_payload), **best_skel, **_app_meta(cfg)}
             if self._should_log_intent(key, path, int(float(b0.get("progress") or p_send))):
-                _log(f"simkl intent {path} using cached {best_desc}, prog={b0.get('progress')}", "DEBUG")
+                _log(f"intent path={path} ids={best_desc} p={b0.get('progress')}", "DEBUG")
             bodies = [b0] + [b for b in bodies if _body_ids_desc(b) != best_desc]
 
         last_err: dict[str, Any] | None = None
@@ -593,14 +648,14 @@ class SimklSink(ScrobbleSink):
             if not (best_skel is not None and i == 0):
                 intent_prog = int(float(body.get("progress") or p_send))
                 if self._should_log_intent(key, path, intent_prog):
-                    _log(f"simkl intent {path} using {_body_ids_desc(body)}, prog={body.get('progress')}", "DEBUG")
+                    _log(f"intent path={path} ids={_body_ids_desc(body)} p={body.get('progress')}", "DEBUG")
             res = self._send_http(path, body, cfg)
             if res.get("ok"):
                 try:
                     act = (res.get("resp") or {}).get("action") or path.rsplit("/", 1)[-1]
                 except Exception:
                     act = path.rsplit("/", 1)[-1]
-                _log(f"simkl {path} -> {res['status']} action={act}", "DEBUG")
+                _log(f"send path={path} status={res['status']} action={act}", "DEBUG")
                 self._best[key] = {
                     "skeleton": _extract_skeleton_from_body(body),
                     "ids_desc": _body_ids_desc(body),
@@ -609,11 +664,11 @@ class SimklSink(ScrobbleSink):
                 try:
                     acc = getattr(ev, "account", None)
                     prog_val = float(body.get("progress") or p_send)
-                    _log(f"user='{acc}' {act} {prog_val:.1f}% • {name}", "INFO")
+                    _log(f"scrobble {act} user='{_mask_account(acc)}' p={prog_val:.1f}% media='{name}'", "INFO")
                 except Exception:
                     pass
                 if action == "stop" and p_send >= comp_thr:
-                    _auto_remove_across(ev, cfg)
+                    _auto_remove_across(ev, cfg, scope=f"simkl:{self._instance_id}")
                 self._a_sess[(sk, mk)] = action
                 if action == "start" and step > 1 and bucket is not None:
                     self._p_step[(sk, mk)] = int(bucket)
@@ -627,7 +682,7 @@ class SimklSink(ScrobbleSink):
         if last_err and last_err.get("status") == 409 and action == "stop":
             _log("Treating 409 (duplicate stop) as watched; proceeding to auto-remove", "WARN")
             if p_send >= comp_thr:
-                _auto_remove_across(ev, cfg)
+                _auto_remove_across(ev, cfg, scope=f"simkl:{self._instance_id}")
             return
 
         if last_err:

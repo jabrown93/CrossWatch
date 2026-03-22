@@ -20,6 +20,7 @@ except Exception:
 
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
+from providers.scrobble.scrobble import mask_account as _mask_account
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
 except Exception:
@@ -506,7 +507,7 @@ def _session_media_key(md: Mapping[str, Any], ids_all: Mapping[str, Any], root: 
     v = md.get("Id")
     if v:
         return str(v)
-    for k in ("imdb", "tmdb", "tvdb", "trakt"):
+    for k in ("tmdb", "imdb", "tvdb", "trakt"):
         vv = ids_all.get(k)
         if vv:
             return f"{k}:{vv}"
@@ -532,7 +533,7 @@ def _make_session_id(payload: Mapping[str, Any], md: Mapping[str, Any], ids_all:
 
 def _guid_search_episode(epi_hint: dict[str, Any], cfg: dict[str, Any], logger: Any | None = None) -> dict[str, Any]:
     try:
-        q = {k: epi_hint.get(k) for k in ("imdb", "tmdb", "tvdb") if epi_hint.get(k)}
+        q = {k: epi_hint.get(k) for k in ("tmdb", "imdb", "tvdb") if epi_hint.get(k)}
         if not q:
             return {}
         r = requests.get(f"{TRAKT_API}/search/episode", params=q, headers=_headers(cfg), timeout=10)
@@ -742,7 +743,7 @@ def _cw_ids_for_payload(
             if logger:
                 logger(f"Emby show metadata fetch failed: {ex}", level="DEBUG", module="SCROBBLE")
 
-    for key in ("imdb", "tmdb", "tvdb"):
+    for key in ("tmdb", "imdb", "tvdb"):
         val = show_ids.get(key)
         if val is not None:
             cw_ids.setdefault(f"{key}_show", val)
@@ -754,7 +755,7 @@ def _cw_ids_for_payload(
             except Exception:
                 hint = dict(ids_all or {})
             extra = _show_ids_from_episode_hint(hint, cfg, logger=logger) or {}
-            for key in ("imdb", "tmdb", "tvdb"):
+            for key in ("tmdb", "imdb", "tvdb"):
                 val = extra.get(key)
                 if val is not None:
                     cw_ids.setdefault(f"{key}_show", val)
@@ -931,7 +932,7 @@ def process_webhook(
         ).strip()
 
         if allow_users and acc_title and acc_title not in allow_users:
-            _emit(logger, f"user '{acc_title}' blocked by filters_emby", "DEBUG")
+            _emit(logger, f"user '{_mask_account(acc_title)}' blocked by filters_emby", "DEBUG")
             return {"ok": True, "ignored": True}
 
         media_type = (md.get("Type") or md.get("type") or "").strip().lower()
@@ -1168,7 +1169,7 @@ def process_webhook(
                     s_num, e_num = _episode_numbers(md, payload)
                     if isinstance(s_num, int) and isinstance(e_num, int):
                         name_dbg = f"{name_dbg} S{s_num:02d}E{e_num:02d}"
-                _emit(logger, f"user='{acc_title}' {action_name} {prog:.1f}% • {name_dbg}", "INFO")
+                _emit(logger, f"user='{_mask_account(acc_title)}' {action_name} {prog:.1f}% • {name_dbg}", "INFO")
             except Exception:
                 pass
 

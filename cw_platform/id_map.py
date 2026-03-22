@@ -4,14 +4,15 @@
 from __future__ import annotations
 
 import re
+import os
 from collections.abc import Iterable, Mapping
 from itertools import chain
 from typing import Any
 
 # Policy
 ID_KEYS: tuple[str, ...] = (
-    "imdb",
     "tmdb",
+    "imdb",
     "tvdb",
     "trakt",
     "simkl",
@@ -21,12 +22,14 @@ ID_KEYS: tuple[str, ...] = (
     "anidb",
     "plex",
     "jellyfin",
+    "mdblist",
+    "emby",
     "guid",
     "slug",
 )
 KEY_PRIORITY: tuple[str, ...] = (
-    "imdb",
     "tmdb",
+    "imdb",
     "tvdb",
     "trakt",
     "mal",
@@ -39,12 +42,31 @@ KEY_PRIORITY: tuple[str, ...] = (
     "slug",
 )
 
+_CAPTURE_PROVIDER_TO_IDKEY: dict[str, str] = {
+    "TRAKT": "trakt",
+    "SIMKL": "simkl",
+    "MDBLIST": "mdblist",
+    "TMDB": "tmdb",
+    "PLEX": "plex",
+    "JELLYFIN": "jellyfin",
+    "EMBY": "emby",
+    "ANILIST": "anilist",
+}
+
+def _capture_prefer_id_key() -> str | None:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    if v not in ("1", "true", "yes", "on"):
+        return None
+    prov = str(os.getenv("CW_CAPTURE_PROVIDER") or "").strip().upper()
+    if not prov:
+        return None
+    return _CAPTURE_PROVIDER_TO_IDKEY.get(prov)
+
 __all__ = [
     "ID_KEYS",
     "KEY_PRIORITY",
     "ids_from",
     "ids_from_guid",
-    "ids_from_jellyfin_providerids",
     "merge_ids",
     "coalesce_ids",
     "canonical_key",
@@ -88,7 +110,7 @@ def _normalize_id(key: str, val: Any) -> str | None:
     if s.lower() in _CLEAN_SENTINELS:
         return None
 
-    if k in ("tmdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb", "plex", "jellyfin"):
+    if k in ("tmdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb", "plex", "jellyfin", "mdblist", "emby"):
         digits = re.sub(r"\D+", "", s)
         return digits or None
 
@@ -109,7 +131,7 @@ def _normalize_id(key: str, val: Any) -> str | None:
     return s
 
 
-# --- GUID to ID
+# GUID to ID
 _GUID_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     # com.plexapp agents
     (re.compile(r"com\.plexapp\.agents\.imdb://(?P<imdb>tt\d+)", re.I), "imdb"),
@@ -132,45 +154,13 @@ def ids_from_guid(guid: str | None) -> dict[str, str]:
         m = rx.search(g)
         if not m:
             continue
-        if label in ("imdb", "tmdb", "tvdb"):
+        if label in ("tmdb", "imdb", "tvdb"):
             raw = m.groupdict().get(label)
             norm = _normalize_id(label, raw)
             if norm:
                 out[label] = norm
         elif label == "guid":
             out["guid"] = g
-    return out
-
-
-# Jellyfin ProviderIds to ids
-_JF_MAP: dict[str, str] = {
-    "Imdb": "imdb",
-    "Tmdb": "tmdb",
-    "Tvdb": "tvdb",
-    "Trakt": "trakt",
-    "Simkl": "simkl",
-    "Anidb": "anidb",
-    "AniDB": "anidb",
-    "Anilist": "anilist",
-    "AniList": "anilist",
-    "Kitsu": "kitsu",
-    "Mal": "mal",
-    "MAL": "mal",
-    "MyAnimeList": "mal",
-}
-
-
-def ids_from_jellyfin_providerids(pids: Mapping[str, Any] | None) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not isinstance(pids, Mapping):
-        return out
-    for k, v in pids.items():
-        dst = _JF_MAP.get(str(k))
-        if not dst:
-            continue
-        n = _normalize_id(dst, v)
-        if n:
-            out[dst] = n
     return out
 
 
@@ -228,6 +218,11 @@ def _title_year_key(item: Mapping[str, Any]) -> str | None:
 
 
 def _best_id_key(idmap: Mapping[str, str]) -> str | None:
+    prefer = _capture_prefer_id_key()
+    if prefer:
+        v_pref = idmap.get(prefer)
+        if v_pref:
+            return f"{prefer}:{v_pref}".lower()
     for k in KEY_PRIORITY:
         v = idmap.get(k)
         if v:
@@ -335,7 +330,7 @@ def minimal(item: Mapping[str, Any]) -> dict[str, Any]:
 # Helpers
 def has_external_ids(obj: Mapping[str, Any]) -> bool:
     ids = ids_from(obj) if "ids" in obj or "guid" in obj else obj
-    return any(ids.get(k) for k in ("imdb", "tmdb", "tvdb"))
+    return any(ids.get(k) for k in ("tmdb", "imdb", "tvdb"))
 
 
 def preferred_id_key(obj: Mapping[str, Any]) -> str | None:

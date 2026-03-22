@@ -65,7 +65,7 @@ def _type_norm(value: object) -> str:
 
 
 def _sync_visible(item: Mapping[str, Any]) -> bool:
-    return _type_norm(item.get("type")) in ("movie", "episode")
+    return _type_norm(item.get("type")) in ("movie", "show", "season", "episode")
 
 
 
@@ -154,9 +154,18 @@ def _migrate_cache(items: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         if w_new >= w_old:
             out[ek] = item
             changed = True
-    if len(out) != len(items):
+    normalized, dropped = _normalize_rollups(out)
+    if dropped["shows"] or dropped["seasons"]:
         changed = True
-    return out, changed
+        _info(
+            "history_rollups_pruned",
+            shows=dropped["shows"],
+            seasons=dropped["seasons"],
+            scope="cache",
+        )
+    if len(normalized) != len(items):
+        changed = True
+    return normalized, changed
 
 
 def _load_cache() -> dict[str, Any]:
@@ -260,11 +269,70 @@ def _merge_event(dst: dict[str, Any], item: Mapping[str, Any]) -> str | None:
         dst[ek] = merged
     return ek
 
+def _show_rollup_key(item: Mapping[str, Any]) -> str | None:
+    ids = item.get("show_ids") if isinstance(item.get("show_ids"), Mapping) else item.get("ids")
+    if not isinstance(ids, Mapping):
+        return None
+    picked = _ids_pick(ids)
+    for k in ("tmdb", "imdb", "trakt", "tvdb", "mdblist", "kitsu"):
+        v = picked.get(k)
+        if v is not None and v != "":
+            return f"{k}:{v}"
+    return None
+
+
+def _normalize_rollups(items: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+    src: dict[str, Any] = {
+        str(k): dict(v) for k, v in (items or {}).items() if isinstance(v, Mapping)
+    }
+    if not src:
+        return {}, {"shows": 0, "seasons": 0}
+
+    episode_children: set[tuple[str, int]] = set()
+    show_children: set[str] = set()
+
+    for item in src.values():
+        typ = _type_norm(item.get("type"))
+        if typ != "episode":
+            continue
+        show_key = _show_rollup_key(item)
+        if not show_key:
+            continue
+        show_children.add(show_key)
+        try:
+            season_no = int(item.get("season") or 0)
+        except Exception:
+            season_no = 0
+        if season_no > 0:
+            episode_children.add((show_key, season_no))
+
+    out: dict[str, Any] = {}
+    dropped = {"shows": 0, "seasons": 0}
+
+    for key, item in src.items():
+        typ = _type_norm(item.get("type"))
+        if typ == "season":
+            show_key = _show_rollup_key(item)
+            try:
+                season_no = int(item.get("season") or 0)
+            except Exception:
+                season_no = 0
+            if show_key and season_no > 0 and (show_key, season_no) in episode_children:
+                dropped["seasons"] += 1
+                continue
+        elif typ == "show":
+            show_key = _show_rollup_key(item)
+            if show_key and show_key in show_children:
+                dropped["shows"] += 1
+                continue
+        out[key] = item
+
+    return out, dropped
 
 def _ids_pick(obj: Mapping[str, Any]) -> dict[str, Any]:
     ids_raw: dict[str, Any] = dict(obj.get('ids') or {})
     out: dict[str, Any] = {}
-    for k in ('imdb', 'tmdb', 'tvdb', 'trakt', 'kitsu', 'mdblist'):
+    for k in ('tmdb', 'imdb', 'tvdb', 'trakt', 'kitsu', 'mdblist'):
         v = ids_raw.get(k) or obj.get(k) or obj.get(f'{k}_id')
         if v is None or v == '':
             continue
@@ -467,8 +535,19 @@ def build_index(
     retries = adapter.cfg.max_retries
 
     acts = _fetch_last_activities(adapter, timeout=timeout, retries=retries) or {}
-    acts_watched = acts.get("watched_at") if isinstance(acts, Mapping) else None
-    acts_watched_iso = _iso_z(acts_watched) if _iso_ok(acts_watched) else None
+    acts_candidates = []
+    if isinstance(acts, Mapping):
+        acts_candidates.extend([
+            acts.get("watched_at"),
+            acts.get("season_watched_at"),
+            acts.get("episode_watched_at"),
+            acts.get("history"),
+            acts.get("updated_at"),
+        ])
+    acts_watched_iso: str | None = None
+    for candidate in acts_candidates:
+        if _iso_ok(candidate):
+            acts_watched_iso = _max_iso(acts_watched_iso, _iso_z(candidate))
 
     wm = get_watermark("history")
     force_baseline = False
@@ -488,25 +567,35 @@ def build_index(
         return cached
 
     cfg_since = str(cfg.get("history_since") or "").strip() or None
-    since_wm = START_OF_TIME_ISO if force_baseline else coalesce_since("history", cfg_since, env_any="MDBLIST_HISTORY_SINCE")
-    since_req = _pad_since_iso(since_wm)
+    if not wm and not force_baseline:
+        since_req: str | None = None
+    else:
+        since_wm = START_OF_TIME_ISO if force_baseline else coalesce_since("history", cfg_since, env_any="MDBLIST_HISTORY_SINCE")
+        since_req = _pad_since_iso(since_wm)
 
     if acts_watched_iso:
-        _log(f"history changed (watched_at={acts_watched_iso} watermark={wm or '-'}) - delta since={since_req}")
+        if since_req:
+            _log(f"history changed (watched_at={acts_watched_iso} watermark={wm or '-'}) - delta since={since_req}")
+        else:
+            _log(f"history changed (watched_at={acts_watched_iso} watermark={wm or '-'}) - baseline full fetch (no since)")
     else:
-        _log(f"history delta since={since_req}")
+        if since_req:
+            _log(f"history delta since={since_req}")
+        else:
+            _log("history baseline full fetch (no since)")
 
     prog_factory = getattr(adapter, "progress_factory", None)
     prog: Any = prog_factory("history") if callable(prog_factory) else None
 
     out: dict[str, dict[str, Any]] = {}
     latest_seen: str | None = None
-    page = 1
+    offset = 0
     pages = 0
     tick = 0
-
     while True:
-        params: dict[str, Any] = {"apikey": apikey, "page": page, "limit": per_page, "since": since_req}
+        params: dict[str, Any] = {"apikey": apikey, "offset": offset, "limit": per_page}
+        if since_req:
+            params["since"] = since_req
         try:
             r = request_with_retries(
                 sess,
@@ -517,11 +606,11 @@ def build_index(
                 max_retries=retries,
             )
         except Exception as e:
-            _log(f"GET watched delta page {page} failed: {type(e).__name__}: {e}")
+            _log(f"GET watched delta offset {offset} failed: {type(e).__name__}: {e}")
             break
 
         if r.status_code != 200:
-            _log(f"GET watched delta page {page} -> {r.status_code}: {(r.text or '')[:160]}")
+            _log(f"GET watched delta offset {offset} -> {r.status_code}: {(r.text or '')[:160]}")
             break
 
         data = r.json() if (r.text or "").strip() else {}
@@ -531,19 +620,26 @@ def build_index(
             "seasons": data.get("seasons") or [],
             "episodes": data.get("episodes") or [],
         }
-        sync_buckets = {
-            "movies": buckets["movies"],
-            "episodes": buckets["episodes"],
-        }
-
         added = 0
-        for row in sync_buckets["movies"]:
+        for row in buckets["movies"]:
             m = _row_movie(row) if isinstance(row, Mapping) else None
             if m:
                 _merge_event(out, m)
                 latest_seen = _max_iso(latest_seen, m.get("watched_at"))
                 added += 1
-        for row in sync_buckets["episodes"]:
+        for row in buckets["shows"]:
+            m = _row_show(row) if isinstance(row, Mapping) else None
+            if m:
+                _merge_event(out, m)
+                latest_seen = _max_iso(latest_seen, m.get("watched_at"))
+                added += 1
+        for row in buckets["seasons"]:
+            m = _row_season(row) if isinstance(row, Mapping) else None
+            if m:
+                _merge_event(out, m)
+                latest_seen = _max_iso(latest_seen, m.get("watched_at"))
+                added += 1
+        for row in buckets["episodes"]:
             m = _row_episode(row) if isinstance(row, Mapping) else None
             if m:
                 _merge_event(out, m)
@@ -566,16 +662,35 @@ def build_index(
         if isinstance(pag, Mapping) and pag.get("has_more") is False:
             break
 
-        rows_total = sum(len(v) for v in sync_buckets.values() if isinstance(v, list))
+        rows_total = sum(len(v) for v in buckets.values() if isinstance(v, list))
         if rows_total == 0:
             break
-
-        page += 1
+        offset += per_page
+        
+    normalized_out, dropped_out = _normalize_rollups(out)
+    if dropped_out["shows"] or dropped_out["seasons"]:
+        _info(
+            "history_rollups_pruned",
+            shows=dropped_out["shows"],
+            seasons=dropped_out["seasons"],
+            scope="delta",
+        )
 
     merged = dict(cached)
-    if out:
-        for k, v in out.items():
+    if normalized_out:
+        for k, v in normalized_out.items():
             merged[str(k)] = dict(v)
+
+    merged, dropped_merged = _normalize_rollups(merged)
+    if dropped_merged["shows"] or dropped_merged["seasons"]:
+        _info(
+            "history_rollups_pruned",
+            shows=dropped_merged["shows"],
+            seasons=dropped_merged["seasons"],
+            scope="merged",
+        )
+
+    if out or dropped_merged["shows"] or dropped_merged["seasons"]:
         _save_cache(merged)
 
     update_watermark_if_new("history", latest_seen or acts_watched_iso)
@@ -665,9 +780,6 @@ def _bucketize(items: Iterable[Mapping[str, Any]], *, unwatch: bool) -> tuple[di
             continue
 
         if typ == "show":
-            if unwatch:
-                _log(f"skip unwatch: derived type=show item={id_minimal({'type': 'show', 'ids': ids})}")
-                continue
             if not ids:
                 continue
             key = _stable_show_key(ids)
@@ -705,9 +817,6 @@ def _bucketize(items: Iterable[Mapping[str, Any]], *, unwatch: bool) -> tuple[di
             seasons_list.append(season_obj)
 
         if typ == "season":
-            if unwatch:
-                _log(f"skip unwatch: derived type=season item={id_minimal({'type': 'season', 'ids': ids or sh_ids, 'season': s})}")
-                continue
             if watched_iso:
                 season_obj["watched_at"] = watched_iso
             shows_nested[skey] = show_obj
@@ -761,7 +870,7 @@ def _bucketize(items: Iterable[Mapping[str, Any]], *, unwatch: bool) -> tuple[di
     skipped_meta = 0
     if not unwatch and shows_plain:
         for k, v in list(shows_plain.items()):
-            if not v.get("title") and not v.get("year"):
+            if (not v.get("title") and not v.get("year")) and not v.get("ids"):
                 shows_plain.pop(k, None)
                 skipped_meta += 1
 

@@ -25,6 +25,7 @@ from ._common import (
     update_watermark_if_new,
     state_file,
     _pair_scope,
+    _is_capture_mode,
 )
 
 BASE = "https://api.simkl.com"
@@ -41,11 +42,11 @@ def _shadow_path() -> str:
     return str(state_file("simkl.ratings.shadow.json"))
 
 
-ID_KEYS = ("tmdb", "imdb", "tvdb", "simkl")
+ID_KEYS = ("tmdb", "imdb", "tvdb", "simkl", "trakt", "mal", "anilist", "kitsu", "anidb")
 
 _ANIME_TVDB_MAP_MEMO: dict[str, str] | None = None
 _ANIME_TVDB_MAP_TTL_SEC = 24 * 3600
-_ANIME_TVDB_MAP_DATE_FROM = "1970-01-01T00:00:00Z"
+_ANIME_TVDB_MAP_DATE_FROM = "1900-01-01T00:00:00Z"
 
 
 def _anime_tvdb_map_path() -> str:
@@ -53,6 +54,8 @@ def _anime_tvdb_map_path() -> str:
 
 
 def _load_anime_tvdb_map() -> tuple[dict[str, str], int]:
+    if _is_capture_mode():
+        return {}, 0
     try:
         raw = json.loads(Path(_anime_tvdb_map_path()).read_text("utf-8"))
         mp = dict(raw.get("map") or {})
@@ -63,6 +66,8 @@ def _load_anime_tvdb_map() -> tuple[dict[str, str], int]:
 
 
 def _save_anime_tvdb_map(mp: Mapping[str, str]) -> None:
+    if _is_capture_mode():
+        return
     try:
         payload = {"updated_at": int(time.time()), "map": dict(mp)}
         Path(_anime_tvdb_map_path()).write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
@@ -88,7 +93,13 @@ def _ensure_anime_tvdb_map(adapter: Any) -> dict[str, str]:
             params={"extended": "full_anime_seasons", "date_from": _ANIME_TVDB_MAP_DATE_FROM},
             timeout=adapter.cfg.timeout,
         )
-        rows = resp.json() if resp.ok else []
+        data = resp.json() if resp.ok else {}
+        if isinstance(data, Mapping):
+            rows = data.get("anime")
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
     except Exception:
         rows = []
 
@@ -206,7 +217,7 @@ def _legacy_path(path: Path) -> Path | None:
 def _migrate_legacy_json(path: Path) -> None:
     if path.exists():
         return
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
     if not legacy or not legacy.exists():
@@ -221,7 +232,7 @@ def _migrate_legacy_json(path: Path) -> None:
 
 
 def _load_json(path: str) -> dict[str, Any]:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return {}
     p = Path(path)
     _migrate_legacy_json(p)
@@ -232,7 +243,7 @@ def _load_json(path: str) -> dict[str, Any]:
 
 
 def _save_json(path: str, data: Mapping[str, Any]) -> None:
-    if _pair_scope() is None:
+    if _is_capture_mode() or _pair_scope() is None:
         return
     try:
         p = Path(path)

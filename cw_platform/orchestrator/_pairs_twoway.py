@@ -6,24 +6,56 @@ from collections.abc import Mapping
 from typing import Any
 
 import os
+import re
+import datetime as _dt
+
+try:
+    from ._pairs_oneway import (
+        _history_bucket_sec as _hist_bucket_sec,
+        _history_ts_from_key as _hist_ts_from_key,
+        _bucket_ts as _hist_bucket_ts,
+    )
+except Exception:  # pragma: no cover
+    _HIST_RE = re.compile(r"^(?P<base>.+?)@(?P<ts>\d+)(?P<rest>.*)$")
+
+    def _hist_bucket_sec(a: str, b: str, feature: str) -> int:
+        if str(feature) != "history":
+            return 0
+        au = str(a or "").upper()
+        bu = str(b or "").upper()
+        return 60 if (au == "TRAKT" or bu == "TRAKT") else 0
+
+    def _hist_ts_from_key(key: str) -> int | None:
+        m = _HIST_RE.match(str(key))
+        if not m:
+            return None
+        try:
+            return int(m.group("ts"))
+        except Exception:
+            return None
+
+    def _hist_bucket_ts(ts: int, bucket_sec: int) -> int:
+        b2 = int(bucket_sec or 0)
+        if b2 <= 1:
+            return int(ts)
+        return (int(ts) // b2) * b2
 
 from ..provider_instances import normalize_instance_id
-
-from ._planner import diff_ratings
+from ._planner import diff_ratings, diff_progress
 try:
     from ._pairs_oneway import _ratings_filter_index as _rate_filter
 except Exception:
     def _rate_filter(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
         return idx
 
-from ..id_map import minimal as _minimal, canonical_key as _ck
+from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
 from ._snapshots import (
     build_snapshots_for_feature,
     coerce_suspect_snapshot,
     module_checkpoint,
     prev_checkpoint,
 )
-from ._applier import apply_add, apply_remove
+from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
 from ._tombstones import keys_for_feature
 from ._unresolved import load_unresolved_keys, record_unresolved
@@ -59,6 +91,86 @@ _PROVIDER_KEY_MAP = {
     "EMBY": "emby",
     "ANILIST": "anilist",
 }
+
+def _index_semantics(ops, feature: str) -> str:
+    try:
+        caps = ops.capabilities() or {}
+    except Exception:
+        return "present"
+    if not isinstance(caps, Mapping):
+        return "present"
+    per = caps.get(feature)
+    if isinstance(per, Mapping):
+        sem = per.get("index_semantics")
+        if sem:
+            return str(sem).lower()
+    return str(caps.get("index_semantics", "present")).lower()
+
+def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
+    if not cur or not prev:
+        return dict(cur or {})
+
+    def _iso_to_epoch(v: Any) -> int | None:
+        if not v:
+            return None
+        try:
+            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    def _pick_newest(a: Any, b: Any) -> Any:
+        ae = _iso_to_epoch(a)
+        be = _iso_to_epoch(b)
+        if be is None:
+            return a
+        if ae is None or be > ae:
+            return b
+        return a
+
+    out: dict[str, Any] = {}
+    for k, cv in (cur or {}).items():
+        pv = (prev or {}).get(k)
+        if not isinstance(cv, Mapping) or not isinstance(pv, Mapping):
+            out[str(k)] = cv
+            continue
+
+        merged: dict[str, Any] = dict(pv)
+
+        ids_prev = pv.get("ids") if isinstance(pv.get("ids"), Mapping) else None
+        ids_cur = cv.get("ids") if isinstance(cv.get("ids"), Mapping) else None
+        ids = _merge_ids(ids_prev, ids_cur)
+        if ids:
+            merged["ids"] = ids
+
+        sids_prev = pv.get("show_ids") if isinstance(pv.get("show_ids"), Mapping) else None
+        sids_cur = cv.get("show_ids") if isinstance(cv.get("show_ids"), Mapping) else None
+        sids = _merge_ids(sids_prev, sids_cur)
+        if sids:
+            merged["show_ids"] = sids
+
+        for fk, fv in cv.items():
+            if fk in ("ids", "show_ids"):
+                continue
+            if fv is None:
+                continue
+            if isinstance(fv, str) and fv == "":
+                continue
+            merged[fk] = fv
+
+        if feature == "history":
+            if "watched_at" in pv or "watched_at" in cv:
+                merged["watched_at"] = _pick_newest(pv.get("watched_at"), cv.get("watched_at"))
+        elif feature == "ratings":
+            if "rated_at" in pv or "rated_at" in cv:
+                merged["rated_at"] = _pick_newest(pv.get("rated_at"), cv.get("rated_at"))
+        out[str(k)] = merged
+
+    return out
+
 
 def _effective_library_whitelist(
     cfg: Mapping[str, Any],
@@ -135,6 +247,23 @@ def _minimal_keep_rating(it: Mapping[str, Any]) -> dict[str, Any]:
         pass
     return out
 
+
+def _minimal_keep_progress(it: Mapping[str, Any]) -> dict[str, Any]:
+    out = _minimal(it)
+    try:
+        for k in ("progress_ms", "progressMs", "viewOffset", "progress"):
+            if k in it and it.get(k) is not None:
+                out["progress_ms"] = it.get(k)
+                break
+        if "duration_ms" in it and it.get("duration_ms") is not None:
+            out["duration_ms"] = it.get("duration_ms")
+        pa = it.get("progress_at") or it.get("progressAt") or it.get("last_played") or it.get("lastViewedAt")
+        if isinstance(pa, str) and pa.strip():
+            out["progress_at"] = pa.strip()
+    except Exception:
+        pass
+    return out
+
 def _confirmed(res: dict) -> int:
     return int((res or {}).get("confirmed", (res or {}).get("count", 0)) or 0)
 
@@ -196,7 +325,15 @@ def _two_way_sync(
 
     def _cap_obsdel(ops) -> bool | None:
         try:
-            v = (ops.capabilities() or {}).get("observed_deletes")
+            caps = ops.capabilities() or {}
+            if isinstance(caps, Mapping):
+                per = caps.get(feature)
+                if isinstance(per, Mapping) and per.get("observed_deletes") is not None:
+                    v = per.get("observed_deletes")
+                else:
+                    v = caps.get("observed_deletes")
+            else:
+                v = None
             return None if v is None else bool(v)
         except Exception:
             return None
@@ -316,14 +453,8 @@ def _two_way_sync(
         A_eff_guard, A_suspect = dict(A_cur), False
         B_eff_guard, B_suspect = dict(B_cur), False
 
-    try:
-        a_sem = str((aops.capabilities() or {}).get("index_semantics", "present")).lower()
-    except Exception:
-        a_sem = "present"
-    try:
-        b_sem = str((bops.capabilities() or {}).get("index_semantics", "present")).lower()
-    except Exception:
-        b_sem = "present"
+    a_sem = _index_semantics(aops, feature)
+    b_sem = _index_semantics(bops, feature)
 
     A_eff = (dict(prevA) | dict(A_cur)) if a_sem == "delta" else dict(A_eff_guard)
     B_eff = (dict(prevB) | dict(B_cur)) if b_sem == "delta" else dict(B_eff_guard)
@@ -343,6 +474,10 @@ def _two_way_sync(
         prevB = _filter_index_by_libraries(prevB, libs_B, allow_unknown=allow_unknown_B)
         B_cur = _filter_index_by_libraries(B_cur, libs_B, allow_unknown=allow_unknown_B)
         B_eff = _filter_index_by_libraries(B_eff, libs_B, allow_unknown=allow_unknown_B)
+
+    # Keep rich metadata when the provider index is presence-only.
+    A_eff = _enrich_index_payload(A_eff, prevA, feature)
+    B_eff = _enrich_index_payload(B_eff, prevB, feature)
 
     now = int(_t.time())
     tomb_ttl_days = int((cfg.get("sync") or {}).get("tombstone_ttl_days", 30))
@@ -469,6 +604,20 @@ def _two_way_sync(
                 return True
         return False
 
+    def _find_in_idx(idx: dict[str, Any], alias: dict[str, str], it: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """Find a matching row in idx for it using canonical key or token overlap."""
+        ck = _ck(it)
+        if ck and ck in idx:
+            v = idx.get(ck)
+            return v if isinstance(v, Mapping) else None
+        for tok in _typed_tokens(it):
+            dk = alias.get(tok)
+            if not dk:
+                continue
+            v = idx.get(dk)
+            return v if isinstance(v, Mapping) else None
+        return None
+
     def _tokens(it: Mapping[str, Any]) -> set[str]:
         toks: set[str] = set()
         try:
@@ -517,6 +666,8 @@ def _two_way_sync(
 
     add_to_A: list[dict[str, Any]] = []
     add_to_B: list[dict[str, Any]] = []
+    upd_to_A: list[dict[str, Any]] = []
+    upd_to_B: list[dict[str, Any]] = []
     rem_from_A: list[dict[str, Any]] = []
     rem_from_B: list[dict[str, Any]] = []
 
@@ -597,22 +748,363 @@ def _two_way_sync(
         if allow_removals:
             rem_from_A.extend(remA)
             rem_from_B.extend(remB)
-    else:
-        for _k, v in A_eff.items():
-            if _present(B_eff, B_alias, v):
-                continue
-            if allow_removals and ((_tokens(v) & tombX) or (_ck(v) in tombX) or (_ck(v) in obsB) or (_ck(v) in shrinkB)) and (_prev_had(prevB, prevB_alias, v) or (_tokens(v) & tombX) or (_ck(v) in tombX)):
-                rem_from_A.append(_minimal(v))
-            else:
-                add_to_B.append(_minimal(v))
-        for _k, v in B_eff.items():
-            if _present(A_eff, A_alias, v):
-                continue
-            if allow_removals and ((_tokens(v) & tombX) or (_ck(v) in tombX) or (_ck(v) in obsA) or (_ck(v) in shrinkA)) and (_prev_had(prevA, prevA_alias, v) or (_tokens(v) & tombX) or (_ck(v) in tombX)):
-                rem_from_B.append(_minimal(v))
-            else:
-                add_to_A.append(_minimal(v))
 
+    elif feature == "progress":
+        B_alias_tmp = _alias_index(B_eff)
+        A_alias_tmp = _alias_index(A_eff)
+
+        B_for_A: dict[str, Any] = {}
+        A_for_B: dict[str, Any] = {}
+        try:
+            for ak, av in (A_eff or {}).items():
+                if ak in (B_eff or {}):
+                    bv0 = (B_eff or {}).get(ak)
+                    if isinstance(bv0, Mapping):
+                        B_for_A[ak] = bv0
+                    continue
+                if not isinstance(av, Mapping):
+                    continue
+                bv = _find_in_idx(B_eff, B_alias_tmp, av)
+                if isinstance(bv, Mapping):
+                    B_for_A[ak] = bv
+
+            for bk, bv in (B_eff or {}).items():
+                if bk in (A_eff or {}):
+                    av0 = (A_eff or {}).get(bk)
+                    if isinstance(av0, Mapping):
+                        A_for_B[bk] = av0
+                    continue
+                if not isinstance(bv, Mapping):
+                    continue
+                av = _find_in_idx(A_eff, A_alias_tmp, bv)
+                if isinstance(av, Mapping):
+                    A_for_B[bk] = av
+        except Exception:
+            B_for_A = dict(B_eff or {})
+            A_for_B = dict(A_eff or {})
+
+        up_B, clr_B = diff_progress(A_eff, B_for_A, fcfg=fcfg, propagate_timestamp_updates=False)
+        up_A, clr_A = diff_progress(B_eff, A_for_B, fcfg=fcfg, propagate_timestamp_updates=False)
+
+        # progress clears from missing items
+        try:
+            cfgp = dict(fcfg or {})
+            min_seconds = int(cfgp.get("min_seconds") or cfgp.get("minSeconds") or 60)
+            max_percent = float(cfgp.get("max_percent") or cfgp.get("maxPercent") or 95)
+            clear_below_min = bool(cfgp.get("clear_below_min") or cfgp.get("clearBelowMin") or False)
+            min_ms = max(0, min_seconds) * 1000
+
+            def _as_int(v: Any) -> int | None:
+                try:
+                    if v is None or isinstance(v, bool):
+                        return None
+                    return int(float(v))
+                except Exception:
+                    return None
+
+            def _pm(it: Mapping[str, Any] | None) -> int:
+                if not it:
+                    return 0
+                for kk in ("progress_ms", "progressMs", "viewOffset", "progress"):
+                    v = _as_int(it.get(kk))
+                    if v is not None:
+                        return max(0, int(v))
+                return 0
+
+            def _dur(it: Mapping[str, Any] | None) -> int | None:
+                if not it:
+                    return None
+                for kk in ("duration_ms", "durationMs", "duration"):
+                    v = _as_int(it.get(kk))
+                    if v is not None and v > 0:
+                        return int(v)
+                return None
+
+            def _pct(ms: int, dur: int | None) -> float | None:
+                if dur is None or dur <= 0:
+                    return None
+                try:
+                    return (float(ms) / float(dur)) * 100.0
+                except Exception:
+                    return None
+
+            def _infer_clears(
+                missing: set[str],
+                prev_idx: dict[str, Any],
+                other_eff: dict[str, Any],
+                other_alias: dict[str, str],
+            ) -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                for ck0 in (missing or set()):
+                    pit = prev_idx.get(ck0)
+                    if not isinstance(pit, Mapping):
+                        continue
+
+                    pms = _pm(pit)
+                    if pms <= 0:
+                        continue
+                    if min_ms and pms < min_ms and not clear_below_min:
+                        # Not synced then don't propagate the clear either (unless clear_below_min)
+                        continue
+                    pp = _pct(pms, _dur(pit))
+                    if pp is not None and pp >= max_percent:
+                        # Near completion then let history sync handle played state
+                        continue
+
+                    # Prefer the target-side row so canonical_key and resolver data matches
+                    tgt = other_eff.get(ck0)
+                    if not isinstance(tgt, Mapping):
+                        tgt = _find_in_idx(other_eff, other_alias, pit)
+
+                    base = _minimal(tgt) if isinstance(tgt, Mapping) else _minimal(pit)
+                    base["progress_ms"] = 0
+                    # Use epoch seconds timestamp for conflict resolution
+                    base["progress_at"] = str(int(now))
+                    out.append(base)
+                return out
+
+            if allow_removals:
+                # A missing => clear on B, B missing => clear on A
+                clr_B = list(clr_B or [])
+                clr_A = list(clr_A or [])
+                clr_B += _infer_clears(obsA, prevA, B_eff, B_alias_tmp)
+                clr_A += _infer_clears(obsB, prevB, A_eff, A_alias_tmp)
+
+                # Tomb-based shit:
+                tck: set[str] = set()
+                for tok in (tomb or set()):
+                    if tok in (A_eff or {}) or tok in (B_eff or {}):
+                        tck.add(tok)
+                        continue
+                    ckA = A_alias_tmp.get(tok)
+                    ckB = B_alias_tmp.get(tok)
+                    if ckA:
+                        tck.add(ckA)
+                    if ckB:
+                        tck.add(ckB)
+
+                miss_on_B = {k for k in tck if k in (A_eff or {}) and k not in (B_eff or {})}
+                miss_on_A = {k for k in tck if k in (B_eff or {}) and k not in (A_eff or {})}
+
+                def _infer_from_present(present_keys: set[str], present_eff: dict[str, Any]) -> list[dict[str, Any]]:
+                    out: list[dict[str, Any]] = []
+                    for ck0 in (present_keys or set()):
+                        pit = present_eff.get(ck0)
+                        if not isinstance(pit, Mapping):
+                            continue
+                        pms = _pm(pit)
+                        if pms <= 0:
+                            continue
+                        if min_ms and pms < min_ms and not clear_below_min:
+                            continue
+                        pp = _pct(pms, _dur(pit))
+                        if pp is not None and pp >= max_percent:
+                            continue
+                        base = _minimal(pit)
+                        base["progress_ms"] = 0
+                        base["progress_at"] = str(int(now))
+                        out.append(base)
+                    return out
+
+                clr_A += _infer_from_present(miss_on_B, A_eff)
+                clr_B += _infer_from_present(miss_on_A, B_eff)
+
+                emit("debug", msg="progress.infer_clears", obsA=len(obsA), obsB=len(obsB), tomb=len(tomb or set()),
+                     tomb_missing_on_A=len(miss_on_A), tomb_missing_on_B=len(miss_on_B), clear_below_min=bool(clear_below_min))
+        except Exception:
+            pass
+
+        def _prog_ms(it: Mapping[str, Any]) -> int:
+            for kk in ("progress_ms", "progressMs", "viewOffset", "progress"):
+                v = it.get(kk)
+                try:
+                    if v is None:
+                        continue
+                    return int(float(v))
+                except Exception:
+                    continue
+            return 0
+
+        def _prog_epoch(it: Mapping[str, Any]) -> int | None:
+            v = it.get("progress_at") or it.get("progressAt") or it.get("last_played") or it.get("lastPlayed") or it.get("lastViewedAt")
+            if v is None:
+                return None
+            try:
+                if isinstance(v, (int, float)):
+                    return int(v)
+                s = str(v).strip()
+                if not s:
+                    return None
+                if s.isdigit():
+                    return int(s)
+                from datetime import datetime
+                return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+            except Exception:
+                return None
+
+        bi = sync_cfg.get("bidirectional") or {}
+        sot = (bi.get("source_of_truth") or bi.get("sourceOfTruth") or "").strip().upper()
+        prefer = sot if sot in (a, b) else a
+
+        upB = {k: it for it in up_B if (k := _ck(it))}
+        upA = {k: it for it in up_A if (k := _ck(it))}
+        clB = {k: it for it in clr_B if (k := _ck(it))}
+        clA = {k: it for it in clr_A if (k := _ck(it))}
+
+        addA: list[dict[str, Any]] = []
+        addB: list[dict[str, Any]] = []
+        remA: list[dict[str, Any]] = []
+        remB: list[dict[str, Any]] = []
+
+        for k in (set(upA) | set(upB) | set(clA) | set(clB)):
+            a_it = (A_eff.get(k) or upB.get(k) or clB.get(k) or {})
+            b_it = (B_eff.get(k) or upA.get(k) or clA.get(k) or {})
+
+            # Both want to set progress.
+            if k in upA and k in upB:
+                ta = _prog_epoch(a_it)
+                tb = _prog_epoch(b_it)
+                if ta is not None and tb is not None and ta != tb:
+                    win = a if ta > tb else b
+                else:
+                    msa = _prog_ms(a_it)
+                    msb = _prog_ms(b_it)
+                    if msa != msb:
+                        win = a if msa > msb else b
+                    else:
+                        win = prefer
+
+                if win == a:
+                    addB.append(_minimal_keep_progress(upB[k]))
+                else:
+                    addA.append(_minimal_keep_progress(upA[k]))
+                continue
+
+            # Clear vs set conflicts.
+            if (k in clB) and (k in upA):
+                # A explicitly cleared; B has progress. Decide by timestamp, then prefer.
+                ta = _prog_epoch(clB[k])
+                tb = _prog_epoch(b_it)
+                if ta is not None and tb is not None and ta != tb:
+                    win = a if ta > tb else b
+                else:
+                    win = prefer
+                if win == a:
+                    if allow_removals:
+                        remB.append(_minimal(clB[k]))
+                else:
+                    addA.append(_minimal_keep_progress(upA[k]))
+                continue
+
+            if (k in clA) and (k in upB):
+                tb = _prog_epoch(clA[k])
+                ta = _prog_epoch(a_it)
+                if ta is not None and tb is not None and ta != tb:
+                    win = a if ta > tb else b
+                else:
+                    win = prefer
+                if win == b:
+                    if allow_removals:
+                        remA.append(_minimal(clA[k]))
+                else:
+                    addB.append(_minimal_keep_progress(upB[k]))
+                continue
+
+            # Single-sided actions.
+            if k in upB:
+                addB.append(_minimal_keep_progress(upB[k]))
+            elif k in upA:
+                addA.append(_minimal_keep_progress(upA[k]))
+            elif allow_removals and k in clB:
+                remB.append(_minimal(clB[k]))
+            elif allow_removals and k in clA:
+                remA.append(_minimal(clA[k]))
+
+        add_to_A = addA if allow_adds else []
+        add_to_B = addB if allow_adds else []
+        if allow_removals:
+            rem_from_A.extend(remA)
+            rem_from_B.extend(remB)
+
+    else:
+        bucket_sec = _hist_bucket_sec(a, b, feature)
+        if bucket_sec and int(bucket_sec) > 1:
+            bsec = int(bucket_sec)
+
+            def _tsb_from_key(k: str) -> int | None:
+                ts = _hist_ts_from_key(k)
+                return None if ts is None else _hist_bucket_ts(int(ts), bsec)
+
+            A_tok_ts: set[tuple[str, int]] = set()
+            for ak, av in (A_eff or {}).items():
+                if not isinstance(av, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(ak))
+                if tsb is None:
+                    continue
+                for tok in _typed_tokens(av):
+                    if tok:
+                        A_tok_ts.add((tok, tsb))
+
+            B_tok_ts: set[tuple[str, int]] = set()
+            for bk, bv in (B_eff or {}).items():
+                if not isinstance(bv, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(bk))
+                if tsb is None:
+                    continue
+                for tok in _typed_tokens(bv):
+                    if tok:
+                        B_tok_ts.add((tok, tsb))
+
+            for ak, v in (A_eff or {}).items():
+                if not isinstance(v, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(ak))
+                if tsb is not None:
+                    toks = _typed_tokens(v)
+                    if toks and any((tok, tsb) in B_tok_ts for tok in toks):
+                        continue
+                else:
+                    if _present(B_eff, B_alias, v):
+                        continue
+
+                if allow_removals and ((_tokens(v) & tombX) or (_ck(v) in tombX) or (_ck(v) in obsB) or (_ck(v) in shrinkB)) and (_prev_had(prevB, prevB_alias, v) or (_tokens(v) & tombX) or (_ck(v) in tombX)):
+                    rem_from_A.append(_minimal(v))
+                else:
+                    add_to_B.append(_minimal(v))
+
+            for bk, v in (B_eff or {}).items():
+                if not isinstance(v, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(bk))
+                if tsb is not None:
+                    toks = _typed_tokens(v)
+                    if toks and any((tok, tsb) in A_tok_ts for tok in toks):
+                        continue
+                else:
+                    if _present(A_eff, A_alias, v):
+                        continue
+
+                if allow_removals and ((_tokens(v) & tombX) or (_ck(v) in tombX) or (_ck(v) in obsA) or (_ck(v) in shrinkA)) and (_prev_had(prevA, prevA_alias, v) or (_tokens(v) & tombX) or (_ck(v) in tombX)):
+                    rem_from_B.append(_minimal(v))
+                else:
+                    add_to_A.append(_minimal(v))
+        else:
+            for _k, v in A_eff.items():
+                if _present(B_eff, B_alias, v):
+                    continue
+                if allow_removals and ((_tokens(v) & tombX) or (_ck(v) in tombX) or (_ck(v) in obsB) or (_ck(v) in shrinkB)) and (_prev_had(prevB, prevB_alias, v) or (_tokens(v) & tombX) or (_ck(v) in tombX)):
+                    rem_from_A.append(_minimal(v))
+                else:
+                    add_to_B.append(_minimal(v))
+            for _k, v in B_eff.items():
+                if _present(A_eff, A_alias, v):
+                    continue
+                if allow_removals and ((_tokens(v) & tombX) or (_ck(v) in tombX) or (_ck(v) in obsA) or (_ck(v) in shrinkA)) and (_prev_had(prevA, prevA_alias, v) or (_tokens(v) & tombX) or (_ck(v) in tombX)):
+                    rem_from_B.append(_minimal(v))
+                else:
+                    add_to_A.append(_minimal(v))
     if not allow_adds:
         add_to_A.clear()
         add_to_B.clear()
@@ -683,25 +1175,15 @@ def _two_way_sync(
     guardB = PhantomGuard(src=a, dst=b, feature=feature, ttl_days=bb_ttl_days, enabled=use_phantoms)
 
     if use_phantoms and add_to_A:
-        # Ratings use upsert semantics (add == set/update). Do not phantom-block updates.
-        if feature == "ratings":
-            upd = [it for it in add_to_A if _present(A_eff, A_alias, it)]
-            fresh = [it for it in add_to_A if not _present(A_eff, A_alias, it)]
-            if fresh:
-                fresh, _ = guardA.filter_adds(fresh, _ck, _minimal, emit, ctx.state_store, pair_key)
-            add_to_A = upd + fresh
-        else:
-            add_to_A, _ = guardA.filter_adds(add_to_A, _ck, _minimal, emit, ctx.state_store, pair_key)
+        add_to_A, _ = guardA.filter_adds(add_to_A, _ck, _minimal, emit, ctx.state_store, pair_key)
     if use_phantoms and add_to_B:
-        # Ratings use upsert semantics
-        if feature == "ratings":
-            upd = [it for it in add_to_B if _present(B_eff, B_alias, it)]
-            fresh = [it for it in add_to_B if not _present(B_eff, B_alias, it)]
-            if fresh:
-                fresh, _ = guardB.filter_adds(fresh, _ck, _minimal, emit, ctx.state_store, pair_key)
-            add_to_B = upd + fresh
-        else:
-            add_to_B, _ = guardB.filter_adds(add_to_B, _ck, _minimal, emit, ctx.state_store, pair_key)
+        add_to_B, _ = guardB.filter_adds(add_to_B, _ck, _minimal, emit, ctx.state_store, pair_key)
+
+    if feature == "ratings":
+        upd_to_A = [it for it in add_to_A if _present(A_eff, A_alias, it)]
+        upd_to_B = [it for it in add_to_B if _present(B_eff, B_alias, it)]
+        add_to_A = [it for it in add_to_A if not _present(A_eff, A_alias, it)]
+        add_to_B = [it for it in add_to_B if not _present(B_eff, B_alias, it)]
 
     rem_from_A = _maybe_block_massdelete(
         rem_from_A, baseline_size=len(A_eff),
@@ -718,6 +1200,7 @@ def _two_way_sync(
 
     emit("two:plan", a=a, b=b, feature=feature,
          add_to_A=len(add_to_A), add_to_B=len(add_to_B),
+         upd_to_A=len(upd_to_A), upd_to_B=len(upd_to_B),
          rem_from_A=len(rem_from_A), rem_from_B=len(rem_from_B))
 
     resA_rem: dict[str, Any] = {"ok": True, "count": 0}
@@ -819,10 +1302,94 @@ def _two_way_sync(
 
     resA_add: dict[str, Any] = {"ok": True, "count": 0}
     resB_add: dict[str, Any] = {"ok": True, "count": 0}
+    resA_upd: dict[str, Any] = {"ok": True, "count": 0}
+    resB_upd: dict[str, Any] = {"ok": True, "count": 0}
+    eff_upd_A = 0
+    eff_upd_B = 0
     eff_add_A = 0
     eff_add_B = 0
     unresolved_new_A_total = 0
     unresolved_new_B_total = 0
+
+    if upd_to_A:
+        if a_down:
+            record_unresolved(a, feature, upd_to_A, hint="provider_down:update")
+            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="update", count=len(upd_to_A))
+            unresolved_new_A_total += len(upd_to_A)
+        else:
+            emit("two:apply:update:A:start", dst=a, feature=feature, count=len(upd_to_A))
+            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=True) or [])
+            resA_upd = apply_update(
+                dst_ops=aops, cfg=cfg, dst_name=a, feature=feature, items=upd_to_A,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+            )
+            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=True) or [])
+            prov_unresolved_keys_A_raw = (resA_upd or {}).get("unresolved_keys")
+            prov_unresolved_keys_A: list[str] = (
+                [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
+            )
+            new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (set(prov_unresolved_keys_A) - unresolved_before_A)
+            unresolved_new_A_total += len(new_unresolved_A)
+            eff_upd_A = int((resA_upd or {}).get("confirmed", (resA_upd or {}).get("count", 0)) or 0)
+            if eff_upd_A and not dry_run_flag:
+                upd_map_A = {(_ck(_minimal(it)) or ""): _minimal(it) for it in upd_to_A}
+                confirmed_keys_A = [str(x) for x in ((resA_upd or {}).get("confirmed_keys") or []) if x]
+                keys_to_write_A = confirmed_keys_A if confirmed_keys_A else (list(upd_map_A.keys()) if eff_upd_A >= len(upd_map_A) else [])
+                for k in keys_to_write_A:
+                    v = upd_map_A.get(k)
+                    if v:
+                        A_eff[k] = v
+                if keys_to_write_A:
+                    _bust_snapshot(a)
+            emit("two:apply:update:A:done", dst=a, feature=feature,
+                 count=eff_upd_A,
+                 attempted=int(resA_upd.get("attempted", 0)),
+                 updated=eff_upd_A,
+                 skipped=int(resA_upd.get("skipped", 0)),
+                 unresolved=int(resA_upd.get("unresolved", 0)),
+                 errors=int(resA_upd.get("errors", 0)),
+                 result=resA_upd)
+
+    if upd_to_B:
+        if b_down:
+            record_unresolved(b, feature, upd_to_B, hint="provider_down:update")
+            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="update", count=len(upd_to_B))
+            unresolved_new_B_total += len(upd_to_B)
+        else:
+            emit("two:apply:update:B:start", dst=b, feature=feature, count=len(upd_to_B))
+            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=True) or [])
+            resB_upd = apply_update(
+                dst_ops=bops, cfg=cfg, dst_name=b, feature=feature, items=upd_to_B,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+            )
+            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=True) or [])
+            prov_unresolved_keys_B_raw = (resB_upd or {}).get("unresolved_keys")
+            prov_unresolved_keys_B: list[str] = (
+                [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
+            )
+            new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (set(prov_unresolved_keys_B) - unresolved_before_B)
+            unresolved_new_B_total += len(new_unresolved_B)
+            eff_upd_B = int((resB_upd or {}).get("confirmed", (resB_upd or {}).get("count", 0)) or 0)
+            if eff_upd_B and not dry_run_flag:
+                upd_map_B = {(_ck(_minimal(it)) or ""): _minimal(it) for it in upd_to_B}
+                confirmed_keys_B = [str(x) for x in ((resB_upd or {}).get("confirmed_keys") or []) if x]
+                keys_to_write_B = confirmed_keys_B if confirmed_keys_B else (list(upd_map_B.keys()) if eff_upd_B >= len(upd_map_B) else [])
+                for k in keys_to_write_B:
+                    v = upd_map_B.get(k)
+                    if v:
+                        B_eff[k] = v
+                if keys_to_write_B:
+                    _bust_snapshot(b)
+            emit("two:apply:update:B:done", dst=b, feature=feature,
+                 count=eff_upd_B,
+                 attempted=int(resB_upd.get("attempted", 0)),
+                 updated=eff_upd_B,
+                 skipped=int(resB_upd.get("skipped", 0)),
+                 unresolved=int(resB_upd.get("unresolved", 0)),
+                 errors=int(resB_upd.get("errors", 0)),
+                 result=resB_upd)
 
     if add_to_A:
         if a_down:
@@ -850,8 +1417,15 @@ def _two_way_sync(
                 chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
             )
             unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=True) or [])
-            new_unresolved_A = unresolved_after_A - unresolved_before_A
+            prov_unresolved_keys_A_raw = (resA_add or {}).get("unresolved_keys")
+            prov_unresolved_keys_A: list[str] = (
+                [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
+            )
+            prov_unresolved_set_A: set[str] = set(prov_unresolved_keys_A)
+
+            new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (prov_unresolved_set_A - unresolved_before_A)
             unresolved_new_A_total += len(new_unresolved_A)
+            still_unresolved_A = set(attempted_A) & (unresolved_after_A | prov_unresolved_set_A)
             
             prov_confirmed_keys_A_raw = (resA_add or {}).get("confirmed_keys")
             prov_skipped_keys_A_raw = (resA_add or {}).get("skipped_keys")
@@ -870,7 +1444,7 @@ def _two_way_sync(
                 attempted_set_A = set(attempted_A)
                 confirmed_A = [k for k in prov_confirmed_keys_A if k in attempted_set_A]
             else:
-                confirmed_A = [k for k in attempted_A if k not in new_unresolved_A]
+                confirmed_A = [k for k in attempted_A if k not in still_unresolved_A]
 
         
             prov_count_A = _confirmed(resA_add)
@@ -887,7 +1461,7 @@ def _two_way_sync(
                 eff_add_A = len(confirmed_A)
             else:
                 ambiguous_partial_A = (not have_exact_keys_A) and bool((resA_add or {}).get("skipped")) and prov_count_A and (prov_count_A < len(confirmed_A))
-                eff_add_A = 0 if new_unresolved_A or ambiguous_partial_A else min(prov_count_A, len(confirmed_A))
+                eff_add_A = 0 if still_unresolved_A or ambiguous_partial_A else min(prov_count_A, len(confirmed_A))
             
             if eff_add_A != prov_count_A and not have_exact_keys_A:
                 dbg("two:apply:add:corrected", dst=a, feature=feature,
@@ -952,8 +1526,15 @@ def _two_way_sync(
                 chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
             )
             unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=True) or [])
-            new_unresolved_B = unresolved_after_B - unresolved_before_B
+            prov_unresolved_keys_B_raw = (resB_add or {}).get("unresolved_keys")
+            prov_unresolved_keys_B: list[str] = (
+                [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
+            )
+            prov_unresolved_set_B: set[str] = set(prov_unresolved_keys_B)
+
+            new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (prov_unresolved_set_B - unresolved_before_B)
             unresolved_new_B_total += len(new_unresolved_B)
+            still_unresolved_B = set(attempted_B) & (unresolved_after_B | prov_unresolved_set_B)
             
             prov_confirmed_keys_B_raw = (resB_add or {}).get("confirmed_keys")
             prov_skipped_keys_B_raw = (resB_add or {}).get("skipped_keys")
@@ -972,7 +1553,7 @@ def _two_way_sync(
                 attempted_set_B = set(attempted_B)
                 confirmed_B = [k for k in prov_confirmed_keys_B if k in attempted_set_B]
             else:
-                confirmed_B = [k for k in attempted_B if k not in new_unresolved_B]
+                confirmed_B = [k for k in attempted_B if k not in still_unresolved_B]
 
         
             prov_count_B = _confirmed(resB_add)
@@ -989,7 +1570,7 @@ def _two_way_sync(
                 eff_add_B = len(confirmed_B)
             else:
                 ambiguous_partial_B = (not have_exact_keys_B) and bool((resB_add or {}).get("skipped")) and prov_count_B and (prov_count_B < len(confirmed_B))
-                eff_add_B = 0 if new_unresolved_B or ambiguous_partial_B else min(prov_count_B, len(confirmed_B))
+                eff_add_B = 0 if still_unresolved_B or ambiguous_partial_B else min(prov_count_B, len(confirmed_B))
             
             if eff_add_B != prov_count_B and not have_exact_keys_B:
                 dbg("two:apply:add:corrected", dst=b, feature=feature,
@@ -1068,6 +1649,90 @@ def _two_way_sync(
             pf = _ensure_pf(pmap, prov, inst, feat)
             pf["checkpoint"] = chk
 
+        # Normalize key drift so state doesn't inflate.
+        if feature in ("history", "ratings", "progress"):
+            def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+                out = dict(base or {})
+                for k, v in (extra or {}).items():
+                    if k in ("ids", "show_ids"):
+                        continue
+                    if out.get(k) in (None, "") and v not in (None, ""):
+                        out[k] = v
+
+                for fld in ("ids", "show_ids"):
+                    b = out.get(fld) if isinstance(out.get(fld), Mapping) else {}
+                    e = extra.get(fld) if isinstance(extra.get(fld), Mapping) else {}
+                    if b or e:
+                        merged: dict[str, Any] = dict(b or {})
+                        for kk, vv in (e or {}).items():
+                            if merged.get(kk) in (None, "") and vv not in (None, ""):
+                                merged[kk] = vv
+                        if merged:
+                            out[fld] = merged
+
+                if feature == "history":
+                    a0 = out.get("watched_at")
+                    b0 = extra.get("watched_at")
+                    if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
+                        out["watched_at"] = b0
+                elif feature == "ratings":
+                    a0 = out.get("rated_at")
+                    b0 = extra.get("rated_at")
+                    if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
+                        out["rated_at"] = b0
+                return out
+
+            def _rekey_to_other(idx0: dict[str, Any], other0: dict[str, Any]) -> dict[str, Any]:
+                if not idx0 or not other0:
+                    return dict(idx0 or {})
+
+                other_alias = _alias_index(other0)
+                other_tmdb = {t: k for t, k in other_alias.items() if str(t).startswith("tmdb:")}
+                other_imdb = {t: k for t, k in other_alias.items() if str(t).startswith("imdb:")}
+                other_tvdb = {t: k for t, k in other_alias.items() if str(t).startswith("tvdb:")}
+
+                out: dict[str, Any] = {}
+                for ck, it in (idx0 or {}).items():
+                    if not isinstance(it, Mapping):
+                        out[str(ck)] = it
+                        continue
+
+                    ck_s = str(ck)
+                    if ck_s in other0:
+                        out[ck_s] = it
+                        continue
+
+                    toks = _typed_tokens(it)
+                    mk: str | None = None
+
+                    for tok in toks:
+                        if tok.startswith("tmdb:") and tok in other_tmdb:
+                            mk = other_tmdb[tok]
+                            break
+                    if not mk:
+                        for tok in toks:
+                            if tok.startswith("imdb:") and tok in other_imdb:
+                                mk = other_imdb[tok]
+                                break
+                    if not mk:
+                        for tok in toks:
+                            if tok.startswith("tvdb:") and tok in other_tvdb:
+                                mk = other_tvdb[tok]
+                                break
+
+                    if not mk:
+                        out[ck_s] = it
+                        continue
+
+                    existing = out.get(mk)
+                    if isinstance(existing, Mapping):
+                        out[mk] = _merge_payload(existing, it)
+                    else:
+                        out[mk] = dict(it)
+
+                return out
+
+            B_eff = _rekey_to_other(B_eff, A_eff)
         _commit_baseline(provs_block, a, src_inst, feature, A_eff)
         _commit_baseline(provs_block, b, dst_inst, feature, B_eff)
         _commit_checkpoint(provs_block, a, src_inst, feature, now_cp_A)
@@ -1079,21 +1744,26 @@ def _two_way_sync(
         pass
 
     emit("two:done", a=a, b=b, feature=feature,
+         upd_to_A=eff_upd_A, upd_to_B=eff_upd_B,
          adds_to_A=eff_add_A, adds_to_B=eff_add_B,
          rem_from_A=_confirmed(resA_rem),
          rem_from_B=_confirmed(resB_rem))
 
-    skipped_total = int(resA_add.get("skipped", 0)) + int(resB_add.get("skipped", 0)) + \
+    skipped_total = int(resA_upd.get("skipped", 0)) + int(resB_upd.get("skipped", 0)) + \
+                    int(resA_add.get("skipped", 0)) + int(resB_add.get("skipped", 0)) + \
                     int(resA_rem.get("skipped", 0)) + int(resB_rem.get("skipped", 0))
-    errors_total = int(resA_add.get("errors", 0)) + int(resB_add.get("errors", 0)) + \
+    errors_total = int(resA_upd.get("errors", 0)) + int(resB_upd.get("errors", 0)) + \
+                   int(resA_add.get("errors", 0)) + int(resB_add.get("errors", 0)) + \
                    int(resA_rem.get("errors", 0)) + int(resB_rem.get("errors", 0))
     unresolved_total = int(unresolved_new_A_total) + int(unresolved_new_B_total)
 
     return {
         "ok": True, "feature": feature, "a": a, "b": b,
+        "upd_to_A": eff_upd_A, "upd_to_B": eff_upd_B,
         "adds_to_A": eff_add_A, "adds_to_B": eff_add_B,
         "rem_from_A": _confirmed(resA_rem),
         "rem_from_B": _confirmed(resB_rem),
+        "resA_update": resA_upd, "resB_update": resB_upd,
         "resA_add": resA_add, "resB_add": resB_add,
         "resA_remove": resA_rem, "resB_remove": resB_rem,
         "unresolved_to_A": int(unresolved_new_A_total),

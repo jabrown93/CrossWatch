@@ -6,20 +6,22 @@ from collections.abc import Mapping
 from typing import Any
 
 import os
+import re
+import datetime as _dt
 
 from ..provider_instances import normalize_instance_id
 
-from ..id_map import minimal as _minimal, canonical_key as _ck
+from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
 from ._snapshots import (
     build_snapshots_for_feature,
     coerce_suspect_snapshot,
     module_checkpoint,
     prev_checkpoint,
 )
-from ._applier import apply_add, apply_remove
+from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
 from ._unresolved import load_unresolved_keys, record_unresolved
-from ._planner import diff, diff_ratings
+from ._planner import diff, diff_ratings, diff_progress
 from ._phantoms import PhantomGuard
 
 
@@ -54,6 +56,155 @@ _PROVIDER_KEY_MAP = {
     "EMBY": "emby",
     "ANILIST": "anilist",
 }
+
+
+def _index_semantics(ops, feature: str) -> str:
+    try:
+        caps = ops.capabilities() or {}
+    except Exception:
+        return "present"
+    if not isinstance(caps, Mapping):
+        return "present"
+    per = caps.get(feature)
+    if isinstance(per, Mapping):
+        sem = per.get("index_semantics")
+        if sem:
+            return str(sem).lower()
+    return str(caps.get("index_semantics", "present")).lower()
+
+# Enrichment and hydration of index payloads
+def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
+    if not cur or not prev:
+        return dict(cur or {})
+
+    def _iso_to_epoch(v: Any) -> int | None:
+        if not v:
+            return None
+        try:
+            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    def _pick_newest(a: Any, b: Any) -> Any:
+        ae = _iso_to_epoch(a)
+        be = _iso_to_epoch(b)
+        if be is None:
+            return a
+        if ae is None or be > ae:
+            return b
+        return a
+
+    out: dict[str, Any] = {}
+    for k, cv in (cur or {}).items():
+        pv = (prev or {}).get(k)
+        if not isinstance(cv, Mapping) or not isinstance(pv, Mapping):
+            out[str(k)] = cv
+            continue
+
+        merged: dict[str, Any] = dict(pv)
+
+        # Merge IDs
+        ids_prev = pv.get("ids") if isinstance(pv.get("ids"), Mapping) else None
+        ids_cur = cv.get("ids") if isinstance(cv.get("ids"), Mapping) else None
+        ids = _merge_ids(ids_prev, ids_cur)
+        if ids:
+            merged["ids"] = ids
+
+        sids_prev = pv.get("show_ids") if isinstance(pv.get("show_ids"), Mapping) else None
+        sids_cur = cv.get("show_ids") if isinstance(cv.get("show_ids"), Mapping) else None
+        sids = _merge_ids(sids_prev, sids_cur)
+        if sids:
+            merged["show_ids"] = sids
+
+        # Overlay fields from current.
+        for fk, fv in cv.items():
+            if fk in ("ids", "show_ids"):
+                continue
+            if fv is None:
+                continue
+            if isinstance(fv, str) and fv == "":
+                continue
+            merged[fk] = fv
+
+        if feature == "history":
+            if "watched_at" in pv or "watched_at" in cv:
+                merged["watched_at"] = _pick_newest(pv.get("watched_at"), cv.get("watched_at"))
+        elif feature == "ratings":
+            if "rated_at" in pv or "rated_at" in cv:
+                merged["rated_at"] = _pick_newest(pv.get("rated_at"), cv.get("rated_at"))
+
+        out[str(k)] = merged
+
+    return out
+
+
+def _hydrate_missing_fields(cur: dict[str, Any], donor: dict[str, Any], feature: str) -> dict[str, Any]:
+    if not cur or not donor:
+        return dict(cur or {})
+
+    def _iso_to_epoch(v: Any) -> int | None:
+        if not v:
+            return None
+        try:
+            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    def _pick_newest(a: Any, b: Any) -> Any:
+        ae = _iso_to_epoch(a)
+        be = _iso_to_epoch(b)
+        if be is None:
+            return a
+        if ae is None or be > ae:
+            return b
+        return a
+
+    out: dict[str, Any] = {}
+    for k, cv in (cur or {}).items():
+        dv = (donor or {}).get(k)
+        if not isinstance(cv, Mapping) or not isinstance(dv, Mapping):
+            out[str(k)] = cv
+            continue
+
+        merged: dict[str, Any] = dict(cv)
+
+        for fk, fv in dv.items():
+            if fk in ("ids", "show_ids"):
+                continue
+            if merged.get(fk) in (None, "") and fv not in (None, ""):
+                merged[fk] = fv
+
+        ids_cur = cv.get("ids") if isinstance(cv.get("ids"), Mapping) else None
+        ids_don = dv.get("ids") if isinstance(dv.get("ids"), Mapping) else None
+        ids = _merge_ids(ids_cur, ids_don)
+        if ids:
+            merged["ids"] = ids
+
+        sids_cur = cv.get("show_ids") if isinstance(cv.get("show_ids"), Mapping) else None
+        sids_don = dv.get("show_ids") if isinstance(dv.get("show_ids"), Mapping) else None
+        sids = _merge_ids(sids_cur, sids_don)
+        if sids:
+            merged["show_ids"] = sids
+
+        if feature == "history":
+            if "watched_at" in cv or "watched_at" in dv:
+                merged["watched_at"] = _pick_newest(cv.get("watched_at"), dv.get("watched_at"))
+        elif feature == "ratings":
+            if "rated_at" in cv or "rated_at" in dv:
+                merged["rated_at"] = _pick_newest(cv.get("rated_at"), dv.get("rated_at"))
+
+        out[str(k)] = merged
+
+    return out
+
 
 def _effective_library_whitelist(
     cfg: Mapping[str, Any],
@@ -117,6 +268,31 @@ def _filter_index_by_libraries(idx: dict[str, Any], libs: list[str], *, allow_un
             out[ck] = v
 
     return out
+
+# History key helpers
+_HISTORY_KEY_RE = re.compile(r"^(?P<base>.+?)@(?P<ts>\d+)(?P<rest>.*)$")
+
+def _history_bucket_sec(a: str, b: str, feature: str) -> int:
+    if str(feature) != "history":
+        return 0
+    a_u = str(a or "").upper()
+    b_u = str(b or "").upper()
+    return 60 if (a_u == "TRAKT" or b_u == "TRAKT") else 0
+
+def _history_ts_from_key(key: str) -> int | None:
+    m = _HISTORY_KEY_RE.match(str(key))
+    if not m:
+        return None
+    try:
+        return int(m.group("ts"))
+    except Exception:
+        return None
+
+def _bucket_ts(ts: int, bucket_sec: int) -> int:
+    b = int(bucket_sec or 0)
+    if b <= 1:
+        return int(ts)
+    return (int(ts) // b) * b
 
 # Feature-specific filters
 def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
@@ -203,7 +379,15 @@ def run_one_way_feature(
 
     def _cap_obsdel(ops) -> bool | None:
         try:
-            v = (ops.capabilities() or {}).get("observed_deletes")
+            caps = ops.capabilities() or {}
+            if isinstance(caps, Mapping):
+                per = caps.get(feature)
+                if isinstance(per, Mapping) and per.get("observed_deletes") is not None:
+                    v = per.get("observed_deletes")
+                else:
+                    v = caps.get("observed_deletes")
+            else:
+                v = None
             return None if v is None else bool(v)
         except Exception:
             return None
@@ -237,11 +421,11 @@ def run_one_way_feature(
 
     def _typed_tokens(it: Mapping[str, Any]) -> set[str]:
         typ = str(it.get("type") or "").strip().lower()
-        if typ in ("episode", "season"):
-            ids_raw = it.get("show_ids") or it.get("ids") or {}
-        else:
-            ids_raw = it.get("ids") or {}
-        ids = ids_raw if isinstance(ids_raw, Mapping) else {}
+        show_ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else {}
+        ids_raw = it.get("ids") if isinstance(it.get("ids"), Mapping) else {}
+        show_ids = dict(show_ids_raw or {})
+        ids = dict(ids_raw or {})
+
         toks: set[str] = set()
 
         if typ == "episode":
@@ -250,12 +434,21 @@ def run_one_way_feature(
                 e = int(it.get("episode") or 0)
             except Exception:
                 s, e = 0, 0
-            if s > 0 and e > 0:
+            has_frag = bool(s > 0 and e > 0)
+            if has_frag:
                 frag = f"#s{s:02d}e{e:02d}"
+    
+                for src_ids in (show_ids, ids):
+                    for k, v in src_ids.items():
+                        if v is None or str(v) == "":
+                            continue
+                        toks.add(f"{str(k).lower()}:{str(v).lower()}{frag}")
+
+            if not has_frag:
                 for k, v in ids.items():
                     if v is None or str(v) == "":
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}{frag}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
 
         elif typ == "season":
             try:
@@ -264,10 +457,11 @@ def run_one_way_feature(
                 s = 0
             if s > 0:
                 frag = f"#season:{s}"
-                for k, v in ids.items():
-                    if v is None or str(v) == "":
-                        continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}{frag}")
+                for src_ids in (show_ids, ids):
+                    for k, v in src_ids.items():
+                        if v is None or str(v) == "":
+                            continue
+                        toks.add(f"{str(k).lower()}:{str(v).lower()}{frag}")
 
         else:
             for k, v in ids.items():
@@ -307,6 +501,58 @@ def run_one_way_feature(
             v = idx.get(dk)
             return v if isinstance(v, Mapping) else None
         return None
+
+    # normalize destination keys onto source keyspace
+    def _rekey_to_src_keyspace(dst_idx: dict[str, Any], src_idx0: dict[str, Any]) -> dict[str, Any]:
+        if not dst_idx or not src_idx0:
+            return dict(dst_idx or {})
+
+        src_alias = _alias_index(src_idx0)
+        src_tmdb = {t: k for t, k in src_alias.items() if str(t).startswith("tmdb:")}
+        src_imdb = {t: k for t, k in src_alias.items() if str(t).startswith("imdb:")}
+        src_tvdb = {t: k for t, k in src_alias.items() if str(t).startswith("tvdb:")}
+
+        out: dict[str, Any] = {}
+        for dk, dv in (dst_idx or {}).items():
+            if not isinstance(dv, Mapping):
+                out[str(dk)] = dv
+                continue
+
+            dk_s = str(dk)
+            if dk_s in src_idx0:
+                out[dk_s] = dv
+                continue
+
+            toks = _typed_tokens(dv)
+            mk: str | None = None
+
+            for tok in toks:
+                if tok.startswith("tmdb:") and tok in src_tmdb:
+                    mk = src_tmdb[tok]
+                    break
+            if not mk:
+                for tok in toks:
+                    if tok.startswith("imdb:") and tok in src_imdb:
+                        mk = src_imdb[tok]
+                        break
+            if not mk:
+                for tok in toks:
+                    if tok.startswith("tvdb:") and tok in src_tvdb:
+                        mk = src_tvdb[tok]
+                        break
+
+            if not mk:
+                out[dk_s] = dv
+                continue
+
+            existing = out.get(mk)
+            if isinstance(existing, Mapping):
+                merged = _hydrate_missing_fields({mk: dict(existing)}, {mk: dict(dv)}, feature).get(mk)
+                out[mk] = merged if isinstance(merged, Mapping) else dict(existing)
+            else:
+                out[mk] = dv
+
+        return out
 
     pair_providers = {src: src_ops, dst: dst_ops}
 
@@ -405,39 +651,165 @@ def run_one_way_feature(
         dst_cur  = _filter_index_by_libraries(dst_cur,  libs_dst, allow_unknown=allow_unknown_dst)
         eff_dst  = _filter_index_by_libraries(eff_dst,  libs_dst, allow_unknown=allow_unknown_dst)
 
-    try:
-        dst_sem = str((dst_ops.capabilities() or {}).get("index_semantics", "present")).lower()
-    except Exception:
-        dst_sem = "present"
-    try:
-        src_sem = str((src_ops.capabilities() or {}).get("index_semantics", "present")).lower()
-    except Exception:
-        src_sem = "present"
+    dst_sem = _index_semantics(dst_ops, feature)
+    src_sem = _index_semantics(src_ops, feature)
 
     dst_full = (dict(prev_dst) | dict(dst_cur)) if dst_sem == "delta" else dict(eff_dst)
     src_idx = (dict(prev_src) | dict(src_cur)) if src_sem == "delta" else dict(eff_src)
+
+    # Keep metadata when the provider index is presence-only.
+    dst_full = _enrich_index_payload(dst_full, prev_dst, feature)
+    src_idx = _enrich_index_payload(src_idx, prev_src, feature)
+
+    # Repair sparse destination snapshots using the source index.
+    if feature in ("history", "ratings", "progress"):
+        dst_full = _hydrate_missing_fields(dst_full, src_idx, feature)
+        dst_full = _rekey_to_src_keyspace(dst_full, src_idx)
 
     remove_mode = str(fcfg.get("remove_mode") or (sync_cfg.get("one_way_remove_mode") or "source_deletes")).strip().lower()
     if remove_mode not in ("source_deletes", "mirror"):
         remove_mode = "source_deletes"
 
     mirror_removes: list[dict[str, Any]] = []
+    updates: list[dict[str, Any]] = []
     if feature == "ratings":
         src_idx  = _ratings_filter_index(src_idx,  fcfg)
         dst_full = _ratings_filter_index(dst_full, fcfg)
         if manual_adds:
             src_idx = _merge_manual_adds(src_idx, manual_adds)
         adds, mirror_removes = diff_ratings(src_idx, dst_full)
+        dst_alias_tmp = _alias_index(dst_full)
+        updates = [it for it in adds if _present(dst_full, dst_alias_tmp, it)]
+        adds = [it for it in adds if not _present(dst_full, dst_alias_tmp, it)]
+
+    elif feature == "progress":
+        if manual_adds:
+            src_idx = _merge_manual_adds(src_idx, manual_adds)
+        dst_for_src: dict[str, Any] = {}
+        try:
+            dst_alias_tmp = _alias_index(dst_full)
+            for sk, sv in (src_idx or {}).items():
+                if sk in (dst_full or {}):
+                    dv0 = (dst_full or {}).get(sk)
+                    if isinstance(dv0, Mapping):
+                        dst_for_src[sk] = dv0
+                    continue
+                if not isinstance(sv, Mapping):
+                    continue
+                dv = _find_in_idx(dst_full, dst_alias_tmp, sv)
+                if isinstance(dv, Mapping):
+                    dst_for_src[sk] = dv
+        except Exception:
+            dst_for_src = dict(dst_full or {})
+
+        adds, mirror_removes = diff_progress(src_idx, dst_for_src, fcfg=fcfg)
+        
+        # Mirror-mode clears for progress:
+        if (
+            remove_mode == "mirror"
+            and (not src_suspect)
+            and (not dst_suspect)
+            and src_sem != "delta"
+            and dst_sem != "delta"
+        ):
+            try:
+                src_alias_tmp = _alias_index(src_idx)
+                extra: list[dict[str, Any]] = []
+                for _dk, dv in (dst_full or {}).items():
+                    if not isinstance(dv, Mapping):
+                        continue
+                    if _present(src_idx, src_alias_tmp, dv):
+                        continue
+                    base = _minimal(dv)
+                    base["progress_ms"] = 0
+                    extra.append(base)
+                if extra:
+                    mirror_removes = list(mirror_removes or []) + extra
+            except Exception:
+                pass
+
     else:
         if manual_adds:
             src_idx = _merge_manual_adds(src_idx, manual_adds)
-        adds, mirror_removes = diff(src_idx, dst_full)
+
+        bucket_sec = _history_bucket_sec(src, dst, feature)
+        if bucket_sec and int(bucket_sec) > 1:
+            b = int(bucket_sec)
+
+            def _tsb_from_key(k: str) -> int | None:
+                ts = _history_ts_from_key(k)
+                return None if ts is None else _bucket_ts(int(ts), b)
+
+            dst_tok_ts: set[tuple[str, int]] = set()
+            for dk, dv in (dst_full or {}).items():
+                if not isinstance(dv, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(dk))
+                if tsb is None:
+                    continue
+                for tok in _typed_tokens(dv):
+                    if tok:
+                        dst_tok_ts.add((tok, tsb))
+
+            src_tok_ts: set[tuple[str, int]] = set()
+            for sk, sv in (src_idx or {}).items():
+                if not isinstance(sv, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(sk))
+                if tsb is None:
+                    continue
+                for tok in _typed_tokens(sv):
+                    if tok:
+                        src_tok_ts.add((tok, tsb))
+
+            adds = []
+            for sk, sv in (src_idx or {}).items():
+                if not isinstance(sv, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(sk))
+                if tsb is None:
+
+                    if str(sk) not in (dst_full or {}):
+                        adds.append(_minimal(sv))
+                    continue
+
+                toks = _typed_tokens(sv)
+                if toks and any((tok, tsb) in dst_tok_ts for tok in toks):
+                    continue
+                adds.append(_minimal(sv))
+
+            mirror_removes = []
+            for dk, dv in (dst_full or {}).items():
+                if not isinstance(dv, Mapping):
+                    continue
+                tsb = _tsb_from_key(str(dk))
+                if tsb is None:
+                    if str(dk) not in (src_idx or {}):
+                        mirror_removes.append(_minimal(dv))
+                    continue
+
+                toks = _typed_tokens(dv)
+                if toks and any((tok, tsb) in src_tok_ts for tok in toks):
+                    continue
+                mirror_removes.append(_minimal(dv))
+        else:
+            adds, mirror_removes = diff(src_idx, dst_full)
 
     src_alias = _alias_index(src_idx)
     dst_alias = _alias_index(dst_full)
 
-    if feature != "ratings" and adds:
-        adds = [it for it in adds if not _present(dst_full, dst_alias, it)]
+    if adds:
+        # Progress uses upsert semantics (update resume position)
+        if feature not in ("ratings", "history", "progress"):
+            adds = [it for it in adds if not _present(dst_full, dst_alias, it)]
+        elif feature == "history":
+            pruned: list[dict[str, Any]] = []
+            for it in adds:
+                ck = _ck(it) or ""
+                if ck and _history_ts_from_key(ck) is None and _present(dst_full, dst_alias, it):
+                    continue
+                pruned.append(it)
+            adds = pruned
 
     removes: list[dict[str, Any]] = []
     if allow_removes:
@@ -486,6 +858,7 @@ def run_one_way_feature(
 
     if not allow_adds:
         adds = []
+        updates = []
     if not allow_removes:
         removes = []
 
@@ -504,10 +877,11 @@ def run_one_way_feature(
 
     manual_blocked = 0
     if manual_blocks:
-        b_adds, b_rem = len(adds), len(removes)
+        b_adds, b_upd, b_rem = len(adds), len(updates), len(removes)
         adds = _filter_manual_block(adds, manual_blocks)
+        updates = _filter_manual_block(updates, manual_blocks)
         removes = _filter_manual_block(removes, manual_blocks)
-        manual_blocked = (b_adds - len(adds)) + (b_rem - len(removes))
+        manual_blocked = (b_adds - len(adds)) + (b_upd - len(updates)) + (b_rem - len(removes))
 
         if manual_blocked:
             ctx.emit(
@@ -535,8 +909,18 @@ def run_one_way_feature(
         if _blocked:
             emit("debug", msg="blocked.unresolved", feature=feature, dst=dst, blocked=_blocked)
 
+    if unresolved_known and updates:
+        _before = len(updates)
+        try:
+            updates = [it for it in updates if _ck(it) not in unresolved_known]
+        except Exception:
+            pass
+        _blocked = _before - len(updates)
+        if _blocked:
+            emit("debug", msg="blocked.unresolved", feature=feature, dst=dst, blocked=_blocked)
+
     emit("one:plan", src=src, dst=dst, feature=feature,
-        adds=len(adds), removes=len(removes),
+        adds=len(adds), removes=len(removes), updates=len(updates),
         src_count=len(src_idx), dst_count=len(dst_full))
 
     bb = ((cfg or {}).get("blackbox") if isinstance(cfg, dict) else getattr(cfg, "blackbox", {})) or {}
@@ -545,15 +929,7 @@ def run_one_way_feature(
 
     guard = PhantomGuard(src, dst, feature, ttl_days=ttl_days, enabled=use_phantoms)
     if use_phantoms and adds:
-        # Ratings use upsert semantics
-        if feature == "ratings":
-            updates = [it for it in adds if _present(dst_full, dst_alias, it)]
-            fresh = [it for it in adds if not _present(dst_full, dst_alias, it)]
-            if fresh:
-                fresh, _blocked = guard.filter_adds(fresh, _ck, _minimal, emit, ctx.state_store, pair_key)
-            adds = updates + fresh
-        else:
-            adds, _blocked = guard.filter_adds(adds, _ck, _minimal, emit, ctx.state_store, pair_key)
+        adds, _blocked = guard.filter_adds(adds, _ck, _minimal, emit, ctx.state_store, pair_key)
 
     attempted_keys: list[str] = []
     key2item: dict[str, Any] = {}
@@ -568,11 +944,97 @@ def run_one_way_feature(
             seen.add(k)
         key2item.setdefault(k, _minimal(it))
 
+    add_attempted_raw = len(adds)
+    add_attempted_unique = len(attempted_keys)
+    add_attempted_duplicate_keys = max(0, add_attempted_raw - add_attempted_unique)
+    if add_attempted_duplicate_keys:
+        dbg(
+            "apply:add:deduped",
+            dst=dst,
+            feature=feature,
+            attempted_raw=add_attempted_raw,
+            attempted_unique=add_attempted_unique,
+            duplicate_canonical_keys=add_attempted_duplicate_keys,
+        )
+
+    updated_effective = 0
     added_effective = 0
-    res_add: dict[str, Any] = {"attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0}
+    added_provider_reported = 0
+    res_update: dict[str, Any] = {
+        "attempted": 0,
+        "confirmed": 0,
+        "skipped": 0,
+        "skipped_exact": 0,
+        "skipped_inferred": 0,
+        "skipped_reported": 0,
+        "skip_basis": "provider_keys",
+        "unresolved": 0,
+        "errors": 0,
+    }
+    res_add: dict[str, Any] = {
+        "attempted": 0,
+        "confirmed": 0,
+        "skipped": 0,
+        "skipped_exact": 0,
+        "skipped_inferred": 0,
+        "skipped_reported": 0,
+        "skip_basis": "provider_keys",
+        "unresolved": 0,
+        "errors": 0,
+    }
     unresolved_new_total = 0
     dry_run_flag = bool(ctx.dry_run or sync_cfg.get("dry_run", False))
     verify_after_write = bool(sync_cfg.get("verify_after_write", False))
+
+    if updates:
+        if dst_down:
+            record_unresolved(dst, feature, updates, hint="provider_down:update")
+            emit("writes:skipped", dst=dst, feature=feature, reason="provider_down", op="update", count=len(updates))
+            unresolved_new_total += len(updates)
+        else:
+            unresolved_before = set(load_unresolved_keys(dst, feature, cross_features=True) or [])
+            upd_res = apply_update(
+                dst_ops=dst_ops,
+                cfg=cfg,
+                dst_name=dst,
+                feature=feature,
+                items=updates,
+                dry_run=dry_run_flag,
+                emit=emit,
+                dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, dst),
+                chunk_pause_ms=_pause_for(dst),
+            )
+            unresolved_after = set(load_unresolved_keys(dst, feature, cross_features=True) or [])
+            res_update = {
+                "attempted": int((upd_res or {}).get("attempted", 0)),
+                "confirmed": int((upd_res or {}).get("confirmed", (upd_res or {}).get("count", 0)) or 0),
+                "skipped": int((upd_res or {}).get("skipped", 0)),
+                "skipped_exact": int((upd_res or {}).get("skipped_exact", 0) or 0),
+                "skipped_inferred": int((upd_res or {}).get("skipped_inferred", 0) or 0),
+                "skipped_reported": int((upd_res or {}).get("skipped_reported", 0) or 0),
+                "skip_basis": str((upd_res or {}).get("skip_basis") or "provider_keys"),
+                "unresolved": int((upd_res or {}).get("unresolved", 0)),
+                "errors": int((upd_res or {}).get("errors", 0)),
+            }
+            prov_unresolved_keys_raw = (upd_res or {}).get("unresolved_keys")
+            prov_unresolved_keys: list[str] = (
+                [str(x) for x in prov_unresolved_keys_raw if x] if isinstance(prov_unresolved_keys_raw, list) else []
+            )
+            prov_unresolved_set: set[str] = set(prov_unresolved_keys)
+            new_unresolved = (unresolved_after - unresolved_before) | (prov_unresolved_set - unresolved_before)
+            unresolved_new_total += len(new_unresolved)
+            updated_effective = int((upd_res or {}).get("confirmed", (upd_res or {}).get("count", 0)) or 0)
+            if updated_effective and not dry_run_flag:
+                upd_map = {(_ck(_minimal(it)) or ""): _minimal(it) for it in updates}
+                confirmed_update_keys = [str(x) for x in ((upd_res or {}).get("confirmed_keys") or []) if x]
+                keys_to_write = confirmed_update_keys if confirmed_update_keys else (list(upd_map.keys()) if updated_effective >= len(upd_map) else [])
+                for k in keys_to_write:
+                    v = upd_map.get(k)
+                    if v:
+                        dst_full[k] = v
+                if keys_to_write:
+                    _bust_snapshot(dst)
 
     if adds:
         if dst_down:
@@ -599,12 +1061,22 @@ def run_one_way_feature(
                 "attempted": int((add_res or {}).get("attempted", 0)),
                 "confirmed": int((add_res or {}).get("confirmed", (add_res or {}).get("count", 0)) or 0),
                 "skipped": int((add_res or {}).get("skipped", 0)),
+                "skipped_exact": int((add_res or {}).get("skipped_exact", 0) or 0),
+                "skipped_inferred": int((add_res or {}).get("skipped_inferred", 0) or 0),
+                "skipped_reported": int((add_res or {}).get("skipped_reported", 0) or 0),
+                "skip_basis": str((add_res or {}).get("skip_basis") or "provider_keys"),
                 "unresolved": int((add_res or {}).get("unresolved", 0)),
                 "errors": int((add_res or {}).get("errors", 0)),
             }
-            new_unresolved = unresolved_after - unresolved_before
+            prov_unresolved_keys_raw = (add_res or {}).get("unresolved_keys")
+            prov_unresolved_keys: list[str] = (
+                [str(x) for x in prov_unresolved_keys_raw if x] if isinstance(prov_unresolved_keys_raw, list) else []
+            )
+            prov_unresolved_set: set[str] = set(prov_unresolved_keys)
+
+            new_unresolved = (unresolved_after - unresolved_before) | (prov_unresolved_set - unresolved_before)
             unresolved_new_total += len(new_unresolved)
-            still_unresolved = set(attempted_keys) & unresolved_after
+            still_unresolved = set(attempted_keys) & (unresolved_after | prov_unresolved_set)
             
             prov_confirmed_keys_raw = (add_res or {}).get("confirmed_keys")
             prov_skipped_keys_raw = (add_res or {}).get("skipped_keys")
@@ -634,6 +1106,7 @@ def run_one_way_feature(
                     pass
             
             prov_confirmed = int((add_res or {}).get("confirmed", (add_res or {}).get("count", 0)) or 0)
+            added_provider_reported = prov_confirmed
             if have_exact_keys:
                 prov_confirmed = min(prov_confirmed or len(confirmed_keys), len(confirmed_keys))
             
@@ -660,6 +1133,17 @@ def run_one_way_feature(
                 dbg("apply:add:corrected", dst=dst, feature=feature,
                     provider_count=prov_confirmed, effective=added_effective,
                     newly_unresolved=len(new_unresolved))
+
+            if int(res_add.get("skipped_inferred", 0) or 0):
+                dbg(
+                    "apply:add:skip_inference",
+                    dst=dst,
+                    feature=feature,
+                    skipped=int(res_add.get("skipped", 0) or 0),
+                    skipped_exact=int(res_add.get("skipped_exact", 0) or 0),
+                    skipped_inferred=int(res_add.get("skipped_inferred", 0) or 0),
+                    skip_basis=str(res_add.get("skip_basis") or "provider_keys"),
+                )
             
             success_keys = confirmed_keys if (verify_after_write or have_exact_keys) else confirmed_keys[:added_effective]
             failed_keys = [k for k in attempted_keys if k not in set(success_keys) and k not in skipped_keys_set]
@@ -811,11 +1295,15 @@ def run_one_way_feature(
 
     return {
         "ok": True,
+        "updated": int(updated_effective),
         "added": int(added_effective),
         "removed": int(removed_count),
-        "skipped": int((res_add or {}).get("skipped", 0)) + int((res_remove or {}).get("skipped", 0)),
-        "unresolved": int((res_add or {}).get("unresolved", 0)) + int((res_remove or {}).get("unresolved", 0)),
-        "errors": int((res_add or {}).get("errors", 0)) + int((res_remove or {}).get("errors", 0)),
+        "skipped": int((res_update or {}).get("skipped", 0)) + int((res_add or {}).get("skipped", 0)) + int((res_remove or {}).get("skipped", 0)),
+        "unresolved": int((res_update or {}).get("unresolved", 0)) + int((res_add or {}).get("unresolved", 0)) + int((res_remove or {}).get("unresolved", 0)),
+        "errors": int((res_update or {}).get("errors", 0)) + int((res_add or {}).get("errors", 0)) + int((res_remove or {}).get("errors", 0)),
+        "skipped_exact": int((res_update or {}).get("skipped_exact", 0)) + int((res_add or {}).get("skipped_exact", 0)),
+        "skipped_inferred": int((res_update or {}).get("skipped_inferred", 0)) + int((res_add or {}).get("skipped_inferred", 0)),
         "res_add": res_add,
+        "res_update": res_update,
         "res_remove": res_remove,
     }

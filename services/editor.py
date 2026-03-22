@@ -5,17 +5,20 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from io import BytesIO
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, IO, Literal, cast
 import os
 import re
 import json
 import shutil
+import tempfile
 import zipfile
 
 from cw_platform.config_base import CONFIG, load_config
 
-Kind = Literal["watchlist", "history", "ratings"]
+Kind = Literal["watchlist", "history", "ratings", "progress"]
+
+_JSON_FILE_SUFFIX = ".json"
 
 def _cw_cfg() -> dict[str, Any]:
     try:
@@ -33,6 +36,16 @@ def _root_dir() -> Path:
         p = Path(CONFIG) / p
     return p
 
+
+def _ensure_under_root(root: Path, path: Path) -> Path:
+    root_r = root.resolve()
+    path_r = path.resolve()
+    try:
+        path_r.relative_to(root_r)
+    except ValueError as e:
+        raise ValueError("Invalid path") from e
+    return path_r
+
 def _snapshots_dir() -> Path:
     d = _root_dir() / "snapshots"
     d.mkdir(parents=True, exist_ok=True)
@@ -40,6 +53,65 @@ def _snapshots_dir() -> Path:
 
 def _state_path(kind: Kind) -> Path:
     return _root_dir() / f"{kind}.json"
+
+
+def _validated_json_filename(name: str, *, label: str) -> str:
+    raw = str(name or "").strip()
+    if not raw or not raw.lower().endswith(_JSON_FILE_SUFFIX):
+        raise ValueError(f"Invalid {label}")
+
+    posix = PurePosixPath(raw)
+    win = PureWindowsPath(raw)
+    if posix.name != raw or win.name != raw:
+        raise ValueError(f"Invalid {label}")
+    if posix.is_absolute() or win.is_absolute() or win.drive or win.root:
+        raise ValueError(f"Invalid {label}")
+    if raw in (".", ".."):
+        raise ValueError(f"Invalid {label}")
+    return raw
+
+
+def _resolve_snapshot_name(name: str) -> Path:
+    raw = _validated_json_filename(name, label="snapshot name")
+    return _ensure_under_root(_snapshots_dir(), _snapshots_dir() / raw)
+
+
+def _resolve_pair_dataset_path(name: str) -> Path:
+    raw = _validated_json_filename(name, label="dataset name")
+    root = _cw_state_dir()
+    return _ensure_under_root(root, root / raw)
+
+
+def _selected_snapshot_path(kind: Kind, snapshot: str | None) -> Path:
+    if not snapshot:
+        return _state_path(kind)
+
+    target = _validated_json_filename(snapshot, label="snapshot name")
+    for meta in list_snapshots(kind):
+        if str(meta.get("name") or "") == target:
+            return _resolve_snapshot_name(target)
+    raise ValueError("Snapshot not found")
+
+
+def _selected_pair_dataset_path(kind: Kind, pair: str, dataset: str | None) -> Path | None:
+    dsets = list_pair_datasets(kind, pair)
+    if not dsets:
+        return None
+
+    if dataset:
+        target = _validated_json_filename(dataset, label="dataset name")
+        for meta in dsets:
+            if str(meta.get("name") or "") == target:
+                try:
+                    return _resolve_pair_dataset_path(target)
+                except ValueError:
+                    return None
+        return None
+
+    try:
+        return _resolve_pair_dataset_path(str(dsets[0]["name"]))
+    except ValueError:
+        return None
 
 def _parse_ts_from_name(name: str) -> datetime | None:
     try:
@@ -135,15 +207,12 @@ def _enforce_snapshot_retention(kind: Kind) -> None:
 def load_state(kind: Kind | None = None, snapshot: str | None = None) -> dict[str, Any]:
     if kind is None:
         kind_val: Kind = "watchlist"
-    elif kind in ("watchlist", "history", "ratings"):
+    elif kind in ("watchlist", "history", "ratings", "progress"):
         kind_val = kind
     else:
         raise ValueError(f"Unsupported kind: {kind!r}")
 
-    if snapshot:
-        path = _snapshots_dir() / snapshot
-    else:
-        path = _state_path(kind_val)
+    path = _selected_snapshot_path(kind_val, snapshot)
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -162,7 +231,7 @@ def load_state(kind: Kind | None = None, snapshot: str | None = None) -> dict[st
 def save_state(kind: Kind | None, items: dict[str, Any]) -> dict[str, Any]:
     if kind is None:
         kind_val: Kind = "watchlist"
-    elif kind in ("watchlist", "history", "ratings"):
+    elif kind in ("watchlist", "history", "ratings", "progress"):
         kind_val = kind
     else:
         raise ValueError(f"Unsupported kind: {kind!r}")
@@ -215,7 +284,7 @@ def import_tracker_zip(fp: IO[bytes]) -> TrackerImportStats:
             rel = PurePosixPath(info.filename)
             if rel.is_absolute() or ".." in rel.parts:
                 continue
-            dest = root / rel
+            dest = _ensure_under_root(root, root.joinpath(*rel.parts))
             dest.parent.mkdir(parents=True, exist_ok=True)
             existed = dest.exists()
             with zf.open(info, "r") as src, dest.open("wb") as out:
@@ -284,13 +353,13 @@ def import_tracker_json(payload: bytes, filename: str) -> TrackerImportStats:
     target: str
     kind: Kind | None = None
 
-    if lower in ("watchlist.json", "history.json", "ratings.json"):
+    if lower in ("watchlist.json", "history.json", "ratings.json", "progress.json"):
         base = lower.split(".")[0]  # "watchlist" / "history" / "ratings"
         kind = cast(Kind, base)
         dest = _state_path(kind)
         target = "state"
     else:
-        for candidate in ("watchlist", "history", "ratings"):
+        for candidate in ("watchlist", "history", "ratings", "progress"):
             if lower.endswith(f"-{candidate}.json"):
                 kind = cast(Kind, candidate)
                 break
@@ -300,7 +369,7 @@ def import_tracker_json(payload: bytes, filename: str) -> TrackerImportStats:
                 "Use filenames like 'watchlist.json' or "
                 "'YYYYMMDDTHHMMSSZ-watchlist.json'.",
             )
-        dest = _snapshots_dir() / name
+        dest = _resolve_snapshot_name(name)
         target = "snapshot"
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -351,7 +420,7 @@ def import_tracker_upload(
 
 _PAIR_SCOPE_RE = re.compile(r"^(?P<mode>[^_]+)_(?P<link>[^_]+)_pair_(?P<pid>.+)$")
 _PAIR_DATASET_RE = re.compile(
-    r"^(?P<prefix>.+)[._-](?P<kind>watchlist|history|ratings)\.(?P<variant>index|shadow)\.(?P<scope>.+)\.json$",
+    r"^(?P<prefix>.+)[._-](?P<kind>watchlist|history|ratings|progress)\.(?P<variant>index|shadow)\.(?P<scope>.+)\.json$",
     re.IGNORECASE,
 )
 
@@ -364,9 +433,18 @@ def _safe_name(name: str) -> str:
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def _pair_meta_from_scope(scope: str) -> dict[str, Any]:
@@ -487,17 +565,8 @@ def _resolve_pair_file(kind: Kind, pair: str, dataset: str | None) -> Path | Non
     if not root.exists():
         return None
 
-    if dataset:
-        name = _safe_name(dataset)
-        if not name:
-            return None
-        p = root / name
-        return p if p.exists() else None
-
-    dsets = list_pair_datasets(kind, pair)
-    if not dsets:
-        return None
-    return root / str(dsets[0]["name"])
+    p = _selected_pair_dataset_path(kind, pair, dataset)
+    return p if p and p.exists() else None
 
 def load_pair_state(kind: Kind, pair: str, dataset: str | None = None) -> dict[str, Any]:
     scope = str(pair or "").strip()

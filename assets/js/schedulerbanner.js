@@ -1,415 +1,278 @@
 /* assets/js/schedulerbanner.js */
-/* CrossWatch - Scheduler Banner and playing card run */
+/* refactored */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
-(()=>{ if(window.__SCHED_BANNER_INIT__) return; window.__SCHED_BANNER_INIT__=1; const $=(s,r=document)=>r.querySelector(s);
+(()=>{
+  if (window.__SCHED_BANNER_INIT__) return;
+  window.__SCHED_BANNER_INIT__ = 1;
 
-/* CSS */
-(()=>{ if($('#sched-banner-css')) return; const st=document.createElement('style'); st.id='sched-banner-css'; st.textContent=`
-#sched-inline-log{
-  position:absolute;
-  right:16px;
-  bottom:10px;
-  z-index:4;
-  pointer-events:none;
-  display:flex;
-  gap:8px;
-  align-items:center;
-  flex-wrap:wrap;
-}
+  const $=(s,r=document)=>r.querySelector(s),
+    CW=()=>window.CW||{}, API=()=>CW().API||null, Cache=()=>CW().Cache||null,
+    blank=()=>({enabled:false,title:"",state:null,streams:0,items:[],index:0}),
+    clear=n=>S.timers[n]&&(clearTimeout(S.timers[n]),S.timers[n]=null),
+    scrobMode=()=>String(S.cfg?.scrobble?.mode||"webhook").toLowerCase(),
+    schedulingOn=c=>!!((c?.scheduling||c||{}).enabled||(c?.scheduling||c||{})?.advanced?.enabled),
+    advancedOn=c=>!!((c?.scheduling||c||{})?.advanced?.enabled),
+    activeCaptureJobs=c=>(((c?.scheduling||c||{})?.advanced?.capture_jobs)||((c?.scheduling||c||{})?.advanced?.captureJobs)||[])
+      .filter(r=>r&&typeof r==="object"&&r.active!==false&&String(r?.provider||"").trim()&&String(r?.feature||"").trim()&&String(r?.at||"").trim()).length,
+    activeEventRules=c=>(((c?.scheduling||c||{})?.advanced?.event_rules)||((c?.scheduling||c||{})?.advanced?.eventRules)||[])
+      .filter(r=>r&&typeof r==="object"&&r.active!==false&&String(r?.action?.kind||"sync_pair")==="sync_pair"&&String(r?.action?.pair_id||r?.action?.pairId||r?.pair_id||"").trim()&&String(r?.filters?.route_id||r?.filters?.routeId||"").trim()).length,
+    chipText={sched:"Scheduler",watch:"Watcher",hook:"Webhook"},
+    S={cfg:null,sched:{enabled:false,running:false,next:0,advanced:false,captures:0},evt:{enabled:false,count:0},watch:{...blank(),alive:false},hook:blank(),timers:{sched:null,scrob:null,wait:null,rotate:null},debounce:null,last:{watcher:"",webhook:""}};
+  const SHARED_WATCH_KEY="__CW_CURRENT_WATCHING_SHARED__",SHARED_WATCH_TTL_MS=10000;
 
-/* pill */
-#sched-inline-log .sched{
-  position:relative;
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  white-space:nowrap;
-  max-width:92vw;
-  padding:3px 12px;
-  border-radius:999px;
-  font-size:11px;
-  line-height:1;
-  background:linear-gradient(180deg,rgba(16,18,26,.78),rgba(16,18,26,.92));
-  backdrop-filter:blur(5px) saturate(110%);
-  border:1px solid rgba(140,160,255,.15);
-  box-shadow:0 2px 8px rgba(0,0,0,.22),0 0 10px rgba(110,140,255,.06);
-  overflow:visible;
-  pointer-events:auto;
-}
-
-#sched-inline-log .ic.dot{
-  width:8px;
-  height:8px;
-  border-radius:50%;
-  background:#ef4444;
-  box-shadow:0 0 0 1px rgba(0,0,0,.6),0 0 6px rgba(239,68,68,.28);
-}
-#sched-inline-log .sched.ok .ic.dot{
-  background:#22c55e;
-  box-shadow:0 0 0 1px rgba(0,0,0,.6),0 0 6px rgba(34,197,94,.28);
-}
-
-#sched-inline-log .sub{
-  display:flex;
-  align-items:center;
-  line-height:1;
-  font-weight:800;
-  letter-spacing:.1px;
-  opacity:.95;
-  transform:translateY(4px);
-}
-
-/* status dot */
-#sched-inline-log .ic{
-  position:relative;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  flex:0 0 auto;
-}
-#sched-inline-log .ic.dot{
-  width:9px;
-  height:9px;
-  border-radius:50%;
-  background:#ef4444;
-  box-shadow:0 0 0 1px rgba(0,0,0,.6),0 0 8px rgba(239,68,68,.4);
-}
-#sched-inline-log .sched.ok .ic.dot{
-  background:#22c55e;
-  box-shadow:0 0 0 1px rgba(0,0,0,.6),0 0 8px rgba(34,197,94,.4);
-}
-#sched-inline-log .sched.live .ic.dot::after{
-  content:"";
-  position:absolute;
-  inset:-3px;
-  border-radius:50%;
-  border:1px solid rgba(34,197,94,.6);
-  opacity:.8;
-  animation:ringPulse 1.6s ease-out infinite;
-}
-@keyframes ringPulse{
-  0%{transform:scale(.7);opacity:.8}
-  80%{transform:scale(1.25);opacity:0}
-  100%{transform:scale(1.25);opacity:0}
-}
-
-/* label */
-#sched-inline-log .sub{
-  display:flex;
-  align-items:center;
-  line-height:1;
-  font-weight:700;
-  letter-spacing:.06em;
-  opacity:.9;
-  text-transform:uppercase;
-}
-`; document.head.appendChild(st); })();
-
-/* Host */
-function findBox(){const picks=['#ops-out','#ops_log','#ops-card','#sync-output','.sync-output','#ops'];for(const s of picks){const n=$(s);if(n)return n}
-const h=[...document.querySelectorAll('h2,h3,h4,div.head,.head')].find(x=>(x.textContent||'').trim().toUpperCase()==='SYNC OUTPUT');return h?h.parentElement?.querySelector('pre,textarea,.box,.card,div'):null}
-function ensureBanner(){const host=findBox(); if(!host) return null; const cs=getComputedStyle(host); if(cs.position==='static') host.style.position='relative';
-let wrap=$('#sched-inline-log',host); if(!wrap){ wrap=document.createElement('div'); wrap.id='sched-inline-log';
-wrap.innerHTML=`<div class="sched" id="chip-sched" aria-live="polite"><span class="ic dot" aria-hidden="true"></span><span class="sub" id="sched-sub">Scheduler: —</span></div>
-<div class="sched" id="chip-watch" aria-live="polite"><span class="ic dot" aria-hidden="true"></span><span class="sub" id="watch-sub">Watcher: —</span></div>
-<div class="sched" id="chip-hook" aria-live="polite"><span class="ic dot" aria-hidden="true"></span><span class="sub" id="hook-sub">Webhook: —</span></div>`; host.appendChild(wrap) } return wrap}
-
-/* Helpers */
-const tClock=(s,withDay=false)=>{if(!s)return'—';const ms=s<1e10?s*1e3:s,dt=new Date(ms);if(isNaN(+dt))return'—';const time=dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});if(!withDay)return time;const now=new Date();if(dt.toDateString()===now.toDateString())return time;const tom=new Date(now);tom.setDate(now.getDate()+1);if(dt.toDateString()===tom.toDateString())return `tomorrow ${time}`;const dow=dt.toLocaleDateString([],{weekday:'short'});return `${dow} ${time}`;};
-
-/* Polling policy */
-const SCROBBLE_POLL_WATCH_MS=15000;
-const SCROBBLE_POLL_WEBHOOK_MS=60000;
-
-const MIN_SCHED_FETCH_MS=2000;
-const MIN_SCROBBLE_FETCH_MS=2000;
-
-/* State */
-let S={enabled:false,running:false,next:0,advanced:false,busy:false},
-    W={enabled:false,alive:false,busy:false,title:null,media_type:null,year:null,season:null,episode:null,progress:0,state:null,streams_count:0},
-    H={enabled:false,busy:false,title:null,media_type:null,year:null,season:null,episode:null,progress:0,state:null,streams_count:0};
-
-let _schedLastAt=0, _schedQueued=false, _schedQueuedForce=false;
-let _scrobLastAt=0, _scrobQueued=false, _scrobQueuedForceCfg=false, _scrobQueuedForce=false;
-let _cwAbort=null;
-
-/* De-dupe event spam to UI listeners */
-const _lastCW = { watcher: '', webhook: '' };
-function emitCurrentlyWatching(source, detail){
-  const payload = { source, ...detail };
-  const key = JSON.stringify(payload);
-  if(_lastCW[source] === key) return;
-  _lastCW[source] = key;
-  try{
-    window.dispatchEvent(new CustomEvent('currently-watching-updated', { detail: payload }));
-  }catch(e){}
-}
-
-let _cfgMemo=null, _cfgAt=0, _cfgBusy=null;
-const CFG_TTL_MS=60000;
-function invalidateCfg(){ _cfgMemo=null; _cfgAt=0; _cfgBusy=null; }
-async function readCfg(force=false){
-  const now=Date.now();
-  if(!force && _cfgMemo && (now-_cfgAt)<CFG_TTL_MS) return _cfgMemo;
-  if(_cfgBusy) return _cfgBusy;
-  _cfgBusy = fetch('/api/config?t='+now,{cache:'no-store'})
-    .then(r=>r.ok?r.json():null)
-    .catch(()=>null)
-    .finally(()=>{ _cfgBusy=null; });
-  const v = await _cfgBusy;
-  if(v && typeof v === 'object'){
-    _cfgMemo = v;
-    _cfgAt = Date.now();
-    return _cfgMemo;
+  if (!$("#sched-banner-css")) {
+    const st=document.createElement("style");
+    st.id="sched-banner-css";
+    st.textContent=`#ops-card .action-row{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap}#ops-card .action-buttons{display:flex;gap:10px;flex:1 1 640px;min-width:min(100%,540px);align-items:center;flex-wrap:wrap}#ops-card .cw-status-dock{display:flex;flex:1 1 360px;min-width:min(100%,320px);justify-content:flex-end;align-items:center;margin-left:auto}#sched-inline-log{position:static;z-index:2;pointer-events:none;display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap;max-width:100%}#sched-inline-log .sched,#sched-inline-log .sched *,#sched-inline-log .sched *::before,#sched-inline-log .sched *::after{box-sizing:border-box}#sched-inline-log .sched{--chip-accent:#ef4444;position:relative;display:inline-flex;align-items:center;gap:10px;min-height:34px;max-width:min(420px,100%);padding:5px 12px;border-radius:999px;background:linear-gradient(180deg,rgba(17,21,29,.96),rgba(10,13,20,.98));backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 8px 18px rgba(0,0,0,.24);overflow:hidden;pointer-events:auto;white-space:nowrap}#sched-inline-log .sched.ok,#sched-inline-log .sched.live{--chip-accent:#22c55e}#sched-inline-log .sched.idle{--chip-accent:#ef4444;background:linear-gradient(180deg,rgba(17,21,29,.94),rgba(10,13,20,.96));border-color:rgba(255,255,255,.07)}#sched-inline-log .sched.warn{--chip-accent:#ef4444;background:linear-gradient(180deg,rgba(30,16,18,.96),rgba(18,10,12,.98));border-color:rgba(211,106,106,.18)}#sched-inline-log .ic{position:relative;display:inline-flex!important;align-items:center!important;justify-content:center!important;align-self:center!important;flex:0 0 auto;z-index:1}#sched-inline-log .ic.dot{width:10px;height:10px;border-radius:50%;background:var(--chip-accent);box-shadow:0 0 0 1px rgba(0,0,0,.48),0 0 10px color-mix(in srgb,var(--chip-accent) 40%,transparent)}#sched-inline-log .sched.live .ic.dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:1px solid color-mix(in srgb,var(--chip-accent) 42%,transparent);opacity:.7;animation:ringPulse 1.7s ease-out infinite}#sched-inline-log .copy{position:relative;z-index:1;display:inline-flex!important;align-items:center!important;align-self:center!important;gap:7px;min-width:0;max-width:100%;height:20px;line-height:20px;overflow:hidden}#sched-inline-log .label{display:inline-flex!important;align-items:center!important;align-self:center!important;vertical-align:middle!important;height:20px;line-height:20px;margin:0!important;padding:0!important;position:relative;top:0!important;bottom:auto!important;transform:none!important;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:rgba(181,190,208,.76);flex:0 0 auto}#sched-inline-log .value,#sched-inline-log .meta,#sched-inline-log .badges{position:relative;top:-1.5px!important}#sched-inline-log .value,#sched-inline-log .meta{display:inline-flex!important;align-items:center!important;align-self:center!important;vertical-align:middle!important;height:20px;line-height:20px;margin:0!important;padding:0!important;bottom:auto!important;transform:none!important}#sched-inline-log .value{font-size:12px;font-weight:800;letter-spacing:.02em;color:#eef3ff;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}#sched-inline-log .meta{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:12px;font-weight:700;color:rgba(188,197,214,.68)}#sched-inline-log .badges{display:inline-flex!important;align-items:center!important;align-self:center!important;gap:6px;flex:0 0 auto;height:20px}#sched-inline-log .badge{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:18px;padding:0 6px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.05);color:rgba(232,238,250,.82);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;line-height:18px}#sched-inline-log .sched[data-tip]{cursor:help;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease,background .16s ease}#sched-inline-log .sched[data-tip]:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(20,24,32,.98),rgba(12,15,22,.99));box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 10px 22px rgba(0,0,0,.28)}#sched-inline-log .sched.warn[data-tip]:hover{background:linear-gradient(180deg,rgba(34,18,21,.98),rgba(22,11,14,.99))}#sched-inline-log .sched[data-tip]::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%) translateY(4px);opacity:0;pointer-events:none;min-width:180px;max-width:min(320px,72vw);padding:8px 10px;border-radius:12px;background:rgba(10,13,20,.98);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 30px rgba(0,0,0,.34);color:#edf4ff;font-size:11px;font-weight:700;line-height:1.35;white-space:pre-line;text-align:left;transition:opacity .16s ease,transform .16s ease}#sched-inline-log .sched[data-tip]:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}@keyframes ringPulse{0%{transform:scale(.72);opacity:.8}80%{transform:scale(1.28);opacity:0}100%{transform:scale(1.28);opacity:0}}@media (max-width:1100px){#ops-card .cw-status-dock{flex-basis:100%;justify-content:flex-start;margin-left:0}#sched-inline-log{justify-content:flex-start}}@media (max-width:640px){#sched-inline-log{gap:8px}#sched-inline-log .sched{min-height:32px;padding:4px 10px;max-width:100%}#sched-inline-log .copy{gap:6px;height:18px;line-height:18px}#sched-inline-log .label,#sched-inline-log .value,#sched-inline-log .meta{height:18px;line-height:18px}#sched-inline-log .label{font-size:9px}#sched-inline-log .value,#sched-inline-log .meta{font-size:11px}#sched-inline-log .value,#sched-inline-log .meta,#sched-inline-log .badges{top:-1px!important}#sched-inline-log .badges{height:18px}#sched-inline-log .badge{height:17px;min-width:22px;padding:0 5px;font-size:9px;line-height:17px}}`;
+    document.head.appendChild(st);
   }
-  if(!_cfgMemo) _cfgMemo = {};
-  _cfgAt = Date.now();
-  return _cfgMemo;
-}
 
-let _pend=false, _forceCfg=false, _forceNow=false;
-function rfr(forceCfg=false){
-  if(forceCfg){ _forceCfg = true; _forceNow = true; }
-  if(_pend) return;
-  _pend=true;
-  setTimeout(()=>{
-    _pend=false;
-    const cfg=_forceCfg;
-    const force=_forceNow;
-    _forceCfg=false;
-    _forceNow=false;
-    fetchSched(force);
-    fetchScrobble(cfg, force);
-    ensureScrobbleLoop(cfg);
-  },120);
-}
+  const findBox=()=>$("#ops-card .cw-status-dock")||(()=>{
+    const row=$("#ops-card .action-row");
+    if (row) return row.appendChild(Object.assign(document.createElement("div"),{className:"cw-status-dock"}));
+    for (const s of ["#ops-card","#ops-out","#ops_log","#sync-output",".sync-output","#ops"]) { const n=$(s); if (n) return n; }
+    const h=[...document.querySelectorAll("h2,h3,h4,div.head,.head")].find(x=>(x.textContent||"").trim().toUpperCase()==="SYNC OUTPUT");
+    return h?.parentElement?.querySelector("pre,textarea,.box,.card,div")||null;
+  })();
 
-/* Render */
-function renderSched(){
-  const host=ensureBanner(); if(!host) return;
-  const sub=$('#sched-sub',host), chip=$('#chip-sched',host);
-  if(!S.enabled){ chip.style.display='none'; return; }
-  chip.style.display='inline-flex';
-  chip.classList.toggle('ok',true);
-  chip.classList.toggle('bad',false);
-  chip.classList.toggle('live',!!S.running);
-  sub.textContent=`Scheduler: ${S.advanced?'advanced ':''}${S.running?'running':'scheduled'}${S.next?` (next ${tClock(S.next,true)})`:''}`;
-}
-
-function renderWatch(){
-  const host=ensureBanner(); if(!host) return;
-  const sub=$('#watch-sub',host), chip=$('#chip-watch',host);
-  if(!W.enabled){ chip.style.display='none'; return; }
-  chip.style.display='inline-flex';
-  const live=!!W.alive;
-  const hasPlay=!!(live && W.state === 'playing' && W.title);
-  chip.classList.toggle('ok',live);
-  chip.classList.toggle('bad',!live);
-  chip.classList.toggle('live',hasPlay);
-  const sc = Number(W.streams_count)||0;
-  const scLabel = (hasPlay && sc > 1) ? ` (${sc} streams)` : '';
-  sub.textContent=hasPlay?`Watcher: ${W.title}${scLabel}`:`Watcher: ${live?'running':'not running'}`;
-
-  const pct=Math.max(0,Math.min(100,Number(W.progress)||0));
-
-  if(hasPlay){
-    emitCurrentlyWatching('watcher',{
-      title:W.title||'',
-      media_type:W.media_type||null,
-      year:W.year||null,
-      season:W.season??null,
-      episode:W.episode??null,
-      progress:pct,
-      state:W.state||'playing',
-      _streams_count: sc
-    });
-  }else{
-    emitCurrentlyWatching('watcher',{ state:'stopped' });
-  }
-}
-
-function renderHook(){
-  const host=ensureBanner(); if(!host) return;
-  const sub=$('#hook-sub',host), chip=$('#chip-hook',host);
-  if(!H.enabled){ chip.style.display='none'; return; }
-  chip.style.display='inline-flex';
-  const hasPlay=!!(H.state === 'playing' && H.title);
-  chip.classList.toggle('ok',true);
-  chip.classList.toggle('bad',false);
-  chip.classList.toggle('live',hasPlay);
-  const sc = Number(H.streams_count)||0;
-  const scLabel = (hasPlay && sc > 1) ? ` (${sc} streams)` : '';
-  sub.textContent=hasPlay?`Webhook: ${H.title}${scLabel}`:'Webhook: enabled';
-
-  const pct=Math.max(0,Math.min(100,Number(H.progress)||0));
-
-  if(hasPlay){
-    emitCurrentlyWatching('webhook',{
-      title:H.title||'',
-      media_type:H.media_type||null,
-      year:H.year||null,
-      season:H.season??null,
-      episode:H.episode??null,
-      progress:pct,
-      state:H.state||'playing',
-      _streams_count: sc
-    });
-  }else{
-    emitCurrentlyWatching('webhook',{ state:'stopped' });
-  }
-}
-
-/* Fetch */
-async function fetchSched(force=false){ if(S.busy){ _schedQueued=true; _schedQueuedForce=_schedQueuedForce||force; return; }
-  const now=Date.now();
-  if(!force && _schedLastAt && (now-_schedLastAt)<MIN_SCHED_FETCH_MS){ renderSched(); return; }
-  S.busy=true;
-try{
-  if(document.hidden){ S.busy=false; return; }
-  const r=await fetch('/api/scheduling/status?t='+Date.now(),{cache:'no-store'}); if(!r.ok) throw 0; const j=await r.json();
-  const cfg=j?.config||{};
-  S.advanced=!!(cfg?.advanced?.enabled);
-  S.enabled=!!(cfg?.enabled||S.advanced);
-  S.running=!!j?.running;
-  S.next=+(j?.next_run_at||0)||0
-}catch{ S.enabled=false; S.running=false; S.next=0; S.advanced=false }
-_schedLastAt=Date.now();
-S.busy=false; renderSched();
-if(_schedQueued){ const f=_schedQueuedForce; _schedQueued=false; _schedQueuedForce=false; setTimeout(()=>fetchSched(f),0); } }
-
-/* Read scrobble once and derive both Watcher and Webhook states */
-async function fetchScrobble(forceCfg=false, force=false){ if(W.busy||H.busy){ _scrobQueued=true; _scrobQueuedForceCfg=_scrobQueuedForceCfg||forceCfg; _scrobQueuedForce=_scrobQueuedForce||force; return; }
-  const now=Date.now();
-  const hard=force||forceCfg;
-  if(!hard && _scrobLastAt && (now-_scrobLastAt)<MIN_SCROBBLE_FETCH_MS){ renderWatch(); renderHook(); return; }
-  W.busy=H.busy=true;
-try{
-  if(document.hidden){ W.busy=H.busy=false; return; }
-
-  const c=await readCfg(!!forceCfg);
-  const mode=String(c?.scrobble?.mode||'').toLowerCase();
-  const enabled=!!c?.scrobble?.enabled;
-
-  W.enabled=enabled && mode==='watch';
-  H.enabled=enabled && mode==='webhook';
-
-  /* Reset details */
-  W.title=null; W.media_type=null; W.year=null; W.season=null; W.episode=null; W.progress=0; W.state=null; W.streams_count=0;
-  H.title=null; H.media_type=null; H.year=null; H.season=null; H.episode=null; H.progress=0; H.state=null; H.streams_count=0;
-
-  if(W.enabled){
-    const s=await fetch('/api/watch/status?t='+Date.now(),{cache:'no-store'}).then(r=>r.ok?r.json():{}).catch(()=>({}));
-    W.alive=!!s?.alive;
-  } else { W.alive=false }
-
-  /* If scrobble is off, don't hit currently_watching */
-  if(!(W.enabled || H.enabled)) throw 0;
-
-  try{ _cwAbort?.abort(); }catch(e){}
-  _cwAbort = new AbortController();
-  const cw = await fetch('/api/watch/currently_watching?t='+Date.now(), {cache:'no-store', signal:_cwAbort.signal})
-    .then(r => r.ok ? r.json() : null)
-    .catch((e) => (e && e.name === 'AbortError') ? null : null);
-  const cur = cw && (cw.currently_watching || cw);
-  const sc = Number(cw?.streams_count) || 0;
-
-  if(cur && cur.state && cur.state!=='stopped'){
-    const src=String(cur.source||'').toLowerCase();
-    const tgt =
-      (src.includes('webhook') && H.enabled) ? H :
-      ((src.includes('watch') || src.includes('watcher')) && W.enabled) ? W :
-      (W.enabled ? W : H);
-
-    tgt.title=cur.title||'';
-    tgt.media_type=cur.media_type||null;
-    tgt.year=cur.year||null;
-    tgt.season=cur.season??null;
-    tgt.episode=cur.episode??null;
-    tgt.progress=+cur.progress||0;
-    tgt.state=cur.state||null;
-    tgt.streams_count = sc;
-  }
-}catch{
-  W.enabled=false; W.alive=false; H.enabled=false;
-  W.title=null; W.media_type=null; W.year=null; W.season=null; W.episode=null; W.progress=0; W.state=null;
-  H.title=null; H.media_type=null; H.year=null; H.season=null; H.episode=null; H.progress=0; H.state=null
-}
-_scrobLastAt=Date.now();
-W.busy=H.busy=false; renderWatch(); renderHook();
-if(_scrobQueued){ const fc=_scrobQueuedForceCfg; const f=_scrobQueuedForce; _scrobQueued=false; _scrobQueuedForceCfg=false; _scrobQueuedForce=false; setTimeout(()=>fetchScrobble(fc, f),0); } }
-
-/* Adaptive scrobble polling */
-async function scrobblePollMs(forceCfg=false){
-  const c=await readCfg(!!forceCfg);
-  const enabled=!!c?.scrobble?.enabled;
-  if(!enabled) return 0;
-  const mode=String(c?.scrobble?.mode||'').toLowerCase();
-  if(mode==='watch') return SCROBBLE_POLL_WATCH_MS;
-  if(mode==='webhook') return SCROBBLE_POLL_WEBHOOK_MS;
-  return 0;
-}
-function stopScrobbleLoop(){
-  if(window._scrobPollT){ clearTimeout(window._scrobPollT); window._scrobPollT=null; }
-  window._scrobPollMs = 0;
-}
-function scheduleScrobbleLoop(ms){
-  if(!ms){ stopScrobbleLoop(); return; }
-  if(window._scrobPollT && window._scrobPollMs === ms) return;
-  stopScrobbleLoop();
-  window._scrobPollMs = ms;
-  window._scrobPollT = setTimeout(async ()=>{
-    window._scrobPollT = null;
-    if(document.hidden){ scheduleScrobbleLoop(window._scrobPollMs||ms); return; }
-    await fetchScrobble(false, false);
-    const next = await scrobblePollMs(false);
-    scheduleScrobbleLoop(next);
-  }, ms);
-}
-async function ensureScrobbleLoop(forceCfg=false){
-  const ms = await scrobblePollMs(!!forceCfg);
-  scheduleScrobbleLoop(ms);
-}
-
-/* API */
-window.refreshSchedulingBanner=rfr;
-
-/* Boot */
-function bootOnce(){
-  if(window.__SCHED_BANNER_STARTED__) return;
-  window.__SCHED_BANNER_STARTED__ = true;
-
-  fetchSched();
-  fetchScrobble(true, true);
-  ensureScrobbleLoop(true);
-
-  if(!window._schedPoll) window._schedPoll = setInterval(fetchSched, 3e4);
-  if(!window._schedTick) window._schedTick = setInterval(()=>{renderSched();renderWatch();renderHook()}, 1e3);
-
-  try{window.dispatchEvent(new Event('sched-banner-ready'))}catch{}
-}
-
-document.addEventListener('DOMContentLoaded',()=>{
-  if(window.__SCHED_BANNER_WAIT__) { clearInterval(window.__SCHED_BANNER_WAIT__); window.__SCHED_BANNER_WAIT__ = null; }
-  window.__SCHED_BANNER_WAIT__ = setInterval(()=>{
-    if(findBox()){
-      clearInterval(window.__SCHED_BANNER_WAIT__);
-      window.__SCHED_BANNER_WAIT__ = null;
-      bootOnce();
+  function ensureBanner(){
+    const host=findBox();
+    if (!host) return null;
+    if (host.id!=="sched-inline-log" && getComputedStyle(host).position==="static") host.style.position="relative";
+    let wrap=host.id==="sched-inline-log"?host:$("#sched-inline-log",host);
+    if (!wrap) {
+      wrap=document.createElement("div");
+      wrap.id="sched-inline-log";
+      wrap.innerHTML=["sched","watch","hook"].map(k=>`<div class="sched idle" id="chip-${k}"><span class="ic dot"></span><span class="copy"><span class="label">${chipText[k]}</span><span class="value" id="${k}-value">-</span><span class="meta" id="${k}-meta"></span><span class="badges" id="${k}-badges"></span></span></div>`).join("");
+      host.appendChild(wrap);
     }
-  },300);
+    const evtChip=$("#chip-evt", wrap);
+    if (evtChip) evtChip.remove();
+    return wrap;
+  }
 
-  document.addEventListener('visibilitychange',()=>{if(!document.hidden)rfr()},{passive:true});
+  function clock(v,day=false){
+    if (!v) return "-";
+    const n=+v, dt=new Date(Number.isFinite(n)&&n>0?(n<1e10?n*1000:n):v);
+    if (isNaN(+dt)) return "-";
+    const time=dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}), now=new Date();
+    if (!day || dt.toDateString()===now.toDateString()) return time;
+    const tom=new Date(now); tom.setDate(now.getDate()+1);
+    return dt.toDateString()===tom.toDateString()?`tomorrow ${time}`:`${dt.toLocaleDateString([],{weekday:"short"})} ${time}`;
+  }
 
-  document.addEventListener('config-saved',e=>{
-    const sec=e?.detail?.section;
-    if(!sec||sec==='scrobble'||sec==='scheduling'){
-      invalidateCfg();
-      rfr(true);
+  const sourceLabel=(src)=>{
+    const s=String(src||"").toLowerCase();
+    const pm=CW()?.ProviderMeta;
+    const base=s.replace(/trakt$/,"");
+    const viaMeta=typeof pm?.label==="function"?pm.label(base):"";
+    if (viaMeta && viaMeta !== "?") return s.endsWith("trakt") ? `${viaMeta} webhook` : viaMeta;
+    if (s==="plex") return "Plex";
+    if (s==="emby") return "Emby";
+    if (s==="jellyfin") return "Jellyfin";
+    if (s==="plextrakt") return "Plex webhook";
+    if (s==="embytrakt") return "Emby webhook";
+    if (s==="jellyfintrakt") return "Jellyfin webhook";
+    return String(src||"");
+  };
+  const instanceLabel=(value)=>{
+    const raw=String(value||"").trim();
+    if (!raw || raw.toLowerCase()==="default") return "Default";
+    return raw;
+  };
+  const streamSummary=(item)=>{
+    if (!item || typeof item!=="object") return "";
+    const src=sourceLabel(item.source);
+    const inst=instanceLabel(item.provider_instance);
+    const title=String(item.title||"").trim() || "Untitled";
+    const pct=Number(item.progress);
+    const bits=[src];
+    if (inst) bits.push(inst);
+    bits.push(title);
+    if (Number.isFinite(pct)) bits.push(`${Math.round(pct)}%`);
+    return bits.join(" • ");
+  };
+  const currentItem=(bucket)=>{
+    const items=Array.isArray(bucket?.items)?bucket.items:[];
+    if (!items.length) return null;
+    const idx=((Number(bucket?.index)||0)%items.length+items.length)%items.length;
+    return items[idx]||items[0]||null;
+  };
+  const tooltipFor=(label,items)=>[label,...(Array.isArray(items)?items.map(streamSummary).filter(Boolean):[])].join("\n");
+
+  function emit(source,detail){
+    const payload={source,...detail}, key=JSON.stringify(payload);
+    if (S.last[source]===key) return;
+    S.last[source]=key;
+    try { window.dispatchEvent(new CustomEvent("currently-watching-updated",{detail:payload})); } catch {}
+  }
+
+  function paint(el,{show=true,value="-",meta="",badges=[],live=false,ok=true,idle=false,tip=""}={}){
+    if (!el?.chip) return;
+    el.chip.style.display=show?"inline-flex":"none";
+    if (!show) {
+      if (el.badges) {
+        el.badges.innerHTML="";
+        el.badges.style.display="none";
+      }
+      return el.chip.removeAttribute("data-tip"), el.chip.removeAttribute("title");
     }
+    const healthy=!!ok&&!idle;
+    el.chip.classList.toggle("ok",healthy);
+    el.chip.classList.toggle("live",!!live);
+    el.chip.classList.toggle("idle",!!idle);
+    el.chip.classList.toggle("warn",!idle&&!ok);
+    el.value.textContent=value||"-";
+    el.meta.textContent=meta||"";
+    el.meta.style.display=meta?"inline":"none";
+    if (el.badges) {
+      const badgeHtml=(Array.isArray(badges)?badges:[]).filter(Boolean).map(x=>`<span class="badge">${String(x)}</span>`).join("");
+      el.badges.innerHTML=badgeHtml;
+      el.badges.style.display=badgeHtml?"inline-flex":"none";
+    }
+    tip=String(tip||"").trim();
+    tip?(el.chip.dataset.tip=tip,el.chip.title=tip):(el.chip.removeAttribute("data-tip"),el.chip.removeAttribute("title"));
+  }
+
+  function render(){
+    const host=ensureBanner();
+    if (!host) return;
+    const E=k=>({chip:$(`#chip-${k}`,host),value:$(`#${k}-value`,host),meta:$(`#${k}-meta`,host),badges:$(`#${k}-badges`,host)}),
+      sched=E("sched"), watch=E("watch"), hook=E("hook"),
+      watchItem=currentItem(S.watch),
+      hookItem=currentItem(S.hook),
+      watchLive=!!(watchItem&&S.watch.alive),
+      hookLive=!!hookItem,
+      schedBadges=[S.sched.captures?`C${S.sched.captures}`:"",S.evt.enabled&&S.evt.count?`E${S.evt.count}`:""].filter(Boolean);
+
+    paint(sched,!S.sched.enabled?{show:false}:{
+      value:S.sched.running?"running":(S.sched.advanced?"advanced":"scheduled"),
+      meta:S.sched.next?`next ${clock(S.sched.next,true)}`:"",
+      badges:schedBadges,
+      live:S.sched.running,
+      tip:`Scheduler ${S.sched.running?"running":(S.sched.advanced?"advanced":"scheduled")}${S.sched.next?` • next ${clock(S.sched.next,true)}`:""}${S.sched.advanced?" • advanced mode":""}${S.sched.captures?` • ${S.sched.captures} capture schedule${S.sched.captures===1?"":"s"}`:""}${S.evt.enabled&&S.evt.count?` • ${S.evt.count} event trigger${S.evt.count===1?"":"s"}`:""}`
+    });
+
+    paint(watch,!S.watch.enabled?{show:false}:{
+      value:watchLive?(watchItem.title||"Watching"):(S.watch.alive?"running":"idle"),
+      meta:"",
+      badges:S.watch.streams>1?[S.watch.streams]:[],
+      live:watchLive, ok:S.watch.alive, idle:!S.watch.alive,
+      tip:watchLive?tooltipFor(`Watcher • ${S.watch.streams} active stream${S.watch.streams===1?"":"s"}`,S.watch.items):`Watcher ${S.watch.alive?"running":"idle"}${S.watch.state?` • state ${S.watch.state}`:""}`
+    });
+    emit("watcher",watchLive?{title:watchItem.title,progress:Number(watchItem.progress)||0,state:watchItem.state||"playing",_streams_count:S.watch.streams}:{state:"stopped"});
+
+    paint(hook,!S.hook.enabled?{show:false}:{
+      value:hookLive?(hookItem.title||"Watching"):"enabled",
+      meta:"",
+      badges:S.hook.streams>1?[S.hook.streams]:[],
+      live:hookLive, idle:!hookLive,
+      tip:hookLive?tooltipFor(`Webhook • ${S.hook.streams} active stream${S.hook.streams===1?"":"s"}`,S.hook.items):"Webhook enabled"
+    });
+    emit("webhook",hookLive?{title:hookItem.title,progress:Number(hookItem.progress)||0,state:hookItem.state||"playing",_streams_count:S.hook.streams}:{state:"stopped"});
+
+    host.style.display=S.sched.enabled||S.evt.enabled||S.watch.enabled||S.hook.enabled?"flex":"none";
+  }
+
+  async function readConfig(force=false){
+    try { return await API()?.Config.load(force)||{}; } catch { return Cache()?.getCfg()||{}; }
+  }
+
+  async function pollSched(force=false){
+    clear("sched");
+    if (document.hidden) return scheduleSched();
+    try {
+      const st=await API().Scheduling.status(force), sc=st?.config||S.cfg?.scheduling||{};
+      const adv=advancedOn(sc), captures=adv?activeCaptureJobs(sc):0, events=adv?activeEventRules(sc):0;
+      S.sched={enabled:schedulingOn(sc),advanced:adv,running:!!st?.running,next:+(st?.next_run_at||st?.next_run||0)||0,captures:captures};
+      S.evt={enabled:adv&&events>0,count:events};
+    } catch { S.sched={enabled:false,running:false,next:0,advanced:false,captures:0}; S.evt={enabled:false,count:0}; }
+    render();
+    scheduleSched();
+  }
+
+  async function pollScrob(force=false){
+    clear("scrob");
+    const sc=S.cfg?.scrobble||{}, mode=scrobMode(), enabled=!!sc.enabled;
+    const prevWatchIndex=Number(S.watch?.index)||0, prevHookIndex=Number(S.hook?.index)||0;
+    S.watch={...blank(),enabled:enabled&&mode==="watch",alive:false,index:prevWatchIndex};
+    S.hook={...blank(),enabled:enabled&&mode==="webhook",index:prevHookIndex};
+    if (!enabled) { clear("rotate"); return render(); }
+    if (document.hidden) return scheduleScrob();
+    try {
+      if (S.watch.enabled) S.watch.alive=!!(await API().Watch.status(force))?.alive;
+      const now=Date.now();
+      const shared=!force?window[SHARED_WATCH_KEY]:null;
+      const cw=shared&&typeof shared==="object"&&(now-(Number(shared.at)||0))<SHARED_WATCH_TTL_MS
+        ? (shared.payload||null)
+        : await API().Watch.currentlyWatching(force).catch(()=>null);
+      if (cw) window[SHARED_WATCH_KEY]={at:now,payload:cw};
+      const all=Array.isArray(cw?.streams)?cw.streams.filter(x=>x&&typeof x==="object"):[];
+      const watchItems=all.filter(it=>!String(it?.source||"").toLowerCase().includes("webhook"));
+      const hookItems=all.filter(it=>String(it?.source||"").toLowerCase().includes("webhook"));
+      if (watchItems.length) Object.assign(S.watch,{items:watchItems,streams:watchItems.length,title:String(watchItems[0]?.title||""),state:String(watchItems[0]?.state||"playing"),index:Math.min(Number(S.watch.index)||0,Math.max(0,watchItems.length-1))});
+      if (hookItems.length) Object.assign(S.hook,{items:hookItems,streams:hookItems.length,title:String(hookItems[0]?.title||""),state:String(hookItems[0]?.state||"playing"),index:Math.min(Number(S.hook.index)||0,Math.max(0,hookItems.length-1))});
+    } catch {}
+    render();
+    scheduleRotate();
+    scheduleScrob();
+  }
+
+  const scheduleSched=()=>S.sched.enabled&&(S.timers.sched=setTimeout(()=>pollSched(false),30000)),
+    scheduleScrob=()=>S.cfg?.scrobble?.enabled&&(S.timers.scrob=setTimeout(()=>pollScrob(false),scrobMode()==="watch"?15000:60000)),
+    stop=()=>["sched","scrob","rotate"].forEach(clear);
+
+  function scheduleRotate(){
+    clear("rotate");
+    const canRotate=(S.watch.streams>1)||(S.hook.streams>1);
+    if (!canRotate) return;
+    S.timers.rotate=setTimeout(()=>{
+      if (S.watch.streams>1) S.watch.index=(Number(S.watch.index)||0)+1;
+      if (S.hook.streams>1) S.hook.index=(Number(S.hook.index)||0)+1;
+      render();
+      scheduleRotate();
+    },30000);
+  }
+
+  async function refresh(forceCfg=false){
+    stop();
+    S.cfg=await readConfig(forceCfg);
+    if (!schedulingOn(S.cfg?.scheduling) && !S.cfg?.scrobble?.enabled) {
+      S.sched={enabled:false,running:false,next:0,advanced:false,captures:0};
+      S.evt={enabled:false,count:0};
+      S.watch={...blank(),alive:false};
+      S.hook=blank();
+      clear("rotate");
+      return render();
+    }
+    schedulingOn(S.cfg?.scheduling)?await pollSched(true):(S.sched={enabled:false,running:false,next:0,advanced:false,captures:0},S.evt={enabled:false,count:0});
+    S.cfg?.scrobble?.enabled?await pollScrob(true):(S.watch.enabled=S.hook.enabled=false,render());
+  }
+
+  function queueRefresh(forceCfg=false){
+    clearTimeout(S.debounce);
+    S.debounce=setTimeout(()=>{
+      if (forceCfg) try { Cache()?.invalidate("config"); } catch {}
+      refresh(forceCfg);
+    },150);
+  }
+
+  function boot(){
+    if (window.__SCHED_BANNER_STARTED__) return;
+    window.__SCHED_BANNER_STARTED__=true;
+    queueRefresh(true);
+    document.addEventListener("visibilitychange",()=>!document.hidden&&queueRefresh(false),{passive:true});
+    document.addEventListener("config-saved",()=>queueRefresh(true));
+    window.addEventListener("auth-changed",()=>queueRefresh(true));
+    document.addEventListener("scheduling-status-refresh",()=>pollSched(true));
+    document.addEventListener("watcher-status-refresh",()=>pollScrob(true));
+    document.addEventListener("tab-changed",e=>["main","settings"].includes(e?.detail?.id)&&queueRefresh(false));
+    window.addEventListener("focus",()=>queueRefresh(false));
+    window.refreshSchedulingBanner=queueRefresh;
+  }
+
+  document.addEventListener("DOMContentLoaded",()=>{
+    clear("wait");
+    S.timers.wait=setInterval(()=>findBox()&&(clear("wait"),boot()),300);
   });
-  document.addEventListener('scheduling-status-refresh',rfr);
-  document.addEventListener('watcher-status-refresh',rfr);
-  document.addEventListener('tab-changed',e=>{const id=e?.detail?.id;if(id==='main'||id==='settings')rfr()});
-  window.addEventListener('focus',rfr);
-});
 })();

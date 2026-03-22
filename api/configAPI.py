@@ -27,6 +27,17 @@ def _env() -> dict[str, Any]:
             "probes_cache": None, "probes_status_cache": None, "scheduler": None,
         }
 
+    probes_cache = getattr(CW, "PROBES_CACHE", None)
+    probes_status_cache = getattr(CW, "PROBES_STATUS_CACHE", None)
+
+    if not isinstance(probes_cache, dict) or not isinstance(probes_status_cache, dict):
+        try:
+            from api.probesAPI import PROBE_CACHE, STATUS_CACHE
+            probes_cache = PROBE_CACHE
+            probes_status_cache = STATUS_CACHE
+        except Exception:
+            pass
+
     return {
         "CW": CW,
         "cfg_base": config_base,
@@ -35,8 +46,8 @@ def _env() -> dict[str, Any]:
         "prune": getattr(CW, "_prune_legacy_ratings", lambda *_: None),
         "ensure": getattr(CW, "_ensure_pair_ratings_defaults", lambda *_: None),
         "norm_pair": getattr(CW, "_normalize_pair_ratings", lambda *_: None),
-        "probes_cache": getattr(CW, "PROBES_CACHE", None),
-        "probes_status_cache": getattr(CW, "PROBES_STATUS_CACHE", None),
+        "probes_cache": probes_cache,
+        "probes_status_cache": probes_status_cache,
         "scheduler": getattr(CW, "scheduler", None),
     }
 
@@ -46,6 +57,33 @@ def _nostore(res: JSONResponse) -> JSONResponse:
 
 router = APIRouter(prefix="/api", tags=["config"])
 
+def _after_config_save(env: dict[str, Any], cfg: dict[str, Any]) -> None:
+    try:
+        pc = env["probes_cache"]; ps = env["probes_status_cache"]
+        if isinstance(pc, dict):
+            for k in list(pc.keys()):
+                pc[k] = (0.0, False)
+        if isinstance(ps, dict):
+            ps["ts"] = 0.0; ps["data"] = None
+    except Exception:
+        pass
+
+    try:
+        sched = env["scheduler"]
+        if hasattr(sched, "refresh_ratings_watermarks"):
+            sched.refresh_ratings_watermarks()
+        s = cfg.get("scheduling") or {}
+        effective_enabled = bool(
+            (s or {}).get("enabled") or ((s or {}).get("advanced") or {}).get("enabled")
+        )
+        if sched is not None:
+            if effective_enabled:
+                getattr(sched, "start", lambda: None)()
+                getattr(sched, "refresh", lambda: None)()
+            else:
+                getattr(sched, "stop", lambda: None)()
+    except Exception:
+        pass
 
 def _norm_ver(v: str | None) -> str:
     raw = (v or "").strip()
@@ -79,7 +117,60 @@ def api_config_meta() -> JSONResponse:
         except Exception:
             raw = {}
 
+    autogen = False
+    try:
+        ui = raw.get("ui") if isinstance(raw, dict) else None
+        if isinstance(ui, dict):
+            autogen = bool(ui.get("_autogen"))
+    except Exception:
+        autogen = False
+
+    auth_reset_required = False
+    try:
+        app_auth = raw.get("app_auth") if isinstance(raw, dict) else None
+        password = app_auth.get("password") if isinstance(app_auth, dict) else None
+        manual_disable_with_existing_credentials = bool(
+            isinstance(app_auth, dict)
+            and not bool(app_auth.get("enabled"))
+            and str(app_auth.get("username") or "").strip()
+            and isinstance(password, dict)
+            and str(password.get("hash") or "").strip()
+            and str(password.get("salt") or "").strip()
+        )
+        if isinstance(app_auth, dict):
+            auth_reset_required = bool(app_auth.get("reset_required")) or manual_disable_with_existing_credentials
+    except Exception:
+        auth_reset_required = False
+
+    auth_configured = False
+    try:
+        app_auth = raw.get("app_auth") if isinstance(raw, dict) else None
+        password = app_auth.get("password") if isinstance(app_auth, dict) else None
+        auth_configured = bool(
+            isinstance(app_auth, dict)
+            and not auth_reset_required
+            and str(app_auth.get("username") or "").strip()
+            and isinstance(password, dict)
+            and str(password.get("hash") or "").strip()
+            and str(password.get("salt") or "").strip()
+        )
+    except Exception:
+        auth_configured = False
+
+    if auth_configured:
+        autogen = False
+
+    first_run = (not exists) or autogen
+
     cfg_ver = _norm_ver(raw.get("version") if isinstance(raw, dict) else None) or None
+    pending_upgrade_from_ver = None
+    try:
+        ui = raw.get("ui") if isinstance(raw, dict) else None
+        if isinstance(ui, dict):
+            pending_upgrade_from_ver = _norm_ver(ui.get("_pending_upgrade_from_version")) or None
+    except Exception:
+        pending_upgrade_from_ver = None
+    effective_cfg_ver = pending_upgrade_from_ver or cfg_ver
     try:
         from api.versionAPI import CURRENT_VERSION as _V
         cur_ver = _norm_ver(str(_V))
@@ -89,11 +180,14 @@ def api_config_meta() -> JSONResponse:
     needs_upgrade = False
     is_legacy_pre_070 = False
     try:
-        needs_upgrade = _safe_ver(cur_ver) > _safe_ver(cfg_ver)
-        is_legacy_pre_070 = _safe_ver(cfg_ver) < Version("0.7.0")
+        needs_upgrade = _safe_ver(cur_ver) > _safe_ver(effective_cfg_ver)
+        is_legacy_pre_070 = _safe_ver(effective_cfg_ver) < Version("0.7.0")
     except Exception:
         needs_upgrade = False
         is_legacy_pre_070 = False
+
+    auth_reset_deferred_to_upgrade = bool(needs_upgrade and auth_reset_required)
+    setup_wizard_required = bool(auth_reset_required and not needs_upgrade)
 
     mtime = None
     size = None
@@ -109,11 +203,19 @@ def api_config_meta() -> JSONResponse:
         JSONResponse(
             {
                 "exists": exists,
+                "first_run": first_run,
+                "autogen": autogen,
+                "auth_configured": auth_configured,
+                "auth_reset_required": auth_reset_required,
+                "auth_reset_deferred_to_upgrade": auth_reset_deferred_to_upgrade,
+                "setup_wizard_required": setup_wizard_required,
                 "path": str(p) if p is not None else None,
                 "size": size,
                 "mtime": mtime,
                 "current_version": cur_ver,
-                "config_version": cfg_ver,
+                "config_version": effective_cfg_ver,
+                "stored_config_version": cfg_ver,
+                "pending_upgrade_from_version": pending_upgrade_from_ver,
                 "needs_upgrade": needs_upgrade,
                 "legacy_pre_070": is_legacy_pre_070,
             }
@@ -126,8 +228,10 @@ def api_config() -> JSONResponse:
     cfg = dict(env["load"]() or {})
     try: env["prune"](cfg); env["ensure"](cfg)
     except Exception: pass
-    try: cfg = env["cfg_base"].redact_config(cfg)  # type: ignore[attr-defined]
-    except Exception: pass
+    base = env.get("cfg_base")
+    if base is None or not hasattr(base, "redact_config"):
+        return _nostore(JSONResponse({"ok": False, "error": "Config redaction unavailable"}, status_code=503))
+    cfg = base.redact_config(cfg)  # type: ignore[attr-defined]
     return _nostore(JSONResponse(cfg))
 
 @router.post("/config")
@@ -141,43 +245,82 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     except Exception:
         merged = {**current, **incoming}
 
+    MASK = "••••••••"
+
     def _blank(v: Any) -> bool:
         s = ("" if v is None else str(v)).strip()
-        return s in {"", "••••••••"}
+        return s in {"", MASK}
 
-    from cw_platform.config_base import _SECRET_PATHS
-    secrets = _SECRET_PATHS
-    def _preserve_blank_secret(path: tuple[str, ...]) -> None:
-        cur = current; inc = incoming; dst = merged
-        for k in path[:-1]:
-            cur = cur.get(k, {}) if isinstance(cur, dict) else {}
-            inc = inc.get(k, {}) if isinstance(inc, dict) else {}
-            dst = dst.setdefault(k, {}) if isinstance(dst, dict) else {}
-        leaf = path[-1]
-        if isinstance(inc, dict) and leaf in inc and _blank(inc[leaf]):
-            dst[leaf] = (cur or {}).get(leaf, "")
+    def _is_sensitive_key(key: Any) -> bool:
+        k = str(key or "").strip().lower()
+        if not k:
+            return False
 
-    providers_with_instances = {"plex","simkl","trakt","tmdb","tmdb_sync","mdblist","jellyfin","emby","anilist","tautulli"}
+        exact = {
+            "api_key", "apikey",
+            "access_token", "refresh_token",
+            "client_secret",
+            "account_token", "pms_token", "home_pin",
+            "session_id",
+            "token_hash", "salt", "hash",
+            "device_code",
+            "_pending_request_token",
+            "request_token",
+            "token",
+            # Webhook URL tokens (security.webhook_ids.*)
+            "webhook_ids", "webhook_id",
+            "plextrakt", "jellyfintrakt", "embytrakt", "plexwatcher",
+        }
+        if k in exact:
+            return True
 
-    for path in secrets:
-        if len(path) == 2 and path[0] in providers_with_instances:
-            prov, leaf = path
-            _preserve_blank_secret((prov, leaf))
+        # Catch token
+        if k.endswith("_token") and k not in {"token_endpoint", "token_url"}:
+            return True
 
-            cur_inst = ((current.get(prov) or {}).get("instances") or {})
-            inc_inst = ((incoming.get(prov) or {}).get("instances") or {})
-            inst_ids: set[str] = set()
-            if isinstance(cur_inst, dict):
-                inst_ids.update([str(k) for k in cur_inst.keys()])
-            if isinstance(inc_inst, dict):
-                inst_ids.update([str(k) for k in inc_inst.keys()])
+        subs = (
+            "access_token", "refresh_token", "client_secret",
+            "api_key", "apikey",
+            "token_hash", "session_id",
+            "account_token", "pms_token", "home_pin",
+            "device_code", "request_token",
+            "password", "secret",
+        )
+        return any(s in k for s in subs)
 
-            for inst_id in sorted(inst_ids):
-                if not str(inst_id).strip():
+    def _preserve_sensitive(cur: Any, inc: Any, dst: Any) -> None:
+        if isinstance(inc, dict) and isinstance(dst, dict):
+            cur_d = cur if isinstance(cur, dict) else {}
+            for k, inc_v in inc.items():
+                if k not in dst:
                     continue
-                _preserve_blank_secret((prov, "instances", str(inst_id), leaf))
-        else:
-            _preserve_blank_secret(tuple(path))
+
+                cur_v = cur_d.get(k) if isinstance(cur_d, dict) else None
+                dst_v = dst.get(k)
+
+                if isinstance(inc_v, dict) and isinstance(dst_v, dict):
+                    _preserve_sensitive(cur_v, inc_v, dst_v)
+                    continue
+
+                if isinstance(inc_v, list) and isinstance(dst_v, list):
+                    if isinstance(cur_v, list):
+                        for i in range(min(len(inc_v), len(dst_v), len(cur_v))):
+                            _preserve_sensitive(cur_v[i], inc_v[i], dst_v[i])
+                    continue
+
+                if _is_sensitive_key(k) and _blank(inc_v):
+                    if isinstance(cur_d, dict) and k in cur_d:
+                        dst[k] = cur_v
+                    else:
+                        dst[k] = ""
+            return
+
+        if isinstance(inc, list) and isinstance(cur, list) and isinstance(dst, list):
+            for i in range(min(len(inc), len(cur), len(dst))):
+                _preserve_sensitive(cur[i], inc[i], dst[i])
+
+    _preserve_sensitive(current, incoming, merged)
+
     try:
         inc_a = incoming.get("app_auth")
         cur_a = current.get("app_auth")
@@ -190,6 +333,7 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     cfg: dict[str, Any] = dict(merged or {})
 
+<<<<<<< HEAD
     # Warn on suspicious server URLs (SSRF guard — log only, don't reject)
     try:
         from cw_platform.url_validation import validate_server_url
@@ -240,30 +384,101 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     except Exception:
         pass
 
+    # Setup-wizard marker: saved config then clear any auto-generated flag.
+    try:
+        ui = cfg.get("ui")
+        if isinstance(ui, dict):
+            ui.pop("_autogen", None)
+            ui.pop("_pending_upgrade_from_version", None)
+    except Exception:
+        pass
+
     env["save"](cfg)
 
-    try:
-        pc = env["probes_cache"]; ps = env["probes_status_cache"]
-        if isinstance(pc, dict):
-            for k in ("plex","simkl","trakt","jellyfin","emby"):
-                pc[k] = (0.0, False)
-        if isinstance(ps, dict):
-            ps["ts"] = 0.0; ps["data"] = None
-    except Exception:
-        pass
-
-    try:
-        sched = env["scheduler"]
-        if hasattr(sched, "refresh_ratings_watermarks"):
-            sched.refresh_ratings_watermarks()
-        s = cfg.get("scheduling") or {}
-        if sched is not None:
-            if bool(s.get("enabled")):
-                getattr(sched, "start", lambda: None)()
-                getattr(sched, "refresh", lambda: None)()
-            else:
-                getattr(sched, "stop", lambda: None)()
-    except Exception:
-        pass
+    _after_config_save(env, cfg)
 
     return {"ok": True}
+
+@router.post("/config/migrate")
+def api_config_migrate() -> dict[str, Any]:
+    env = _env()
+    base = env.get("cfg_base")
+    if base is None:
+        return {"ok": False, "error": "Configuration backend unavailable"}
+
+    current = dict(env["load"]() or {})
+    backup_path = None
+    forced_paths: list[str] = []
+
+    try:
+        backup = getattr(base, "backup_config_file", None)
+        if callable(backup):
+            backup_result = backup()
+            if backup_result is not None:
+                backup_path = str(backup_result)
+    except Exception:
+        return {"ok": False, "error": "config_backup_failed"}
+
+    cfg: dict[str, Any] = dict(current or {})
+
+    try:
+        apply = getattr(base, "apply_migration_overrides", None)
+        if callable(apply):
+            result = apply(cfg)
+            if isinstance(result, tuple) and len(result) == 2:
+                next_cfg, next_paths = result
+                if isinstance(next_cfg, dict):
+                    cfg = next_cfg
+                if isinstance(next_paths, list):
+                    forced_paths = [str(path) for path in next_paths]
+    except Exception:
+        return {"ok": False, "error": "migration_overrides_failed"}
+
+    sc = cfg.setdefault("scrobble", {})
+    sc_enabled = bool(sc.get("enabled", False))
+    mode = str(sc.get("mode") or "").strip().lower()
+    if mode not in {"webhook","watch"}:
+        legacy_webhook = bool((cfg.get("webhook") or {}).get("enabled"))
+        mode = "webhook" if legacy_webhook else ("watch" if sc_enabled else "")
+        if mode:
+            sc["mode"] = mode
+    if mode == "webhook":
+        sc.setdefault("watch", {}).setdefault("autostart", bool(sc.get("watch", {}).get("autostart", False)))
+    elif mode != "watch":
+        sc["enabled"] = False
+
+    features = cfg.setdefault("features", {})
+    watch_feat = features.setdefault("watch", {})
+    watch_feat["enabled"] = bool(sc_enabled and mode == "watch" and sc.get("watch", {}).get("autostart", False))
+
+    try:
+        env["prune"](cfg)
+        env["ensure"](cfg)
+        for p in (cfg.get("pairs") or []):
+            try:
+                env["norm_pair"](p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        ui = cfg.get("ui")
+        if isinstance(ui, dict):
+            ui.pop("_autogen", None)
+            ui.pop("_pending_upgrade_from_version", None)
+    except Exception:
+        pass
+
+    try:
+        env["save"](cfg)
+    except Exception:
+        return {"ok": False, "error": "config_save_failed"}
+
+    _after_config_save(env, cfg)
+
+    return {
+        "ok": True,
+        "backup": backup_path,
+        "forced_paths": forced_paths,
+    }
