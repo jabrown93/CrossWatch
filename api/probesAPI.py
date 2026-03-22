@@ -3,6 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import hashlib
+import hmac as _hmac
 import json
 import os
 import secrets
@@ -58,7 +60,9 @@ PROBE_CACHE: dict[str, tuple[float, bool]] = {k: (0.0, False) for k in PROVIDERS
 # Keyed by per-credential probe key 
 PROBE_DETAIL_CACHE: dict[str, tuple[float, bool, str]] = {}
 _USERINFO_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+# Maps HMAC(per-process salt, secret) → opaque tag; the secret is never stored as a key.
 _SECRET_CACHE_TAGS: dict[str, str] = {}
+_PROBE_SALT: bytes = os.urandom(32)
 
 _CACHE_LOCK = threading.Lock()
 _BUST_SEEN: set[str] = set()
@@ -107,13 +111,14 @@ def _secret_cache_tag(v: str) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
-    # Keep per-credential cache keys opaque without deriving them from a fast hash
-    # of secret-looking inputs, which static analyzers can mistake for password hashing.
+    # Derive an opaque, non-reversible lookup key via HMAC so the secret value
+    # is never stored as a dictionary key (reducing exposure in memory dumps).
+    opaque_key = _hmac.new(_PROBE_SALT, s.encode(), hashlib.sha256).hexdigest()
     with _CACHE_LOCK:
-        tag = _SECRET_CACHE_TAGS.get(s)
+        tag = _SECRET_CACHE_TAGS.get(opaque_key)
         if not tag:
             tag = secrets.token_hex(5)
-            _SECRET_CACHE_TAGS[s] = tag
+            _SECRET_CACHE_TAGS[opaque_key] = tag
         return tag
 
 
