@@ -350,8 +350,12 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                     _log(_w, level="WARN", module="CONFIG")
                 except Exception:
                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            from _logging import log as _log
+            _log(f"Error during URL validation: {e}", level="WARN", module="CONFIG")
+        except Exception:
+            pass
 
     # Scrobble watcher: ensure routes exist when legacy fields are used
     try:
