@@ -3,7 +3,6 @@
 # Copyright (c) 2025 -2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import hmac
 import time
 import requests
 from typing import Any, Mapping, Callable
@@ -18,6 +17,7 @@ except Exception:
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
+from providers.webhooks._utils import verify_webhook_secret as _verify_webhook_secret
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
 except Exception:
@@ -240,16 +240,6 @@ def _is_debug() -> bool:
         return bool(rt.get("debug") or rt.get("debug_mods"))
     except Exception:
         return False
-
-
-def _verify_webhook_secret(headers: Mapping[str, str], secret: str) -> bool:
-    """Check X-CW-Webhook-Secret header against configured secret."""
-    if not secret:
-        return True
-    header_val = headers.get("X-CW-Webhook-Secret") or headers.get("x-cw-webhook-secret") or ""
-    if not header_val:
-        return False
-    return hmac.compare_digest(header_val, secret)
 
 
 def _emit(logger: Callable[..., None] | Any | None, msg: str, level: str = "INFO") -> None:
