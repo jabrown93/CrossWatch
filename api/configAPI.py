@@ -333,7 +333,6 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     cfg: dict[str, Any] = dict(merged or {})
 
-<<<<<<< HEAD
     # Warn on suspicious server URLs (SSRF guard — log only, don't reject)
     try:
         from cw_platform.url_validation import validate_server_url
