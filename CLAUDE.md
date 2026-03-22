@@ -19,8 +19,6 @@ CrossWatch (CW) is a synchronization engine that keeps Plex, Jellyfin, Emby, SIM
 - Trackers: SIMKL, Trakt, AniList, MDBList, CrossWatch (internal)
 - Monitoring: Tautulli
 
-**Not supported:** Multi-user or multi-server configurations
-
 ## Development Commands
 
 ### Running the Application
