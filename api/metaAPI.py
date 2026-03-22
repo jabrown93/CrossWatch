@@ -593,7 +593,11 @@ def get_art_file(
     safe_typ = _safe_cache_part(typ, default="media")
     safe_tmdb_id = _safe_cache_part(tmdb_id)
     safe_kind = _safe_cache_part(art_kind, default="poster")
-    safe_size = _safe_cache_part(_sanitize_tmdb_size(size), default="w342")
+    try:
+        raw_size = _sanitize_tmdb_size(size)
+    except ValueError:
+        raw_size = "w342"
+    safe_size = _safe_cache_part(raw_size, default="w342")
     base = cache_root / f"{safe_typ}_{safe_tmdb_id}_{safe_kind}_{loc_tag}_{safe_size}"
     meta_path = base.with_suffix(".json")
 

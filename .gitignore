@@ -65,3 +65,5 @@ playwright/.auth/
 # Local test/temp workspaces
 .pytest_tmp*/
 pytest-cache-files-*/
+
+.idea/

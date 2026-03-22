@@ -53,14 +53,13 @@ CrossWatch includes endpoints that read/write configuration and orchestrate sync
 
 ### 3) Secrets are stored locally
 
-CrossWatch stores tokens/keys in a local `config.json` 
+CrossWatch stores tokens/keys in a local `config.json`.
 
-* Sensitive values are stored encrypted in `config.json`
-  * It will reduce accidental leakage but it does not protect against a compromised host.
-* sensitive values are masked **** in logging
-* protect the config directory with proper OS permissions
-* don’t commit config files to git
-* rotate tokens immediately if you suspect exposure
+* Sensitive values are masked in logs and diagnostic output to reduce accidental leakage.
+* This does not protect against a compromised host.
+* Protect the config directory with proper OS permissions.
+* Don’t commit config files to git.
+* Rotate tokens immediately if you suspect exposure.
 
 ### 4) TLS verification
 

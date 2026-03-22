@@ -3,7 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import json, time
+import json
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -19,6 +20,7 @@ except Exception:
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
+from providers.webhooks._utils import verify_webhook_secret as _verify_webhook_secret
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
 except Exception:
@@ -842,9 +844,14 @@ def process_webhook(
     raw: bytes | None = None,
     logger: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
-    _ = headers, raw
     try:
         cfg = _ensure_scrobble(_load_config())
+
+        secret = ((cfg.get("emby") or {}).get("webhook_secret") or "").strip()
+        if not _verify_webhook_secret(headers, secret):
+            _emit(logger, "invalid X-CW-Webhook-Secret", "WARN")
+            return {"ok": False, "error": "invalid_webhook_secret"}
+
         sc = cfg.get("scrobble") or {}
         if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "webhook":
             _emit(logger, "scrobble webhook disabled", "DEBUG")
