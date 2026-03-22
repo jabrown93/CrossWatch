@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 _METADATA_HOSTS = frozenset({
     "169.254.169.254",
     "metadata.google.internal",
-    "metadata.google.internal.",
 })
 
 
