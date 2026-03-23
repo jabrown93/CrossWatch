@@ -28,8 +28,8 @@ ID_KEYS: tuple[str, ...] = (
     "slug",
 )
 KEY_PRIORITY: tuple[str, ...] = (
-    "tmdb",
     "imdb",
+    "tmdb",
     "tvdb",
     "trakt",
     "mal",
