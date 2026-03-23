@@ -67,6 +67,7 @@ __all__ = [
     "KEY_PRIORITY",
     "ids_from",
     "ids_from_guid",
+    "ids_from_jellyfin_providerids",
     "merge_ids",
     "coalesce_ids",
     "canonical_key",
@@ -174,6 +175,19 @@ def coalesce_ids(*many: Mapping[str, Any]) -> dict[str, str]:
             n = _normalize_id(k, ids.get(k))
             if n:
                 out[k] = n
+    return out
+
+
+def ids_from_jellyfin_providerids(provider_ids: Mapping[str, Any]) -> dict[str, str]:
+    """Normalize Jellyfin ProviderIds dict (e.g. {"Imdb": "tt123", "Tmdb": "550"})."""
+    out: dict[str, str] = {}
+    for raw_key, raw_val in provider_ids.items():
+        key = raw_key.lower().strip()
+        if key not in ID_KEYS:
+            continue
+        norm = _normalize_id(key, raw_val)
+        if norm:
+            out[key] = norm
     return out
 
 
