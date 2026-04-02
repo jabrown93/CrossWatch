@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.22
 FROM python:3.14-slim
 
 LABEL org.opencontainers.image.description="One brain for all your media syncs A single place to configure everything."
