@@ -16,7 +16,9 @@ STATE_DIR = Path("/config/.cw_state")
 WATERMARK_PATH = STATE_DIR / "mdblist.watermarks.json"
 START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# STATE_DIR is created lazily on first write (see write_json / _migrate_legacy_json).
+# Don't mkdir at import time — it crashes when /config is absent or unwritable (e.g. CI),
+# and the other sync providers already defer directory creation the same way.
 
 
 def _pair_scope() -> str | None:
