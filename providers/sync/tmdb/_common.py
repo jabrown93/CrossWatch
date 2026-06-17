@@ -13,7 +13,9 @@ from typing import Any, Mapping
 from cw_platform.id_map import canonical_key, ids_from, minimal as id_minimal
 
 STATE_DIR = Path("/config/.cw_state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# STATE_DIR is created lazily on first write (see write_json / _migrate_legacy_json).
+# Don't mkdir at import time — it crashes when /config is absent or unwritable (e.g. CI),
+# and the other sync providers already defer directory creation the same way.
 
 
 def _pair_scope() -> str | None:

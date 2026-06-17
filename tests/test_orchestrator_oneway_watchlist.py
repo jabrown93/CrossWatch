@@ -81,13 +81,16 @@ class FakeOps:
 def test_orchestrator_oneway_watchlist_add_then_observed_remove(
     config_base: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # SRC initially has A, B, C; DST has only A. With the default one-way
+    # remove_mode of "source_deletes", DST removals are driven by items observed
+    # to disappear from SRC (not by a plain DST-minus-SRC mirror diff).
     src_items = {
         "imdb:tt01": {"type": "movie", "title": "A", "year": 2000, "ids": {"imdb": "tt01"}},
+        "imdb:tt02": {"type": "movie", "title": "B", "year": 2001, "ids": {"imdb": "tt02"}},
         "imdb:tt03": {"type": "movie", "title": "C", "year": 2002, "ids": {"imdb": "tt03"}},
     }
     dst_items = {
         "imdb:tt01": {"type": "movie", "title": "A", "year": 2000, "ids": {"imdb": "tt01"}},
-        "imdb:tt02": {"type": "movie", "title": "B", "year": 2001, "ids": {"imdb": "tt02"}},
     }
 
     src = FakeOps("SRC", src_items)
@@ -134,13 +137,17 @@ def test_orchestrator_oneway_watchlist_add_then_observed_remove(
 
     orch = Orchestrator(cfg)
 
-    # Run 1: DST should receive missing C
+    # Run 1: DST should receive the missing B and C, and establishes the
+    # source baseline. No removals on the first run.
     orch.run()
     assert len(dst.add_calls) == 1
-    assert [it.get("ids", {}).get("imdb") for it in dst.add_calls[0]] == ["tt03"]
+    assert sorted(it.get("ids", {}).get("imdb") for it in dst.add_calls[0]) == ["tt02", "tt03"]
     assert dst.remove_calls == []
 
-    # Run 2: now DST has a baseline that includes B,  removal is allowed.
+    # B is deleted from SRC -> the next run should observe the deletion.
+    src.index.pop("imdb:tt02", None)
+
+    # Run 2: the observed source-side deletion of B propagates to DST.
     orch.run()
     assert len(dst.remove_calls) == 1
     assert [it.get("ids", {}).get("imdb") for it in dst.remove_calls[0]] == ["tt02"]

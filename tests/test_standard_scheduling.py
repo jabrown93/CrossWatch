@@ -9,7 +9,7 @@ def test_normalize_scheduling_clamps_custom_interval_to_minimum() -> None:
     cfg = {
         "scheduling": {
             "enabled": True,
-            "mode": "custom",
+            "mode": "custom_interval",
             "custom_interval_minutes": 5,
         }
     }
