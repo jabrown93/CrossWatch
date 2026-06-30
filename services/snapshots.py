@@ -15,7 +15,7 @@ import re
 import uuid
 
 from cw_platform.config_base import CONFIG, load_config
-from cw_platform.modules_registry import MODULES as MR_MODULES, load_sync_ops
+from cw_platform.modules_registry import MODULES as MR_MODULES, load_sync_ops, state_read_features
 from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id
 
 Feature = Literal["watchlist", "ratings", "history", "progress"]
@@ -218,13 +218,8 @@ def _capture_mode_env(
                 os.environ[key] = value
 
 
-def _feature_enabled(ops: Any, feature: Feature) -> bool:
-    try:
-        feats = ops.features() or {}
-        v = feats.get(feature)
-        return bool(v)
-    except Exception:
-        return False
+def _state_read_feature_enabled(ops: Any, feature: Feature) -> bool:
+    return bool(state_read_features(ops).get(feature))
 
 
 def _configured(ops: Any, cfg: Mapping[str, Any]) -> bool:
@@ -271,12 +266,8 @@ def snapshot_manifest(cfg: Mapping[str, Any] | None = None) -> list[dict[str, An
         ops = load_sync_ops(pid)
         if not ops:
             continue
-        feats = {}
-        try:
-            raw = ops.features() or {}
-            feats = {k: bool(raw.get(k)) for k in SNAPSHOT_FEATURES}
-        except Exception:
-            feats = {"watchlist": False, "ratings": False, "history": False, "progress": False}
+        raw = state_read_features(ops)
+        feats = {k: bool(raw.get(k)) for k in SNAPSHOT_FEATURES}
 
         insts = list_instance_ids(cfg, pid)
         inst_meta: list[dict[str, Any]] = []
@@ -389,6 +380,7 @@ def _canonical_item_key(provider: str, feature: Feature, orig_key: str, item: Ma
         "JELLYFIN": ["jellyfin"],
         "EMBY": ["emby"],
         "ANILIST": ["anilist"],
+        "PUBLICMETADB": ["tmdb"],
     }
 
     if pid in native:
@@ -531,7 +523,7 @@ def create_snapshot(
 
         for f in SNAPSHOT_FEATURES:
             feat = _norm_feature(f)
-            if not _feature_enabled(ops, feat):
+            if not _state_read_feature_enabled(ops, feat):
                 continue
             try:
                 child = _create_single_snapshot(ops=ops, cfg=cfg, pid=pid, instance=inst, feat=feat, label=label, ts=ts)
@@ -565,7 +557,7 @@ def create_snapshot(
         return {"ok": True, "path": rel, "provider": pid, "instance": inst, "feature": "all", "label": payload["label"], "created_at": payload["created_at"], "stats": stats, "children": children}
 
     feat = _norm_feature(str(feat_any))
-    if not _feature_enabled(ops, feat):
+    if not _state_read_feature_enabled(ops, feat):
         raise ValueError(f"Feature not enabled for provider: {pid} / {feat}")
 
     return _create_single_snapshot(ops=ops, cfg=cfg, pid=pid, instance=inst, feat=feat, label=label, ts=ts)
@@ -751,7 +743,7 @@ def _restore_single_snapshot(
 
     if not _configured(ops, cfg_view):
         raise ValueError(f"Provider not configured: {pid}#{inst}")
-    if not _feature_enabled(ops, feat):
+    if not _state_read_feature_enabled(ops, feat):
         raise ValueError(f"Feature not enabled for provider: {pid} / {feat}")
 
     snap_items = snap.get("items") or {}
@@ -867,6 +859,51 @@ def delete_snapshot(path: str, *, delete_children: bool = True) -> dict[str, Any
 
     return {"ok": len(errors) == 0, "deleted": deleted, "errors": errors}
 
+
+def delete_all_snapshots() -> dict[str, Any]:
+    base = _snapshots_dir().resolve()
+    deleted: list[str] = []
+    errors: list[str] = []
+    freed_bytes = 0
+
+    for candidate in sorted(base.rglob("*.json")):
+        try:
+            target = candidate.resolve()
+            rel = str(target.relative_to(base)).replace("\\", "/")
+            if not target.is_file():
+                continue
+            size = target.stat().st_size
+            target.unlink()
+            deleted.append(rel)
+            freed_bytes += int(size)
+        except Exception as e:
+            errors.append(str(e))
+
+    directories = sorted(
+        (path for path in base.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        try:
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        except Exception:
+            pass
+
+    return {
+        "ok": len(errors) == 0,
+        "root": str(base),
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+        "errors": errors,
+        "summary": {
+            "removed_files": len(deleted),
+            "removed_items": 0,
+            "freed_bytes": freed_bytes,
+        },
+    }
+
 def restore_snapshot(
     path: str,
     *,
@@ -945,7 +982,7 @@ def clear_provider_features(
 
     for f in features:
         feat = _norm_feature(f)
-        if not _feature_enabled(ops, feat):
+        if not _state_read_feature_enabled(ops, feat):
             done["results"][feat] = {"ok": True, "skipped": True, "reason": "feature_disabled"}
             continue
         if pid == "PLEX" and feat == "progress":

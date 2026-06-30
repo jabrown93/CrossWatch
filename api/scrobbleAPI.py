@@ -20,6 +20,8 @@ from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import build_provider_config_view, normalize_instance_id
 from providers.scrobble.routes import build_route_cfg_by_id, normalize_route_options, normalize_routes
 from providers.scrobble.scrobble import mask_account as _mask_account
+from providers.scrobble.sources import scrobble_sources
+from services.activity import add_event as _activity_add_event
 
 try:
     from providers.scrobble.currently_watching import state_file as _cw_state_file
@@ -246,9 +248,12 @@ def api_scrobble_event_routes() -> dict[str, Any]:
     sc = (cfg.get("scrobble") or {}) if isinstance(cfg.get("scrobble"), dict) else {}
     enabled = bool(sc.get("enabled"))
     mode = str(sc.get("mode") or "").strip().lower()
+    sources = scrobble_sources(sc)
+    watcher_enabled = bool(sources.get("watcher"))
+    webhook_enabled = bool(sources.get("webhook"))
 
     watcher_routes: list[dict[str, Any]] = []
-    if enabled and mode == "watch":
+    if watcher_enabled:
         for raw in normalize_routes(cfg):
             if not isinstance(raw, dict) or not bool(raw.get("enabled")):
                 continue
@@ -268,7 +273,7 @@ def api_scrobble_event_routes() -> dict[str, Any]:
             watcher_routes.append(route)
 
     webhook_routes: list[dict[str, Any]] = []
-    if enabled and mode == "webhook":
+    if webhook_enabled:
         for provider in ("plex", "jellyfin", "emby"):
             webhook_routes.append({
                 "id": provider,
@@ -282,8 +287,9 @@ def api_scrobble_event_routes() -> dict[str, Any]:
         "ok": True,
         "enabled": enabled,
         "mode": mode,
-        "watcher_enabled": enabled and mode == "watch",
-        "webhook_enabled": enabled and mode == "webhook",
+        "sources": sources,
+        "watcher_enabled": watcher_enabled,
+        "webhook_enabled": webhook_enabled,
         "watcher_routes": watcher_routes,
         "webhook_routes": webhook_routes,
     }
@@ -365,6 +371,21 @@ def _scheduler_event_webhook_payload(provider: str, payload: dict[str, Any], res
         except Exception:
             return None
 
+    def _first(*values: Any) -> Any:
+        for value in values:
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _number(*values: Any) -> int | None:
+        value = _first(*values)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     provider_lc = str(provider or "").strip().lower()
     action_raw = str((result or {}).get("action") or "").strip().lower()
     event_name = action_raw.rsplit("/", 1)[-1] if action_raw.startswith("/scrobble/") else action_raw
@@ -394,6 +415,7 @@ def _scheduler_event_webhook_payload(provider: str, payload: dict[str, Any], res
     media_type = str(
         _dig(payload, "Metadata", "type")
         or _dig(payload, "Item", "Type")
+        or _dig(payload, "NowPlayingItem", "Type")
         or payload.get("itemType")
         or ""
     ).strip().lower()
@@ -407,14 +429,38 @@ def _scheduler_event_webhook_payload(provider: str, payload: dict[str, Any], res
         or ""
     ).strip()
 
-    title = str(
-        _dig(payload, "Metadata", "title")
-        or _dig(payload, "Metadata", "grandparentTitle")
-        or _dig(payload, "Item", "Name")
-        or _dig(payload, "Item", "SeriesName")
-        or payload.get("Name")
+    series_title = str(
+        _first(
+            _dig(payload, "Metadata", "grandparentTitle"),
+            _dig(payload, "Item", "SeriesName"),
+            _dig(payload, "NowPlayingItem", "SeriesName"),
+            payload.get("SeriesName"),
+        )
         or ""
     ).strip()
+    item_title = str(
+        _first(
+            _dig(payload, "Metadata", "title"),
+            _dig(payload, "Item", "Name"),
+            _dig(payload, "NowPlayingItem", "Name"),
+            payload.get("Name"),
+        )
+        or ""
+    ).strip()
+    title = series_title if media_type == "episode" and series_title else item_title
+
+    season = _number(
+        _dig(payload, "Metadata", "parentIndex"),
+        _dig(payload, "Item", "ParentIndexNumber"),
+        _dig(payload, "NowPlayingItem", "ParentIndexNumber"),
+        payload.get("SeasonNumber"),
+    )
+    episode = _number(
+        _dig(payload, "Metadata", "index"),
+        _dig(payload, "Item", "IndexNumber"),
+        _dig(payload, "NowPlayingItem", "IndexNumber"),
+        payload.get("EpisodeNumber"),
+    )
 
     ids = {}
     for key in ("imdb", "tmdb", "tvdb", "trakt"):
@@ -435,6 +481,8 @@ def _scheduler_event_webhook_payload(provider: str, payload: dict[str, Any], res
         "finished": finished,
         "session_key": str(payload.get("sessionKey") or payload.get("SessionId") or "").strip(),
         "title": title,
+        "season": season if media_type == "episode" else None,
+        "episode": episode if media_type == "episode" else None,
         "ids": ids,
         "ts": int(time.time()),
     }
@@ -449,6 +497,53 @@ def _emit_scheduler_webhook_event(provider: str, payload: dict[str, Any], result
         import crosswatch as CW
 
         CW.scheduler_handle_event(_scheduler_event_webhook_payload(provider, payload or {}, result))
+    except Exception:
+        pass
+
+
+def _emit_activity_webhook_event(provider: str, payload: dict[str, Any], result: dict[str, Any]) -> None:
+    if not isinstance(result, dict):
+        return
+    if result.get("error") or result.get("ignored") or result.get("debounced") or result.get("suppressed") or result.get("dedup"):
+        return
+    action = str(result.get("action") or "").strip().lower()
+    if action not in {"/scrobble/stop", "stop"}:
+        return
+
+    try:
+        event = _scheduler_event_webhook_payload(provider, payload or {}, result)
+        trakt_payload = result.get("trakt")
+        trakt_action = str(trakt_payload.get("action") or "").strip().lower() if isinstance(trakt_payload, dict) else ""
+        confirmed_scrobble = trakt_action in {"scrobble", "stop"}
+        confirmed_conflict = str(result.get("note") or "").strip().lower() == "409_checkin"
+        if trakt_action and not confirmed_scrobble:
+            return
+        if not trakt_action and not confirmed_conflict and not bool(event.get("finished")):
+            return
+        media_type = str(event.get("media_type") or "").strip().lower()
+        if media_type not in {"movie", "episode"}:
+            return
+        _activity_add_event(
+            {
+                "kind": "scrobble",
+                "method": "webhook",
+                "event": "scrobble_stop",
+                "status": "ok",
+                "source": provider,
+                "source_instance": "default",
+                "target": "trakt",
+                "target_instance": "default",
+                "media_type": media_type,
+                "title": event.get("title"),
+                "season": event.get("season"),
+                "episode": event.get("episode"),
+                "progress": event.get("progress"),
+                "account": event.get("account"),
+                "watched_at": event.get("ts"),
+                "captured_at": event.get("ts"),
+                "ids": event.get("ids") or {},
+            }
+        )
     except Exception:
         pass
 
@@ -1175,6 +1270,7 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
         "DEBUG",
     )
     _emit_scheduler_webhook_event("jellyfin", payload, res)
+    _emit_activity_webhook_event("jellyfin", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,
@@ -1327,6 +1423,7 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
         "DEBUG",
     )
     _emit_scheduler_webhook_event("emby", payload, res)
+    _emit_activity_webhook_event("emby", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,
@@ -1442,7 +1539,7 @@ async def webhook_trakt(request: Request) -> JSONResponse:
     elif res.get("debounced"):
         log("plex-webhook: debounced pause", "DEBUG")
     elif res.get("suppressed"):
-        log("plex-webhook: suppressed late start", "DEBUG")
+        log("plex-webhook: event suppressed by scrobble rules", "DEBUG")
     elif res.get("dedup"):
         log("plex-webhook: duplicate event suppressed", "DEBUG")
 
@@ -1451,6 +1548,7 @@ async def webhook_trakt(request: Request) -> JSONResponse:
         "DEBUG",
     )
     _emit_scheduler_webhook_event("plex", payload, res)
+    _emit_activity_webhook_event("plex", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,

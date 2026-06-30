@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 import copy
 
 import importlib
+import re
 import secrets
 import threading
 import time
@@ -38,6 +39,12 @@ import providers.sync.plex._utils as plex_utils
 
 __all__ = ["register_auth"]
 
+
+def _provider_auth():
+    from providers.auth import runtime as provider_auth
+
+    return provider_auth
+
 # Helpers
 def _status_from_msg(msg: str) -> int:
     m = (msg or "").lower()
@@ -66,6 +73,107 @@ def _looks_masked_secret(value: Any) -> bool:
     if text in {"••••••••", "********", "**********"}:
         return True
     return len(text) >= 3 and all(ch in {"•", "*"} for ch in text)
+
+
+def _validate_mdblist_api_key(api_key: str, *, timeout: float = 12.0) -> tuple[bool, str]:
+    key = str(api_key or "").strip()
+    if not key:
+        return False, "api_key_required"
+    try:
+        r = requests.get(
+            "https://api.mdblist.com/user",
+            params={"apikey": key},
+            headers={"Accept": "application/json", "User-Agent": "CrossWatch/MDBListAuth"},
+            timeout=timeout,
+        )
+    except requests.Timeout:
+        return False, "validation_timeout"
+    except requests.RequestException:
+        return False, "validation_failed"
+    if r.status_code in (401, 403):
+        return False, "invalid_api_key"
+    if r.status_code >= 400:
+        return False, f"validation_http_{int(r.status_code)}"
+    try:
+        data = r.json() or {}
+    except ValueError:
+        return False, "validation_bad_response"
+    if not isinstance(data, dict) or not (data.get("user_id") or data.get("username")):
+        return False, "invalid_api_key"
+    return True, ""
+
+
+def _validate_publicmetadb_api_key(api_key: str, *, base_url: str = "https://publicmetadb.com", timeout: float = 12.0) -> tuple[bool, str]:
+    key = str(api_key or "").strip()
+    if not key:
+        return False, "api_key_required"
+    base = str(base_url or "https://publicmetadb.com").strip().rstrip("/") or "https://publicmetadb.com"
+    try:
+        r = requests.get(
+            f"{base}/api/external/lists",
+            params={"page": 1, "perPage": 1},
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {key}",
+                "User-Agent": "CrossWatch/PublicMetaDBAuth",
+            },
+            timeout=timeout,
+        )
+    except requests.Timeout:
+        return False, "validation_timeout"
+    except requests.RequestException:
+        return False, "validation_failed"
+    if r.status_code in (401, 403):
+        return False, "invalid_api_key"
+    if r.status_code >= 400:
+        return False, f"validation_http_{int(r.status_code)}"
+    try:
+        data = r.json() or {}
+    except ValueError:
+        return False, "validation_bad_response"
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return False, "validation_bad_response"
+    return True, ""
+
+
+def _validate_tautulli_credentials(server_url: str, api_key: str, *, timeout: float = 12.0, verify_ssl: bool = True) -> tuple[bool, str]:
+    server = str(server_url or "").strip().rstrip("/")
+    key = str(api_key or "").strip()
+    if not server:
+        return False, "server_url_required"
+    if not key:
+        return False, "api_key_required"
+    if not server.startswith(("http://", "https://")):
+        server = "http://" + server
+    try:
+        r = requests.get(
+            f"{server}/api/v2",
+            params={"apikey": key, "cmd": "get_server_info"},
+            headers={"Accept": "application/json", "User-Agent": "CrossWatch/TautulliAuth"},
+            timeout=timeout,
+            verify=bool(verify_ssl),
+        )
+    except requests.Timeout:
+        return False, "validation_timeout"
+    except requests.RequestException:
+        return False, "validation_failed"
+    if r.status_code in (401, 403):
+        return False, "invalid_api_key"
+    if r.status_code >= 400:
+        return False, f"validation_http_{int(r.status_code)}"
+    try:
+        data = r.json() or {}
+    except ValueError:
+        return False, "validation_bad_response"
+    resp = data.get("response") if isinstance(data, dict) else None
+    if isinstance(resp, dict) and str(resp.get("result") or "").lower() == "success":
+        return True, ""
+    msg = str((resp or {}).get("message") or "").strip().lower() if isinstance(resp, dict) else ""
+    if "apikey" in msg or "api key" in msg:
+        return False, "invalid_api_key"
+    return False, "validation_bad_response"
+
+
 def _defaults_for_provider(provider_key: str) -> dict[str, Any]:
     blk = DEFAULT_CFG.get(provider_key)
     return copy.deepcopy(blk) if isinstance(blk, dict) else {}
@@ -409,7 +517,14 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         token = (plex.get("account_token") or "").strip()
         base = (plex.get("server_url") or "").strip()
         if not token:
-            return {"users": [], "count": 0, "instance": inst}
+            return {
+                "users": [],
+                "count": 0,
+                "instance": inst,
+                "ok": False,
+                "reason": "token_required",
+                "message": "Connect this Plex profile first.",
+            }
 
         norm = lambda s: (s or "").strip().lower()
         is_local_id = (
@@ -1009,10 +1124,87 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {"users": users, "count": len(users), "instance": inst}
 
     # TMDB
+    TMDB_API_BASE = "https://api.themoviedb.org/3"
+
+    def _tmdb_v3_api_key_error(api_key: str) -> str:
+        key = str(api_key or "").strip()
+        if not key:
+            return "Missing api_key"
+        if key.lower().startswith("bearer "):
+            return "Paste the TMDb v3 API Key only, without a Bearer prefix."
+        if key.startswith("eyJ") or key.count(".") >= 2:
+            return "Use the TMDb API Key (v3 auth), not the API Read Access Token."
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", key):
+            return "Invalid TMDb API key format. Use the 32-character API Key (v3 auth)."
+        return ""
+
+    def _tmdb_request_error(e: Exception) -> str:
+        if isinstance(e, requests.exceptions.Timeout):
+            return "TMDb request timed out"
+        if isinstance(e, requests.exceptions.HTTPError):
+            resp = getattr(e, "response", None)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            msg = ""
+            try:
+                data = resp.json() if resp is not None else {}
+                if isinstance(data, dict):
+                    msg = str(data.get("status_message") or data.get("message") or "").strip()
+            except Exception:
+                msg = ""
+            low = msg.lower()
+            if status in (401, 403) or "invalid api key" in low:
+                return "Invalid TMDb API key. Use the v3 API Key, not the v4 Read Access Token."
+            if status == 429:
+                return "TMDb rate limit reached. Try again later."
+            if status >= 500:
+                return "TMDb server error. Try again later."
+            if msg:
+                return f"TMDb rejected the request: {msg}"
+            return f"TMDb rejected the request (HTTP {status})"
+        if isinstance(e, requests.exceptions.RequestException):
+            return "Could not reach TMDb. Check network/DNS from the CrossWatch container."
+        return "TMDb check failed"
+
+    def _tmdb_validate_metadata_key(api_key: str) -> tuple[bool, str]:
+        key = str(api_key or "").strip()
+        key_error = _tmdb_v3_api_key_error(key)
+        if key_error:
+            return False, key_error
+        try:
+            r = requests.get(f"{TMDB_API_BASE}/configuration", params={"api_key": key}, timeout=12)
+            r.raise_for_status()
+            data = r.json() or {}
+            if not isinstance(data, dict) or not isinstance(data.get("images"), dict):
+                return False, "TMDb returned an unexpected response"
+            return True, ""
+        except Exception as e:
+            return False, _tmdb_request_error(e)
+
+    @app.post("/api/tmdb/verify", tags=["auth"])
+    def api_tmdb_verify(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
+        try:
+            cfg = load_config()
+            current = str(((cfg.get("tmdb") or {}).get("api_key") or "")).strip()
+            key = str((payload or {}).get("api_key") or "").strip()
+            if _looks_masked_secret(key):
+                key = current
+            if not key:
+                key = current
+            ok, error = _tmdb_validate_metadata_key(key)
+            return {"ok": ok, "valid": ok, "error": error}
+        except Exception as e:
+            _safe_log(log_fn, "TMDB", f"[TMDB] ERROR verify: {e}")
+            return {"ok": False, "valid": False, "error": "TMDb check failed"}
+
     @app.post("/api/tmdb/save", tags=["auth"])
     def api_tmdb_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         try:
             key = str((payload or {}).get("api_key") or "").strip()
+            if key:
+                ok, error = _tmdb_validate_metadata_key(key)
+                if not ok:
+                    _safe_log(log_fn, "TMDB", f"[TMDB] api_key validation failed: {error}")
+                    return {"ok": False, "error": error}
             cfg = load_config(); cfg.setdefault("tmdb", {})["api_key"] = key
             save_config(cfg)
             _safe_log(log_fn, "TMDB", "[TMDB] api_key saved")
@@ -1034,9 +1226,6 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "TMDB", f"[TMDB] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
-    # TMDB Sync (v3 session)
-    TMDB_API_BASE = "https://api.themoviedb.org/3"
-
     def _tmdb_v3_request_token(api_key: str) -> dict[str, Any]:
         r = requests.get(f"{TMDB_API_BASE}/authentication/token/new", params={"api_key": api_key}, timeout=15)
         r.raise_for_status()
@@ -1057,15 +1246,24 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         r.raise_for_status()
         return r.json() or {}
 
+    def _tmdb_sync_error(e: Exception) -> str:
+        return _tmdb_request_error(e).replace("TMDb check failed", "TMDb connect failed")
+
+    def _tmdb_sync_key_error(api_key: str) -> str:
+        return _tmdb_v3_api_key_error(api_key)
+
     @app.post("/api/tmdb_sync/connect/start", tags=["auth"])
     def api_tmdb_sync_connect_start(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
-        key = str((payload or {}).get("api_key") or "").strip()
-        if not key:
-            return {"ok": False, "error": "Missing api_key"}
         try:
             cfg = load_config()
             tm = ensure_instance_block(cfg, "tmdb_sync", inst)
+            key = str((payload or {}).get("api_key") or "").strip()
+            if _looks_masked_secret(key):
+                key = str((tm or {}).get("api_key") or "").strip()
+            key_error = _tmdb_sync_key_error(key)
+            if key_error:
+                return {"ok": False, "error": key_error}
             tm["api_key"] = key
 
             j = _tmdb_v3_request_token(key)
@@ -1088,8 +1286,9 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                 "instance": inst,
             }
         except Exception as e:
-            _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] ERROR connect/start: {e}")
-            return {"ok": False, "error": "internal"}
+            err = _tmdb_sync_error(e)
+            _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] ERROR connect/start: {err}")
+            return {"ok": False, "error": err}
 
     @app.post("/api/tmdb_sync/connect/finish", tags=["auth"])
     def api_tmdb_sync_connect_finish(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
@@ -1098,6 +1297,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             cfg = load_config()
             tm = ensure_instance_block(cfg, "tmdb_sync", inst)
             key = str((payload or {}).get("api_key") or tm.get("api_key") or "").strip()
+            if _looks_masked_secret(key):
+                key = str((tm or {}).get("api_key") or "").strip()
             token = str((payload or {}).get("request_token") or tm.get("_pending_request_token") or "").strip()
             if not key:
                 return {"ok": False, "error": "Missing api_key"}
@@ -1134,10 +1335,14 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
     def api_tmdb_sync_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         try:
-            key = str((payload or {}).get("api_key") or "").strip()
-            sess = str((payload or {}).get("session_id") or "").strip()
             cfg = load_config()
             tm = ensure_instance_block(cfg, "tmdb_sync", inst)
+            key = str((payload or {}).get("api_key") or "").strip()
+            sess = str((payload or {}).get("session_id") or "").strip()
+            if _looks_masked_secret(key):
+                key = str((tm or {}).get("api_key") or "").strip()
+            if _looks_masked_secret(sess):
+                sess = str((tm or {}).get("session_id") or "").strip()
             tm["api_key"] = key
             tm["session_id"] = sess
             tm.pop("_pending_request_token", None)
@@ -1224,44 +1429,151 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
     @app.post("/api/mdblist/save", tags=["auth"])
     def api_mdblist_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
         try:
+            provider_auth = _provider_auth()
+            method = provider_auth.normalize_auth_method("mdblist", (payload or {}).get("auth_method") or "api_key")
             key = str((payload or {}).get("api_key") or "").strip()
             cfg = load_config()
-            m = ensure_instance_block(cfg, "mdblist", instance)
-            if key:
-                if _looks_masked_secret(key):
-                    key = ""
-                else:
+            m = ensure_instance_block(cfg, "mdblist", inst)
+            if method == "api_key":
+                if not _looks_masked_secret(key):
+                    ok, reason = _validate_mdblist_api_key(key)
+                    if not ok:
+                        _safe_log(log_fn, "MDBLIST", f"[MDBLIST] api_key validation failed reason={reason} instance={inst}")
+                        return {"ok": False, "error": reason, "instance": inst}
                     m["api_key"] = key
+                provider_auth.set_active_method("mdblist", m, "api_key")
+            else:
+                m.pop("client_id", None)
+                provider_auth.set_active_method("mdblist", m, "device_code")
             save_config(cfg)
-            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] api_key saved instance={normalize_instance_id(instance)}")
+            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] auth saved method={method} instance={inst}")
             if isinstance(probe_cache, dict):
                 probe_cache["mdblist"] = (0.0, False)
-            return {"ok": True, "instance": normalize_instance_id(instance)}
+            return {"ok": True, "instance": inst, "auth_method": method}
         except Exception as e:
             _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR save: {e}")
             return {"ok": False, "error": "internal"}
 
+    @app.post("/api/mdblist/device/start", tags=["auth"])
+    def api_mdblist_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().start_device_code("mdblist", cfg, instance_id=inst)
+            if isinstance(probe_cache, dict):
+                probe_cache["mdblist"] = (0.0, False)
+            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] device start instance={inst} ok={bool(res.get('ok'))}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR device start: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/mdblist/device/poll", tags=["auth"])
+    def api_mdblist_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code("mdblist", cfg, instance_id=inst, device_code=str((payload or {}).get("device_code") or "").strip() or None)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["mdblist"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR device poll: {e}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.post("/api/mdblist/refresh", tags=["auth"])
+    def api_mdblist_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("mdblist", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["mdblist"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR refresh: {e}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
     @app.get("/api/mdblist/status", tags=["auth"])
     def api_mdblist_status(instance: str | None = Query(None)) -> dict[str, Any]:
         cfg = load_config()
-        m = ensure_instance_block(cfg, "mdblist", instance)
-        has = bool(str(m.get("api_key") or "").strip())
-        return {"connected": has, "instance": normalize_instance_id(instance)}
+        inst = normalize_instance_id(instance)
+        m = ensure_instance_block(cfg, "mdblist", inst)
+        out = _provider_auth().status_for_block("mdblist", m)
+        out["instance"] = inst
+        return out
 
     @app.post("/api/mdblist/disconnect", tags=["auth"])
     def api_mdblist_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
-            m = ensure_instance_block(cfg, "mdblist", instance)
+            m = ensure_instance_block(cfg, "mdblist", inst)
             m["api_key"] = ""
+            _provider_auth().clear_oauth("mdblist", m)
             save_config(cfg)
-            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] disconnected instance={normalize_instance_id(instance)}")
+            _safe_log(log_fn, "MDBLIST", f"[MDBLIST] disconnected instance={inst}")
             if isinstance(probe_cache, dict):
                 probe_cache["mdblist"] = (0.0, False)
-            return {"ok": True, "instance": normalize_instance_id(instance)}
+            return {"ok": True, "instance": inst}
         except Exception as e:
             _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR disconnect: {e}")
+            return {"ok": False, "error": "internal"}
+
+    @app.post("/api/publicmetadb/save", tags=["auth"])
+    def api_publicmetadb_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+        try:
+            key = str((payload or {}).get("api_key") or "").strip()
+            cfg = load_config()
+            p = ensure_instance_block(cfg, "publicmetadb", instance)
+            if key:
+                if _looks_masked_secret(key):
+                    key = ""
+                else:
+                    base_url = str(p.get("base_url") or "https://publicmetadb.com").strip().rstrip("/")
+                    ok, reason = _validate_publicmetadb_api_key(key, base_url=base_url)
+                    if not ok:
+                        _safe_log(log_fn, "PUBLICMETADB", f"[PUBLICMETADB] api_key validation failed reason={reason} instance={normalize_instance_id(instance)}")
+                        return {"ok": False, "error": reason, "instance": normalize_instance_id(instance)}
+                    p["api_key"] = key
+            p.setdefault("base_url", "https://publicmetadb.com")
+            save_config(cfg)
+            _safe_log(log_fn, "PUBLICMETADB", f"[PUBLICMETADB] api_key saved instance={normalize_instance_id(instance)}")
+            if isinstance(probe_cache, dict):
+                probe_cache["publicmetadb"] = (0.0, False)
+            return {"ok": True, "instance": normalize_instance_id(instance)}
+        except Exception as e:
+            _safe_log(log_fn, "PUBLICMETADB", f"[PUBLICMETADB] ERROR save: {e}")
+            return {"ok": False, "error": "internal"}
+
+    @app.get("/api/publicmetadb/status", tags=["auth"])
+    def api_publicmetadb_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        p = ensure_instance_block(cfg, "publicmetadb", instance)
+        key = str(p.get("api_key") or "").strip()
+        if not key:
+            return {"connected": False, "instance": normalize_instance_id(instance), "reason": "api_key_required"}
+        ok, reason = _validate_publicmetadb_api_key(
+            key,
+            base_url=str(p.get("base_url") or "https://publicmetadb.com").strip().rstrip("/"),
+        )
+        return {"connected": bool(ok), "instance": normalize_instance_id(instance), **({} if ok else {"reason": reason})}
+
+    @app.post("/api/publicmetadb/disconnect", tags=["auth"])
+    def api_publicmetadb_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+        try:
+            cfg = load_config()
+            p = ensure_instance_block(cfg, "publicmetadb", instance)
+            p["api_key"] = ""
+            save_config(cfg)
+            _safe_log(log_fn, "PUBLICMETADB", f"[PUBLICMETADB] disconnected instance={normalize_instance_id(instance)}")
+            if isinstance(probe_cache, dict):
+                probe_cache["publicmetadb"] = (0.0, False)
+            return {"ok": True, "instance": normalize_instance_id(instance)}
+        except Exception as e:
+            _safe_log(log_fn, "PUBLICMETADB", f"[PUBLICMETADB] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
 
@@ -1302,6 +1614,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             raise HTTPException(status_code=400, detail="server_url required")
         if not final_key:
             raise HTTPException(status_code=400, detail="api_key required")
+        ok, reason = _validate_tautulli_credentials(final_server, final_key, verify_ssl=bool(t.get("verify_ssl", True)))
+        if not ok:
+            _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] validation failed reason={reason} instance={inst}")
+            return {"ok": False, "error": reason, "instance": inst}
 
         save_config(cfg)
         _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] saved instance={inst}")
@@ -1323,38 +1639,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         if not verify:
             return {"connected": True, "instance": inst}
 
-        if server and not server.startswith(("http://", "https://")):
-            server = "http://" + server
-
-        try:
-            r = requests.get(
-                f"{server}/api/v2",
-                params={"apikey": key, "cmd": "get_server_info"},
-                headers={"Accept": "application/json"},
-                timeout=float(t.get("timeout", 10) or 10),
-                verify=bool(t.get("verify_ssl", True)),
-            )
-            j = {}
-            try:
-                j = r.json() if r.ok else {}
-            except Exception:
-                j = {}
-            resp = j.get("response") if isinstance(j, dict) else None
-            ok = bool(
-                r.ok
-                and isinstance(resp, dict)
-                and str(resp.get("result") or "").lower() == "success"
-            )
-            if ok:
-                return {"connected": True, "instance": inst}
-            reason = "verify_failed"
-            if isinstance(resp, dict):
-                reason = str(resp.get("message") or reason)
-            elif not r.ok:
-                reason = f"HTTP {r.status_code}"
-            return {"connected": False, "instance": inst, "reason": reason}
-        except Exception:
-            return {"connected": False, "instance": inst, "reason": "verify_failed"}
+        ok, reason = _validate_tautulli_credentials(
+            server,
+            key,
+            timeout=float(t.get("timeout", 10) or 10),
+            verify_ssl=bool(t.get("verify_ssl", True)),
+        )
+        return {"connected": bool(ok), "instance": inst, **({} if ok else {"reason": reason})}
 
     @app.post("/api/tautulli/disconnect", tags=["auth"])
     def api_tautulli_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
@@ -1707,10 +1998,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                 return PlainTextResponse("SIMKL token exchange failed.", 400)
 
             simkl_cfg["access_token"] = str(tokens.get("access_token") or "").strip()
-            if tokens.get("refresh_token"):
-                simkl_cfg["refresh_token"] = str(tokens.get("refresh_token") or "").strip()
-            if tokens.get("expires_in"):
-                simkl_cfg["token_expires_at"] = int(time.time()) + int(tokens["expires_in"])
+            simkl_cfg.pop("refresh_token", None)
+            simkl_cfg.pop("token_expires_at", None)
             save_config(cfg)
 
             SIMKL_STATE.pop(state, None)
@@ -1883,12 +2172,5 @@ def simkl_exchange_code(cfg: dict[str, Any], instance_id: Any, client_id: str, c
     access = str(s.get("access_token") or "").strip()
     if not access:
         return None
-    refresh = str(s.get("refresh_token") or "").strip()
-    exp_at = int(s.get("token_expires_at", 0) or 0)
-    expires_in = max(0, exp_at - int(time.time())) if exp_at else 0
     out: dict[str, Any] = {"access_token": access}
-    if refresh:
-        out["refresh_token"] = refresh
-    if expires_in:
-        out["expires_in"] = expires_in
     return out

@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from starlette.staticfiles import StaticFiles
 from api.versionAPI import CURRENT_VERSION
 from cw_platform.config_base import load_config
@@ -15,20 +15,6 @@ from cw_platform.config_base import load_config
 __all__ = ["register_assets_and_favicons", "register_ui_root", "get_index_html"]
 
 _ASSET_VERSION_CACHE: dict[str, float | str] = {"ts": 0.0, "val": CURRENT_VERSION}
-
-# Static favicon
-FAVICON_SVG: str = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<defs><linearGradient id="g" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
-<stop offset="0" stop-color="#2de2ff"/><stop offset="0.5" stop-color="#5f69d6"/><stop offset="1" stop-color="#7a6aa8"/></linearGradient></defs>
-<rect width="64" height="64" rx="14" fill="#0b0b0f"/>
-<rect x="10" y="16" width="44" height="28" rx="6" fill="none" stroke="url(#g)" stroke-width="3"/>
-<rect x="24" y="46" width="16" height="3" rx="1.5" fill="url(#g)"/>
-<circle cx="20" cy="30" r="2.5" fill="url(#g)"/>
-<circle cx="32" cy="26" r="2.5" fill="url(#g)"/>
-<circle cx="44" cy="22" r="2.5" fill="url(#g)"/>
-<path d="M20 30 L32 26 L44 22" fill="none" stroke="url(#g)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>"""
-
 
 DEFAULT_MANIFEST: str = r"""{
   "name": "CrossWatch",
@@ -70,10 +56,13 @@ def register_assets_and_favicons(app: FastAPI, root: Path) -> None:
             content = fallback
         return Response(content=content, media_type=media_type, headers=headers)
 
-    @app.get("/favicon.svg", include_in_schema=False, tags=["ui"])
     @app.get("/favicon.ico", include_in_schema=False, tags=["ui"])
-    def favicon() -> Response:
-        return Response(FAVICON_SVG, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+    def favicon_ico() -> FileResponse:
+        return FileResponse(assets_dir / "pwa" / "favicon.ico", media_type="image/x-icon", headers={"Cache-Control": "public, max-age=86400"})
+
+    @app.get("/favicon.svg", include_in_schema=False, tags=["ui"])
+    def favicon_svg_compat() -> FileResponse:
+        return FileResponse(assets_dir / "pwa" / "favicon-64.png", media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
     @app.get("/manifest.webmanifest", include_in_schema=False, tags=["ui"])
     def manifest_webmanifest() -> Response:
@@ -105,13 +94,12 @@ def _is_https_request(request: Request) -> bool:
 
 _HELPER_SCRIPTS = (
     "provider-meta.js", "icon-select.js", "scrobbler-ui.js", "scrobbler-user-picker.js", "page-loader.js", "dom.js", "events.js", "api.js", "core.js", "details-log.js",
-    "watchlist-preview.js", "providers-ui.js", "settings-ui.js", "settings-save.js", "maintenance.js",
+    "watchlist-preview.js", "providers-ui.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
     "restart_apply.js",
 )
 _APP_SCRIPTS = (
     "syncbar.js", "main.js", "connections.overlay.js", "connections.pairs.overlay.js", "scheduler.js",
-    "schedulerbanner.js", "playingcard.js", "insights.js", "main-status.js", "settings-insight.js", "scrobbler.js",
-    "editor.js", "snapshots.js",
+    "schedulerbanner.js", "playingcard.js", "insights.js", "activity.js", "dashboard-widgets.js", "main-status.js",
 )
 _AUTH_HEADER_ICONS = (
     {"prov": "PLEX", "label": "Plex"},
@@ -119,6 +107,7 @@ _AUTH_HEADER_ICONS = (
     {"prov": "SIMKL", "label": "SIMKL"},
     {"prov": "TRAKT", "label": "Trakt"},
     {"prov": "MDBLIST", "label": "MDBList"},
+    {"prov": "PUBLICMETADB", "label": "PublicMetaDB"},
     {"prov": "TMDB", "label": "TMDb", "extra_class": "cw-provider-head-icon--tmdb"},
     {"prov": "TAUTULLI", "label": "TAUTULLI"},
     {"prov": "ANILIST", "label": "AniList"},
@@ -134,11 +123,12 @@ def _asset_block() -> str:
         '<script src="/assets/helpers/media_user_picker.js?v=__CW_VERSION__" defer></script>',
         '<script src="/assets/crosswatch.js?v=__CW_VERSION__"></script>',
         app_tags,
+        '<script src="/assets/auth/auth.shared.js?v=__CW_VERSION__"></script>',
         '<script src="/assets/auth/auth_loader.js?v=__CW_VERSION__" defer></script>',
         '<script src="/assets/auth/auth.tmdb.js?v=__CW_VERSION__" defer></script>',
         '<script src="/assets/js/client-formatter.js?v=__CW_VERSION__" defer></script>',
-        '<link rel="stylesheet" href="/assets/js/modals/core/styles.css?v=__CW_VERSION__">',
         '<script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>',
+        '<script src="/assets/js/theme-flat-runtime.js?v=__CW_VERSION__" defer></script>',
     ))
 
 
@@ -196,6 +186,7 @@ def _get_index_html_static() -> str:
   const TITLES = {
     main: "Main",
     watchlist: "Watchlist",
+    playback_progress: "Playback Progress",
     snapshots: "Captures",
     editor: "Editor",
     settings: "Settings",
@@ -224,14 +215,33 @@ def _get_index_html_static() -> str:
   });
 })();
 </script>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="alternate icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="64x64" href="/assets/pwa/favicon-64.png?v=__CW_VERSION__"><link rel="alternate icon" href="/favicon.ico?v=__CW_VERSION__">
 <meta name="theme-color" content="#0b0b0f">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/assets/pwa/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<script>
+(() => {
+  try {
+    const raw = localStorage.getItem("cw.ui.theme") || "flat-dark";
+    const theme = raw === "flat-light" ? "flat-light" : raw === "original" ? "original" : "flat-dark";
+    if (theme === "original") {
+      delete document.documentElement.dataset.cwTheme;
+    } else {
+      document.documentElement.dataset.cwTheme = theme;
+    }
+    document.documentElement.classList.toggle("cw-theme-light", theme === "flat-light");
+    document.documentElement.classList.toggle("cw-theme-dark", theme === "flat-dark");
+    document.documentElement.classList.toggle("cw-theme-original", theme === "original");
+  } catch {
+    document.documentElement.dataset.cwTheme = "flat-dark";
+  }
+})();
+</script>
 
+<link rel="stylesheet" href="/assets/themes/tokens.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/crosswatch.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/ui-shell.css?v=__CW_VERSION__">
 <style id="cw-dark-shell-overrides">
@@ -259,13 +269,17 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 #page-settings .sub,#page-settings p,#page-settings small,#page-settings label,#page-settings .cw-settings-pane-kicker,#page-settings .cw-settings-overview-kicker,#page-settings .cw-settings-jumpbar,#page-settings .cw-hub-desc{color:var(--cw-ov-soft)!important}
 #page-settings h3,#page-settings h4,#page-settings strong,#page-settings .cw-panel-title,#page-settings .cw-settings-nav-title{color:var(--cw-ov-fg)!important}
 #page-settings .chip,#page-settings .pill,#page-settings .cw-provider-head-icon,#page-settings .auth-dot{filter:saturate(.88)}
-#cw-settings-menu.cw-menu,#cw-about-menu.cw-menu{position:absolute;top:calc(100% + 6px);right:0;min-width:190px;padding:6px;display:flex;flex-direction:column;gap:4px;border-radius:16px;border:1px solid rgba(255,255,255,.10);background:rgba(12,14,23,.96);box-shadow:0 18px 42px rgba(0,0,0,.38);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
-#cw-settings-menu.cw-menu{right:-18px}
-#cw-settings-menu .cw-menu-item,#cw-about-menu .cw-menu-item{display:flex;align-items:center;min-height:32px;padding:0 10px;border-radius:10px;border:1px solid transparent;background:rgba(255,255,255,.03);color:var(--fg);font-weight:700;font-size:13px}
-#cw-settings-menu .cw-menu-item:hover,#cw-about-menu .cw-menu-item:hover{background:rgba(255,255,255,.07);border-color:rgba(124,92,255,.28)}
-#cw-settings-menu .cw-menu-item.danger{color:rgba(255,186,194,.96);background:rgba(255,92,112,.08);border-color:rgba(255,92,112,.12)}
-#cw-settings-menu .cw-menu-item.danger:hover{color:#fff1f4;background:rgba(255,92,112,.14);border-color:rgba(255,120,138,.28)}
-#cw-settings-menu .cw-menu-sep{height:1px;margin:4px 2px;border:0;background:rgba(255,255,255,.08)}
+#cw-settings-menu.cw-menu,#cw-about-menu.cw-menu{--menu-bg:rgba(12,14,23,.94);--menu-active:rgba(124,92,255,.15);--menu-active-border:rgba(142,124,255,.28);--menu-text:color-mix(in srgb,var(--cw-theme-text) 68%,var(--cw-theme-muted));--menu-text-active:color-mix(in srgb,var(--cw-theme-text) 86%,var(--cw-theme-muted));position:absolute;top:calc(100% + 6px);right:0;padding:7px;display:flex;flex-direction:column;gap:1px;border-radius:12px;border:1px solid var(--cw-theme-border);background:var(--menu-bg)!important;box-shadow:0 18px 40px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.035)!important;backdrop-filter:blur(16px) saturate(115%);-webkit-backdrop-filter:blur(16px) saturate(115%)}
+#cw-settings-menu.cw-menu{right:-8px;width:218px}#cw-about-menu.cw-menu{width:148px}
+#cw-settings-menu .cw-menu-item,#cw-about-menu .cw-menu-item{position:relative;width:100%;display:grid!important;grid-template-columns:19px minmax(0,1fr);align-items:center;justify-content:initial!important;column-gap:12px;min-height:36px;padding:0 9px;border-radius:8px;border:1px solid transparent;background:transparent!important;color:var(--menu-text);font-weight:700;font-size:12.5px;line-height:1.15;text-align:left;cursor:pointer;transform:none!important;transition:background .16s ease,border-color .16s ease,color .16s ease}
+#cw-settings-menu .cw-menu-icon,#cw-about-menu .cw-menu-icon{display:grid;place-items:center;width:19px;font-size:19px;line-height:1;color:color-mix(in srgb,var(--cw-theme-text) 62%,var(--cw-theme-muted));font-variation-settings:"FILL" 0,"wght" 425,"GRAD" 0,"opsz" 20}
+#cw-settings-menu .cw-menu-item:hover,#cw-about-menu .cw-menu-item:hover,#cw-settings-menu .cw-menu-item:focus-visible,#cw-about-menu .cw-menu-item:focus-visible,#cw-settings-menu .cw-menu-item.active{background:var(--menu-active)!important;border-color:var(--menu-active-border)!important;color:var(--menu-text-active)!important;outline:0}
+#cw-settings-menu .cw-menu-item.active::before{content:"";position:absolute;left:-1px;top:7px;bottom:7px;width:2px;border-radius:2px;background:var(--cw-theme-accent)}
+#cw-settings-menu .cw-menu-item.danger{color:var(--cw-theme-danger)}#cw-settings-menu .cw-menu-item.danger .cw-menu-icon{color:var(--cw-theme-danger)}
+#cw-settings-menu .cw-menu-item.danger:hover{background:color-mix(in srgb,var(--cw-theme-danger) 12%,transparent)!important;border-color:color-mix(in srgb,var(--cw-theme-danger) 30%,transparent)!important;color:var(--cw-theme-danger)!important}
+#cw-settings-menu .cw-menu-sep{height:1px;margin:4px 3px;border:0;background:var(--cw-theme-border)}
+html[data-cw-theme=flat-dark] :is(#cw-settings-menu.cw-menu,#cw-about-menu.cw-menu){--menu-bg:rgba(23,26,34,.94);--menu-active:rgba(125,134,201,.14);--menu-active-border:rgba(125,134,201,.34);box-shadow:0 18px 38px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.035)!important}
+html[data-cw-theme=flat-light] :is(#cw-settings-menu.cw-menu,#cw-about-menu.cw-menu){--menu-bg:rgba(255,255,255,.96);--menu-active:rgba(70,86,166,.09);--menu-active-border:rgba(70,86,166,.25);box-shadow:0 18px 38px rgba(16,24,40,.16),inset 0 1px 0 rgba(255,255,255,.9)!important}
 .cw-field-inline-error{margin-top:8px;padding:10px 12px;border-radius:14px;border:1px solid rgba(255,120,120,.22);background:linear-gradient(180deg,rgba(7,9,13,.98),rgba(3,5,8,.99));color:rgba(245,247,255,.96);font-size:12px;line-height:1.45;box-shadow:0 14px 28px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.03)}
 .cw-field-inline-error.hidden{display:none}
 #page-settings .cw-settings-panel.cw-settings-shell{padding:18px;border-radius:26px;background:radial-gradient(120% 140% at 0% 0%,rgba(92,96,182,.12),transparent 38%),radial-gradient(90% 120% at 100% 100%,rgba(54,120,210,.08),transparent 48%),linear-gradient(180deg,rgba(11,14,21,.96),rgba(6,8,12,.985))!important;border:1px solid rgba(255,255,255,.08)!important;box-shadow:0 24px 46px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.03)!important}
@@ -283,6 +297,29 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 #page-settings .cw-settings-status{display:grid;gap:3px;min-width:220px}
 #page-settings .cw-settings-status strong{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:rgba(228,234,248,.72)}
 #page-settings .cw-settings-status .sub{margin:0!important}
+#page-settings .cw-mobile-companion{display:grid;gap:14px}
+#page-settings .cw-mobile-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#page-settings .cw-mobile-title{display:grid;gap:4px;min-width:220px}
+#page-settings .cw-mobile-title strong{font-size:15px;color:var(--cw-ov-fg)!important}
+#page-settings .cw-mobile-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#page-settings .cw-mobile-banner{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:16px;border:1px solid rgba(245,158,11,.24);background:linear-gradient(135deg,rgba(245,158,11,.14),rgba(124,92,255,.08));color:var(--cw-ov-fg)}
+#page-settings .cw-mobile-banner .material-symbols-rounded{flex:0 0 auto;width:28px;height:28px;border-radius:10px;display:grid;place-items:center;background:rgba(245,158,11,.16);color:#fbbf24;font-size:18px;line-height:1}
+#page-settings .cw-mobile-banner-copy{display:grid;gap:3px;min-width:0}
+#page-settings .cw-mobile-banner-copy strong{font-size:13px;line-height:1.25;color:var(--cw-ov-fg)!important}
+#page-settings .cw-mobile-banner-copy span{font-size:12px;line-height:1.45;color:var(--cw-ov-muted)!important}
+#page-settings .cw-mobile-pairing{display:grid;grid-template-columns:252px minmax(0,1fr);gap:18px;align-items:center;padding:16px;border-radius:18px;border:1px solid rgba(124,92,255,.20);background:linear-gradient(180deg,rgba(124,92,255,.10),rgba(255,255,255,.025))}
+#page-settings .cw-mobile-pairing.hidden{display:none}
+#page-settings .cw-mobile-qr{width:236px;min-height:236px;padding:12px;border-radius:18px;background:#fff;display:grid;place-items:center;box-shadow:0 16px 32px rgba(0,0,0,.22)}
+#page-settings .cw-mobile-qr img{display:block;width:212px;height:212px;object-fit:contain}
+#page-settings .cw-mobile-pairing-details{display:grid;gap:8px;min-width:0}
+#page-settings .cw-mobile-code{display:inline-flex;align-items:center;width:max-content;max-width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.24);font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;font-size:18px;font-weight:900;letter-spacing:.14em;color:#f6f8ff;overflow-wrap:anywhere}
+#page-settings .cw-mobile-uri{height:auto!important;min-height:38px!important;font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;font-size:12px!important}
+#page-settings .cw-mobile-devices{display:grid;gap:8px}
+#page-settings .cw-mobile-device-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:58px;padding:10px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.14)}
+#page-settings .cw-mobile-device-meta{display:grid;gap:3px;min-width:0}
+#page-settings .cw-mobile-device-meta strong{font-size:14px;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#page-settings .cw-mobile-device-meta .sub{font-size:12px}
+#page-settings .cw-mobile-device-row .btn{min-height:34px!important;border-radius:12px!important;padding:0 12px!important}
 #page-settings .cw-settings-shell label{font-size:12px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;color:rgba(226,232,248,.74)!important}
 #page-settings .cw-settings-shell input,#page-settings .cw-settings-shell select{height:34px;min-height:34px;padding:0 12px;border-radius:12px!important;background:linear-gradient(180deg,rgba(3,5,9,.96),rgba(1,3,6,.985))!important;color:#eef3ff!important;line-height:1.1;font-size:14px}
 #page-settings .cw-settings-shell textarea{min-height:96px;padding:10px 12px;border-radius:12px!important;background:linear-gradient(180deg,rgba(3,5,9,.96),rgba(1,3,6,.985))!important;color:#eef3ff!important;line-height:1.4;font-size:14px}
@@ -292,15 +329,22 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 #page-settings .cw-settings-shell .btn.primary,#page-settings .cw-settings-shell #btn-auth-logout,#page-settings .cw-settings-shell #btn-auth-logout-others{min-width:144px;background:linear-gradient(135deg,rgba(86,60,180,.42),rgba(56,106,208,.42))!important;border-color:rgba(124,92,255,.24)!important;box-shadow:0 14px 28px rgba(22,24,40,.24)}
 #page-settings .cw-settings-shell .btn.primary:hover,#page-settings .cw-settings-shell #btn-auth-logout:hover,#page-settings .cw-settings-shell #btn-auth-logout-others:hover{filter:brightness(1.05)}
 #page-settings .cw-settings-inline-action{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#page-settings .cw-panel-title-row{display:flex;align-items:center;gap:8px;margin-top:10px}
+#page-settings .cw-panel-title-row .cw-panel-title{margin-top:0!important}
+#page-settings .cw-title-help{appearance:none;display:inline-grid;place-items:center;width:28px;height:28px;flex:0 0 28px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:rgba(226,232,248,.78);cursor:help;padding:0;line-height:1;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+#page-settings .cw-title-help:hover,#page-settings .cw-title-help:focus-visible{color:#fff;border-color:rgba(124,92,255,.30);background:rgba(124,92,255,.10);outline:none}
+#page-settings .cw-title-help.material-symbols-rounded{font-size:19px;font-variation-settings:"FILL" 0,"wght" 500,"GRAD" 0,"opsz" 24}
+#page-settings .cw-field-label-row{display:flex;align-items:center;gap:7px;margin:0 0 6px}
+#page-settings .cw-field-label-row label,#page-settings .cw-field-label-row strong{margin:0!important}
+#page-settings .cw-field-help{appearance:none;display:inline-grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.035);color:rgba(226,232,248,.70);cursor:help;padding:0;line-height:1}
+#page-settings .cw-field-help:hover,#page-settings .cw-field-help:focus-visible{color:#fff;border-color:rgba(124,92,255,.30);background:rgba(124,92,255,.10);outline:none}
+#page-settings .cw-field-help.material-symbols-rounded{font-size:16px;font-variation-settings:"FILL" 0,"wght" 500,"GRAD" 0,"opsz" 20}
 #page-settings .cw-settings-panel.cw-settings-shell[data-tab="security"]{background:radial-gradient(120% 140% at 0% 0%,rgba(124,92,255,.16),transparent 38%),linear-gradient(180deg,rgba(11,14,21,.96),rgba(6,8,12,.985))!important}
 #page-settings .cw-settings-panel.cw-settings-shell[data-tab="tracker"]{background:radial-gradient(120% 140% at 0% 0%,rgba(45,161,255,.14),transparent 38%),linear-gradient(180deg,rgba(11,14,21,.96),rgba(6,8,12,.985))!important}
 #page-settings .cw-settings-hub{gap:14px;align-items:start}
 #page-settings .cw-hub-tile{position:relative;overflow:hidden;min-height:148px;padding:18px;border-radius:24px;display:grid;align-content:start}
 #page-settings .cw-hub-tile::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.05),transparent 42%)}
 #page-settings .cw-hub-tile>*{position:relative;z-index:1}
-#page-settings .cw-hub-tile[data-tab="ui"]{background:radial-gradient(125% 145% at 0% 0%,rgba(92,96,182,.16),transparent 40%),linear-gradient(180deg,rgba(11,14,21,.96),rgba(6,8,12,.985))!important}
-#page-settings .cw-hub-tile[data-tab="security"]{background:radial-gradient(125% 145% at 0% 0%,rgba(124,92,255,.18),transparent 40%),linear-gradient(180deg,rgba(11,14,21,.96),rgba(6,8,12,.985))!important}
-#page-settings .cw-hub-tile[data-tab="tracker"]{background:radial-gradient(125% 145% at 0% 0%,rgba(45,161,255,.16),transparent 40%),linear-gradient(180deg,rgba(11,14,21,.96),rgba(6,8,12,.985))!important}
 #page-settings .cw-hub-top{display:flex;align-items:flex-start;gap:14px}
 #page-settings .cw-hub-icon{width:44px;height:44px;flex:0 0 44px;display:grid;place-items:center;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.03));box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
 #page-settings .cw-hub-icon .material-symbols-rounded{font-size:21px;line-height:1;color:#f1f5ff}
@@ -309,8 +353,40 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 #page-settings .cw-hub-desc{margin-top:0;font-size:12px;line-height:1.3}
 #page-settings .cw-hub-tile .chips{margin-top:14px;align-self:start}
 #page-settings .cw-hub-tile .chip{padding:6px 10px;border-radius:999px;border-color:rgba(255,255,255,.09);background:rgba(0,0,0,.24);font-size:12px}
+#page-settings .cw-maint-section{overflow:hidden}
+#page-settings .cw-maint-section>.head{display:none!important}
+#page-settings .cw-maint-section>.body{padding:18px!important}
+#page-settings .cw-maint-layout{display:grid;gap:14px}
+#page-settings .cw-maint-debug-card{display:grid;gap:14px;padding:16px;border:1px solid rgba(255,255,255,.08);border-radius:22px;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.018));box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+#page-settings .cw-maint-card-head{display:flex;align-items:center;gap:12px;min-width:0}
+#page-settings .cw-maint-card-icon{width:42px;height:42px;flex:0 0 42px;display:grid;place-items:center;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(125,134,201,.18),rgba(125,134,201,.08));color:#edf2ff}
+#page-settings .cw-maint-card-icon.material-symbols-rounded{font-size:22px;font-variation-settings:"FILL" 0,"wght" 600,"GRAD" 0,"opsz" 24}
+#page-settings .cw-maint-card-copy{display:grid;gap:3px;min-width:0}
+#page-settings .cw-maint-card-copy strong{font-size:15px;line-height:1.15}
+#page-settings .cw-maint-card-copy small{font-size:12px;line-height:1.35;color:var(--cw-ov-soft)!important}
+#page-settings .cw-maint-debug-field{display:grid;gap:7px}
+#page-settings .cw-maint-debug-field label{font-size:11px;font-weight:900;letter-spacing:.11em;text-transform:uppercase}
+#page-settings .cw-maint-debug-field select{height:44px;min-height:44px;border-radius:14px!important}
+#page-settings .cw-maint-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+#page-settings .cw-maint-action.btn{min-height:104px;height:auto;padding:14px!important;border-radius:18px!important;display:flex!important;align-items:flex-start!important;justify-content:flex-start!important;gap:12px!important;text-align:left!important;background:linear-gradient(180deg,rgba(255,255,255,.042),rgba(255,255,255,.018))!important;border-color:rgba(255,255,255,.09)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)!important;color:var(--cw-ov-fg)!important}
+#page-settings .cw-maint-action.btn:hover{background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.026))!important;border-color:rgba(255,255,255,.16)!important;transform:translateY(-1px)}
+#page-settings .cw-maint-action-icon{width:38px;height:38px;flex:0 0 38px;display:grid;place-items:center;border-radius:13px;border:1px solid rgba(255,255,255,.10);background:rgba(125,134,201,.12);color:#eef3ff}
+#page-settings .cw-maint-action-icon.material-symbols-rounded{font-size:21px;font-variation-settings:"FILL" 0,"wght" 600,"GRAD" 0,"opsz" 24}
+#page-settings .cw-maint-action-copy{display:grid;gap:4px;min-width:0}
+#page-settings .cw-maint-action-copy strong{font-size:14px;line-height:1.15;color:var(--cw-ov-fg)!important}
+#page-settings .cw-maint-action-copy small{font-size:12px;line-height:1.35;color:var(--cw-ov-soft)!important;font-weight:700;white-space:normal}
+#page-settings .cw-maint-action.backup .cw-maint-action-icon{background:rgba(34,197,94,.11);border-color:rgba(34,197,94,.18);color:#d9fff0}
+#page-settings .cw-maint-action.tools .cw-maint-action-icon{background:rgba(125,134,201,.14);border-color:rgba(125,134,201,.22);color:#edf2ff}
+#page-settings .cw-maint-action.restart .cw-maint-action-icon{background:rgba(255,92,112,.10);border-color:rgba(255,120,138,.22);color:#ffdce2}
+#page-settings .cw-maint-action.restart{border-color:rgba(255,120,138,.18)!important}
+html[data-cw-theme=flat-dark] #page-settings .cw-maint-debug-card,html[data-cw-theme=flat-dark] #page-settings .cw-maint-action.btn{background:#20242d!important;background-image:none!important;border-color:rgba(255,255,255,.13)!important;box-shadow:none!important}
+html[data-cw-theme=flat-dark] #page-settings .cw-maint-card-icon,html[data-cw-theme=flat-dark] #page-settings .cw-maint-action-icon{background:#171a22!important;background-image:none!important;border-color:rgba(255,255,255,.14)!important;color:#dbe1eb!important}
+html[data-cw-theme=flat-light] #page-settings .cw-maint-debug-card,html[data-cw-theme=flat-light] #page-settings .cw-maint-action.btn{background:#fff!important;background-image:none!important;border-color:rgba(21,31,48,.14)!important;box-shadow:none!important;color:#172033!important}
+html[data-cw-theme=flat-light] #page-settings .cw-maint-card-icon,html[data-cw-theme=flat-light] #page-settings .cw-maint-action-icon{background:#eef2f7!important;background-image:none!important;border-color:rgba(21,31,48,.14)!important;color:#344054!important}
+html[data-cw-theme=flat-light] #page-settings .cw-maint-action.restart .cw-maint-action-icon{background:#f7dde2!important;border-color:rgba(201,79,97,.36)!important;color:#7f1d2d!important}
 @media (max-width:900px){#page-settings .cw-settings-2col,#page-settings .cw-settings-split{grid-template-columns:1fr}}
-@media (max-width:640px){#page-settings .cw-settings-statusrow{align-items:stretch}#page-settings .cw-settings-status{min-width:0}#page-settings .cw-settings-shell .btn.primary,#page-settings .cw-settings-shell #btn-auth-logout,#page-settings .cw-settings-shell #btn-auth-logout-others,#page-settings .cw-settings-inline-action .btn{width:100%}}
+@media (max-width:900px){#page-settings .cw-maint-actions{grid-template-columns:1fr}}
+@media (max-width:640px){#page-settings .cw-settings-statusrow{align-items:stretch}#page-settings .cw-settings-status{min-width:0}#page-settings .cw-settings-shell .btn.primary,#page-settings .cw-settings-shell #btn-auth-logout,#page-settings .cw-settings-shell #btn-auth-logout-others,#page-settings .cw-settings-inline-action .btn,#page-settings .cw-mobile-actions .btn{width:100%}#page-settings .cw-mobile-pairing{grid-template-columns:1fr}#page-settings .cw-mobile-qr{width:100%;min-height:236px}#page-settings .cw-mobile-qr img{width:212px;height:212px}#page-settings .cw-mobile-device-row{align-items:stretch;flex-direction:column}#page-settings .cw-maint-section>.body{padding:14px!important}#page-settings .cw-maint-card-head{align-items:flex-start}#page-settings .cw-maint-action.btn{min-height:auto}}
 </style>
 <script>
 (() => {
@@ -339,7 +415,22 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 })();
 </script>
 
+<link rel="preload" href="/assets/fonts/material-symbols-rounded-full-v355.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/fonts/material-symbols-rounded.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/js/modals/core/styles.css?v=__CW_VERSION__">
+<link id="cw-theme-flat-css" rel="stylesheet" href="/assets/themes/flat.css?v=__CW_VERSION__" media="not all" disabled>
+<link id="cw-theme-original-css" rel="stylesheet" href="/assets/themes/original-coverage.css?v=__CW_VERSION__" media="not all" disabled>
+<script>
+(() => {
+  const original = document.documentElement.classList.contains("cw-theme-original");
+  const flatLink = document.getElementById("cw-theme-flat-css");
+  const originalLink = document.getElementById("cw-theme-original-css");
+  flatLink.disabled = original;
+  flatLink.media = original ? "not all" : "all";
+  originalLink.disabled = !original;
+  originalLink.media = original ? "all" : "not all";
+})();
+</script>
 </head><body>
 
 <header>
@@ -360,6 +451,7 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
   <nav class="tabs" aria-label="Primary navigation">
     <button id="tab-main" class="tab active" type="button" onclick="showTab('main')">Main</button>
     <button id="tab-watchlist" class="tab" type="button" onclick="showTab('watchlist')">Watchlist</button>
+    <button id="tab-playback_progress" class="tab" type="button" onclick="showTab('playback_progress')">Playback</button>
     <button id="tab-snapshots" class="tab" type="button" onclick="showTab('snapshots')">Captures</button>
     <button id="tab-editor" class="tab" type="button" onclick="showTab('editor')">Editor</button>
     <div class="cw-tabmenu" id="tab-settings-menu">
@@ -367,19 +459,19 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
               aria-haspopup="menu" aria-expanded="false"
               onclick="window.cwToggleSettingsMenu(event)">
         <span>Settings</span>
-        <span class="tab-caret" aria-hidden="true">▾</span>
+        <span class="tab-caret" aria-hidden="true"></span>
       </button>
       <div class="cw-menu hidden" id="cw-settings-menu" role="menu" aria-labelledby="tab-settings">
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('overview')">Settings overview</button>
+        <button class="cw-menu-item active" data-settings-pane="overview" type="button" role="menuitem" aria-current="page" onclick="window.cwSettingsMenuSelect('overview')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">settings</span><span>Settings overview</span></button>
         <div class="cw-menu-sep" role="separator" aria-hidden="true"></div>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('providers')">Connections</button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('pairs')">Sync pairs</button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('scrobbler')">Scrobbler</button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('scheduling')">Scheduling</button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('app')">UI and Security</button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('maintenance')">Maintenance</button>
+        <button class="cw-menu-item" data-settings-pane="providers" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('providers')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">link</span><span>Connections</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('pairs')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">sync_alt</span><span>Sync pairs</span></button>
+        <button class="cw-menu-item" data-settings-pane="scrobbler" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('scrobbler')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">music_note</span><span>Scrobbler</span></button>
+        <button class="cw-menu-item" data-settings-pane="scheduling" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('scheduling')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">calendar_month</span><span>Scheduling</span></button>
+        <button class="cw-menu-item" data-settings-pane="app" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('app')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">shield</span><span>UI and Security</span></button>
+        <button class="cw-menu-item" data-settings-pane="maintenance" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('maintenance')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">build</span><span>Maintenance</span></button>
         <div class="cw-menu-sep" role="separator" aria-hidden="true"></div>
-        <button class="cw-menu-item danger" type="button" role="menuitem" onclick="window.cwSettingsMenuLogout()">Log out</button>
+        <button class="cw-menu-item danger" type="button" role="menuitem" onclick="window.cwSettingsMenuLogout()"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Log out</span></button>
       </div>
     </div>
     <div class="cw-tabmenu" id="tab-about-menu">
@@ -387,11 +479,11 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
               aria-haspopup="menu" aria-expanded="false"
               onclick="window.cwToggleAboutMenu(event)">
         <span>About</span>
-        <span class="tab-caret" aria-hidden="true">▾</span>
+        <span class="tab-caret" aria-hidden="true"></span>
       </button>
       <div class="cw-menu hidden" id="cw-about-menu" role="menu" aria-labelledby="tab-about">
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('about')">About</button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('help')">Help</button>
+        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('about')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">info</span><span>About</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('help')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help</span></button>
       </div>
     </div>
   </nav>
@@ -431,13 +523,13 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
     <div class="action-row">
       <div class="action-buttons">
         <div class="cw-split-run" id="cw-sync-split">
-        <button id="run" class="btn acc cw-split-main" onclick="runSync()"><span class="label">Synchronize</span><span class="spinner" aria-hidden="true"></span></button>
-        <button id="run-menu" class="btn acc cw-split-edge" type="button" title="Sync options" aria-haspopup="menu" aria-expanded="false" onclick="window.cwToggleSyncMenu(event)">▾</button>
+        <button id="run" class="btn acc cw-split-main" onclick="runSync()"><span class="material-symbols-rounded cw-action-icon cw-sync-action-icon" aria-hidden="true">sync</span><span class="label">Synchronize</span></button>
+        <button id="run-menu" class="btn acc cw-split-edge" type="button" title="Sync options" aria-label="Sync options" aria-haspopup="menu" aria-expanded="false" onclick="window.cwToggleSyncMenu(event)"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button>
         <div class="cw-menu cw-sync-menu hidden" id="cw-sync-menu" role="menu" aria-labelledby="run-menu"></div>
       </div>
-        <button class="btn" onclick="toggleDetails()">View details</button>
-        <button class="btn" onclick="openAnalyzer()">Analyzer</button>
-        <button class="btn" onclick="openExporter()">Exporter</button>
+        <button id="btn-details" class="btn cw-hub-action" onclick="toggleDetails()"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">description</span><span>View details</span></button>
+        <button class="btn cw-hub-action" onclick="openAnalyzer()"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">monitoring</span><span>Analyzer</span></button>
+        <button class="btn cw-hub-action" onclick="openExporter()"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">ios_share</span><span>Exporter</span></button>
       </div>
     </div>
 
@@ -445,17 +537,18 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
       <div class="details-grid">
         <div class="det-left">
           <div class="det-head">
-            <div class="det-title">Output</div>
             <div class="det-tabs" role="tablist" aria-label="Output tabs">
               <button id="det-tab-sync" class="det-tab active" type="button"
                 role="tab" aria-selected="true" aria-controls="det-panel-sync" data-tab="sync">Sync</button>
               <button id="det-tab-watcher" class="det-tab" type="button"
                 role="tab" aria-selected="false" aria-controls="det-panel-watcher" data-tab="watcher">Watcher</button>
+              <button id="det-tab-debug" class="det-tab" type="button"
+                role="tab" aria-selected="false" aria-controls="det-panel-debug" data-tab="debug">Debug</button>
             </div>
             <div class="det-tools">
-              <button id="det-copy" class="ghost" type="button" title="Copy current output">Copy</button>
-              <button id="det-clear" class="ghost" type="button" title="Clear current output">Clear</button>
-              <button id="det-follow" class="ghost" type="button" title="Toggle auto-follow">Follow</button>
+              <button id="det-copy" class="ghost det-tool-icon" type="button" title="Copy current output" aria-label="Copy current output"><span class="material-symbols-rounded" aria-hidden="true">content_copy</span></button>
+              <button id="det-clear" class="ghost det-tool-icon" type="button" title="Clear current output" aria-label="Clear current output"><span class="material-symbols-rounded" aria-hidden="true">delete</span></button>
+              <button id="det-follow" class="ghost det-follow" type="button" title="Toggle auto-follow" aria-pressed="true"><span class="material-symbols-rounded det-follow-icon" aria-hidden="true">podcasts</span><span>Follow</span><span class="material-symbols-rounded det-follow-caret" aria-hidden="true">expand_more</span></button>
             </div>
           </div>
           <div class="det-panels">
@@ -465,16 +558,26 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
             <div id="det-panel-watcher" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-watcher">
               <div id="det-watch-log" class="log wlog"></div>
             </div>
+            <div id="det-panel-debug" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-debug">
+              <div id="det-debug-log" class="log wlog"></div>
+            </div>
+          </div>
+          <div class="det-console-footer" aria-live="polite">
+            <span id="det-live-state" class="det-live-state"><span class="det-live-dot" aria-hidden="true"></span><span class="det-live-label">Live</span></span>
+            <span id="det-follow-state" class="det-follow-state">Auto-scroll on</span>
+            <span class="det-footer-spacer"></span>
+            <span id="det-line-count" class="det-line-count">0 lines</span>
+            <span class="material-symbols-rounded det-list-icon" aria-hidden="true">format_list_bulleted</span>
           </div>
 
         </div>
         <div class="det-right">
           <div class="meta-card">
             <div class="meta-grid">
-              <div class="meta-label">Module</div><div class="meta-value"><span id="det-cmd" class="pillvalue truncate">–</span></div>
-              <div class="meta-label">Version</div><div class="meta-value"><span id="det-ver" class="pillvalue">–</span></div>
-              <div class="meta-label">Started</div><div class="meta-value"><span id="det-start" class="pillvalue mono">–</span></div>
-              <div class="meta-label">Finished</div><div class="meta-value"><span id="det-finish" class="pillvalue mono">–</span></div>
+              <div class="meta-label">Module</div><div class="meta-value"><span id="det-cmd" class="pillvalue truncate">-</span></div>
+              <div class="meta-label">Version</div><div class="meta-value"><span id="det-ver" class="pillvalue">-</span></div>
+              <div class="meta-label">Started</div><div class="meta-value"><span id="det-start" class="pillvalue mono">-</span></div>
+              <div class="meta-label">Finished</div><div class="meta-value"><span id="det-finish" class="pillvalue mono">-</span></div>
             </div>
             <div class="meta-actions"><button class="btn" onclick="copySummary(this)">Copy summary</button></div>
           </div>
@@ -503,30 +606,89 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 
     <div class="stat-tiles" id="stat-providers"></div>
 
+    <div class="stat-block" id="recent-activity-block">
+      <div class="stat-block-header"><span class="pill plain">Recent Scrobble</span><button id="activity-view-all" class="ghost refresh-insights" type="button">View all</button></div>
+      <div id="recent-activity" class="history-list"></div>
+    </div>
+
     <div class="stat-block">
-      <div class="stat-block-header"><span class="pill plain">Recent syncs</span><button class="ghost refresh-insights" onclick="refreshInsights()" title="Refresh">⟲</button></div>
+      <div class="stat-block-header"><span class="pill plain">Recent syncs</span><button class="ghost refresh-insights material-symbols-rounded" onclick="refreshInsights()" title="Refresh" aria-label="Refresh recent syncs">refresh</button></div>
       <div id="sync-history" class="history-list"></div>
     </div>
   </section>
 
   <section id="placeholder-card" class="card cw-main-card cw-main-card--wall hidden">
-    <div class="title">Watchlist Preview</div>
+    <div class="title">Watchlist</div>
     <div class="cw-main-card-head cw-main-card-head--compact">
       <div class="cw-main-card-head-copy">
-        <div class="cw-main-card-kicker">Watchlist Preview</div>
+        <div class="cw-main-card-kicker">Watchlist</div>
       </div>
+      <span id="watchlist-count-chip" class="cw-widget-count-chip hidden" aria-live="polite"></span>
+      <button class="cw-watchlist-see-all" type="button" onclick="showTab('watchlist')" aria-label="Open Watchlist page">
+        <span class="material-symbols-rounded" aria-hidden="true">apps</span>
+      </button>
     </div>
-    <div id="wall-msg" class="wall-msg">Loading…</div>
+    <div id="wall-msg" class="wall-msg">Loading...</div>
     <div class="wall-wrap">
       <div id="edgeL" class="edge left"></div><div id="edgeR" class="edge right"></div>
-      <div id="poster-row" class="row-scroll" aria-label="Watchlist preview"></div>
-      <button class="nav prev" type="button" onclick="scrollWall(-1)" aria-label="Scroll left">‹</button>
-      <button class="nav next" type="button" onclick="scrollWall(1)" aria-label="Scroll right">›</button>
+      <div id="poster-row" class="row-scroll" aria-label="Watchlist"></div>
+      <button class="nav prev" type="button" onclick="scrollWall(-1)" aria-label="Scroll left"><</button>
+      <button class="nav next" type="button" onclick="scrollWall(1)" aria-label="Scroll right">></button>
     </div>
+  </section>
+
+  <section id="dashboard-widgets-card" class="cw-dashboard-widgets hidden" aria-label="Media widgets">
+    <article id="recent-history-widget" class="cw-dash-widget cw-dash-widget--history">
+      <div class="cw-dash-widget-head">
+        <div class="cw-dash-title-row">
+          <span class="material-symbols-rounded" aria-hidden="true">history</span>
+          <h3>Recent History</h3>
+        </div>
+        <div class="cw-dash-head-actions">
+          <span id="recent-history-count-chip" class="cw-widget-count-chip hidden" aria-live="polite"></span>
+          <button id="recent-history-refresh" class="cw-dash-ghost material-symbols-rounded" type="button" title="Refresh recent history" aria-label="Refresh recent history">refresh</button>
+        </div>
+      </div>
+      <div id="recent-history-list" class="cw-history-widget-list cw-widget-scrollbar" aria-live="polite"></div>
+    </article>
+
+    <article id="latest-ratings-widget" class="cw-dash-widget cw-dash-widget--ratings">
+      <div class="cw-dash-widget-head">
+        <div class="cw-dash-title-row">
+          <span class="material-symbols-rounded" aria-hidden="true">star</span>
+          <h3>Latest Ratings</h3>
+        </div>
+        <div class="cw-dash-head-actions">
+          <span id="latest-ratings-count-chip" class="cw-widget-count-chip hidden" aria-live="polite"></span>
+          <button id="latest-ratings-refresh" class="cw-dash-ghost material-symbols-rounded" type="button" title="Refresh latest ratings" aria-label="Refresh latest ratings">refresh</button>
+        </div>
+      </div>
+      <div id="latest-ratings-grid" class="cw-ratings-widget-grid" aria-live="polite"></div>
+    </article>
+
+    <article id="recent-scrobble-widget" class="cw-dash-widget cw-dash-widget--scrobble">
+      <div class="cw-dash-widget-head">
+        <div class="cw-dash-title-row">
+          <span class="material-symbols-rounded" aria-hidden="true">sensors</span>
+          <h3>Recent Scrobble</h3>
+        </div>
+        <div class="cw-dash-head-actions">
+          <span id="recent-scrobble-count-chip" class="cw-widget-count-chip hidden" aria-live="polite"></span>
+          <button id="recent-scrobble-refresh" class="cw-dash-ghost material-symbols-rounded" type="button" title="Refresh recent scrobble" aria-label="Refresh recent scrobble">refresh</button>
+        </div>
+      </div>
+      <div id="recent-scrobble-list" class="cw-history-widget-list cw-widget-scrollbar" aria-live="polite"></div>
+    </article>
   </section>
 
   <section id="page-watchlist" class="card hidden">
     <div class="title">Watchlist</div><div id="watchlist-root"></div>
+  </section>
+
+  <section id="page-playback_progress" class="card hidden tab-page">
+    <div id="playback-progress-root">
+      <div class="cw-page-loading">Loading Playback Progress...</div>
+    </div>
   </section>
 
   <section id="page-snapshots" class="card hidden"></section>
@@ -687,20 +849,20 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
             <div class="cw-settings-jumpbar" aria-label="Provider sections">
               <button type="button" class="cw-settings-jump" data-target="sec-auth" onclick="cwProvidersJump?.('sec-auth')">Authentication</button>
               <button type="button" class="cw-settings-jump" data-target="sec-sync" onclick="cwProvidersJump?.('sec-sync')">Synchronization</button>
-              <button type="button" class="cw-settings-jump" data-target="sec-meta" onclick="cwProvidersJump?.('sec-meta')">Metadata</button>
+              <button type="button" class="cw-settings-jump" data-target="sec-meta" onclick="cwProvidersJump?.('sec-meta')">Metadata / ID Mapping</button>
             </div>
           </div>
           <div class="cw-settings-pane-stack cw-settings-providers-stack">
             <div class="section cw-settings-section cw-settings-provider-section" id="sec-auth">
-              <div class="head" onclick="toggleSection('sec-auth')">
-                <span class="chev">▶</span><strong>Authentication</strong>
+              <div class="head" data-toggle-section="sec-auth">
+                <span class="chev"></span><strong>Authentication</strong>
                 <span id="auth-providers-icons" class="cw-provider-head-icons">__CW_AUTH_HEADER_ICONS__</span>
               </div>
               <div class="body"><div id="auth-providers"></div></div>
             </div>
 
             <div class="section cw-settings-section cw-settings-provider-section" id="sec-sync">
-              <div class="head" onclick="toggleSection('sec-sync')"><span class="chev">▶</span><strong>Synchronization</strong></div>
+              <div class="head" data-toggle-section="sec-sync"><span class="chev"></span><strong>Synchronization</strong></div>
               <div class="body">
                 <div class="sub">Providers</div><div id="providers_list" class="grid2"></div>
                 <div class="sep"></div><div class="sub">Pairs</div><div id="pairs_list"></div>
@@ -711,19 +873,9 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
               </div>
             </div>
 
-            <div class="section cw-settings-section cw-settings-provider-section" id="sec-meta"><div class="head" onclick="toggleSection('sec-meta')"><span class="chev">▶</span><strong>Metadata</strong></div><div class="body">
+            <div class="section cw-settings-section cw-settings-provider-section" id="sec-meta"><div class="head" data-toggle-section="sec-meta"><span class="chev"></span><strong>Metadata / ID Mapping</strong></div><div class="body">
 <div id="metadata-providers">
-  <div class="cw-settings-hub" id="meta_provider_tiles">
-    <button type="button" class="cw-hub-tile tmdb" data-provider="tmdb" aria-selected="false">
-      <div class="cw-meta-provider-row">
-        <div class="cw-hub-title">TMDb</div>
-        <span class="auth-dot" id="meta-tmdb-dot" aria-hidden="true"></span>
-      </div>
-      <span class="hidden" id="hub_tmdb_key" aria-hidden="true">API key: —</span>
-    </button>
-  </div>
-
-  <div id="meta-provider-panel" class="cw-panel hidden"></div>
+  <div id="meta-provider-panel" class="cw-meta-provider-stack"></div>
   <div id="meta-provider-raw" class="hidden"></div>
 </div>
 </div></div>
@@ -745,13 +897,13 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
             </div>
           </div>
           <div class="section open cw-settings-section" id="sec-scheduling" data-accordion="off">
-            <div class="head"><span class="chev">▶</span><strong>Scheduling</strong></div>
+            <div class="head"><span class="chev"></span><strong>Scheduling</strong></div>
             <div class="body">
               <div id="sched-provider-panel" class="cw-panel hidden"></div>
               <div id="sched-provider-raw" class="hidden">
                 <div class="grid2">
                   <div><label for="schEnabled">Enable</label><select id="schEnabled" name="schEnabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></div>
-                  <div><label for="schMode">Frequency</label><select id="schMode" name="schMode"><option value="hourly">Every hour</option><option value="every_n_hours">Every N hours</option><option value="daily_time">Daily at…</option><option value="custom_interval">Custom</option></select></div>
+                  <div><label for="schMode">Frequency</label><select id="schMode" name="schMode"><option value="hourly">Every hour</option><option value="every_n_hours">Every N hours</option><option value="daily_time">Daily at...</option><option value="custom_interval">Custom</option></select></div>
                   <div><label for="schN">Every N hours</label><input id="schN" name="schN" type="number" min="2" value="12"></div>
                   <div><label for="schTime">Time</label><input id="schTime" name="schTime" type="time" value="03:30"></div>
                   <div><label for="schCustomValue">Custom interval</label><input id="schCustomValue" name="schCustomValue" type="number" min="15" step="15" value="60"></div>
@@ -778,14 +930,14 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
           <div id="sec-scrobbler" class="cw-settings-pane-stack cw-settings-scrobbler-stack" data-accordion="off">
             <div id="scrobble-mount" class="cw-settings-pane-stack cw-settings-scrobbler-stack-inner">
               <div class="section cw-settings-section cw-settings-provider-section" id="sc-sec-webhook">
-                <div class="head" onclick="toggleSection('sc-sec-webhook')">
-                  <span class="chev">▶</span><strong>Webhook</strong>
+                <div class="head" data-toggle-section="sc-sec-webhook">
+                  <span class="chev"></span><strong>Webhook</strong>
                 </div>
                 <div class="body"><div id="scrob-webhook"></div></div>
               </div>
               <div class="section open cw-settings-section cw-settings-provider-section" id="sc-sec-watch">
-                <div class="head" onclick="toggleSection('sc-sec-watch')">
-                  <span class="chev">▶</span><strong>Watcher</strong>
+                <div class="head" data-toggle-section="sc-sec-watch">
+                  <span class="chev"></span><strong>Watcher</strong>
                 </div>
                 <div class="body"><div id="scrob-watcher"></div></div>
               </div>
@@ -808,58 +960,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
           </div>
           <div class="section open cw-settings-section" id="sec-ui" data-accordion="off">
             <div class="head" style="display:flex;align-items:center">
-              <span class="chev">▶</span>
+              <span class="chev"></span>
               <strong>Settings (UI / Security / CW Tracker)</strong>
             </div>
             <div class="body">
-
-              <div class="cw-settings-hub" id="ui_settings_hub">
-                <button type="button" class="cw-hub-tile active" data-tab="ui" onclick="cwUiSettingsSelect?.('ui')">
-                  <div class="cw-hub-top">
-                    <div class="cw-hub-icon" aria-hidden="true"><span class="material-symbols-rounded">palette</span></div>
-                    <div class="cw-hub-copy">
-                      <div class="cw-hub-title">User Interface</div>
-                      <div class="cw-hub-desc">Dashboard visuals</div>
-                    </div>
-                  </div>
-                  <div class="chips">
-                    <span class="chip" id="hub_ui_watchlist">Watchlist: -</span>
-                    <span class="chip" id="hub_ui_playing">Playing: -</span>
-                    <span class="chip" id="hub_ui_askai">ASK AI: -</span>
-                    <span class="chip" id="hub_ui_quickadd">Quick Add: -</span>
-                    <span class="chip" id="hub_ui_proto">Proto: -</span>
-                  </div>
-                </button>
-
-                <button type="button" class="cw-hub-tile" data-tab="security" onclick="cwUiSettingsSelect?.('security')">
-                  <div class="cw-hub-top">
-                    <div class="cw-hub-icon" aria-hidden="true"><span class="material-symbols-rounded">shield_lock</span></div>
-                    <div class="cw-hub-copy">
-                      <div class="cw-hub-title">Security</div>
-                      <div class="cw-hub-desc">Protect CrossWatch</div>
-                    </div>
-                  </div>
-                  <div class="chips">
-                    <span class="chip" id="hub_sec_auth">Auth: -</span>
-                    <span class="chip" id="hub_sec_session">Session: -</span>
-                    <span class="chip" id="hub_sec_proxy">Proxy: -</span>
-                  </div>
-                </button>
-
-                <button type="button" class="cw-hub-tile" data-tab="tracker" onclick="cwUiSettingsSelect?.('tracker')">
-                  <div class="cw-hub-top">
-                    <div class="cw-hub-icon" aria-hidden="true"><span class="material-symbols-rounded">inventory_2</span></div>
-                    <div class="cw-hub-copy">
-                      <div class="cw-hub-title">CW Tracker</div>
-                      <div class="cw-hub-desc">Local snapshots</div>
-                    </div>
-                  </div>
-                  <div class="chips">
-                    <span class="chip" id="hub_cw_enabled">Tracker: -</span>
-                    <span class="chip" id="hub_cw_retention">Retention: -</span>
-                  </div>
-                </button>
-              </div>
 
               <div class="cw-settings-panels" id="ui_settings_panels">
 
@@ -867,17 +971,23 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                 <div class="cw-settings-panel cw-settings-shell active" data-tab="ui">
                   <div class="cw-panel-head cw-settings-head">
                     <div>
-                      <div class="cw-panel-title" style="margin-top:10px">User Interface</div>
+                      <div class="cw-panel-title-row">
+                        <div class="cw-panel-title">User Interface</div>
+                        <button type="button" class="cw-title-help material-symbols-rounded" title="User Interface: Choose dashboard widgets, quick-add controls, AI helper visibility, and the protocol used to serve the UI." aria-label="User Interface help">help</button>
+                      </div>
                       <div class="sub cw-settings-copy">Choose which dashboard elements stay visible and how CrossWatch serves the UI.</div>
                     </div>
                   </div>
 
                   <div class="cw-settings-layout">
                     <div class="cw-settings-block">
-                      <div class="cw-settings-block-title">Visibility</div>
+                      <div class="cw-settings-block-title">Dashboard widgets</div>
                       <div class="cw-settings-2col">
                         <div>
-                          <label for="ui_show_watchlist_preview">Watchlist</label>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_watchlist_preview">Watchlist widget</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Watchlist widget: Shows or hides the dashboard Watchlist card on the Main screen." aria-label="Watchlist widget setting help">help</button>
+                          </div>
                           <select id="ui_show_watchlist_preview" name="ui_show_watchlist_preview">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
@@ -885,7 +995,48 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div>
-                          <label for="ui_show_playingcard">Playing card</label>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_recent_history_widget">Recent history widget</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Recent history widget: Shows or hides the Main screen media history widget below Watchlist." aria-label="Recent history widget setting help">help</button>
+                          </div>
+                          <select id="ui_show_recent_history_widget" name="ui_show_recent_history_widget">
+                            <option value="true">Show</option>
+                            <option value="false">Hide</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_latest_ratings_widget">Latest ratings widget</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Latest ratings widget: Shows or hides the Main screen latest ratings poster widget below Watchlist." aria-label="Latest ratings widget setting help">help</button>
+                          </div>
+                          <select id="ui_show_latest_ratings_widget" name="ui_show_latest_ratings_widget">
+                            <option value="true">Show</option>
+                            <option value="false">Hide</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_recent_scrobble_widget">Recent Scrobble widget</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Scrobble widget: Shows or hides the Main screen recent scrobble widget below Watchlist." aria-label="Recent Scrobble widget setting help">help</button>
+                          </div>
+                          <select id="ui_show_recent_scrobble_widget" name="ui_show_recent_scrobble_widget">
+                            <option value="true">Show</option>
+                            <option value="false">Hide</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="cw-settings-block">
+                      <div class="cw-settings-block-title">Visibility</div>
+                      <div class="cw-settings-2col">
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_playingcard">Playing card</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Playing card: Shows or hides the currently playing card on the Main screen." aria-label="Playing card setting help">help</button>
+                          </div>
                           <select id="ui_show_playingcard" name="ui_show_playingcard">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
@@ -893,7 +1044,51 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div>
-                          <label for="ui_show_AI">Help ASK AI</label>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_recent_activity">Recent Scrobble list</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Scrobble list: Shows or hides the Main screen text list of locally recorded scrobbled movies and episodes." aria-label="Recent Scrobble list setting help">help</button>
+                          </div>
+                          <select id="ui_show_recent_activity" name="ui_show_recent_activity">
+                            <option value="true">Show</option>
+                            <option value="false">Hide</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="ui_recent_activity_display">Recent Scrobble display</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Scrobble display: Choose a fixed number of rows, or show items from the last 24, 48, or 72 hours with a maximum of 5 rows." aria-label="Recent Scrobble display setting help">help</button>
+                          </div>
+                          <select id="ui_recent_activity_display" name="ui_recent_activity_display">
+                            <option value="count:3">Last 3 items</option>
+                            <option value="count:4">Last 4 items</option>
+                            <option value="count:5">Last 5 items</option>
+                            <option value="hours:24">Last 24 hours, max 5</option>
+                            <option value="hours:48">Last 48 hours, max 5</option>
+                            <option value="hours:72">Last 72 hours, max 5</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="ui_recent_syncs_display">Recent syncs display</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Recent syncs display: Choose a fixed number of rows, or show runs from the last 24, 48, or 72 hours with a maximum of 5 rows." aria-label="Recent syncs display setting help">help</button>
+                          </div>
+                          <select id="ui_recent_syncs_display" name="ui_recent_syncs_display">
+                            <option value="count:3">Last 3 items</option>
+                            <option value="count:4">Last 4 items</option>
+                            <option value="count:5">Last 5 items</option>
+                            <option value="hours:24">Last 24 hours, max 5</option>
+                            <option value="hours:48">Last 48 hours, max 5</option>
+                            <option value="hours:72">Last 72 hours, max 5</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_AI">Help ASK AI</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Help ASK AI: Shows or hides the in-app AI help entry point." aria-label="Help ASK AI setting help">help</button>
+                          </div>
                           <select id="ui_show_AI" name="ui_show_AI">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
@@ -901,7 +1096,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div>
-                          <label for="ui_show_quick_add_desktop">Desktop quick add</label>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_quick_add_desktop">Desktop quick add</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Desktop quick add: Shows or hides the quick-add control on larger screens." aria-label="Desktop quick add setting help">help</button>
+                          </div>
                           <select id="ui_show_quick_add_desktop" name="ui_show_quick_add_desktop">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
@@ -909,7 +1107,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div>
-                          <label for="ui_show_quick_add_mobile">Mobile quick add</label>
+                          <div class="cw-field-label-row">
+                            <label for="ui_show_quick_add_mobile">Mobile quick add</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Mobile quick add: Shows or hides the compact quick-add control on mobile layouts." aria-label="Mobile quick add setting help">help</button>
+                          </div>
                           <select id="ui_show_quick_add_mobile" name="ui_show_quick_add_mobile">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
@@ -919,9 +1120,27 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                     </div>
 
                     <div class="cw-settings-block">
+                      <div class="cw-settings-block-title">Theme</div>
+                      <div>
+                        <div class="cw-field-label-row">
+                          <label for="ui_theme">Theme</label>
+                          <button type="button" class="cw-field-help material-symbols-rounded" title="Theme: Choose Flat dark, Flat light, or Original to use the classic CrossWatch styling." aria-label="Theme setting help">help</button>
+                        </div>
+                        <select id="ui_theme" name="ui_theme" style="min-width:220px;max-width:360px">
+                          <option value="flat-dark">Flat dark</option>
+                          <option value="flat-light">Flat light</option>
+                          <option value="original">Original</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div class="cw-settings-block">
                       <div class="cw-settings-block-title">Protocol</div>
                       <div>
-                        <label for="ui_protocol">UI protocol</label>
+                        <div class="cw-field-label-row">
+                          <label for="ui_protocol">UI protocol</label>
+                          <button type="button" class="cw-field-help material-symbols-rounded" title="UI protocol: HTTP is simplest. HTTPS serves CrossWatch with a self-signed certificate for encrypted browser traffic." aria-label="UI protocol setting help">help</button>
+                        </div>
                         <div class="cw-settings-inline-action">
                           <select id="ui_protocol" name="ui_protocol" style="min-width:220px;flex:1">
                             <option value="http">HTTP</option>
@@ -941,7 +1160,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                 <div class="cw-settings-panel cw-settings-shell" data-tab="security">
                   <div class="cw-panel-head cw-settings-head">
                     <div>
-                      <div class="cw-panel-title" style="margin-top:10px">Security</div>
+                      <div class="cw-panel-title-row">
+                        <div class="cw-panel-title">Security</div>
+                        <button type="button" class="cw-title-help material-symbols-rounded" title="Security: Manage CrossWatch sign-in, optional Plex login, remembered sessions, active browser sessions, and trusted reverse proxies for rate limiting." aria-label="Security help">help</button>
+                      </div>
                       <div class="sub cw-settings-copy">
                         Manage your sign-in details, session persistence, and reverse-proxy trust settings from one place.
                       </div>
@@ -953,19 +1175,28 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                       <div class="cw-settings-block-title">Sign-in</div>
                       <div class="cw-settings-stack">
                         <div>
-                          <label for="app_auth_username">Username</label>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_username">Username</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Username: The local CrossWatch username used on the login screen." aria-label="Username setting help">help</button>
+                          </div>
                           <input id="app_auth_username" name="app_auth_username" type="text" autocomplete="username" placeholder="admin">
                         </div>
 
                         <div class="cw-settings-2col">
                           <div>
-                            <label for="app_auth_password">New password</label>
+                            <div class="cw-field-label-row">
+                              <label for="app_auth_password">New password</label>
+                              <button type="button" class="cw-field-help material-symbols-rounded" title="New password: Enter a new local CrossWatch password. Leave it blank to keep the current password." aria-label="New password setting help">help</button>
+                            </div>
                             <input id="app_auth_password" name="app_auth_password" type="password" autocomplete="new-password" placeholder="(leave blank to keep)">
                             <div class="sub" style="margin-top:0.35rem">Leave blank to keep the current password.</div>
                           </div>
 
                           <div>
-                            <label for="app_auth_password2">Confirm password</label>
+                            <div class="cw-field-label-row">
+                              <label for="app_auth_password2">Confirm password</label>
+                              <button type="button" class="cw-field-help material-symbols-rounded" title="Confirm password: Repeat the new password exactly so CrossWatch can verify it before saving." aria-label="Confirm password setting help">help</button>
+                            </div>
                             <input id="app_auth_password2" name="app_auth_password2" type="password" autocomplete="new-password" placeholder="(repeat)">
                             <div class="sub" style="margin-top:0.35rem">Repeat the new password exactly before saving.</div>
                           </div>
@@ -977,7 +1208,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                       <div class="cw-settings-block-title">Session</div>
                       <div class="cw-settings-split">
                         <div>
-                          <label for="app_auth_remember_enabled">Session caching</label>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_remember_enabled">Session caching</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Session caching: Keeps you signed in across browser restarts. Browser session only signs out when the browser session ends." aria-label="Session caching setting help">help</button>
+                          </div>
                           <select id="app_auth_remember_enabled" name="app_auth_remember_enabled">
                             <option value="true">Enabled</option>
                             <option value="false">Browser session only</option>
@@ -986,7 +1220,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div id="app_auth_remember_days_wrap">
-                          <label for="app_auth_remember_days">Cached for days</label>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_remember_days">Cached for days</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Cached for days: Number of days a remembered login remains valid when session caching is enabled." aria-label="Cached for days setting help">help</button>
+                          </div>
                           <input id="app_auth_remember_days" name="app_auth_remember_days" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" autocomplete="off" placeholder="30">
                           <div id="app_auth_remember_days_error" class="cw-field-inline-error hidden" role="alert"></div>
                           <div class="sub" style="margin-top:0.35rem">Used only when session caching is enabled. Maximum 365 days.</div>
@@ -998,7 +1235,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                       <div class="cw-settings-block-title">Plex sign-in</div>
                       <div class="cw-settings-stack">
                         <div>
-                          <strong>Linked Plex account</strong>
+                          <div class="cw-field-label-row">
+                            <strong>Linked Plex account</strong>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Linked Plex account: Adds optional Sign in with Plex on the login screen while keeping the local password as fallback." aria-label="Linked Plex account help">help</button>
+                          </div>
                           <div class="sub" id="app_auth_plex_state">Not linked</div>
                         </div>
                         <div class="cw-settings-inline-action">
@@ -1011,9 +1251,47 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                       </div>
                     </div>
 
+                    <div class="cw-settings-block cw-mobile-companion">
+                      <div class="cw-mobile-head">
+                        <div class="cw-mobile-title">
+                          <div class="cw-field-label-row">
+                            <strong>CrossWatch companion app</strong>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Companion app: Pair trusted phones and tablets with scoped mobile tokens, then revoke them here when needed." aria-label="Companion app help">help</button>
+                          </div>
+                          <div class="sub" id="mobile_auth_state">No paired devices</div>
+                        </div>
+                        <div class="cw-mobile-actions">
+                          <button class="btn primary" type="button" id="btn-mobile-pairing-start" onclick="cwMobilePairingStart?.()">Add device</button>
+                          <button class="btn" type="button" id="btn-mobile-devices-refresh" onclick="cwMobileDevicesRefresh?.()">Refresh</button>
+                        </div>
+                      </div>
+
+                      <div class="cw-mobile-banner" role="note">
+                        <span class="material-symbols-rounded" aria-hidden="true">science</span>
+                        <div class="cw-mobile-banner-copy">
+                          <strong>Preview feature</strong>
+                          <span>The Android companion app is a side-project preview and not production-ready yet. Use it for local testing only, and revoke devices you no longer use.</span>
+                        </div>
+                      </div>
+
+                      <div class="cw-mobile-pairing hidden" id="mobile_pairing_box">
+                        <div class="cw-mobile-qr" id="mobile_pairing_qr"></div>
+                        <div class="cw-mobile-pairing-details">
+                          <div class="cw-mobile-code" id="mobile_pairing_code">----------</div>
+                          <input class="cw-mobile-uri" id="mobile_pairing_uri" type="text" readonly autocomplete="off" aria-label="Companion pairing URI">
+                          <div class="sub" id="mobile_pairing_expiry"></div>
+                        </div>
+                      </div>
+
+                      <div class="cw-mobile-devices" id="mobile_devices_list"></div>
+                    </div>
+
                     <div class="cw-settings-statusrow">
                       <div class="cw-settings-status">
-                        <strong>Current session</strong>
+                        <div class="cw-field-label-row">
+                          <strong>Current session</strong>
+                          <button type="button" class="cw-field-help material-symbols-rounded" title="Current session: Shows the browser session you are using now and lets you log it out." aria-label="Current session help">help</button>
+                        </div>
                         <div class="sub" id="app_auth_state">&mdash;</div>
                       </div>
                       <button class="btn" id="btn-auth-logout" onclick="cwAppLogout?.()">Log out</button>
@@ -1021,7 +1299,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 
                     <div class="cw-settings-statusrow">
                       <div class="cw-settings-status">
-                        <strong>Other browser sessions</strong>
+                        <div class="cw-field-label-row">
+                          <strong>Other browser sessions</strong>
+                          <button type="button" class="cw-field-help material-symbols-rounded" title="Other browser sessions: Shows remembered logins from other browsers or devices and lets you revoke them." aria-label="Other browser sessions help">help</button>
+                        </div>
                         <div class="sub" id="app_auth_other_sessions_state">Logged in from: 0 browser sessions</div>
                         <div class="sub" id="app_auth_other_sessions_detail"></div>
                       </div>
@@ -1030,7 +1311,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 
                     <div class="cw-settings-block">
                       <div class="cw-settings-block-title">Reverse proxy</div>
-                      <label for="trusted_proxies">Trusted reverse proxies (optional)</label>
+                      <div class="cw-field-label-row">
+                        <label for="trusted_proxies">Trusted reverse proxies (optional)</label>
+                        <button type="button" class="cw-field-help material-symbols-rounded" title="Trusted reverse proxies: Enter proxy IPs or CIDR ranges so CrossWatch can read the real client IP for login rate limiting." aria-label="Trusted reverse proxies setting help">help</button>
+                      </div>
                       <input id="trusted_proxies" name="trusted_proxies" type="text" placeholder="127.0.0.1;192.168.2.1;192.168.2.0/16">
                       <div class="sub" style="margin-top:0.35rem">
                         Only needed when behind a reverse proxy and you want accurate IP-based login rate limiting.
@@ -1044,7 +1328,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                 <div class="cw-settings-panel cw-settings-shell" data-tab="tracker">
                   <div class="cw-panel-head cw-settings-head">
                     <div>
-                      <div class="cw-panel-title" style="margin-top:10px">CW Tracker</div>
+                      <div class="cw-panel-title-row">
+                        <div class="cw-panel-title">CW Tracker</div>
+                        <button type="button" class="cw-title-help material-symbols-rounded" title="CW Tracker: Stores local snapshots of provider data before writes so you can inspect or restore Watchlist, Ratings, and History state." aria-label="CW Tracker help">help</button>
+                      </div>
                       <div class="sub cw-settings-copy">
                         Local backup tracker for Watchlist, Ratings and History snapshots stored under <code>/config/.cw_provider</code>.
                       </div>
@@ -1056,7 +1343,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                       <div class="cw-settings-block-title">Retention and capture</div>
                       <div class="cw-settings-2col">
                         <div>
-                          <label for="cw_enabled">Enabled</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_enabled">Enabled</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Enabled: Turns the local CW Tracker snapshot system on or off." aria-label="CW Tracker enabled setting help">help</button>
+                          </div>
                           <select id="cw_enabled" name="cw_enabled">
                             <option value="true">Enabled</option>
                             <option value="false">Disabled</option>
@@ -1064,13 +1354,19 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div>
-                          <label for="cw_retention_days">Retention (days)</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_retention_days">Retention (days)</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Retention days: How long snapshot files are kept before cleanup. Set 0 to keep snapshots forever." aria-label="Retention days setting help">help</button>
+                          </div>
                           <input id="cw_retention_days" name="cw_retention_days" type="number" min="0" step="1" placeholder="30">
                           <div class="sub" style="margin-top:0.35rem">0 = keep snapshots forever.</div>
                         </div>
 
                         <div>
-                          <label for="cw_auto_snapshot">Auto snapshot</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_auto_snapshot">Auto snapshot</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Auto snapshot: Saves a tracker snapshot before CrossWatch writes provider changes, giving you a local restore point." aria-label="Auto snapshot setting help">help</button>
+                          </div>
                           <select id="cw_auto_snapshot" name="cw_auto_snapshot">
                             <option value="true">On (before writes)</option>
                             <option value="false">Off</option>
@@ -1078,7 +1374,10 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                         </div>
 
                         <div>
-                          <label for="cw_max_snapshots">Max snapshots per feature</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_max_snapshots">Max snapshots per feature</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Max snapshots per feature: Limits how many Watchlist, Ratings, and History snapshots are kept. Set 0 for unlimited." aria-label="Max snapshots per feature setting help">help</button>
+                          </div>
                           <input id="cw_max_snapshots" name="cw_max_snapshots" type="number" min="0" step="1" placeholder="64">
                           <div class="sub" style="margin-top:0.35rem">0 = unlimited.</div>
                         </div>
@@ -1089,17 +1388,26 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
                       <div class="cw-settings-block-title">Restore snapshots</div>
                       <div class="cw-settings-2col" id="cw_restore_fields">
                         <div>
-                          <label for="cw_restore_watchlist">Watchlist snapshot</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_restore_watchlist">Watchlist snapshot</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Watchlist snapshot: Select which local watchlist snapshot should be used for restore or tracker-backed reads." aria-label="Watchlist snapshot setting help">help</button>
+                          </div>
                           <select id="cw_restore_watchlist" name="cw_restore_watchlist"></select>
                         </div>
 
                         <div>
-                          <label for="cw_restore_history">History snapshot</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_restore_history">History snapshot</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="History snapshot: Select which local history snapshot should be used for restore or tracker-backed reads." aria-label="History snapshot setting help">help</button>
+                          </div>
                           <select id="cw_restore_history" name="cw_restore_history"></select>
                         </div>
 
                         <div>
-                          <label for="cw_restore_ratings">Ratings snapshot</label>
+                          <div class="cw-field-label-row">
+                            <label for="cw_restore_ratings">Ratings snapshot</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Ratings snapshot: Select which local ratings snapshot should be used for restore or tracker-backed reads." aria-label="Ratings snapshot setting help">help</button>
+                          </div>
                           <select id="cw_restore_ratings" name="cw_restore_ratings"></select>
                         </div>
                       </div>
@@ -1123,23 +1431,55 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
               <p>Use these actions to reset CrossWatch states. They are safe but cannot be undone.</p>
             </div>
           </div>
-          <div class="section open cw-settings-section" id="sec-troubleshoot" data-accordion="off">
-            <div class="head"><span class="chev">▶</span><strong>Maintenance</strong></div>
+          <div class="section open cw-settings-section cw-maint-section" id="sec-troubleshoot" data-accordion="off">
+            <div class="head"><span class="chev"></span><strong>Maintenance</strong></div>
             <div class="body">
-              <div>
-                <label for="debug">Debug</label>
-                <select id="debug" name="debug">
-                  <option value="off">off</option>
-                  <option value="on">on</option>
-                  <option value="mods">on - including MOD debug - best option for debug</option>
-                  <option value="full">on - full (requires restart) - use with caution</option>
-                </select>
+              <div class="cw-maint-layout">
+                <div class="cw-maint-debug-card">
+                  <div class="cw-maint-card-head">
+                    <span class="material-symbols-rounded cw-maint-card-icon" aria-hidden="true">bug_report</span>
+                    <div class="cw-maint-card-copy">
+                      <strong>Debug logging</strong>
+                      <small>Control how much detail CrossWatch writes to the live logs and diagnostics.</small>
+                    </div>
+                  </div>
+                  <div class="cw-maint-debug-field">
+                    <label for="debug">Level</label>
+                    <select id="debug" name="debug">
+                      <option value="off">off</option>
+                      <option value="on">on</option>
+                      <option value="mods">on - including MOD debug - best option for debug</option>
+                      <option value="full">on - full (requires restart) - use with caution</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="cw-maint-actions" aria-label="Maintenance actions">
+                  <button class="btn cw-maint-action backup" type="button" onclick="openBackupRestore()">
+                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">backup</span>
+                    <span class="cw-maint-action-copy">
+                      <strong>Backup & Restore</strong>
+                      <small>Create archives, validate backups, restore state, or manage schedules.</small>
+                    </span>
+                  </button>
+                  <button class="btn cw-maint-action tools" type="button" onclick="openMaintenanceModal()">
+                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">tune</span>
+                    <span class="cw-maint-action-copy">
+                      <strong>Maintenance Tools</strong>
+                      <small>Clean local state, reset counters, and run recovery actions.</small>
+                    </span>
+                  </button>
+                  <button class="btn cw-maint-action restart" type="button" onclick="restartCrossWatch()">
+                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">restart_alt</span>
+                    <span class="cw-maint-action-copy">
+                      <strong>Restart CrossWatch</strong>
+                      <small>Restart CW contrainer.</small>
+                    </span>
+                  </button>
+                </div>
+
+                <div id="tb_msg" class="msg ok hidden">Done </div>
               </div>
-              <div class="chiprow">
-                <button class="btn danger" onclick="openMaintenanceModal()">Maintenance Tools</button>
-                <button class="btn danger" onclick="restartCrossWatch()">Restart CrossWatch</button>
-              </div>
-              <div id="tb_msg" class="msg ok hidden">Done ✓</div>
             </div>
           </div>
         </section>
@@ -1158,19 +1498,20 @@ header .tab.active,header .cw-ui-btn.active{background:linear-gradient(180deg,rg
 </div>
 
 
-<script>(()=>{const $=id=>document.getElementById(id),closeMenu=id=>{const m=$(id==="settings"?"cw-settings-menu":"cw-about-menu"),b=$(id==="settings"?"tab-settings":"tab-about");m?.classList.add("hidden");b?.setAttribute("aria-expanded","false")},closeAll=()=>{closeMenu("settings");closeMenu("about")},toggleMenu=(id,e)=>{e?.preventDefault?.();e?.stopPropagation?.();const menuId=id==="settings"?"cw-settings-menu":"cw-about-menu",btnId=id==="settings"?"tab-settings":"tab-about",m=$(menuId),b=$(btnId);if(!m||!b)return;const open=m.classList.contains("hidden");closeAll();m.classList.toggle("hidden",!open);b.setAttribute("aria-expanded",String(open))},setHelp=open=>{const o=$("cw-help-overlay");if(!o)return;if(open){const f=$("cw-help-frame");if(f&&!f.src)f.src="https://wiki.crosswatch.app";o.classList.remove("hidden");o.setAttribute("aria-hidden","false")}else{o.classList.add("hidden");o.setAttribute("aria-hidden","true")}},openSettings=pane=>{window.showTab?.("settings");setTimeout(()=>window.cwSettingsSelect?.(pane),0)},logout=()=>{closeMenu("settings");if(typeof window.cwAppLogout==="function")return window.cwAppLogout();window.location.href="/logout"};window.APP_VERSION="__CW_VERSION__";window["__CW_"+"VERSION__"]=window.APP_VERSION;window.cwOpenHelp=()=>setHelp(true);window.cwCloseHelp=()=>setHelp(false);window.openHelp=()=>window.location?.protocol==="https:"?window.cwOpenHelp?.():window.open("https://wiki.crosswatch.app","_blank","noopener,noreferrer");window.cwCloseAboutMenu=()=>closeMenu("about");window.cwCloseSettingsMenu=()=>closeMenu("settings");window.cwToggleAboutMenu=e=>toggleMenu("about",e);window.cwToggleSettingsMenu=e=>toggleMenu("settings",e);window.cwAboutMenuSelect=w=>(closeMenu("about"),w==="about"?window.openAbout?.():w==="help"?window.openHelp?.():undefined);window.cwSettingsMenuLogout=logout;window.cwSettingsMenuSelect=w=>{closeMenu("settings");if(w==="overview")return openSettings("overview");if(w==="providers")return openSettings("providers");if(w==="scheduling")return openSettings("scheduling");if(w==="pairs")return(window.showTab?.("settings"),window.cwProvidersJump?.("sec-sync"));if(w==="scrobbler")return openSettings("scrobbler");if(w==="app")return openSettings("app");if(w==="maintenance")return window.openMaintenanceModal?.()};document.addEventListener("click",e=>{const o=$("cw-help-overlay"),c=$("cw-help-card"),aboutHost=$("tab-about-menu"),settingsHost=$("tab-settings-menu");if(o&&!o.classList.contains("hidden")&&c&&!c.contains(e.target))window.cwCloseHelp?.();if(aboutHost&&!aboutHost.contains(e.target))closeMenu("about");if(settingsHost&&!settingsHost.contains(e.target))closeMenu("settings")},true);document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;window.cwCloseHelp?.();closeAll()},true)})();</script>
+<script>(()=>{const $=id=>document.getElementById(id),closeMenu=id=>{const m=$(id==="settings"?"cw-settings-menu":"cw-about-menu"),b=$(id==="settings"?"tab-settings":"tab-about");m?.classList.add("hidden");b?.setAttribute("aria-expanded","false")},closeAll=()=>{closeMenu("settings");closeMenu("about")},toggleMenu=(id,e)=>{e?.preventDefault?.();e?.stopPropagation?.();const menuId=id==="settings"?"cw-settings-menu":"cw-about-menu",btnId=id==="settings"?"tab-settings":"tab-about",m=$(menuId),b=$(btnId);if(!m||!b)return;const open=m.classList.contains("hidden");closeAll();m.classList.toggle("hidden",!open);b.setAttribute("aria-expanded",String(open))},setHelp=open=>{const o=$("cw-help-overlay");if(!o)return;if(open){const f=$("cw-help-frame");if(f&&!f.src)f.src="https://wiki.crosswatch.app";o.classList.remove("hidden");o.setAttribute("aria-hidden","false")}else{o.classList.add("hidden");o.setAttribute("aria-hidden","true")}},openSettings=pane=>{window.showTab?.("settings");setTimeout(()=>window.cwSettingsSelect?.(pane),0)},logout=()=>{closeMenu("settings");if(typeof window.cwAppLogout==="function")return window.cwAppLogout();window.location.href="/logout"};window.CW_CURRENT_VERSION="__CW_CURRENT_VERSION__";window.APP_VERSION="__CW_VERSION__";window["__CW_"+"VERSION__"]=window.APP_VERSION;window.cwOpenHelp=()=>setHelp(true);window.cwCloseHelp=()=>setHelp(false);window.openHelp=()=>window.location?.protocol==="https:"?window.cwOpenHelp?.():window.open("https://wiki.crosswatch.app","_blank","noopener,noreferrer");window.cwCloseAboutMenu=()=>closeMenu("about");window.cwCloseSettingsMenu=()=>closeMenu("settings");window.cwToggleAboutMenu=e=>toggleMenu("about",e);window.cwToggleSettingsMenu=e=>toggleMenu("settings",e);window.cwAboutMenuSelect=w=>(closeMenu("about"),w==="about"?window.openAbout?.():w==="help"?window.openHelp?.():undefined);window.cwSettingsMenuLogout=logout;window.cwSettingsMenuSelect=w=>{closeMenu("settings");if(w==="overview")return openSettings("overview");if(w==="providers")return openSettings("providers");if(w==="scheduling")return openSettings("scheduling");if(w==="pairs")return(window.showTab?.("settings"),window.cwProvidersJump?.("sec-sync"));if(w==="scrobbler")return openSettings("scrobbler");if(w==="app")return openSettings("app");if(w==="maintenance")return openSettings("maintenance")};document.addEventListener("click",e=>{const o=$("cw-help-overlay"),c=$("cw-help-card"),aboutHost=$("tab-about-menu"),settingsHost=$("tab-settings-menu");if(o&&!o.classList.contains("hidden")&&c&&!c.contains(e.target))window.cwCloseHelp?.();if(aboutHost&&!aboutHost.contains(e.target))closeMenu("about");if(settingsHost&&!settingsHost.contains(e.target))closeMenu("settings")},true);document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;window.cwCloseHelp?.();closeAll()},true)})();</script>
 
 __CW_ASSET_BLOCK__
 
 <script>document.addEventListener('DOMContentLoaded',()=>{try{if(typeof openSummaryStream==='function')openSummaryStream()}catch(e){}});</script>
 
 <div id="save-frost" class="hidden" aria-hidden="true"></div>
-<div id="save-fab" class="hidden" role="toolbar" aria-label="Sticky save"><button id="save-fab-btn" class="btn" onclick="saveSettings(this)"><span class="btn-ic">✔</span> <span class="btn-label">Save</span></button></div>
+<div id="save-fab" class="hidden" role="toolbar" aria-label="Sticky save"><button id="save-fab-btn" class="btn" onclick="saveSettings(this)"><span class="btn-label">SAVE</span></button></div>
 
-<script>(()=>{const list=p=>[...p.querySelectorAll(':scope>.section')].filter(s=>s.dataset.accordion!=='off'),set=(s,on)=>{s.classList.toggle('open',!!on);s.querySelector('.head')?.setAttribute('aria-expanded',String(!!on));const c=s.querySelector('.chev');if(c)c.textContent=on?'▼':'▶'},siblings=s=>s?.parentElement?list(s.parentElement):[];window.toggleSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;const on=!s.classList.contains('open');siblings(s).forEach(x=>set(x,x===s&&on))};window.openSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;siblings(s).forEach(x=>set(x,x===s))};document.addEventListener('DOMContentLoaded',()=>[...new Set([...document.querySelectorAll('.section')].map(s=>s.parentElement).filter(Boolean))].forEach(p=>{const open=list(p).find(s=>s.classList.contains('open'));list(p).forEach(s=>set(s,s===open))}),{once:true})})();</script>
+<script>(()=>{const list=p=>[...p.querySelectorAll(':scope>.section')].filter(s=>s.dataset.accordion!=='off'),set=(s,on)=>{s.classList.toggle('open',!!on);s.querySelector('.head')?.setAttribute('aria-expanded',String(!!on));const c=s.querySelector('.chev');if(c)c.textContent=''},siblings=s=>s?.parentElement?list(s.parentElement):[];window.toggleSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;const on=!s.classList.contains('open');siblings(s).forEach(x=>set(x,x===s&&on))};window.openSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;siblings(s).forEach(x=>set(x,x===s))};document.addEventListener('click',e=>{const h=e.target?.closest?.('[data-toggle-section]');if(!h)return;e.preventDefault();window.toggleSection?.(h.dataset.toggleSection)},true);document.addEventListener('DOMContentLoaded',()=>[...new Set([...document.querySelectorAll('.section')].map(s=>s.parentElement).filter(Boolean))].forEach(p=>{const open=list(p).find(s=>s.classList.contains('open'));list(p).forEach(s=>set(s,s===open))}),{once:true})})();</script>
 
 
 <script>(()=>{const panes='#page-settings .cw-settings-pane',nav='#cw-settings-nav .cw-settings-nav-btn',norm=v=>String(v||'overview').trim().toLowerCase(),apply=p=>{const name=norm(p);let found=false;document.querySelectorAll(panes).forEach(n=>{const on=norm(n.dataset.pane)===name;n.classList.toggle('active',on);found=found||on});if(!found&&name!=='overview')return apply('overview');document.querySelectorAll(nav).forEach(b=>{const on=norm(b.dataset.pane)===name;b.classList.toggle('active',on);b.setAttribute('aria-current',on?'page':'false')});window.__cwSettingsPane=name;document.dispatchEvent(new CustomEvent('cw-settings-pane-changed',{detail:{pane:name}}))};window.cwSettingsSelect=p=>{apply(p);const main=document.getElementById('cw-settings-left');if(main&&window.innerWidth<1200)main.scrollIntoView({behavior:'smooth',block:'start'})};document.addEventListener('DOMContentLoaded',()=>apply(window.__cwSettingsPane||'overview'),{once:true});document.addEventListener('tab-changed',e=>((e?.detail?.id||e?.detail?.tab)==='settings')&&setTimeout(()=>apply(window.__cwSettingsPane||'overview'),0))})();</script>
+<script>(()=>{const sync=e=>{const pane=String(e?.detail?.pane||window.__cwSettingsPane||'overview').toLowerCase();document.querySelectorAll('#cw-settings-menu .cw-menu-item[data-settings-pane]').forEach(item=>{const active=item.dataset.settingsPane===pane;item.classList.toggle('active',active);if(active)item.setAttribute('aria-current','page');else item.removeAttribute('aria-current')})};document.addEventListener('cw-settings-pane-changed',sync);document.addEventListener('DOMContentLoaded',sync,{once:true})})();</script>
 
 <script>(()=>{const scrollTo=id=>document.getElementById(id)?.scrollIntoView({behavior:'smooth',block:'start'});window.cwProvidersJump=sectionId=>(window.cwSettingsSelect?.('providers'),setTimeout(()=>{window.openSection?.(sectionId);scrollTo(sectionId)},0));window.cwOverviewJump=(sectionId,authGroupId='')=>(window.cwSettingsSelect?.('providers'),setTimeout(async()=>{if(sectionId==='sec-auth'){window.openSection?.('sec-auth');try{await window.mountAuthProviders?.()}catch{}if(authGroupId){window.openSection?.(authGroupId);scrollTo(authGroupId)}else scrollTo('sec-auth');return}window.openSection?.(sectionId);scrollTo(sectionId)},0))})();</script>
 <script>
@@ -1194,7 +1535,7 @@ __CW_ASSET_BLOCK__
     if (key === "scheduling" || key === "automation") return window.cwSettingsSelect?.("scheduling");
     if (key === "scrobbler") return window.cwSettingsSelect?.("scrobbler");
     if (key === "app") return window.cwSettingsSelect?.("app");
-    if (key === "maintenance") return window.openMaintenanceModal?.();
+    if (key === "maintenance") return window.cwSettingsSelect?.("maintenance");
   };
 
   window.cwSettingsOverviewGo = (key) => {
@@ -1325,13 +1666,13 @@ __CW_ASSET_BLOCK__
   document.addEventListener("DOMContentLoaded", () => render({}), { once: true });
 })();
 </script>
-<script>(()=>{window.cwScrobblerJump=sectionId=>(window.cwSettingsSelect?.('scrobbler'),setTimeout(()=>{window.openSection?.(sectionId);document.getElementById(sectionId)?.scrollIntoView({behavior:'smooth',block:'start'})},0));window.cwUiSettingsJump=tab=>(window.cwSettingsSelect?.('app'),setTimeout(()=>{window.cwUiSettingsSelect?.(tab);document.querySelector(`#ui_settings_hub .cw-hub-tile[data-tab="${String(tab||'').trim().toLowerCase()}"]`)?.scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'})},0))})();</script>
+<script>(()=>{window.cwScrobblerJump=sectionId=>(window.cwSettingsSelect?.('scrobbler'),setTimeout(()=>{window.openSection?.(sectionId);document.getElementById(sectionId)?.scrollIntoView({behavior:'smooth',block:'start'})},0));window.cwUiSettingsJump=tab=>(window.cwSettingsSelect?.('app'),setTimeout(()=>{const t=String(tab||'').trim().toLowerCase();window.cwUiSettingsSelect?.(t);document.querySelector(`#ui_settings_panels .cw-settings-panel[data-tab="${t}"]`)?.scrollIntoView({behavior:'smooth',block:'start'})},0))})();</script>
 
 <script>(()=>{const origFetch=window.fetch;if(typeof origFetch!=='function'||origFetch.__cwAuthPendingWrapped)return;const pending=()=>window.cwIsAuthSetupPending?.()===true,allowPath=p=>p.startsWith('/api/app-auth/')||p==='/api/config/meta'||p.startsWith('/api/config/meta?')||p.startsWith('/assets/')||p==='/favicon.svg';const emptyJson=(body='{}')=>new Response(body,{status:200,headers:{'Content-Type':'application/json','Cache-Control':'no-store'}});window.fetch=Object.assign(async function(resource,init){try{if(!pending())return await origFetch(resource,init);const url=typeof resource==='string'?resource:String(resource?.url||'');const u=new URL(url,location.origin);if(u.origin!==location.origin||!u.pathname.startsWith('/api/')||allowPath(u.pathname)||allowPath(u.pathname+u.search))return await origFetch(resource,init);const method=String(init?.method||resource?.method||'GET').toUpperCase();if(method!=='GET'&&method!=='HEAD')return await origFetch(resource,init);if(u.pathname.startsWith('/api/config'))return emptyJson('{}');if(u.pathname.startsWith('/api/status'))return emptyJson('{"providers":{}}');if(u.pathname.startsWith('/api/pairs'))return emptyJson('[]');if(u.pathname.startsWith('/api/scheduling'))return emptyJson('{}');if(u.pathname.startsWith('/api/insights'))return emptyJson('{}');if(u.pathname.startsWith('/api/watch/'))return emptyJson('{}');if(u.pathname.startsWith('/api/webhooks/'))return emptyJson('{}');return emptyJson('{}')}catch{return await origFetch(resource,init)}},{__cwAuthPendingWrapped:true})})();</script>
 
 <script>(()=>{const $=id=>document.getElementById(id),fab=$('save-fab'),frost=$('save-frost'),page=$('page-settings'),tab=$('tab-settings'),visible=()=>{if(!page)return false;const cs=getComputedStyle(page);return!page.classList.contains('hidden')&&cs.display!=='none'&&cs.visibility!=='hidden'},update=()=>{const on=visible();fab?.classList.toggle('hidden',!on);frost?.classList.toggle('hidden',!on)},watch=(el,attrs)=>el&&new MutationObserver(update).observe(el,{attributes:true,attributeFilter:attrs});document.addEventListener('DOMContentLoaded',()=>{watch(page,['class','style']);watch(tab,['class']);update()},{once:true});document.addEventListener('tab-changed',update);window.addEventListener('hashchange',update);document.querySelector('.tabs')?.addEventListener('click',update,true)})();</script>
 
-<script>(()=>{const install=()=>{const orig=window.saveSettings;if(typeof orig!=='function'||orig._wrapped)return;window.saveSettings=Object.assign(async function(btnOrEvent){const btn=btnOrEvent instanceof HTMLElement?btnOrEvent:document.getElementById('save-fab-btn');if(btn&&!btn.dataset.defaultHtml)btn.dataset.defaultHtml=btn.innerHTML;if(btn)btn.disabled=true;try{const ret=orig.apply(this,arguments);await(ret&&typeof ret.then==='function'?ret:Promise.resolve());window.invalidateConfigCache?.();window.manualRefreshStatus?.();if(btn){btn.innerHTML='Settings saved ✓';setTimeout(()=>{btn.innerHTML=btn.dataset.defaultHtml||'<span class="btn-ic">✔</span> <span class="btn-label">Save</span>';btn.disabled=false},1600)}return ret}catch(e){if(btn){btn.innerHTML='Save failed';setTimeout(()=>{btn.innerHTML=btn.dataset.defaultHtml||'<span class="btn-ic">✔</span> <span class="btn-label">Save</span>';btn.disabled=false},2000)}throw e}},{_wrapped:true})};document.readyState==='complete'?install():window.addEventListener('load',install,{once:true})})();</script>
+<script>(()=>{const install=()=>{const orig=window.saveSettings;if(typeof orig!=='function'||orig._wrapped)return;window.saveSettings=Object.assign(async function(btnOrEvent){const btn=btnOrEvent instanceof HTMLElement?btnOrEvent:document.getElementById('save-fab-btn');if(btn&&!btn.dataset.defaultHtml)btn.dataset.defaultHtml=btn.innerHTML;if(btn)btn.disabled=true;try{const ret=orig.apply(this,arguments);await(ret&&typeof ret.then==='function'?ret:Promise.resolve());window.invalidateConfigCache?.();window.manualRefreshStatus?.();if(btn){btn.innerHTML='Settings saved';setTimeout(()=>{btn.innerHTML=btn.dataset.defaultHtml||'<span class="btn-label">SAVE</span>';btn.disabled=false},1600)}return ret}catch(e){if(btn){btn.innerHTML='Save failed';setTimeout(()=>{btn.innerHTML=btn.dataset.defaultHtml||'<span class="btn-label">SAVE</span>';btn.disabled=false},2000)}throw e}},{_wrapped:true})};document.readyState==='complete'?install():window.addEventListener('load',install,{once:true})})();</script>
 </body></html>
 
 """

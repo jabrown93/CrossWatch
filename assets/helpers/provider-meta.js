@@ -12,9 +12,10 @@
     JELLYFIN: { key: "JELLYFIN", label: "Jellyfin", shortLabel: "Jellyfin", brandClass: "brand-jellyfin", badgeId: "badge-jellyfin", authSectionId: "sec-jellyfin", authGroupId: "sec-auth-media", aliases: ["JELLYFIN"], statusLegacy: ["jellyfin_connected", "jellyfin"], hasLogo: true, hasLogLogo: true, tone: { solid: "#7b61ff", rgb: "123,97,255" }, watchlist: true },
     EMBY: { key: "EMBY", label: "Emby", shortLabel: "Emby", brandClass: "brand-emby", badgeId: "badge-emby", authSectionId: "sec-emby", authGroupId: "sec-auth-media", aliases: ["EMBY"], statusLegacy: ["emby_connected", "emby"], hasLogo: true, hasLogLogo: true, tone: { solid: "#3bb273", rgb: "59,178,115" }, watchlist: true },
     MDBLIST: { key: "MDBLIST", label: "MDBList", shortLabel: "MDBList", brandClass: "brand-mdblist", badgeId: "badge-mdblist", authSectionId: "sec-mdblist", authGroupId: "sec-auth-trackers", aliases: ["MDBLIST", "MDB LIST", "MDB-LIST"], statusLegacy: ["mdblist_connected", "mdblist"], hasLogo: true, hasLogLogo: true, tone: { solid: "#2d74da", rgb: "45,116,218" }, watchlist: true, scrobblerSink: true },
+    PUBLICMETADB: { key: "PUBLICMETADB", label: "PublicMetaDB", shortLabel: "PMDB", brandClass: "brand-publicmetadb", badgeId: "badge-publicmetadb", authSectionId: "sec-publicmetadb", authGroupId: "sec-auth-trackers", aliases: ["PUBLICMETADB", "PUBLIC META DB", "PUBLIC-META-DB", "PMDB"], statusLegacy: ["publicmetadb_connected", "publicmetadb"], hasLogo: true, hasLogLogo: true, tone: { solid: "#f5f5f5", rgb: "245,245,245" }, watchlist: true, ratings: true, history: true },
     TAUTULLI: { key: "TAUTULLI", label: "Tautulli", shortLabel: "Tautulli", brandClass: "brand-tautulli", badgeId: "badge-tautulli", authSectionId: "sec-tautulli", authGroupId: "sec-auth-others", aliases: ["TAUTULLI"], statusLegacy: ["tautulli_connected", "tautulli"], hasLogo: true, hasLogLogo: false, tone: { solid: "#f59e0b", rgb: "245,158,11" } },
   });
-  const order = Object.freeze(["CROSSWATCH","PLEX","SIMKL","TRAKT","ANILIST","TMDB","JELLYFIN","EMBY","MDBLIST","TAUTULLI"]);
+  const order = Object.freeze(["CROSSWATCH","PLEX","SIMKL","TRAKT","ANILIST","TMDB","JELLYFIN","EMBY","MDBLIST","PUBLICMETADB","TAUTULLI"]);
   function normalizeToken(v){ return String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]+/g, ""); }
   function aliasPool(key){
     const info = providers[key];
@@ -54,8 +55,12 @@
   function authProviders(){ return order.map((key) => get(key)).filter((info) => info?.authSectionId).map((info) => ({ key: info.key, sectionId: info.authSectionId, groupId: info.authGroupId || "" })); }
   function watchlistProviders(){ return order.filter((key) => !!get(key)?.watchlist); }
   function scrobblerSinks(){ return order.filter((key) => !!get(key)?.scrobblerSink); }
-  function logoPath(v){ const info = get(v); return info?.hasLogo ? `/assets/img/${info.key}.svg` : ""; }
-  function logLogoPath(v){ const info = get(v); return info?.hasLogLogo ? `/assets/img/${info.key}-log.svg` : ""; }
+  function assetPath(path){
+    const version = String(window.APP_VERSION || window.__CW_VERSION__ || "").trim();
+    return version ? `${path}?v=${encodeURIComponent(version)}` : path;
+  }
+  function logoPath(v){ const info = get(v); return info?.hasLogo ? assetPath(`/assets/img/${info.key}.svg`) : ""; }
+  function logLogoPath(v){ const info = get(v); return info?.hasLogLogo ? assetPath(`/assets/img/${info.key}-log.svg`) : ""; }
   function brandInfo(v){ const info = get(v); return { cls: info?.brandClass || "", icon: logoPath(v) || "" }; }
   function logoHtml(v, cls = "token-logo"){
     const k = keyOf(v);
@@ -72,7 +77,7 @@
   (window.CW ||= {});
   window.CW.ProviderMeta = {
     providers, order, get, normalizeToken, keyOf, matchKey, label, shortLabel, aliases, aliasesMap, badgeId, sectionId, authGroupId,
-    statusLegacy, tone, statusProviders, authProviders, watchlistProviders, scrobblerSinks, logoPath, logLogoPath, brandInfo, logoHtml,
+    statusLegacy, tone, statusProviders, authProviders, watchlistProviders, scrobblerSinks, assetPath, logoPath, logLogoPath, brandInfo, logoHtml,
     logLogoHtml, logo: logoPath, logLogo: logLogoPath,
     labels: Object.fromEntries(order.map((key) => [key, label(key)])),
   };

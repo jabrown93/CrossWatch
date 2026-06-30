@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, quote
 
@@ -41,6 +42,7 @@ from api.appAuthAPI import (
 )
 
 from _logging import log as LOG, BLUE, GREEN, DIM, RESET  # type: ignore
+BACKUP_LOG = LOG.child("BACKUP")
 
 def _c(text: str, color: str) -> str:
     return f"{color}{text}{RESET}" if LOG.use_color else text
@@ -54,6 +56,7 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+from starlette.middleware.gzip import GZipMiddleware
 
 from api.wallAPI import _load_wall_snapshot
 from providers.webhooks.plextrakt import process_webhook as process_webhook
@@ -352,6 +355,7 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
 # API
 _apply_auth_reset_env_once()
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 # CORS: deny all cross-origin requests by default
 from starlette.middleware.cors import CORSMiddleware
@@ -421,15 +425,8 @@ async def app_auth_gate(request: Request, call_next):
     if path in _PUBLIC_HEALTH_PATHS:
         return await call_next(request)
     
-    if path.startswith("/api/app-auth/") or path in {"/login", "/logout"}:
-        return await call_next(request)
-    
     # exclude webhooks from auth
     if path.startswith("/webhook/"):
-        return await call_next(request)
-
-    # exclude callback paths
-    if path == "/callback" or path.startswith("/callback/"):
         return await call_next(request)
 
     if app_auth_setup_lock_required(cfg):
@@ -442,6 +439,16 @@ async def app_auth_gate(request: Request, call_next):
                 headers={"Cache-Control": "no-store"},
             )
         return RedirectResponse(url="/", status_code=302)
+
+    if path.startswith("/api/app-auth/") or path in {"/login", "/logout"}:
+        return await call_next(request)
+
+    if path.startswith("/api/mobile/"):
+        return await call_next(request)
+
+    # exclude callback paths
+    if path == "/callback" or path.startswith("/callback/"):
+        return await call_next(request)
 
     if not app_auth_required(cfg):
         return await call_next(request)
@@ -472,9 +479,10 @@ def get_primary_ip() -> str:
 
 # Log buffers
 MAX_LOG_LINES = 3000
-LOG_BUFFERS: Dict[str, List[str]] = {"SYNC": []}
-LOG_BASE_SEQ: Dict[str, int] = {"SYNC": 1}
-LOG_NEXT_SEQ: Dict[str, int] = {"SYNC": 1}
+DIAG_LOG_TAG = "DEBUG"
+LOG_BUFFERS: Dict[str, List[str]] = {"SYNC": [], DIAG_LOG_TAG: []}
+LOG_BASE_SEQ: Dict[str, int] = {"SYNC": 1, DIAG_LOG_TAG: 1}
+LOG_NEXT_SEQ: Dict[str, int] = {"SYNC": 1, DIAG_LOG_TAG: 1}
 
 ANSI_RE    = re.compile(r"\x1b\[([0-9;]*)m")
 ANSI_STRIP = re.compile(r"\x1b\[[0-9;]*m")
@@ -511,6 +519,30 @@ def _log_lines(tag: str | None, tail: int | None = None) -> List[str]:
     if not tail:
         return list(buf)
     return buf[-int(tail):]
+
+class _LogTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "br":
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+def _log_stream_text(line: str, plain: bool) -> str:
+    text = str(line or "")
+    if plain:
+        parser = _LogTextExtractor()
+        parser.feed(text)
+        parser.close()
+        text = "".join(parser.parts)
+    return text.replace("\r", " ").replace("\n", " ")
 
 def ansi_to_html(line: str) -> str:
     out, pos = [], 0
@@ -560,7 +592,7 @@ def ansi_to_html(line: str) -> str:
 
     return "".join(out)
 
-def _append_log(tag: str, raw_line: str) -> None:
+def _append_log_to_buffer(tag: str, raw_line: str) -> None:
     t = _norm_log_tag(tag)
     safe_line = _redact_secrets_in_text(raw_line)
     html = ansi_to_html(safe_line.rstrip("\n"))
@@ -571,6 +603,13 @@ def _append_log(tag: str, raw_line: str) -> None:
         drop = len(buf) - MAX_LOG_LINES
         del buf[:drop]
         LOG_BASE_SEQ[t] = int(LOG_BASE_SEQ.get(t, 1)) + drop
+
+def _append_log(tag: str, raw_line: str) -> None:
+    t = _norm_log_tag(tag)
+    _append_log_to_buffer(t, raw_line)
+    if t != DIAG_LOG_TAG:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _append_log_to_buffer(DIAG_LOG_TAG, f"[{ts}] [{t}] {raw_line}")
 
 def _install_ui_log_forwarder() -> None:
     try:
@@ -636,7 +675,7 @@ class _UIHostLogger:
 # Orchestrator getter
 def _get_orchestrator() -> Orchestrator:
     cfg = load_config()
-    return Orchestrator(config=cfg)
+    return Orchestrator(cfg)
 
 # Startup sequence
 @asynccontextmanager
@@ -657,7 +696,22 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
             )
         sc = (cfg.get("scrobble") or {}) or {}
         watch = (sc.get("watch") or {}) if isinstance(sc.get("watch"), dict) else {}
-        want_autostart = bool(sc.get("enabled")) and str(sc.get("mode") or "").lower() == "watch" and bool(watch.get("autostart"))
+        from providers.scrobble.sources import source_enabled
+        want_webhooks = source_enabled(cfg, "webhook")
+        want_autostart = source_enabled(cfg, "watcher") and bool(watch.get("autostart"))
+
+        if want_webhooks:
+            LOG(
+                "Webhook listening; endpoints ready for Plex/Jellyfin/Emby events",
+                level="INFO",
+                module="WEBHOOK",
+            )
+        if want_webhooks and source_enabled(cfg, "watcher"):
+            LOG(
+                "WARNING: both Webhook and Watcher are enabled; avoid sending the same server through both",
+                level="WARN",
+                module="SCROBBLE",
+            )
 
         if want_autostart:
             try:
@@ -703,8 +757,23 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         except Exception:
             pass
     try:
+        from cw_platform.anime_mapping.auto_update import refresh_from_config as _anime_mapping_refresh_auto_update
+
+        _anime_mapping_refresh_auto_update(load_config)
+    except Exception as e:
+        try:
+            _UIHostLogger("SYNC")(f"anime mapping auto-update startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
         yield
     finally:
+        try:
+            from cw_platform.anime_mapping.auto_update import stop as _anime_mapping_stop_auto_update
+
+            _anime_mapping_stop_auto_update()
+        except Exception:
+            pass
         try:
             from providers.scrobble.watch_manager import stop_all as _wm_stop
             _wm_stop(app)
@@ -723,10 +792,11 @@ async def cache_headers_for_api(request: Request, call_next):
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
-    elif path == "/assets/js/modals.js" or path.startswith("/assets/js/modals/"):
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["Pragma"] = "no-cache"
-        resp.headers["Expires"] = "0"
+    elif path.startswith("/assets/") and request.query_params.get("v") and resp.status_code in (200, 304):
+        # The global asset token changes whenever a bundled asset changes.
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path.startswith("/assets/fonts/") and resp.status_code in (200, 304):
+        resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800"
     return resp
 
 # Files listing API - TODO: move to api/files.py
@@ -764,13 +834,19 @@ def logs_dump(channel: str = "TRAKT", n: int = 50):
     return {"channel": channel, "lines": _log_lines(channel, tail=n)}
 
 @app.get("/api/logs/stream", tags=["logging"])
-async def api_logs_stream_initial(request: Request, tag: str = Query("SYNC")):
+async def api_logs_stream_initial(
+    request: Request,
+    tag: str = Query("SYNC"),
+    tail: int | None = Query(None, ge=1, le=MAX_LOG_LINES),
+    plain: bool = Query(False),
+):
     tag = _norm_log_tag(tag)
 
     async def agen():
         buf = _get_log_buf(tag)
-        for line in buf:
-            yield f"data: {line}\n\n"
+        initial = buf[-int(tail):] if tail else buf
+        for line in initial:
+            yield f"data: {_log_stream_text(line, plain)}\n\n"
         base = int(LOG_BASE_SEQ.get(tag, int(LOG_NEXT_SEQ.get(tag, 1))))
         last_seq = base + len(buf) - 1
         last = time.time()
@@ -787,7 +863,7 @@ async def api_logs_stream_initial(request: Request, tag: str = Query("SYNC")):
                 start_idx = 0
             for i in range(start_idx, len(new_buf)):
                 line = new_buf[i]
-                yield f"data: {line}\n\n"
+                yield f"data: {_log_stream_text(line, plain)}\n\n"
                 last = time.time()
                 last_seq = base + i
             if time.time() - last > 15:
@@ -812,6 +888,7 @@ async def api_logs_watcher(
     request: Request,
     tail: int = Query(200, ge=1, le=3000),
     tags: str = Query("", description="Optional CSV override"),
+    plain: bool = Query(False),
 ):
     cfg = load_config() or {}
     if tags and tags.strip():
@@ -850,7 +927,7 @@ async def api_logs_watcher(
             buf = _get_log_buf(t)
             start = max(0, len(buf) - int(tail))
             for line in buf[start:]:
-                safe = (line or "").replace("\n", " ")
+                safe = _log_stream_text(line, plain)
                 yield f"event: {t}\ndata: {safe}\n\n"
             base = int(LOG_BASE_SEQ.get(t, int(LOG_NEXT_SEQ.get(t, 1))))
             last_seq[t] = base + len(buf) - 1
@@ -872,7 +949,7 @@ async def api_logs_watcher(
                     start_idx = 0
                 for i in range(start_idx, len(buf)):
                     line = buf[i]
-                    safe = (line or "").replace("\n", " ")
+                    safe = _log_stream_text(line, plain)
                     yield f"event: {t}\ndata: {safe}\n\n"
                     last = time.time()
                     seen = base + i
@@ -899,10 +976,76 @@ async def api_logs_watcher(
 # Scheduler sync starter
 def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
     p = dict(payload or {})
+    raw_backup = p.get("backup")
+    backup: dict[str, Any] = raw_backup if isinstance(raw_backup, dict) else {}
+    backup_job_id = str(p.get("backup_job_id") or "").strip()
+    scheduler_mode = str(p.get("scheduler_mode") or "").strip().lower()
+    if backup_job_id or scheduler_mode == "advanced_backup" or backup:
+        try:
+            from services.backups import create_backup, enforce_backup_retention, render_backup_label_template
+
+            scope = str(backup.get("scope") or "app_state").strip().lower()
+            label_template = str(backup.get("label_template") or backup.get("labelTemplate") or "").strip()
+            try:
+                retention_days = max(0, int(backup.get("retention_days") or 0))
+            except Exception:
+                retention_days = 0
+            try:
+                max_backups = max(0, int(backup.get("max_backups") or 0))
+            except Exception:
+                max_backups = 0
+            auto_delete_old = backup.get("auto_delete_old") is True
+            label = render_backup_label_template(label_template, scope=scope)
+            BACKUP_LOG.info(f"scheduled backup starting scope={scope} job={backup_job_id or 'default'}")
+            BACKUP_LOG.debug(
+                "scheduled backup options",
+                extra={
+                    "scope": scope,
+                    "job_id": backup_job_id or "default",
+                    "retention_days": retention_days,
+                    "max_backups": max_backups,
+                    "auto_delete_old": auto_delete_old,
+                    "include_snapshots": bool(backup.get("include_snapshots")),
+                    "include_reports": bool(backup.get("include_reports")),
+                    "include_cache": bool(backup.get("include_cache")),
+                },
+            )
+            res = create_backup(
+                scope=scope,
+                label=label,
+                include_snapshots=bool(backup.get("include_snapshots")),
+                include_reports=bool(backup.get("include_reports")),
+                include_cache=bool(backup.get("include_cache")),
+                trigger="scheduler",
+            ) or {}
+            _append_log(
+                "SYNC",
+                f"[i] Scheduler backup: saved {scope} -> {res.get('path') or 'backup created'}",
+            )
+            BACKUP_LOG.success(f"scheduled backup completed scope={scope} path={res.get('path') or 'backup created'}")
+            if auto_delete_old:
+                cleanup = enforce_backup_retention(
+                    retention_days=retention_days,
+                    max_backups=max_backups,
+                    auto_delete_old=True,
+                ) or {}
+                deleted = cleanup.get("deleted") or []
+                if deleted:
+                    _append_log("SYNC", f"[i] Scheduler backup retention: deleted {len(deleted)} old backup(s)")
+                BACKUP_LOG.debug(
+                    "scheduled backup retention completed",
+                    extra={"deleted": len(deleted), "errors": len(cleanup.get("errors") or [])},
+                )
+            return True
+        except Exception as e:
+            _append_log("SYNC", f"[!] Scheduler backup failed: {type(e).__name__}")
+            BACKUP_LOG.error(f"scheduled backup failed: {type(e).__name__}")
+            BACKUP_LOG.debug("scheduled backup failure detail", extra={"error_type": type(e).__name__})
+            return False
+
     raw_capture = p.get("capture")
     capture: dict[str, Any] = raw_capture if isinstance(raw_capture, dict) else {}
     capture_job_id = str(p.get("capture_job_id") or "").strip()
-    scheduler_mode = str(p.get("scheduler_mode") or "").strip().lower()
     if capture_job_id or scheduler_mode == "advanced_capture" or capture:
         try:
             from services.snapshots import create_snapshot, enforce_capture_retention, render_capture_label_template

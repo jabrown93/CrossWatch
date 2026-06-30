@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
@@ -22,8 +23,10 @@ from ._common import (
     cfg_int,
     cfg_section,
     get_watermark,
+    has_auth,
     iso_ok,
     iso_z,
+    mdblist_request,
     now_iso,
     read_json,
     save_watermark,
@@ -154,8 +157,8 @@ def _fetch_last_activities(adapter: Any, *, apikey: str, timeout: float, retries
             pass
         return None
     try:
-        r = request_with_retries(
-            adapter.client.session,
+        r = mdblist_request(
+            adapter,
             "GET",
             URL_LAST_ACTIVITIES,
             params={"apikey": apikey},
@@ -257,7 +260,9 @@ def _ids_for_mdblist(item: Mapping[str, Any]) -> dict[str, Any]:
             "kitsu": item.get("kitsu") or item.get("kitsu_id"),
         }
 
-    typ = str(item.get("type") or item.get("mediatype") or "").strip().lower()
+    typ = mapped_or_default_media_type(item)
+    if not typ:
+        typ = str(item.get("type") or item.get("mediatype") or "").strip().lower()
     if typ.endswith("s") and typ in ("movies", "shows"):
         typ = typ[:-1]
     if typ not in ("movie", "show"):
@@ -377,8 +382,8 @@ def _parse_rows_and_total(data: Any) -> tuple[list[Mapping[str, Any]], int | Non
 
 def _peek_live(adapter: Any, apikey: str, timeout: float, retries: int) -> tuple[str | None, int | None]:
     try:
-        r = request_with_retries(
-            adapter.client.session,
+        r = mdblist_request(
+            adapter,
             "GET",
             URL_LIST,
             params={"apikey": apikey, "limit": 1, "offset": 0, "unified": "true"},
@@ -407,12 +412,12 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     apikey = _as_str(cfg.get("api_key")) or ""
     shadow = _shadow_load()
     cached: dict[str, dict[str, Any]] = dict(shadow.get("items") or {})
-    if not apikey:
+    if not has_auth(cfg):
         if cached:
-            _dbg("index_cache_hit", source="shadow", reason="missing_api_key", count=len(cached))
+            _dbg("index_cache_hit", source="shadow", reason="missing_auth", count=len(cached))
             _info("index_done", count=len(cached), source="shadow")
         else:
-            _dbg("index_reconcile", reason="missing_api_key", strategy="empty")
+            _dbg("index_reconcile", reason="missing_auth", strategy="empty")
             _info("index_done", count=0, source="empty")
         return cached
 
@@ -472,7 +477,7 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
 
     while True:
         params = {"apikey": apikey, "limit": limit, "offset": offset, "unified": "true"}
-        r = request_with_retries(sess, "GET", URL_LIST, params=params, timeout=timeout, max_retries=retries)
+        r = mdblist_request(adapter, "GET", URL_LIST, params=params, timeout=timeout, max_retries=retries)
         if r.status_code != 200:
             _warn("http_failed", op="index", method="GET", url=URL_LIST, status=r.status_code, offset=offset)
             break
@@ -540,7 +545,7 @@ def _batch_payload(items: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, A
         if not any(ids.get(k) not in (None, "") for k in ("imdb", "tmdb", "trakt", "tvdb", "kitsu", "mdblist")):
             rejected.append({"item": minimal_item, "hint": "missing_supported_ids"})
             continue
-        kind = "show" if str(item.get("type") or "").lower() in ("show", "shows", "tv", "series") else "movie"
+        kind = "show" if mapped_or_default_media_type(item) == "show" else "movie"
         accepted.append({"type": kind, "ids": ids})
     return accepted, rejected
 
@@ -554,18 +559,21 @@ def _payload_from_accepted(accepted_slice: list[dict[str, Any]]) -> dict[str, An
             entry: dict[str, Any] = {}
             imdb = ids.get("imdb")
             tmdb = ids.get("tmdb")
+            mdblist = ids.get("mdblist")
             tvdb = ids.get("tvdb")
             if imdb is not None:
                 entry["imdb"] = imdb
             if tmdb is not None:
                 entry["tmdb"] = tmdb
+            if mdblist is not None:
+                entry["mdblist"] = mdblist
             if not entry and tvdb is not None:
                 entry["tvdb"] = tvdb
             if entry:
                 movies.append(entry)
             continue
 
-        entry = {"imdb": ids.get("imdb"), "tmdb": ids.get("tmdb")}
+        entry = {"imdb": ids.get("imdb"), "tmdb": ids.get("tmdb"), "mdblist": ids.get("mdblist")}
         shows.append(entry)
     movies = [{k: v for k, v in d.items() if v is not None} for d in movies]
     shows = [{k: v for k, v in d.items() if v is not None} for d in shows]
@@ -614,9 +622,9 @@ def _write(adapter: Any, action: str, items: Iterable[Mapping[str, Any]]) -> tup
     cfg = _cfg(adapter)
     apikey = _as_str(cfg.get("api_key")) or ""
     items_list = list(items or [])
-    if not apikey:
-        unresolved = [{"item": id_minimal(it), "hint": "missing_api_key"} for it in items_list]
-        _info("write_skipped", op=action, reason="missing_api_key", unresolved=len(unresolved))
+    if not has_auth(cfg):
+        unresolved = [{"item": id_minimal(it), "hint": "missing_auth"} for it in items_list]
+        _info("write_skipped", op=action, reason="missing_auth", unresolved=len(unresolved))
         return 0, unresolved
 
     batch = _cfg_int(cfg, "watchlist_batch_size", 100)
@@ -637,8 +645,8 @@ def _write(adapter: Any, action: str, items: Iterable[Mapping[str, Any]]) -> tup
                 unresolved.append({"item": minimal, "hint": "missing_write_ids"})
             continue
 
-        r = request_with_retries(
-            sess,
+        r = mdblist_request(
+            adapter,
             "POST",
             URL_MODIFY.format(action=action),
             params={"apikey": apikey},

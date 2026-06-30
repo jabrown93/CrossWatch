@@ -485,12 +485,6 @@
         if (needsSpotlights(s)) queueLogHydration(runKey);
       } catch {}
       try {
-        window.wallLoaded = false;
-        if (typeof window.updateWatchlistPreview === "function") window.updateWatchlistPreview();
-        else if (typeof window.updatePreviewVisibility === "function") window.updatePreviewVisibility();
-        else if (typeof window.loadWatchlist === "function") window.loadWatchlist();
-      } catch {}
-      try {
         window.dispatchEvent(new CustomEvent("sync-complete", { detail: { at: nowTs(), summary: s, source: source || "?" } }));
       } catch {}
     }
@@ -638,7 +632,7 @@
 
 (() => {
   document.getElementById("preview-guard-css")?.remove();
-  document.head.appendChild(Object.assign(document.createElement("style"), { id: "preview-guard-css", textContent: `html[data-tab!="main"] #placeholder-card{display:none!important;}` }));
+  document.head.appendChild(Object.assign(document.createElement("style"), { id: "preview-guard-css", textContent: `html:not([data-tab="main"]) #placeholder-card{display:none!important;}` }));
 
   const DOC = document.documentElement;
   DOC.dataset.tab ||= "main";
@@ -662,7 +656,7 @@
     return ret;
   };
 
-  ["updateWatchlistPreview", "updatePreviewVisibility", "loadWatchlist"].forEach(guard);
+  ["updateWatchlistPreview", "updatePreviewVisibility", "loadWall", "loadWatchlist"].forEach(guard);
   document.addEventListener("tab-changed", () => !isMain() && hidePreview());
   document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && !isMain() && hidePreview());
 })();

@@ -17,9 +17,13 @@ export const HELP_TEXT = {
   "cx-wl-enable": "Watchlist: Enable\nCompare watchlists and write missing items to the target.",
   "cx-wl-add": "Watchlist: Add\nAdds missing items to the target watchlist.",
   "cx-wl-remove": "Watchlist: Remove\nRemoves items from the target.",
+  "cx-wl-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database for this AniList watchlist pair. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-wl-anime-only": "Anime-only sync\nOnly sync items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before AniList title search.",
   "cx-rt-enable": "Ratings: Enable\nCompare and write ratings to the target.",
   "cx-rt-add": "Ratings: Add / Update\nWrites ratings/updates to the target.",
   "cx-rt-remove": "Ratings: Remove\nClears ratings on the target (destructive and only for very specific needs).",
+  "cx-rt-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database for this AniList ratings pair. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-rt-anime-only": "Anime-only sync\nOnly sync ratings for items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before AniList title search.",
 
   "cx-hs-enable": "History: Enable\nCompare and write watch history to the target.",
   "cx-hs-add": "History: Add\nAdds plays/watched items to the target history.",
@@ -29,7 +33,7 @@ export const HELP_TEXT = {
   "cx-md-hs-ignore-dropped": "MDBList: Ignore dropped shows\nWhen enabled, shows marked as dropped on MDBList are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
   "cx-sm-hs-ignore-dropped": "Simkl: Ignore dropped shows\nWhen enabled, shows marked as dropped on Simkl are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
 
-  "cx-pr-enable": "Progress: Enable\nSync resume position (where you left off) between media servers.",
+  "cx-pr-enable": "Progress: Enable\nSync resume position (where you left off) between providers.",
   "cx-pr-add": "Progress: Add / Update\nWrite resume position to the target.",
   "cx-pr-remove": "Progress: Remove\nClear resume position on the target (rare; Plex may not support).",
   "cx-pr-min": "Progress: Minimum seconds\nIgnore tiny offsets (scrubbing).",

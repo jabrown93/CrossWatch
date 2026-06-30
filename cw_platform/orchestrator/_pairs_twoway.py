@@ -65,6 +65,11 @@ except Exception:
         return idx
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
+from ..anime_mapping.service import (
+    anime_mapping_pair_feature_options as _anime_pair_feature_options,
+    config_with_pair_feature_options as _anime_config_with_pair_feature_options,
+    enrich_index_for_pair as _anime_enrich_index_for_pair,
+)
 from ._snapshots import (
     build_snapshots_for_feature,
     coerce_suspect_snapshot,
@@ -298,6 +303,8 @@ def _two_way_sync(
 
     aops = provs.get(a)
     bops = provs.get(b)
+    anime_pair_opts = _anime_pair_feature_options(cfg, fcfg, feature, a, b, anime_only_default=(a == "ANILIST" or b == "ANILIST"))
+    provider_cfg = _anime_config_with_pair_feature_options(cfg, anime_pair_opts) if "ANILIST" in {a, b} else cfg
     if not aops or not bops:
         info(f"[!] Missing provider ops for {a}<->{b}")
         return {"ok": False, "adds_to_A": 0, "adds_to_B": 0, "rem_from_A": 0, "rem_from_B": 0}
@@ -387,7 +394,7 @@ def _two_way_sync(
     pair_providers = {a: aops, b: bops}
 
     snaps = build_snapshots_for_feature(
-        feature=feature, config=cfg, providers=pair_providers,
+        feature=feature, config=provider_cfg, providers=pair_providers,
         snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
         dbg=dbg, emit_info=info,
     )
@@ -435,12 +442,12 @@ def _two_way_sync(
 
     prev_cp_A = prev_checkpoint(prev_state, a, feature, src_inst)
     prev_cp_B = prev_checkpoint(prev_state, b, feature, dst_inst)
-    now_cp_A = module_checkpoint(aops, cfg, feature)
-    now_cp_B = module_checkpoint(bops, cfg, feature)
+    now_cp_A = module_checkpoint(aops, provider_cfg, feature)
+    now_cp_B = module_checkpoint(bops, provider_cfg, feature)
 
     if drop_guard:
         A_eff_guard, A_suspect, A_reason = coerce_suspect_snapshot(
-            config=cfg,
+            config=provider_cfg,
             provider=a, ops=aops, prev_idx=prevA, cur_idx=A_cur, feature=feature,
             suspect_min_prev=int((cfg.get("runtime") or {}).get("suspect_min_prev", 20)),
             suspect_shrink_ratio=float((cfg.get("runtime") or {}).get("suspect_shrink_ratio", 0.10)),
@@ -450,7 +457,7 @@ def _two_way_sync(
         if A_suspect:
             dbg("snapshot.guard", provider=a, feature=feature, reason=A_reason)
         B_eff_guard, B_suspect, B_reason = coerce_suspect_snapshot(
-            config=cfg,
+            config=provider_cfg,
             provider=b, ops=bops, prev_idx=prevB, cur_idx=B_cur, feature=feature,
             suspect_min_prev=int((cfg.get("runtime") or {}).get("suspect_min_prev", 20)),
             suspect_shrink_ratio=float((cfg.get("runtime") or {}).get("suspect_shrink_ratio", 0.10)),
@@ -508,6 +515,14 @@ def _two_way_sync(
     # Keep rich metadata when the provider index is presence-only.
     A_eff = _enrich_index_payload(A_eff, prevA, feature)
     B_eff = _enrich_index_payload(B_eff, prevB, feature)
+
+    if bool(anime_pair_opts.get("use_anime_mapping", False)):
+        a_before = len(A_eff)
+        b_before = len(B_eff)
+        A_eff = _anime_enrich_index_for_pair(A_eff, provider_cfg, a, b)
+        B_eff = _anime_enrich_index_for_pair(B_eff, provider_cfg, a, b)
+        if len(A_eff) != a_before or len(B_eff) != b_before:
+            dbg("anime_mapping.rekeyed", feature=feature, a=a, b=b, a_items=len(A_eff), b_items=len(B_eff))
 
     now = int(_t.time())
     tomb_ttl_days = int((cfg.get("sync") or {}).get("tombstone_ttl_days", 30))
@@ -585,11 +600,13 @@ def _two_way_sync(
 
         if typ == "episode":
             try:
-                s = int(it.get("season") or 0)
-                e = int(it.get("episode") or 0)
+                season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
+                episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
+                s = int(season_raw) if season_raw is not None else -1
+                e = int(episode_raw) if episode_raw is not None else 0
             except Exception:
-                s, e = 0, 0
-            if s > 0 and e > 0:
+                s, e = -1, 0
+            if s >= 0 and e > 0:
                 frag = f"#s{s:02d}e{e:02d}"
                 for k, v in ids.items():
                     if v is None or str(v) == "":
@@ -598,10 +615,11 @@ def _two_way_sync(
 
         elif typ == "season":
             try:
-                s = int(it.get("season") or 0)
+                season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
+                s = int(season_raw) if season_raw is not None else -1
             except Exception:
-                s = 0
-            if s > 0:
+                s = -1
+            if s >= 0:
                 frag = f"#season:{s}"
                 for k, v in ids.items():
                     if v is None or str(v) == "":
@@ -1465,7 +1483,7 @@ def _two_way_sync(
         else:
             emit("two:apply:remove:A:start", dst=a, feature=feature, count=len(rem_from_A))
             resA_rem = apply_remove(
-                dst_ops=aops, cfg=cfg, dst_name=a, feature=feature, items=rem_from_A,
+                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=rem_from_A,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
             )
@@ -1497,7 +1515,7 @@ def _two_way_sync(
         else:
             emit("two:apply:remove:B:start", dst=b, feature=feature, count=len(rem_from_B))
             resB_rem = apply_remove(
-                dst_ops=bops, cfg=cfg, dst_name=b, feature=feature, items=rem_from_B,
+                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=rem_from_B,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
             )
@@ -1542,7 +1560,7 @@ def _two_way_sync(
             emit("two:apply:update:A:start", dst=a, feature=feature, count=len(upd_to_A))
             unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
             resA_upd = apply_update(
-                dst_ops=aops, cfg=cfg, dst_name=a, feature=feature, items=upd_to_A,
+                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=upd_to_A,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
             )
@@ -1582,7 +1600,7 @@ def _two_way_sync(
             emit("two:apply:update:B:start", dst=b, feature=feature, count=len(upd_to_B))
             unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
             resB_upd = apply_update(
-                dst_ops=bops, cfg=cfg, dst_name=b, feature=feature, items=upd_to_B,
+                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=upd_to_B,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
             )
@@ -1634,7 +1652,7 @@ def _two_way_sync(
                 k2i_A[k] = _minimal(it)
             
             resA_add = apply_add(
-                dst_ops=aops, cfg=cfg, dst_name=a, feature=feature, items=add_to_A,
+                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=add_to_A,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
             )
@@ -1750,7 +1768,7 @@ def _two_way_sync(
                 k2i_B[k] = _minimal(it)
             
             resB_add = apply_add(
-                dst_ops=bops, cfg=cfg, dst_name=b, feature=feature, items=add_to_B,
+                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=add_to_B,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
             )

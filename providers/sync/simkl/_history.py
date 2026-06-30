@@ -19,6 +19,7 @@ from ._common import (
     load_json_state,
     maybe_map_tvdb_ids,
     normalize_flat_watermarks,
+    simkl_api_params_from_headers,
     key_of as simkl_key_of,
     normalize as simkl_normalize,
     save_json_state,
@@ -41,15 +42,17 @@ def _unresolved_path() -> str:
 
 ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb")
 _MOVIE_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl")  # anime IDs excluded to prevent SIMKL misrouting to anime bucket
+_EPISODE_LOOKUP_ID_KEYS = ("tvdb", "anidb")
 
 _EP_LOOKUP_MEMO: dict[str, dict[tuple[int, int], dict[str, Any]]] = {}
 def _maybe_map_tvdb(adapter: Any, ids: Mapping[str, Any]) -> dict[str, str]:
     def _fetch_rows() -> Iterable[Mapping[str, Any]]:
+        headers = _headers(adapter, force_refresh=True)
         try:
             resp = adapter.client.session.get(
                 f"{BASE}/sync/all-items/anime",
-                headers=_headers(adapter, force_refresh=True),
-                params={"extended": "full_anime_seasons"},
+                headers=headers,
+                params=simkl_api_params_from_headers(headers, extended="full_anime_seasons"),
                 timeout=adapter.cfg.timeout,
             )
             data = resp.json() if resp.ok else {}
@@ -135,6 +138,13 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _chunk_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
     size = max(1, int(n or 1))
     for i in range(0, len(seq), size):
@@ -202,6 +212,11 @@ def _headers(adapter: Any, *, force_refresh: bool = False) -> dict[str, str]:
 def _ids_of(obj: Mapping[str, Any]) -> dict[str, Any]:
     ids = dict(obj.get("ids") or {})
     return {k: ids[k] for k in ID_KEYS if ids.get(k)}
+
+
+def _episode_lookup_ids(item: Mapping[str, Any]) -> dict[str, str]:
+    ids = dict(item.get("ids") or {})
+    return {k: str(ids[k]) for k in _EPISODE_LOOKUP_ID_KEYS if ids.get(k)}
 
 
 def _raw_show_ids(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -283,16 +298,13 @@ def _episode_lookup(
             d["simkl"] = d["simkl_id"]
         return {k: str(d[k]) for k in ID_KEYS if d.get(k)}
 
-    client_id = str(headers.get("simkl-api-key") or "").strip()
-
     for cand in candidates:
         out: dict[tuple[int, int], dict[str, Any]] = {}
         url = f"{base_url}/{cand}"
-        params: dict[str, str] = {
-            "extended": "full_anime_seasons" if str(kind).lower() == "anime" else "full",
-        }
-        if client_id:
-            params["client_id"] = client_id
+        params = simkl_api_params_from_headers(
+            headers,
+            extended="full_anime_seasons" if str(kind).lower() == "anime" else "full",
+        )
         try:
             resp = session.get(url, headers=dict(headers), params=params, timeout=timeout)
             if not resp.ok:
@@ -539,11 +551,15 @@ def _inject_adds_into_cache(items_list: list[Mapping[str, Any]]) -> None:
             entry["season"] = item.get("season")
             entry["episode"] = item.get("episode")
             entry["series_title"] = item.get("series_title")
-            entry["simkl_bucket"] = "shows"
+            entry["simkl_bucket"] = str(item.get("simkl_bucket") or "shows").strip().lower() or "shows"
         else:
             entry["title"] = item.get("title")
             entry["year"] = item.get("year")
-            entry["simkl_bucket"] = "movies"
+            bucket = str(item.get("simkl_bucket") or "").strip().lower()
+            entry["simkl_bucket"] = bucket if bucket in {"movies", "shows", "anime"} else ("movies" if item_type == "movie" else "shows")
+            anime_type = str(item.get("anime_type") or "").strip().lower()
+            if anime_type:
+                entry["anime_type"] = anime_type
         to_inject[event_key] = entry
 
     if not to_inject:
@@ -554,6 +570,84 @@ def _inject_adds_into_cache(items_list: list[Mapping[str, Any]]) -> None:
     _dbg("cache_injected", count=len(to_inject))
 
 
+def _response_bucket(simkl_type: Any) -> str | None:
+    typ = str(simkl_type or "").strip().lower()
+    if typ in {"movie", "movies"}:
+        return "movies"
+    if typ in {"show", "shows", "tv", "tv_show", "tv_shows"}:
+        return "shows"
+    if typ == "anime":
+        return "anime"
+    return None
+
+
+def _response_classification(row: Any) -> dict[str, str]:
+    if not isinstance(row, Mapping):
+        return {}
+    response = row.get("response")
+    src: Mapping[str, Any] = response if isinstance(response, Mapping) else row
+    out: dict[str, str] = {}
+    bucket = _response_bucket(src.get("simkl_type") or src.get("type") or row.get("simkl_type"))
+    if bucket:
+        out["simkl_bucket"] = bucket
+    anime_type = src.get("anime_type") or src.get("animeType") or row.get("anime_type") or row.get("animeType")
+    if isinstance(anime_type, str) and anime_type.strip():
+        out["anime_type"] = anime_type.strip().lower()
+    status = src.get("status") or row.get("status")
+    if isinstance(status, str) and status.strip():
+        out["simkl_status"] = status.strip().lower()
+    return out
+
+
+def _response_ids(row: Any) -> dict[str, str]:
+    if not isinstance(row, Mapping):
+        return {}
+    response = row.get("response")
+    src: Mapping[str, Any] = response if isinstance(response, Mapping) else row
+    ids = src.get("ids") if isinstance(src.get("ids"), Mapping) else row.get("ids")
+    if not isinstance(ids, Mapping):
+        return {}
+    return {str(k).lower(): str(v) for k, v in ids.items() if v not in (None, "")}
+
+
+def _classification_key(item: Mapping[str, Any]) -> str:
+    return json.dumps(dict(_scope_ids_for_freeze(item) or _ids_of(item) or {}), sort_keys=True)
+
+
+def _apply_response_classification(items_list: list[Mapping[str, Any]], payload: Mapping[str, Any]) -> None:
+    added = payload.get("added")
+    statuses = added.get("statuses") if isinstance(added, Mapping) else None
+    if not isinstance(statuses, list):
+        return
+
+    by_key: dict[str, list[Mapping[str, Any]]] = {}
+    by_id: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for item in items_list:
+        if not isinstance(item, Mapping):
+            continue
+        by_key.setdefault(_classification_key(item), []).append(item)
+        for field, value in (_scope_ids_for_freeze(item) or _ids_of(item) or {}).items():
+            if value not in (None, ""):
+                by_id.setdefault((str(field).lower(), str(value)), []).append(item)
+
+    fallback = [item for item in items_list if isinstance(item, Mapping)]
+    for idx, row in enumerate(statuses):
+        cls = _response_classification(row)
+        if not cls:
+            continue
+        matches: list[Mapping[str, Any]] = []
+        ids = _response_ids(row)
+        for field, value in ids.items():
+            matches.extend(by_id.get((field, value), []))
+        if not matches and ids:
+            matches = by_key.get(json.dumps(ids, sort_keys=True), [])
+        if not matches and idx < len(fallback):
+            matches = [fallback[idx]]
+        for item in matches:
+            if isinstance(item, dict):
+                item.update(cls)
+
+
 def _fetch_all_items(
     session: Any,
     headers: Mapping[str, str],
@@ -561,10 +655,12 @@ def _fetch_all_items(
     since_iso: str | None,
     timeout: float,
 ) -> dict[str, list[dict[str, Any]]]:
-    params: dict[str, str] = {
-        "extended": "full_anime_seasons",
-        "episode_watched_at": "yes",
-    }
+    params = simkl_api_params_from_headers(
+        headers,
+        extended="full_anime_seasons",
+        episode_watched_at="yes",
+        include_all_episodes="yes",
+    )
     if since_iso:
         params["date_from"] = since_iso
     resp = session.get(URL_ALL_ITEMS, headers=headers, params=params, timeout=timeout)
@@ -583,6 +679,16 @@ def _fetch_all_items(
         if isinstance(rows, list):
             out[kind] = [x for x in rows if isinstance(x, dict) and not _is_null_env(x)]
     return out
+
+
+def _anime_type_from_row(row: Mapping[str, Any], show: Any, base: Mapping[str, Any]) -> str | None:
+    for node in (show, row.get("anime"), row.get("show"), row, base):
+        if not isinstance(node, Mapping):
+            continue
+        at = node.get("anime_type") or node.get("animeType")
+        if isinstance(at, str) and at.strip():
+            return at.strip().lower()
+    return None
 
 
 def _apply_since_limit(
@@ -686,8 +792,7 @@ def _parse_rows(
             sid = str(show_ids.get("simkl") or "").strip()
             series_name = f"SIMKL:{sid}" if sid else "Unknown Series"
         if row_kind == "anime":
-            at = (show.get("anime_type") or show.get("animeType")) if isinstance(show, Mapping) else None
-            anime_type = at.strip().lower() if isinstance(at, str) and at.strip() else None
+            anime_type = _anime_type_from_row(row, show, base)
             if anime_type == "movie":
                 watched_at = (row.get("last_watched_at") or row.get("watched_at") or "").strip()
                 if not watched_at:
@@ -727,10 +832,16 @@ def _parse_rows(
                 continue
         for season in row.get("seasons") or []:
             season = season if isinstance(season, Mapping) else {}
-            s_num_internal = int((season.get("number") or season.get("season") or 0))
+            raw_season = season.get("number") if season.get("number") is not None else season.get("season")
+            s_num_internal = _int_or_none(raw_season)
+            if s_num_internal is None or s_num_internal < 0:
+                continue
             for episode in (season.get("episodes") or []):
                 episode = episode if isinstance(episode, Mapping) else {}
-                e_num_internal = int((episode.get("number") or episode.get("episode") or 0))
+                raw_episode = episode.get("number") if episode.get("number") is not None else episode.get("episode")
+                e_num_internal = _int_or_none(raw_episode)
+                if e_num_internal is None or e_num_internal <= 0:
+                    continue
                 s_num = s_num_internal
                 e_num = e_num_internal
                 if row_kind == "anime":
@@ -746,13 +857,14 @@ def _parse_rows(
                 if not ts and row_kind == "shows":
                     watched_at = (row.get("last_watched_at") or "").strip()
                     ts = _as_epoch(watched_at)
-                if not ts or not s_num or not e_num:
+                if not ts or s_num < 0 or e_num <= 0:
                     continue
+                episode_ids = _episode_lookup_ids(episode) if s_num == 0 else {}
                 ep = {
                     "type": "episode",
                     "season": s_num,
                     "episode": e_num,
-                    "ids": dict(show_ids),
+                    "ids": dict(episode_ids or show_ids),
                     "title": f"S{s_num:02d}E{e_num:02d}",
                     "year": None,
                     "series_title": series_name,
@@ -1031,36 +1143,48 @@ def _season_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, 
     return show, s_num, watched_at
 
 
-def _episode_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, Any], int, int, str] | None:
+def _episode_add_entry(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, Any], int, int, str, dict[str, str]] | None:
     show_ids_raw = _show_ids_of_episode(item)
     if not show_ids_raw:
         return None
-    s_num = _safe_int(item.get("season") or item.get("season_number"))
+    raw_season = item.get("season") if item.get("season") is not None else item.get("season_number")
+    s_num = _safe_int(raw_season)
     e_num = _safe_int(item.get("episode") or item.get("episode_number"))
     watched_at = item.get("watched_at") or item.get("watchedAt")
-    if not s_num or not e_num or not isinstance(watched_at, str) or not watched_at:
+    episode_ids = _episode_lookup_ids(item)
+    if not e_num or not isinstance(watched_at, str) or not watched_at:
+        return None
+    if not s_num:
+        if _int_or_none(raw_season) == 0 and episode_ids:
+            s_num = 0
+        else:
+            return None
+
+    if s_num == 0 and not episode_ids:
         return None
 
     anime_force = False
     mapped = None
-    try:
-        mapped = _map_tvdb_episode_to_simkl_anime(
-            adapter,
-            show_ids=show_ids_raw,
-            season=s_num,
-            episode=e_num,
-        )
-    except Exception:
-        mapped = None
+    if s_num > 0:
+        try:
+            mapped = _map_tvdb_episode_to_simkl_anime(
+                adapter,
+                show_ids=show_ids_raw,
+                season=s_num,
+                episode=e_num,
+            )
+        except Exception:
+            mapped = None
     if mapped is not None:
         anime_force = True
         s_num, e_num = mapped
+        episode_ids = {}
 
     show = _show_scope_entry(adapter, item, show_ids_raw, force_anime=anime_force)
     if not show:
         return None
 
-    return show, s_num, e_num, watched_at
+    return show, s_num, e_num, watched_at, episode_ids
 
 
 def _merge_show_group(groups: dict[str, dict[str, Any]], show_entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -1100,6 +1224,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     shows_scoped: dict[str, dict[str, Any]] = {}
     scoped_items: dict[str, list[Mapping[str, Any]]] = {}  # ids_key for original items (seasons)
     scoped_ep_index: dict[tuple[str, int, int], Mapping[str, Any]] = {}  # (ids_key, season, ep) for original episode item
+    scoped_ep_id_index: dict[tuple[str, str], Mapping[str, Any]] = {}  # episode-level lookup ids for original episode item
     scoped_id_index: dict[tuple[str, str], str] = {}  # (field, str(value)) ids_key, for matching
     failed_thaw_keys: set[str] = set()  # thaw keys of items confirmed as not_found, excluded from cache injection
     unresolved: list[dict[str, Any]] = []
@@ -1163,13 +1288,19 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 )
                 continue
 
-            show_entry, s_num, e_num, watched_at = packed
+            show_entry, s_num, e_num, watched_at, episode_ids = packed
             ids_key = json.dumps(dict(show_entry.get("ids") or {}), sort_keys=True)
             group = _merge_show_group(shows_scoped, show_entry)
             season = _merge_show_season(group, s_num)
-            season.setdefault("episodes", []).append({"number": e_num, "watched_at": watched_at})
+            ep_payload: dict[str, Any] = {"number": e_num, "watched_at": watched_at}
+            if s_num == 0 and episode_ids:
+                ep_payload["ids"] = dict(episode_ids)
+            season.setdefault("episodes", []).append(ep_payload)
             scoped_items.setdefault(ids_key, []).append(item)
             scoped_ep_index[(ids_key, s_num, e_num)] = item
+            for _f, _v in episode_ids.items():
+                if _v is not None:
+                    scoped_ep_id_index.setdefault((_f, str(_v)), item)
             for _f, _v in (show_entry.get("ids") or {}).items():
                 if _v is not None:
                     scoped_id_index.setdefault((_f, str(_v)), ids_key)
@@ -1203,9 +1334,16 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         return 0, unresolved
 
     try:
-        resp = session.post(URL_ADD, headers=headers, json=body, timeout=timeout)
+        resp = session.post(
+            URL_ADD,
+            headers=headers,
+            params=simkl_api_params_from_headers(headers),
+            json=body,
+            timeout=timeout,
+        )
         if 200 <= resp.status_code < 300:
             _unfreeze(thaw_keys)
+            payload: dict[str, Any] = {}
             eps_count = sum(
                 len(season.get("episodes", []))
                 for group in shows_scoped.values()
@@ -1223,6 +1361,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             try:
                 payload = resp.json() if (resp.text or '').strip() else {}
                 if isinstance(payload, dict):
+                    _apply_response_classification(items_list, payload)
                     a = payload.get("added")
                     if isinstance(a, dict):
                         added_new["movies"] = int(a.get("movies") or 0)
@@ -1286,6 +1425,13 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                         for _e in (_s.get("episodes") or []):
                             _enum = int(_e.get("number") or 0)
                             _orig = scoped_ep_index.get((_matched_ids_key, _snum, _enum))
+                            if _orig is None and isinstance(_e, Mapping):
+                                for _f, _v in (_e.get("ids") or {}).items():
+                                    if _v is None:
+                                        continue
+                                    _orig = scoped_ep_id_index.get((_f, str(_v)))
+                                    if _orig is not None:
+                                        break
                             nf_total += 1
                             if _orig is not None:
                                 failed_thaw_keys.add(_thaw_key(_orig))
@@ -1372,9 +1518,18 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 continue
             if typ == "episode":
                 show_ids = _show_ids_of_episode(item)
-                s_num = int(item.get("season") or item.get("season_number") or 0)
-                e_num = int(item.get("episode") or item.get("episode_number") or 0)
-                if not show_ids or not s_num or not e_num:
+                raw_season = item.get("season") if item.get("season") is not None else item.get("season_number")
+                raw_episode = item.get("episode") if item.get("episode") is not None else item.get("episode_number")
+                s_num = _safe_int(raw_season)
+                e_num = _safe_int(raw_episode)
+                episode_ids = _episode_lookup_ids(item)
+                if not s_num:
+                    if _int_or_none(raw_season) == 0 and episode_ids:
+                        s_num = 0
+                    else:
+                        unresolved.append({"item": id_minimal(item), "hint": "missing_show_ids_or_s/e"})
+                        continue
+                if not show_ids or e_num <= 0:
                     unresolved.append({"item": id_minimal(item), "hint": "missing_show_ids_or_s/e"})
                     continue
                 show_entry = _show_scope_entry(adapter, item, show_ids)
@@ -1383,7 +1538,10 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                     continue
                 group = _merge_show_group(shows_scoped, show_entry)
                 season = _merge_show_season(group, s_num)
-                season.setdefault("episodes", []).append({"number": e_num})
+                episode_payload: dict[str, Any] = {"number": e_num}
+                if s_num == 0:
+                    episode_payload["ids"] = dict(episode_ids)
+                season.setdefault("episodes", []).append(episode_payload)
                 thaw_keys.append(_thaw_key(item))
                 continue
             ids = _ids_of(item)
@@ -1406,7 +1564,13 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         if not body:
             continue
         try:
-            resp = session.post(URL_REMOVE, headers=headers, json=body, timeout=timeout)
+            resp = session.post(
+                URL_REMOVE,
+                headers=headers,
+                params=simkl_api_params_from_headers(headers),
+                json=body,
+                timeout=timeout,
+            )
             if 200 <= resp.status_code < 300:
                 _unfreeze(thaw_keys)
                 ok += len(thaw_keys)

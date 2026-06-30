@@ -4,7 +4,8 @@
 <p align="center" style="font-size:14px;">
 <b>⭐ Star this repository to get updates</b><br>
 </p>
-<img width="1566" height="631" alt="providers1 (1)" src="https://github.com/user-attachments/assets/fa833ac6-ff96-440d-bfc0-5f749120af8c" />
+<img width="1975" height="796" alt="ov" src="https://github.com/user-attachments/assets/bcf1d3c0-628c-49e2-8249-c3d853f8b115" />
+
 <p align="center">
   <a href="https://github.com/cenodude/CrossWatch/releases/latest">
     <img src="https://img.shields.io/github/v/release/cenodude/CrossWatch?display_name=release&amp;sort=semver&amp;logo=github&amp;label=Latest%20Release&amp;style=for-the-badge" alt="Latest Release">
@@ -43,7 +44,7 @@
   style="max-width:170px; height:auto; margin:0 0 12px 16px;"
 />
 
-**CrossWatch/CW** is a synchronization engine that keeps your **Plex, Jellyfin, Emby, SIMKL, Trakt, AniList, TMDb, MDBList and Tautulli** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
+**CrossWatch/CW** is a synchronization engine that keeps your **Plex, Jellyfin, PublicMetaDB, Emby, SIMKL, Trakt, AniList, TMDb, MDBList and Tautulli** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
 
 ### CW in a nutshell:
 * **One brain for all your media syncs** A single place to configure everything.
@@ -51,7 +52,8 @@
 * **Multi media-server** and **multi tracker** support with profiles.
 * **Synchronization**
   * Watchlists, ratings and History
-  * Progress sync your progress status between Plex, Emby and Jellyfin.
+  * Progress sync your progress status between Plex, Emby, Jellyfin and PublicMetaDB.
+  * Anime ID mapping (powered AniBridge) for better AniList matching across providers.
 * **Scrobble (tracks your activity)**
   * **Watcher** (Plex/Emby/Jellyfin to Trakt/SIMKL/MDBList)
     * Does not require any Plex Pass, Emby Premiere,etc.  
@@ -59,8 +61,10 @@
   * **Watchlist Auto-Remove** Clears items from your Watchlist after a verified finish.
 * **Tools**
   * Analyzer: Finds items that are **stuck** or inconsistent between providers.
+  * Playback Progress Manager: View and edit unfinished playback sessions across providers.
   * Editor: Inspect and adjust your items and add or block items.
   * Captures: Rollback tool for provider watchlist, ratings, and history.
+  * Backup & Restore: Create, validate, import and restore configuration, application state, or full CrossWatch backups.
 
 And much more...such as:
 * Simple and advanced scheduling: From standard to more detailed pair schedules
