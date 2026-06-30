@@ -1,62 +1,86 @@
-FROM python:3.14-slim
+# syntax=docker/dockerfile:1
+
+# =====================================================================
+# Builder: the DHI -dev variant has a shell, apk and build tools, and
+# runs as root, so we use it only to install dependencies. Nothing from
+# this stage ships except the venv and a few data files copied below.
+# =====================================================================
+FROM dhi.io/python:3.14.6-alpine3.24-dev AS builder
+
+USER root
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Toolchain + libs as a fallback for any dependency that lacks a
+# musllinux wheel (cryptography, pydantic-core, etc. normally ship them).
+# tzdata/ca-certificates are harvested for the shell-less runtime stage.
+RUN apk add --no-cache \
+      build-base \
+      libffi-dev \
+      openssl-dev \
+      cargo \
+      rust \
+      ca-certificates \
+      tzdata
+
+# Install Python deps into an isolated venv we can copy wholesale.
+COPY requirements.txt /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/venv \
+ && /opt/venv/bin/python -m pip install --upgrade pip setuptools wheel \
+ && /opt/venv/bin/pip install -r /tmp/requirements.txt
+
+# Empty skeleton used to materialize /config in the runtime stage with
+# nonroot ownership (the runtime stage has no shell to chown).
+RUN mkdir -p /config-skel
+
+# =====================================================================
+# Runtime: the hardened DHI image has no shell, no package manager, and
+# runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
+# -- no RUN. Dependencies and data are brought in from the builder.
+# =====================================================================
+FROM dhi.io/python:3.14.6-alpine3.24
 
 LABEL org.opencontainers.image.description="One brain for all your media syncs A single place to configure everything."
 
-# --- env ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app \
-    TZ=Europe/Amsterdam
-
-# --- minimal OS deps ---
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tzdata bash curl util-linux \
- && rm -rf /var/lib/apt/lists/*
+    PATH=/opt/venv/bin:$PATH \
+    TZ=Europe/Amsterdam \
+    RUNTIME_DIR=/config \
+    WEB_HOST=0.0.0.0 \
+    WEB_PORT=8787 \
+    WEBINTERFACE=yes
 
 WORKDIR /app
 
-# --- runtime user ---
-ARG APP_USER=appuser
-ARG APP_GROUP
-ARG APP_UID=1000
-ARG APP_GID=1000
-RUN APP_GROUP="${APP_GROUP:-${APP_USER}}" \
- && groupadd -g "${APP_GID}" "${APP_GROUP}" \
- && useradd -m -u "${APP_UID}" -g "${APP_GROUP}" -s /bin/bash "${APP_USER}"
+# Python dependencies (venv shares the same base CPython as this image).
+COPY --from=builder /opt/venv /opt/venv
 
-# --- deps
-COPY requirements.txt /app/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt
+# Timezone database and CA bundle (no apk available in this stage).
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 
-# --- app code ---
+# Application code (.dockerignore keeps .git/__pycache__/.venv/tests out).
 COPY . /app
 
-# --- cleanup & avoid import shadows ---
-RUN rm -rf /app/.venv /app/.vscode /app/.idea || true \
- && find /app -type d -name "__pycache__" -prune -exec rm -rf {} + || true \
- && find /app -maxdepth 2 -type f -name "packaging.py" -delete || true \
- && find /app -maxdepth 2 -type d -name "packaging" -exec rm -rf {} + || true
+# Writable runtime dir owned by the nonroot runtime user. Named volumes
+# inherit this ownership on first use; bind mounts must be chowned on the
+# host to the nonroot UID, since this image cannot remap UIDs at runtime.
+COPY --chown=nonroot:nonroot --from=builder /config-skel/ /config/
 
-# --- scripts ---
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY docker/run-sync.sh   /usr/local/bin/run-sync.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/run-sync.sh
-
-# --- runtime env ---
-ENV RUNTIME_DIR=/config \
-    WEB_HOST=0.0.0.0 \
-    WEB_PORT=8787 \
-    WEBINTERFACE=yes \
-    DEV_SHELL_ON_FAIL=yes
-
-# --- healthcheck ---
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD ["python","-c","import os,socket,sys; s=socket.socket(); s.settimeout(2); p=int(os.environ.get('WEB_PORT','8787')); sys.exit(0 if s.connect_ex(('127.0.0.1',p))==0 else 1)"]
 
 EXPOSE 8787
 VOLUME ["/config"]
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+USER nonroot
+
+# crosswatch ignores argv and always binds 0.0.0.0:8787; the bash
+# entrypoint (dynamic PUID/PGID + privilege drop) is not possible on a
+# shell-less, nonroot hardened image and has been removed.
+ENTRYPOINT ["python", "-m", "crosswatch"]

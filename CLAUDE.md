@@ -166,7 +166,7 @@ The application uses a config-driven architecture where `config.json` (stored in
 
 ### Sync Engine Flow
 
-When a sync runs (via UI or `/docker/run-sync.sh`):
+When a sync runs (via UI or `docker/run-sync.py`):
 
 1. **Load config** from `config.json` (via `cw_platform/config_base.py`)
 2. **Instantiate Orchestrator** (`cw_platform/orchestrator/facade.py`)
