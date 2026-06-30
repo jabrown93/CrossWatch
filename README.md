@@ -1,4 +1,29 @@
 
+> ## 🍴 This is a fork
+>
+> This repository is a fork of [**cenodude/CrossWatch**](https://github.com/cenodude/CrossWatch),
+> kept in sync with upstream. It tracks upstream releases and layers the changes below on top.
+> For general usage, the upstream documentation and [wiki](https://wiki.crosswatch.app/) still apply.
+>
+> **Differences from upstream:**
+>
+> - **Security hardening** — secrets are redacted from config output/logs, inbound media-server
+>   webhooks (Plex/Emby/Jellyfin) are authenticated with a shared secret, and outbound requests
+>   are guarded against SSRF via URL validation.
+> - **Bug fixes** — ID-mapping fixes (prefer IMDb over TMDb in match priority; map Jellyfin
+>   `ProviderIds`) and a PublicMetaDB specials fix so `season 0` is no longer dropped from
+>   progress/ratings.
+> - **CI & automation** — a GitHub Actions test suite (pytest), automated Docker image and
+>   GitHub Release publishing, and Renovate for dependency updates with SHA-pinned actions.
+> - **Resilience** — provider state directories are created lazily (never at import time), and
+>   PublicMetaDB honors `CONFIG_BASE`, so source/non-Docker installs don't fail provider
+>   discovery on a missing or read-only `/config`.
+>
+> A few upstream tests fail on a pristine upstream checkout; they are tracked (deselected) in
+> CI so the suite stays green — see `.github/workflows/ci.yml`.
+
+---
+
 <img width="1468" height="795" alt="overview (1)" src="https://github.com/user-attachments/assets/d4afb18c-b655-4aa7-ba2b-da10f3cef89a" />
 
 <p align="center" style="font-size:14px;">
