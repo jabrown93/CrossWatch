@@ -31,14 +31,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Create writable /config for tests
-        # Upstream's providers/sync/publicmetadb/_common.py does an import-time
-        # mkdir of /config/.cw_state, which fails for the non-root CI user and
-        # aborts collection. Make /config writable so test collection succeeds.
-        run: |
-          sudo mkdir -p /config
-          sudo chown "$(id -u):$(id -g)" /config
-
       - name: Run tests
         # The deselected tests fail on a pristine upstream/main checkout too —
         # they are pre-existing upstream bugs (cenodude/CrossWatch), not caused

@@ -20,8 +20,12 @@ from cw_platform.metadata_cache import (
 
 from .._log import log as cw_log
 
-STATE_DIR = Path("/config/.cw_state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR = CONFIG_BASE() / ".cw_state"
+# STATE_DIR is created lazily on first write (see write_json). Don't mkdir at
+# import time and don't hard-code /config: importing this module runs during
+# provider discovery, and a failed mkdir (non-root / source installs / CI where
+# /config is absent or unwritable) would crash the import and silently drop
+# PUBLICMETADB from the available providers.
 
 
 def _pair_scope() -> str | None:

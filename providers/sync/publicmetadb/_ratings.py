@@ -145,7 +145,8 @@ def _to_minimal(row: Mapping[str, Any], *, episode_rating: bool) -> dict[str, An
     rid = str(row.get("id") or row.get("rating_id") or "").strip()
 
     if episode_rating:
-        season = as_int(row.get("season") or row.get("season_number"))
+        season_raw = row.get("season") if row.get("season") is not None else row.get("season_number")
+        season = as_int(season_raw)
         episode = as_int(row.get("episode") or row.get("episode_number"))
         if season is None or episode is None:
             return None

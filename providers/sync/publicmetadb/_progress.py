@@ -100,7 +100,8 @@ def _to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
 
     media = str(row.get("media_type") or row.get("type") or "").strip().lower()
     if media in ("tv", "show", "series", "episode"):
-        season = as_int(row.get("season") or row.get("season_number"))
+        season_raw = row.get("season") if row.get("season") is not None else row.get("season_number")
+        season = as_int(season_raw)
         episode = as_int(row.get("episode") or row.get("episode_number"))
         if season is None or episode is None:
             return None
