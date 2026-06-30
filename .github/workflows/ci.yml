@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # main = post-merge run. renovate/** lets Renovate's branch-automerge updates
+    # (which never open a PR) run `test` on the branch, so the default-branch
+    # ruleset (required `test (3.14)` check, pull_request rule dropped) can
+    # fast-forward main once the branch is green.
+    branches: [main, 'renovate/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
