@@ -93,28 +93,12 @@ async function loadCrossWatchSnapshots(cfg) {
 
 const UI_SETTINGS_TAB_KEY = "cw.ui.settings.tab.v1";
 
-function _uiDaysLeftFromEpochSeconds(epochSeconds) {
-  if (!epochSeconds || !Number.isFinite(epochSeconds)) return null;
-  const ms = epochSeconds * 1000;
-  const diffMs = ms - Date.now();
-  if (diffMs <= 0) return 0;
-  return Math.ceil(diffMs / (24 * 60 * 60 * 1000));
-}
-
 function cwUiSettingsSelect(tab, opts = {}) {
   const t = String(tab || "ui").toLowerCase();
   const persist = opts.persist !== false;
 
-  const hub = document.getElementById("ui_settings_hub");
   const panels = document.getElementById("ui_settings_panels");
-  if (!hub || !panels) return;
-
-  const tiles = hub.querySelectorAll(".cw-hub-tile");
-  tiles.forEach((btn) => {
-    const k = String(btn.dataset.tab || "").toLowerCase();
-    btn.classList.toggle("active", k === t);
-    btn.setAttribute("aria-selected", k === t ? "true" : "false");
-  });
+  if (!panels) return;
 
   const ps = panels.querySelectorAll(".cw-settings-panel");
   ps.forEach((p) => {
@@ -130,78 +114,8 @@ function cwUiSettingsSelect(tab, opts = {}) {
 }
 
 function cwUiSettingsHubUpdate() {
-  const set = (id, text) => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = text;
-  };
-
-  const wl = document.getElementById("ui_show_watchlist_preview");
-  if (wl) set("hub_ui_watchlist", `Watchlist: ${wl.value === "false" ? "Hide" : "Show"}`);
-
-  const pc = document.getElementById("ui_show_playingcard");
-  if (pc) set("hub_ui_playing", `Playing: ${pc.value === "false" ? "Hide" : "Show"}`);
-
-  const ai = document.getElementById("ui_show_AI");
-  if (ai) set("hub_ui_askai", `ASK AI: ${ai.value === "false" ? "Hide" : "Show"}`);
-
-  const quickDesk = document.getElementById("ui_show_quick_add_desktop");
-  const quickMobile = document.getElementById("ui_show_quick_add_mobile");
-  if (quickDesk || quickMobile) {
-    const deskShown = quickDesk ? quickDesk.value !== "false" : false;
-    const mobileShown = quickMobile ? quickMobile.value !== "false" : false;
-    let quickAddLabel = "Hide";
-    if (deskShown && mobileShown) quickAddLabel = "Show";
-    else if (deskShown) quickAddLabel = "Desktop";
-    else if (mobileShown) quickAddLabel = "Mobile";
-    set("hub_ui_quickadd", `Quick Add: ${quickAddLabel}`);
-  }
-
-  const proto = document.getElementById("ui_protocol");
-  if (proto) set("hub_ui_proto", `Proto: ${String(proto.value || "http").toUpperCase()}`);
-
-  const aaEnabled = true;
   const aaRememberEnabled = (document.getElementById("app_auth_remember_enabled")?.value || "").toString() === "true";
-  const st = window._appAuthStatus || null;
-
-  if (st && st.configured && st.authenticated) {
-    set("hub_sec_auth", "Auth: On");
-    if (!aaRememberEnabled) {
-      set("hub_sec_session", "Session: browser");
-    } else {
-      const days = _uiDaysLeftFromEpochSeconds(st.session_expires_at);
-      set("hub_sec_session", days == null ? "Session: active" : `Session: ${days}d`);
-    }
-  } else if (st && st.enabled && !st.configured) {
-    set("hub_sec_auth", "Auth: On");
-    set("hub_sec_session", "Set password");
-  } else {
-    set("hub_sec_auth", "Auth: On");
-    set("hub_sec_session", "Locked");
-  }
-
-  // Trusted reverse proxies indicator
-  try {
-    const raw = (document.getElementById("trusted_proxies")?.value || "").toString().trim();
-    let on = false;
-    if (raw) {
-      on = raw.split(/[;\n,]+/).map(s => s.trim()).filter(Boolean).length > 0;
-    } else {
-      const tp = window._cfgCache?.security?.trusted_proxies;
-      on = Array.isArray(tp) && tp.length > 0;
-    }
-    set("hub_sec_proxy", `Proxy: ${on ? "On" : "Off"}`);
-  } catch {
-    set("hub_sec_proxy", "Proxy: —");
-  }
-
   const cwEnabled = (document.getElementById("cw_enabled")?.value || "").toString() !== "false";
-  set("hub_cw_enabled", `Tracker: ${cwEnabled ? "On" : "Off"}`);
-
-  const retRaw = (document.getElementById("cw_retention_days")?.value || "").toString().trim();
-  const ret = retRaw === "" ? null : parseInt(retRaw, 10);
-  if (ret == null || Number.isNaN(ret)) set("hub_cw_retention", "Retention: —");
-  else if (ret === 0) set("hub_cw_retention", "Retention: ∞");
-  else set("hub_cw_retention", `Retention: ${ret}d`);
 
   const authFields = document.getElementById("app_auth_fields");
   if (authFields) authFields.classList.remove("cw-disabled");
@@ -275,9 +189,16 @@ function cwUiSettingsHubInit() {
   const ids = [
     "ui_show_watchlist_preview",
     "ui_show_playingcard",
+    "ui_show_recent_activity",
+    "ui_show_recent_history_widget",
+    "ui_show_latest_ratings_widget",
+    "ui_show_recent_scrobble_widget",
+    "ui_recent_activity_display",
+    "ui_recent_syncs_display",
     "ui_show_AI",
     "ui_show_quick_add_desktop",
     "ui_show_quick_add_mobile",
+    "ui_theme",
     "ui_protocol",
     "app_auth_username",
     "app_auth_password",
@@ -696,8 +617,10 @@ try {
 const META_SETTINGS_TAB_KEY = "cw.ui.metadata.tab.v1";
 const META_PROVIDER_STATE_KEY = "cw.ui.meta.provider.v1";
 const TMDB_META_SUBTAB_KEY = "cw.ui.meta.tmdb.sub.v1";
+const ANIME_MAPPING_PROVIDER = "anime-mapping";
 
 let activeMetaProvider = null;
+let animeMappingBusy = false;
 
 function cwMetaProviderUpdateChips() {
   try { cwMetaSettingsHubUpdate?.(); } catch {}
@@ -706,25 +629,15 @@ function cwMetaProviderUpdateChips() {
 function cwMetaProviderSelect(provider, opts = {}) {
   const want = provider ? String(provider).toLowerCase() : null;
 
-  const tilesHost = document.getElementById("meta_provider_tiles");
   const panelHost = document.getElementById("meta-provider-panel");
-  if (!tilesHost || !panelHost) return;
-
-  const tiles = tilesHost.querySelectorAll("[data-provider]");
-  tiles.forEach((btn) => {
-    const k = String(btn.dataset.provider || "").toLowerCase();
-    const on = !!(want && k === want);
-    btn.classList.toggle("active", on);
-    btn.setAttribute("aria-selected", on ? "true" : "false");
-  });
+  if (!panelHost) return;
 
   activeMetaProvider = want;
-  panelHost.classList.toggle("hidden", !want);
+  panelHost.classList.remove("hidden");
 
   const panels = panelHost.querySelectorAll(".cw-meta-provider-panel");
   panels.forEach((p) => {
-    const k = String(p.dataset.provider || "").toLowerCase();
-    p.classList.toggle("active", !!(want && k === want));
+    p.classList.add("active");
   });
 
   if (opts.persist !== false) {
@@ -759,22 +672,12 @@ function cwMetaProviderInit() {
 }
 
 function cwMetaProviderEnsure() {
-  const tilesHost = document.getElementById("meta_provider_tiles");
   const panelHost = document.getElementById("meta-provider-panel");
-  if (!tilesHost || !panelHost) return;
-
-  tilesHost.querySelectorAll("[data-provider]").forEach((btn) => {
-    if (btn.__cwMetaWired) return;
-    btn.addEventListener("click", () => {
-      const want = String(btn.dataset.provider || "").toLowerCase();
-      if (want && activeMetaProvider === want) cwMetaProviderSelect(null);
-      else cwMetaProviderSelect(btn.dataset.provider || null);
-    });
-    btn.__cwMetaWired = true;
-  });
+  if (!panelHost) return;
 
   if (!panelHost.dataset.__cwMetaBuilt) {
     try { cwBuildTmdbPanel(); } catch {}
+    try { cwBuildAnimeMappingPanel(); } catch {}
     panelHost.dataset.__cwMetaBuilt = "1";
   }
 
@@ -788,6 +691,258 @@ function cwMetaProviderEnsure() {
 
   try { cwMetaProviderInit(); } catch {}
   try { cwMetaProviderUpdateChips(); } catch {}
+  try { cwAnimeMappingRefreshStatus(); } catch {}
+}
+
+function _cwSetText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = String(value ?? "");
+}
+
+function _cwSetChecked(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.checked = !!value;
+}
+
+function _cwFormatUtc(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "-";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+  return d.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+}
+
+function _cwAnimeMappingUseForLabel() {
+  const cfg = window._cfgCache || {};
+  const block = cfg.anime_mapping || {};
+  const raw = Array.isArray(block.use_for_pairs) ? block.use_for_pairs : ["anilist"];
+  const vals = raw.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean);
+  if (!vals.length || vals.includes("anilist")) return "AniList pairs";
+  return vals.map((x) => x.toUpperCase()).join(", ");
+}
+
+function _cwAnimeMappingSetBusy(on, label = "") {
+  animeMappingBusy = !!on;
+  ["anime_mapping_enabled", "anime_mapping_auto_update", "btn-anime-mapping-update", "btn-anime-mapping-rebuild"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !!on;
+  });
+  if (on) {
+    _cwSetText("anime_mapping_dataset", label || "Updating");
+  }
+}
+
+function cwAnimeMappingRenderStatus(st = {}) {
+  const cfg = window._cfgCache || {};
+  const block = cfg.anime_mapping || {};
+  const err = String(st.error || st.message || "").trim();
+  const installed = !!st.installed;
+  const ready = !!st.index_ready;
+  const enabled = st.enabled !== undefined ? !!st.enabled : !!block.enabled;
+  const autoUpdate = st.auto_update !== undefined ? !!st.auto_update : block.auto_update !== false;
+  const dataset = err ? "Error" : (animeMappingBusy ? "Updating" : (installed ? "Installed" : "Missing"));
+  const index = ready ? "Ready" : "Missing";
+
+  _cwSetChecked("anime_mapping_enabled", enabled);
+  _cwSetChecked("anime_mapping_auto_update", autoUpdate);
+  _cwSetText("anime_mapping_used_for", _cwAnimeMappingUseForLabel());
+  _cwSetText("anime_mapping_auto_update_state", autoUpdate ? "Daily" : "Manual");
+  _cwSetText("anime_mapping_dataset", dataset);
+  _cwSetText("anime_mapping_generated", _cwFormatUtc(st.dataset_generated_on));
+  _cwSetText("anime_mapping_index", index);
+  _cwSetText("anime_mapping_counts", installed ? `${Number(st.source_count || 0).toLocaleString()} sources | ${Number(st.edge_count || 0).toLocaleString()} edges` : "-");
+  _cwSetText("anime_mapping_error", err);
+
+  const dot = document.getElementById("anime-mapping-dot");
+  if (dot) {
+    dot.classList.toggle("on", !!(enabled && installed && ready && !err));
+    dot.classList.toggle("off", !!(!enabled || !installed || !ready || err));
+  }
+}
+
+async function cwAnimeMappingRefreshStatus() {
+  try {
+    const r = await fetch("/api/anime-mapping/status", { cache: "no-store", credentials: "same-origin" });
+    if (!r.ok) throw new Error(`GET /api/anime-mapping/status ${r.status}`);
+    const st = await r.json();
+    window.__animeMappingStatus = st || {};
+    cwAnimeMappingRenderStatus(st || {});
+    return st;
+  } catch (e) {
+    cwAnimeMappingRenderStatus({ error: e?.message || "Status failed" });
+    return null;
+  }
+}
+
+async function cwAnimeMappingSaveSettings() {
+  const enabled = !!document.getElementById("anime_mapping_enabled")?.checked;
+  const autoUpdate = !!document.getElementById("anime_mapping_auto_update")?.checked;
+  const st0 = window.__animeMappingStatus || {};
+  const needsBootstrap = enabled && !(st0.installed && st0.index_ready);
+  _cwAnimeMappingSetBusy(true, needsBootstrap ? "Downloading" : "Saving");
+  try {
+    const r = await fetch("/api/anime-mapping/settings", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled,
+        auto_update: autoUpdate,
+        provider: "anibridge",
+        use_for_pairs: ["anilist"],
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) throw new Error(data.message || data.error || `Settings failed (${r.status})`);
+    window._cfgCache ||= {};
+    window._cfgCache.anime_mapping = data.anime_mapping || {
+      ...(window._cfgCache.anime_mapping || {}),
+      enabled,
+      auto_update: autoUpdate,
+      provider: "anibridge",
+      use_for_pairs: ["anilist"],
+    };
+    if (data.status) window.__animeMappingStatus = data.status;
+    cwAnimeMappingRenderStatus(data.status || window.__animeMappingStatus || {});
+    if (data.bootstrap_error) throw new Error(data.bootstrap_error);
+    try { window.CW?.DOM?.showToast?.(needsBootstrap ? "Anime mapping enabled and downloaded" : "Anime ID Mapping saved", true); } catch {}
+  } catch (e) {
+    cwAnimeMappingRenderStatus({ ...(window.__animeMappingStatus || {}), error: e?.message || "Save failed" });
+    try { window.CW?.DOM?.showToast?.(e?.message || "Anime ID Mapping save failed", false); } catch {}
+  } finally {
+    _cwAnimeMappingSetBusy(false);
+    try { await cwAnimeMappingRefreshStatus(); } catch {}
+  }
+}
+
+async function cwAnimeMappingRun(action) {
+  const update = action === "update";
+  _cwAnimeMappingSetBusy(true, update ? "Updating" : "Rebuilding");
+  try {
+    const r = await fetch(update ? "/api/anime-mapping/update" : "/api/anime-mapping/rebuild-index", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update ? { force: false } : {}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) throw new Error(data.message || data.error || `${update ? "Update" : "Rebuild"} failed (${r.status})`);
+    cwAnimeMappingRenderStatus(data.status || data || {});
+    try { window.CW?.DOM?.showToast?.(update ? "Anime mapping updated" : "Anime mapping index rebuilt", true); } catch {}
+  } catch (e) {
+    cwAnimeMappingRenderStatus({ ...(window.__animeMappingStatus || {}), error: e?.message || "Action failed" });
+    try { window.CW?.DOM?.showToast?.(e?.message || "Anime mapping action failed", false); } catch {}
+  } finally {
+    _cwAnimeMappingSetBusy(false);
+    try { await cwAnimeMappingRefreshStatus(); } catch {}
+  }
+}
+
+function cwBuildAnimeMappingPanel() {
+  const panelHost = document.getElementById("meta-provider-panel");
+  if (!panelHost) return;
+  if (panelHost.querySelector(`.cw-meta-provider-panel[data-provider="${ANIME_MAPPING_PROVIDER}"]`)) return;
+
+  const wrap = document.createElement("div");
+  wrap.className = "section cw-settings-section cw-settings-provider-section cw-meta-provider-panel active";
+  wrap.id = "sec-meta-anime-mapping";
+  wrap.dataset.provider = ANIME_MAPPING_PROVIDER;
+  wrap.innerHTML = `
+    <div class="head" data-toggle-section="sec-meta-anime-mapping">
+      <span class="chev"></span>
+      <div class="cw-meta-provider-head-copy">
+        <strong>Anime ID Mapping</strong>
+        <span class="cw-meta-provider-help" title="Only needed for anime-specific providers such as AniList." aria-label="Only needed for anime-specific providers such as AniList.">
+          <span class="material-symbols-rounded cw-meta-provider-help-icon" aria-hidden="true">info</span>
+        </span>
+      </div>
+      <span class="auth-dot" id="anime-mapping-dot" aria-hidden="true"></span>
+    </div>
+    <div class="body">
+    <div class="cw-panel-head anime-mapping-head">
+      <div class="cw-panel-head-main">
+        <div class="cw-panel-title">Anime ID Mapping</div>
+        <div class="muted">Local anime ID index for AniList watchlist and ratings pairs.</div>
+      </div>
+      <label class="cx-toggle anime-mapping-toggle">
+        <input type="checkbox" id="anime_mapping_enabled">
+        <span class="cx-toggle-ui" aria-hidden="true"></span>
+        <span class="cx-toggle-text">Enable</span>
+        <span class="cx-toggle-state" aria-hidden="true"></span>
+      </label>
+    </div>
+    <div class="auth-card anime-mapping-card">
+      <div class="anime-mapping-summary">
+        <div>
+          <div class="muted">Used for</div>
+          <strong id="anime_mapping_used_for">AniList pairs</strong>
+        </div>
+        <div>
+          <div class="muted">Auto-update</div>
+          <label class="cx-toggle anime-mapping-inline-toggle">
+            <input type="checkbox" id="anime_mapping_auto_update">
+            <span class="cx-toggle-ui" aria-hidden="true"></span>
+            <span class="cx-toggle-text" id="anime_mapping_auto_update_state">Daily</span>
+            <span class="cx-toggle-state" aria-hidden="true"></span>
+          </label>
+        </div>
+      </div>
+      <div class="anime-mapping-status-grid">
+        <div class="anime-mapping-status">
+          <span>Dataset</span>
+          <strong id="anime_mapping_dataset">-</strong>
+        </div>
+        <div class="anime-mapping-status">
+          <span>Index</span>
+          <strong id="anime_mapping_index">-</strong>
+        </div>
+        <div class="anime-mapping-status">
+          <span>Generated</span>
+          <strong class="mono" id="anime_mapping_generated">-</strong>
+        </div>
+        <div class="anime-mapping-status">
+          <span>Size</span>
+          <strong id="anime_mapping_counts">-</strong>
+        </div>
+      </div>
+      <div class="anime-mapping-source">
+        Dataset source: <a href="https://github.com/anibridge/anibridge-mappings" target="_blank" rel="noopener noreferrer">anibridge/anibridge-mappings</a>. CrossWatch downloads the AniBridge mappings dataset to translate media identifiers between AniList and TMDB, TVDB, IMDb, MyAnimeList, and AniDB.
+      </div>
+      <div class="auth-card-notes" id="anime_mapping_error"></div>
+      <div class="cw-settings-inline-action anime-mapping-actions">
+        <button class="btn primary" type="button" id="btn-anime-mapping-update">Update now</button>
+        <button class="btn" type="button" id="btn-anime-mapping-rebuild">Rebuild index</button>
+      </div>
+    </div>
+    </div>
+  `;
+
+  panelHost.appendChild(wrap);
+
+  const enabled = document.getElementById("anime_mapping_enabled");
+  const autoUpdate = document.getElementById("anime_mapping_auto_update");
+  const btnUpdate = document.getElementById("btn-anime-mapping-update");
+  const btnRebuild = document.getElementById("btn-anime-mapping-rebuild");
+  if (enabled && !enabled.__cwAnimeWired) {
+    enabled.addEventListener("change", () => cwAnimeMappingSaveSettings());
+    enabled.__cwAnimeWired = true;
+  }
+  if (autoUpdate && !autoUpdate.__cwAnimeWired) {
+    autoUpdate.addEventListener("change", () => cwAnimeMappingSaveSettings());
+    autoUpdate.__cwAnimeWired = true;
+  }
+  if (btnUpdate && !btnUpdate.__cwAnimeWired) {
+    btnUpdate.addEventListener("click", () => cwAnimeMappingRun("update"));
+    btnUpdate.__cwAnimeWired = true;
+  }
+  if (btnRebuild && !btnRebuild.__cwAnimeWired) {
+    btnRebuild.addEventListener("click", () => cwAnimeMappingRun("rebuild"));
+    btnRebuild.__cwAnimeWired = true;
+  }
+
+  try { cwAnimeMappingRenderStatus(window.__animeMappingStatus || {}); } catch {}
 }
 
 function cwBuildTmdbPanel() {
@@ -797,8 +952,26 @@ function cwBuildTmdbPanel() {
   if (panelHost.querySelector('.cw-meta-provider-panel[data-provider="tmdb"]')) return;
 
   const wrap = document.createElement("div");
-  wrap.className = "cw-meta-provider-panel";
+  wrap.className = "section cw-settings-section cw-settings-provider-section cw-meta-provider-panel active";
+  wrap.id = "sec-meta-tmdb";
   wrap.dataset.provider = "tmdb";
+
+  const sectionHead = document.createElement("div");
+  sectionHead.className = "head";
+  sectionHead.dataset.toggleSection = "sec-meta-tmdb";
+  sectionHead.innerHTML = `
+    <span class="chev"></span>
+    <div class="cw-meta-provider-head-copy">
+      <strong>TMDb</strong>
+      <span class="cw-meta-provider-help" title="Highly recommended for matching, metadata and images." aria-label="Highly recommended for matching, metadata and images.">
+        <span class="material-symbols-rounded cw-meta-provider-help-icon" aria-hidden="true">info</span>
+      </span>
+    </div>
+    <span class="auth-dot" id="meta-tmdb-dot" aria-hidden="true"></span>
+  `;
+
+  const sectionBody = document.createElement("div");
+  sectionBody.className = "body";
 
   const head = document.createElement("div");
   head.className = "cw-panel-head";
@@ -863,7 +1036,36 @@ function cwBuildTmdbPanel() {
   apiField.innerHTML = `<div class="muted" style="margin-bottom:6px;">API key</div>`;
   apiField.appendChild(keyInput);
 
+  const checkRow = document.createElement("div");
+  checkRow.className = "inline";
+  checkRow.style.display = "flex";
+  checkRow.style.marginTop = "10px";
+  checkRow.style.gap = "10px";
+  checkRow.style.alignItems = "center";
+  checkRow.style.justifyContent = "flex-start";
+  checkRow.innerHTML = `
+    <button type="button" class="btn secondary" id="tmdb_check">Check</button>
+    <button type="button" class="btn danger" id="tmdb_delete">Delete</button>
+    <div id="tmdb_check_msg" class="msg ok hidden" aria-live="polite" style="margin-left:auto;width:auto;max-width:min(520px,60%);flex:0 1 auto;white-space:normal"></div>
+  `;
+  checkRow.querySelector("#tmdb_check")?.addEventListener("click", () => {
+    try { cwVerifyTmdbKey(); } catch {}
+  });
+  checkRow.querySelector("#tmdb_delete")?.addEventListener("click", () => {
+    try { cwDeleteTmdbKey(); } catch {}
+  });
+  keyInput.addEventListener("input", () => {
+    keyInput.dataset.verified = "";
+    const msg = document.getElementById("tmdb_check_msg");
+    if (msg) {
+      msg.textContent = "";
+      msg.classList.add("hidden");
+    }
+    try { cwMetaSettingsHubUpdate(); } catch {}
+  });
+
   apiFields.appendChild(apiField);
+  apiFields.appendChild(checkRow);
   apiCard.appendChild(hint);
   apiCard.appendChild(apiFields);
 
@@ -915,9 +1117,11 @@ function cwBuildTmdbPanel() {
   subPanels.appendChild(pApi);
   subPanels.appendChild(pAdv);
 
-  wrap.appendChild(head);
-  wrap.appendChild(subTiles);
-  wrap.appendChild(subPanels);
+  sectionBody.appendChild(head);
+  sectionBody.appendChild(subTiles);
+  sectionBody.appendChild(subPanels);
+  wrap.appendChild(sectionHead);
+  wrap.appendChild(sectionBody);
 
   panelHost.appendChild(wrap);
 
@@ -956,11 +1160,11 @@ function cwMetaSettingsSelect(tab, opts = {}) {
     try { localStorage.setItem(META_SETTINGS_TAB_KEY, want); } catch {}
   }
   try { cwMetaSettingsHubUpdate(); } catch {}
+  try { cwAnimeMappingRefreshStatus(); } catch {}
 }
 
 function cwMetaSettingsHubUpdate() {
   const chip = document.getElementById("hub_tmdb_key");
-  if (!chip) return;
 
   const cfg = window._cfgCache || {};
   const cfgKey = String(cfg?.tmdb?.api_key || "").trim();
@@ -981,7 +1185,20 @@ function cwMetaSettingsHubUpdate() {
   }
 
   const hasKeyNow = uiHasKey || (!uiTouched && cfgHasKey);
-  chip.textContent = `API key: ${hasKeyNow ? "set" : "missing"}`;
+  const verifyState = keyEl?.dataset?.verified || "";
+  const verified = hasKeyNow && verifyState === "1";
+  const failed = hasKeyNow && verifyState === "0";
+  if (chip) chip.textContent = `API key: ${verified ? "verified" : failed ? "check failed" : hasKeyNow ? "set" : "missing"}`;
+
+  const dot = document.getElementById("meta-tmdb-dot");
+  if (dot) {
+    dot.classList.toggle("on", hasKeyNow && !failed);
+    dot.title = verified ? "Verified" : failed ? "TMDb key check failed" : hasKeyNow ? "Configured; click Check to validate" : "Not configured";
+    dot.setAttribute("aria-label", dot.title);
+    dot.closest?.('.cw-meta-provider-panel[data-provider="tmdb"]')?.classList?.toggle("is-configured", hasKeyNow && !failed);
+  }
+
+  try { window.syncMetadataProviderDot?.(); } catch {}
 }
 
 function cwMetaSettingsHubInit() {
@@ -1111,7 +1328,7 @@ async function loadConfig() {
     _setSelectValue("debug", mode);
   })();
   _setVal("metadata_locale", cfg.metadata?.locale || "");
-  _setVal("metadata_ttl_hours", String(Number.isFinite(cfg.metadata?.ttl_hours) ? cfg.metadata.ttl_hours : 72));
+  _setVal("metadata_ttl_hours", String(Number.isFinite(cfg.metadata?.ttl_hours) ? cfg.metadata.ttl_hours : 720));
 
   
   (function () {
@@ -1132,6 +1349,57 @@ async function loadConfig() {
         ? !!ui.show_playingcard
         : true;
       _setSelectValue("ui_show_playingcard", on ? "true" : "false");
+    }
+
+    {
+      const on = (typeof ui.show_recent_activity === "boolean")
+        ? !!ui.show_recent_activity
+        : true;
+      _setSelectValue("ui_show_recent_activity", on ? "true" : "false");
+    }
+
+    {
+      const on = (typeof ui.show_recent_history_widget === "boolean")
+        ? !!ui.show_recent_history_widget
+        : true;
+      _setSelectValue("ui_show_recent_history_widget", on ? "true" : "false");
+    }
+
+    {
+      const on = (typeof ui.show_latest_ratings_widget === "boolean")
+        ? !!ui.show_latest_ratings_widget
+        : true;
+      _setSelectValue("ui_show_latest_ratings_widget", on ? "true" : "false");
+    }
+
+    {
+      const on = (typeof ui.show_recent_scrobble_widget === "boolean")
+        ? !!ui.show_recent_scrobble_widget
+        : true;
+      _setSelectValue("ui_show_recent_scrobble_widget", on ? "true" : "false");
+    }
+
+    const normalizeDisplay = (value, fallbackLimit) => {
+      const raw = String(value || "").trim().toLowerCase();
+      const allowed = new Set(["count:3", "count:4", "count:5", "hours:24", "hours:48", "hours:72"]);
+      if (allowed.has(raw)) return raw;
+      const limit = Math.max(3, Math.min(5, Number.isFinite(fallbackLimit) ? Number(fallbackLimit) : 3));
+      return `count:${limit}`;
+    };
+
+    _setSelectValue("ui_recent_activity_display", normalizeDisplay(ui.recent_activity_display, Number(ui.recent_activity_limit)));
+    _setSelectValue("ui_recent_syncs_display", normalizeDisplay(ui.recent_syncs_display, Number(ui.recent_syncs_limit)));
+
+    {
+      const theme = String(ui.theme || "flat-dark").trim().toLowerCase();
+      let storedTheme = "";
+      try {
+        const raw = localStorage.getItem("cw.ui.theme");
+        if (raw === "flat-light" || raw === "flat-dark" || raw === "original") storedTheme = raw;
+      } catch {}
+      const normalizedTheme = storedTheme || ((theme === "flat-light" || theme === "original") ? theme : "flat-dark");
+      _setSelectValue("ui_theme", normalizedTheme);
+      try { window.CWTheme?.apply?.(normalizedTheme, { persist: true }); } catch {}
     }
 
     {
@@ -1232,29 +1500,26 @@ async function loadConfig() {
   };
 
   
-  setRaw("plex_token",    val(cfg.plex?.account_token));
   setRaw("plex_home_pin", val(cfg.plex?.home_pin));
 
   
   setRaw("simkl_client_id",     val(cfg.simkl?.client_id));
   setRaw("simkl_client_secret", val(cfg.simkl?.client_secret));
-  setRaw("simkl_access_token",  val(cfg.simkl?.access_token) || val(cfg.auth?.simkl?.access_token));
 
   
   setRaw("anilist_client_id",     val(cfg.anilist?.client_id));
   setRaw("anilist_client_secret", val(cfg.anilist?.client_secret));
-  setRaw("anilist_access_token",  val(cfg.anilist?.access_token) || val(cfg.auth?.anilist?.access_token));
 
   
   setRaw("tmdb_api_key",        val(cfg.tmdb?.api_key));
 
   
   setRaw("mdblist_key",         val(cfg.mdblist?.api_key));
+  setRaw("publicmetadb_key",    val(cfg.publicmetadb?.api_key));
 
   
   setRaw("trakt_client_id",     val(cfg.trakt?.client_id));
   setRaw("trakt_client_secret", val(cfg.trakt?.client_secret));
-  setRaw("trakt_token",         val(cfg.trakt?.access_token) || val(cfg.auth?.trakt?.access_token));
 })(cfg);
 
   try { cwMetaSettingsHubUpdate(); } catch {}
@@ -1303,6 +1568,7 @@ async function loadConfig() {
     cwRenderOtherSessions(st);
   } catch {}
 
+  try { await cwMobileDevicesRefresh(); } catch {}
   try { await cwAppAuthPlexRefreshStatus(); } catch {}
   try { cwUiSettingsHubUpdate?.(); } catch {}
 
@@ -1373,6 +1639,190 @@ function cwRenderOtherSessions(st) {
   if (btn) btn.disabled = !(st && st.authenticated && count > 0);
 }
 
+function cwMobileDateLabel(seconds) {
+  const n = Number(seconds || 0);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  try {
+    return new Date(n * 1000).toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+async function cwMobileJson(url, options = {}) {
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...options,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
+  }
+  return data;
+}
+
+function cwMobileSetStatus(text, warn = false) {
+  const el = document.getElementById("mobile_auth_state");
+  if (!el) return;
+  el.textContent = String(text || "");
+  el.classList.toggle("warn", !!warn);
+}
+
+function cwMobileRenderDevices(devices) {
+  const list = document.getElementById("mobile_devices_list");
+  const count = Array.isArray(devices) ? devices.length : 0;
+  cwMobileSetStatus(`${count} paired ${count === 1 ? "device" : "devices"}`);
+  if (!list) return;
+  list.textContent = "";
+
+  if (!count) {
+    const empty = document.createElement("div");
+    empty.className = "sub";
+    empty.textContent = "No paired companion devices.";
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const device of devices) {
+    const id = String(device?.id || "");
+    const name = String(device?.name || "Android device");
+    const scopes = Array.isArray(device?.scopes) ? device.scopes.join(", ") : "read";
+    const seen = cwMobileDateLabel(device?.last_seen_at);
+    const row = document.createElement("div");
+    row.className = "cw-mobile-device-row";
+    row.dataset.mobileDeviceId = id;
+
+    const meta = document.createElement("div");
+    meta.className = "cw-mobile-device-meta";
+    const title = document.createElement("strong");
+    title.textContent = name;
+    const detail = document.createElement("div");
+    detail.className = "sub";
+    detail.textContent = `${scopes || "read"}${seen ? ` | seen ${seen}` : ""}`;
+    meta.append(title, detail);
+
+    const revoke = document.createElement("button");
+    revoke.className = "btn";
+    revoke.type = "button";
+    revoke.textContent = "Revoke";
+    revoke.disabled = !id;
+    revoke.addEventListener("click", () => cwMobileRevokeDevice(id, name));
+
+    row.append(meta, revoke);
+    list.appendChild(row);
+  }
+}
+
+async function cwMobileDevicesRefresh() {
+  try {
+    const data = await cwMobileJson("/api/mobile/devices");
+    const devices = Array.isArray(data?.devices) ? data.devices : [];
+    cwMobileRenderDevices(devices);
+    return devices;
+  } catch (err) {
+    cwMobileSetStatus(String(err?.message || err || "Could not load companion devices."), true);
+    return [];
+  }
+}
+
+function cwMobilePairingPollUntil(expiresAt) {
+  try { clearInterval(window.__cwMobilePairingPoll); } catch {}
+  const stopAt = Number(expiresAt || 0);
+  if (!Number.isFinite(stopAt) || stopAt <= 0) return;
+  window.__cwMobilePairingPoll = setInterval(async () => {
+    if (Date.now() / 1000 > stopAt) {
+      clearInterval(window.__cwMobilePairingPoll);
+      return;
+    }
+    try { await cwMobileDevicesRefresh(); } catch {}
+  }, 5000);
+}
+
+async function cwMobilePairingStart() {
+  const btn = document.getElementById("btn-mobile-pairing-start");
+  const box = document.getElementById("mobile_pairing_box");
+  const qr = document.getElementById("mobile_pairing_qr");
+  const code = document.getElementById("mobile_pairing_code");
+  const uri = document.getElementById("mobile_pairing_uri");
+  const expiry = document.getElementById("mobile_pairing_expiry");
+  const previous = btn?.textContent || "Add device";
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Creating...";
+    }
+    const data = await cwMobileJson("/api/mobile/pairing/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device_name: "CrossWatch companion",
+        server_url: window.location?.origin || "",
+        scopes: ["read", "actions", "diagnostics", "safe-config"],
+      }),
+    });
+    if (box) box.classList.remove("hidden");
+    if (code) code.textContent = String(data?.code || "");
+    if (uri) uri.value = String(data?.pairing_uri || "");
+    if (expiry) {
+      const until = cwMobileDateLabel(data?.expires_at);
+      expiry.textContent = until ? `Expires ${until}` : "";
+    }
+    if (qr) {
+      qr.textContent = "";
+      const img = document.createElement("img");
+      img.alt = "Companion pairing QR code";
+      img.addEventListener("error", () => {
+        qr.textContent = "";
+        const msg = document.createElement("div");
+        msg.className = "sub";
+        msg.style.color = "#1f2937";
+        msg.style.textAlign = "center";
+        msg.textContent = "QR generator missing. Install requirements and restart CrossWatch.";
+        qr.appendChild(msg);
+        cwMobileSetStatus("QR image could not be loaded. Use the code or URI for now.", true);
+      });
+      img.src = `/api/mobile/pairing/${encodeURIComponent(String(data?.id || ""))}/qr.svg?t=${Date.now()}`;
+      qr.appendChild(img);
+    }
+    cwMobileSetStatus("Pairing code ready");
+    cwMobilePairingPollUntil(data?.expires_at);
+    try { await cwMobileDevicesRefresh(); } catch {}
+  } catch (err) {
+    cwMobileSetStatus(String(err?.message || err || "Could not create pairing code."), true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = previous;
+    }
+  }
+}
+
+async function cwMobileRevokeDevice(id, name = "") {
+  const deviceId = String(id || "");
+  if (!deviceId) return false;
+  if (!confirm(`Revoke ${name || "this companion device"}?`)) return false;
+  const row = Array.from(document.querySelectorAll(".cw-mobile-device-row"))
+    .find((el) => String(el?.dataset?.mobileDeviceId || "") === deviceId);
+  const btn = row?.querySelector("button");
+  try {
+    if (btn) btn.disabled = true;
+    await cwMobileJson(`/api/mobile/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+    await cwMobileDevicesRefresh();
+    return true;
+  } catch (err) {
+    cwMobileSetStatus(String(err?.message || err || "Could not revoke companion device."), true);
+    if (btn) btn.disabled = false;
+    return false;
+  }
+}
+
 async function cwRefreshAppAuthStatus() {
   const r = await fetch("/api/app-auth/status", { cache: "no-store", credentials: "same-origin" });
   const st = r.ok ? await r.json() : null;
@@ -1401,6 +1851,7 @@ async function cwRefreshAppAuthStatus() {
   const btn = document.getElementById("btn-auth-logout");
   if (btn) btn.disabled = !(st && st.authenticated);
   cwRenderOtherSessions(st);
+  try { await cwMobileDevicesRefresh(); } catch {}
 }
 
 window.cwAppLogout = async function cwAppLogout() {
@@ -1456,6 +1907,101 @@ async function updateTmdbHint() {
   }
 }
 
+function cwReadTmdbKeyForVerify() {
+  const input = document.getElementById("tmdb_api_key");
+  const value = String(input?.value || "").trim();
+  const masked = !!value && (input?.dataset?.masked === "1" || value === "********" || /^[*•]+$/.test(value));
+  if (masked) return { has: true, value: "********" };
+  return { has: !!value, value };
+}
+
+function cwSetTmdbCheckMessage(ok, text) {
+  const msg = document.getElementById("tmdb_check_msg");
+  if (!msg) return;
+  msg.textContent = String(text || "");
+  msg.classList.toggle("hidden", !msg.textContent);
+  msg.classList.toggle("warn", !!msg.textContent && !ok);
+  msg.classList.toggle("ok", !!msg.textContent && !!ok);
+}
+
+async function cwVerifyTmdbKey() {
+  const input = document.getElementById("tmdb_api_key");
+  const btn = document.getElementById("tmdb_check");
+  const state = cwReadTmdbKeyForVerify();
+  if (!state.has) {
+    if (input) input.dataset.verified = "0";
+    cwSetTmdbCheckMessage(false, "Missing API key");
+    try { cwMetaSettingsHubUpdate(); } catch {}
+    return false;
+  }
+  try {
+    if (btn) btn.disabled = true;
+    cwSetTmdbCheckMessage(true, "Checking...");
+    const r = await fetch("/api/tmdb/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ api_key: state.value }),
+    });
+    const data = await r.json().catch(() => ({}));
+    const ok = !!(r.ok && data && data.valid !== false && data.ok !== false);
+    if (input) input.dataset.verified = ok ? "1" : "0";
+    cwSetTmdbCheckMessage(ok, ok ? "Connected" : (data?.error || "TMDb key check failed."));
+    try { cwMetaSettingsHubUpdate(); } catch {}
+    return ok;
+  } catch {
+    if (input) input.dataset.verified = "0";
+    cwSetTmdbCheckMessage(false, "TMDb key check failed.");
+    try { cwMetaSettingsHubUpdate(); } catch {}
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function cwDeleteTmdbKey() {
+  const input = document.getElementById("tmdb_api_key");
+  const btn = document.getElementById("tmdb_delete");
+  const checkBtn = document.getElementById("tmdb_check");
+  try {
+    if (btn) btn.disabled = true;
+    if (checkBtn) checkBtn.disabled = true;
+    cwSetTmdbCheckMessage(true, "Deleting...");
+    const r = await fetch("/api/tmdb/disconnect", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data?.ok === false) throw new Error(data?.error || "disconnect_failed");
+    if (input) {
+      input.value = "";
+      input.dataset.masked = "0";
+      input.dataset.loaded = "1";
+      input.dataset.touched = "";
+      input.dataset.clear = "";
+      input.dataset.verified = "0";
+    }
+    try {
+      const cfg = window._cfgCache;
+      if (cfg?.tmdb && typeof cfg.tmdb === "object") cfg.tmdb.api_key = "";
+    } catch {}
+    try { window.CW?.Cache?.invalidate?.("config"); } catch {}
+    try { window.invalidateConfigCache?.(); } catch {}
+    try { window.manualRefreshStatus?.(); } catch {}
+    try { updateTmdbHint(); } catch {}
+    try { cwMetaSettingsHubUpdate(); } catch {}
+    cwSetTmdbCheckMessage(true, "Deleted");
+    return true;
+  } catch {
+    cwSetTmdbCheckMessage(false, "TMDb key delete failed.");
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+    if (checkBtn) checkBtn.disabled = false;
+  }
+}
+
 function setTraktSuccess(show) {
   const el = document.getElementById("trakt_msg");
   if (el) el.classList.toggle("hidden", !show);
@@ -1478,11 +2024,20 @@ function setTraktSuccess(show) {
     cwMetaProviderSubSelect,
     cwMetaProviderInit,
     cwMetaProviderEnsure,
+    cwBuildAnimeMappingPanel,
+    cwAnimeMappingRenderStatus,
+    cwAnimeMappingRefreshStatus,
+    cwAnimeMappingSaveSettings,
+    cwAnimeMappingRun,
     cwBuildTmdbPanel,
+    cwDeleteTmdbKey,
     cwMetaSettingsSelect,
     cwMetaSettingsHubUpdate,
     cwMetaSettingsHubInit,
     cwMetaSettingsHubEnsure,
+    cwMobileDevicesRefresh,
+    cwMobilePairingStart,
+    cwMobileRevokeDevice,
     loadConfig,
     updateTmdbHint,
     setTraktSuccess,

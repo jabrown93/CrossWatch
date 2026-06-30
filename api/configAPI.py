@@ -11,8 +11,12 @@ from datetime import datetime, timezone
 
 from packaging.version import InvalidVersion, Version
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
+from providers.scrobble.sources import source_enabled
+from _logging import log as BASE_LOG
+
+BACKUP_LOG = BASE_LOG.child("BACKUP")
 
 def _env() -> dict[str, Any]:
     try:
@@ -57,7 +61,51 @@ def _nostore(res: JSONResponse) -> JSONResponse:
 
 router = APIRouter(prefix="/api", tags=["config"])
 
+_LAST_SCROBBLE_SOURCE_LOG: tuple[bool, bool, bool] | None = None
+
+
+def _log_scrobble_source_state(env: dict[str, Any], cfg: dict[str, Any]) -> None:
+    global _LAST_SCROBBLE_SOURCE_LOG
+    try:
+        sc = cfg.get("scrobble") if isinstance(cfg.get("scrobble"), dict) else {}
+        enabled = bool((sc or {}).get("enabled"))
+        webhook = source_enabled(cfg, "webhook")
+        watcher = source_enabled(cfg, "watcher")
+        state = (enabled, webhook, watcher)
+        if state == _LAST_SCROBBLE_SOURCE_LOG:
+            return
+        _LAST_SCROBBLE_SOURCE_LOG = state
+
+        cw = env.get("CW")
+        logger_cls = getattr(cw, "_UIHostLogger", None) if cw is not None else None
+        base_log = getattr(cw, "LOG", None) if cw is not None else None
+        def emit(message: str, level: str = "INFO", module: str = "SCROBBLE") -> None:
+            if callable(base_log):
+                base_log(message, level=level, module=module)
+                return
+            logger = logger_cls(module, module) if callable(logger_cls) else None
+            if callable(logger):
+                logger(message, level=level)
+
+        if webhook:
+            emit("Webhook listening; endpoints ready for Plex/Jellyfin/Emby events", module="WEBHOOK")
+        if watcher:
+            emit("Watcher source enabled", module="WATCH")
+        if webhook and watcher:
+            emit(
+                "WARNING: both Webhook and Watcher are enabled; duplicate events are possible if the same server sends both",
+                level="WARN",
+                module="SCROBBLE",
+            )
+        if not webhook and not watcher:
+            emit("Scrobble sources disabled")
+    except Exception:
+        pass
+
+
 def _after_config_save(env: dict[str, Any], cfg: dict[str, Any]) -> None:
+    _log_scrobble_source_state(env, cfg)
+
     try:
         pc = env["probes_cache"]; ps = env["probes_status_cache"]
         if isinstance(pc, dict):
@@ -99,6 +147,14 @@ def _safe_ver(v: str | None) -> Version:
         return Version("0.0.0")
 
 
+def _pre_upgrade_backup_label(cfg: dict[str, Any]) -> str:
+    ui = cfg.get("ui") if isinstance(cfg.get("ui"), dict) else {}
+    pending = _norm_ver((ui or {}).get("_pending_upgrade_from_version")) if isinstance(ui, dict) else ""
+    stored = _norm_ver(cfg.get("version"))
+    version = pending or stored or "unknown"
+    return f"pre-upgrade version {version}"
+
+
 def _set_cfg_version_current(env: dict[str, Any], cfg: dict[str, Any]) -> None:
     try:
         base = env.get("cfg_base")
@@ -119,7 +175,7 @@ def _set_cfg_version_current(env: dict[str, Any], cfg: dict[str, Any]) -> None:
 
 
 @router.get("/config/meta")
-def api_config_meta() -> JSONResponse:
+def api_config_meta(request: Request) -> JSONResponse:
     env = _env()
     base = env.get("cfg_base")
     try:
@@ -205,8 +261,9 @@ def api_config_meta() -> JSONResponse:
         needs_upgrade = False
         is_legacy_pre_070 = False
 
+    auth_setup_required = bool(auth_reset_required or not auth_configured)
     auth_reset_deferred_to_upgrade = bool(needs_upgrade and auth_reset_required)
-    setup_wizard_required = bool(auth_reset_required and not needs_upgrade)
+    setup_wizard_required = bool(auth_setup_required and not needs_upgrade)
 
     mtime = None
     size = None
@@ -218,28 +275,41 @@ def api_config_meta() -> JSONResponse:
         except Exception:
             pass
 
-    return _nostore(
-        JSONResponse(
+    authenticated = False
+    try:
+        from . import appAuthAPI as app_auth
+
+        token = request.cookies.get(app_auth.COOKIE_NAME)
+        authenticated = app_auth.auth_required(raw) and app_auth.is_authenticated(raw, token)
+    except Exception:
+        authenticated = False
+
+    payload = {
+        "exists": exists,
+        "first_run": first_run,
+        "autogen": autogen,
+        "auth_configured": auth_configured,
+        "auth_setup_required": auth_setup_required,
+        "auth_reset_required": auth_reset_required,
+        "auth_reset_deferred_to_upgrade": auth_reset_deferred_to_upgrade,
+        "setup_wizard_required": setup_wizard_required,
+        "current_version": cur_ver,
+        "config_version": effective_cfg_ver,
+        "stored_config_version": cfg_ver,
+        "pending_upgrade_from_version": pending_upgrade_from_ver,
+        "needs_upgrade": needs_upgrade,
+        "legacy_pre_070": is_legacy_pre_070,
+    }
+    if authenticated:
+        payload.update(
             {
-                "exists": exists,
-                "first_run": first_run,
-                "autogen": autogen,
-                "auth_configured": auth_configured,
-                "auth_reset_required": auth_reset_required,
-                "auth_reset_deferred_to_upgrade": auth_reset_deferred_to_upgrade,
-                "setup_wizard_required": setup_wizard_required,
                 "path": str(p) if p is not None else None,
                 "size": size,
                 "mtime": mtime,
-                "current_version": cur_ver,
-                "config_version": effective_cfg_ver,
-                "stored_config_version": cfg_ver,
-                "pending_upgrade_from_version": pending_upgrade_from_ver,
-                "needs_upgrade": needs_upgrade,
-                "legacy_pre_070": is_legacy_pre_070,
             }
         )
-    )
+
+    return _nostore(JSONResponse(payload))
 
 @router.get("/config")
 def api_config() -> JSONResponse:
@@ -396,7 +466,7 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     features = cfg.setdefault("features", {})
     watch_feat = features.setdefault("watch", {})
-    watch_feat["enabled"] = bool(sc_enabled and mode == "watch" and sc.get("watch", {}).get("autostart", False))
+    watch_feat["enabled"] = bool(source_enabled(cfg, "watcher") and sc.get("watch", {}).get("autostart", False))
 
     try:
         env["prune"](cfg)
@@ -434,12 +504,29 @@ def api_config_migrate() -> dict[str, Any]:
     forced_paths: list[str] = []
 
     try:
-        backup = getattr(base, "backup_config_file", None)
-        if callable(backup):
-            backup_result = backup()
-            if backup_result is not None:
-                backup_path = str(backup_result)
+        try:
+            if not hasattr(base, "config_path"):
+                raise RuntimeError("config backend has no file path")
+            from services.backups import create_backup
+
+            backup_label = _pre_upgrade_backup_label(current)
+            BACKUP_LOG.info(f"creating {backup_label} backup")
+            backup_result = create_backup(scope="config_only", label=backup_label, trigger="upgrade")
+            backup_path = str(backup_result.get("path") or "")
+            BACKUP_LOG.success(f"pre-upgrade backup created path={backup_path or 'backup created'}")
+        except Exception as e:
+            BACKUP_LOG.debug(f"pre-upgrade backup service unavailable: {type(e).__name__}")
+            backup = getattr(base, "backup_config_file", None)
+            if callable(backup):
+                BACKUP_LOG.debug("pre-upgrade backup falling back to legacy config backup")
+                legacy_backup = backup()
+                if legacy_backup is not None:
+                    backup_path = str(legacy_backup)
+                    BACKUP_LOG.success("legacy pre-upgrade config backup created")
+            if not backup_path:
+                BACKUP_LOG.warn("pre-upgrade backup was not created")
     except Exception:
+        BACKUP_LOG.error("pre-upgrade backup failed")
         return {"ok": False, "error": "config_backup_failed"}
 
     cfg: dict[str, Any] = dict(current or {})
@@ -472,7 +559,7 @@ def api_config_migrate() -> dict[str, Any]:
 
     features = cfg.setdefault("features", {})
     watch_feat = features.setdefault("watch", {})
-    watch_feat["enabled"] = bool(sc_enabled and mode == "watch" and sc.get("watch", {}).get("autostart", False))
+    watch_feat["enabled"] = bool(source_enabled(cfg, "watcher") and sc.get("watch", {}).get("autostart", False))
 
     try:
         env["prune"](cfg)

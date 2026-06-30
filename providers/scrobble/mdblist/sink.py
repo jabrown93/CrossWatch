@@ -13,6 +13,7 @@ import requests
 
 from cw_platform.config_base import load_config
 from cw_platform.provider_instances import normalize_instance_id
+from services.activity import record_scrobble_event
 
 try:
     from _logging import log as BASE_LOG
@@ -53,6 +54,12 @@ def _cfg() -> dict[str, Any]:
         return load_config()
     except Exception:
         return {}
+
+
+def _provider_auth():
+    from providers.auth import runtime as provider_auth
+
+    return provider_auth
 
 
 def _is_debug() -> bool:
@@ -485,6 +492,12 @@ class MDBListSink(ScrobbleSink):
         self._last_intent_prog: dict[str, int] = {}
         self._warn_no_key = False
 
+    def _route_source(self, cfg: dict[str, Any]) -> tuple[str, str]:
+        watch = ((cfg.get("scrobble") or {}).get("watch") or {}) if isinstance(cfg, dict) else {}
+        source = str(watch.get("route_provider") or watch.get("provider") or "watcher").strip().lower() or "watcher"
+        source_instance = str(watch.get("route_provider_instance") or watch.get("provider_instance") or "default").strip() or "default"
+        return source, source_instance
+
     def _mkey(self, ev: Any) -> str:
         ids = getattr(ev, "ids", {}) or {}
         parts: list[str] = []
@@ -532,12 +545,19 @@ class MDBListSink(ScrobbleSink):
 
     def _post(self, path: str, body: dict[str, Any], api_key: str, cfg: dict[str, Any]) -> requests.Response:
         headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": APP_AGENT}
-        return requests.post(
+        session = requests.Session()
+        return _provider_auth().request_with_auth(
+            "mdblist",
+            session,
+            "POST",
             f"{MDBLIST_API}{path}",
+            cfg=cfg,
+            instance_id=self._instance_id,
             headers=headers,
             params={"apikey": api_key},
             json=body,
             timeout=_timeout(cfg),
+            max_retries=1,
         )
 
     def _send_http(self, path: str, body: dict[str, Any], api_key: str, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -600,9 +620,9 @@ class MDBListSink(ScrobbleSink):
         m = cfg.get("mdblist") or {}
         api_key = str(m.get("api_key") or "").strip()
 
-        if not api_key:
+        if not _provider_auth().is_configured("mdblist", m):
             if not self._warn_no_key:
-                _log("Missing mdblist.api_key in config.json — skipping scrobble", "ERROR")
+                _log("Missing MDBList authentication in config.json - skipping scrobble", "ERROR")
                 self._warn_no_key = True
             return
 
@@ -756,4 +776,16 @@ class MDBListSink(ScrobbleSink):
                 pass
 
         if sent_ok and action == "stop" and int(p_send) >= comp_thr:
+            src, src_inst = self._route_source(cfg)
+            try:
+                record_scrobble_event(
+                    ev,
+                    source=src,
+                    source_instance=src_inst,
+                    target="mdblist",
+                    target_instance=self._instance_id,
+                    progress=p_send,
+                )
+            except Exception:
+                pass
             _auto_remove_across(ev, cfg, scope=f"mdblist:{self._instance_id}")

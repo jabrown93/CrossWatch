@@ -7,11 +7,16 @@ from .configAPI import router as config_router
 from .healthAPI import router as health_router
 from .tlsAPI import router as tls_router
 from .maintenanceAPI import router as maintenance_router
+from .activityAPI import router as activity_router
+from .dashboardAPI import router as dashboard_router
+from .mobileAPI import router as mobile_router
 from .metaAPI import router as meta_router
+from .animeMappingAPI import router as anime_mapping_router
 from .manualAPI import router as manual_router
 from .insightAPI import register_insights
 from .watchlistAPI import router as watchlist_router
 from .snapshotsAPI import router as snapshots_router
+from .backupsAPI import router as backups_router
 from .schedulingAPI import router as scheduling_router
 from .probesAPI import (
     register_probes,
@@ -24,6 +29,7 @@ from .wallAPI import register_wall
 from .versionAPI import router as version_router
 from .editorAPI import router as editor_router
 from .providerInstancesAPI import router as provider_instances_router
+from .playbackProgressAPI import router as playback_progress_router
 from .syncAPI import (
     router as sync_router,
     _is_sync_running,
@@ -39,10 +45,15 @@ __all__ = [
     "health_router",
     "tls_router",
     "maintenance_router",
+    "activity_router",
+    "dashboard_router",
+    "mobile_router",
     "meta_router",
+    "anime_mapping_router",
     "manual_router",
     "watchlist_router",
     "snapshots_router",
+    "backups_router",
     "scheduling_router",
     "scrobble_router",
     "sync_router",
@@ -51,6 +62,7 @@ __all__ = [
     "export_router",
     "editor_router",
     "provider_instances_router",
+    "playback_progress_router",
     "register_probes",
     "register_insights",
     "register_wall",
@@ -73,10 +85,15 @@ def register(
     app.include_router(health_router)
     app.include_router(tls_router)
     app.include_router(meta_router)
+    app.include_router(anime_mapping_router)
     app.include_router(manual_router)
     app.include_router(watchlist_router)
     app.include_router(snapshots_router)
+    app.include_router(backups_router)
     app.include_router(maintenance_router)
+    app.include_router(activity_router)
+    app.include_router(dashboard_router)
+    app.include_router(mobile_router)
     app.include_router(scheduling_router)
     app.include_router(scrobble_router)
     app.include_router(sync_router)
@@ -85,6 +102,7 @@ def register(
     app.include_router(export_router)
     app.include_router(editor_router)
     app.include_router(provider_instances_router)
+    app.include_router(playback_progress_router)
 
     register_probes(app, load_config)
     register_insights(app)

@@ -5,9 +5,9 @@
 
 const _cwJSONHeaders = { "Content-Type": "application/json" };
 const _cwSecretIds = [
-  "plex_token", "plex_home_pin", "simkl_client_id", "simkl_client_secret",
+  "plex_home_pin", "simkl_client_id", "simkl_client_secret",
   "trakt_client_id", "trakt_client_secret", "anilist_client_id", "anilist_client_secret",
-  "tmdb_api_key", "mdblist_key"
+  "tmdb_api_key", "tmdb_sync_api_key", "tmdb_sync_session_id", "mdblist_key", "publicmetadb_key", "tautulli_key"
 ];
 
 function _cwEl(id) { return document.getElementById(id); }
@@ -290,6 +290,84 @@ function _cwReadSecret(id, previousValue) {
   return raw !== previousValue ? { changed: true, set: raw } : { changed: false };
 }
 
+function _cwProviderAuthError(provider, code) {
+  const key = _cwNorm(code);
+  if (provider === "tautulli") {
+    if (key === "server_url_required") return "Enter Tautulli server URL";
+    if (key === "api_key_required") return "Enter your Tautulli API key";
+    if (key === "invalid_api_key") return "Invalid Tautulli API key";
+    if (key === "validation_timeout") return "Tautulli validation timed out";
+    if (key === "validation_failed") return "Could not connect to Tautulli";
+    if (key === "validation_bad_response") return "Tautulli validation returned an unexpected response";
+    if (key.startsWith("validation_http_")) return "Tautulli validation failed";
+    return "Saving Tautulli failed";
+  }
+  if (provider === "publicmetadb") {
+    if (key === "api_key_required") return "Enter your PublicMetaDB API key";
+    if (key === "invalid_api_key") return "Invalid PublicMetaDB API key";
+    if (key === "validation_timeout") return "PublicMetaDB validation timed out";
+    if (key === "validation_failed") return "Could not validate PublicMetaDB API key";
+    if (key === "validation_bad_response") return "PublicMetaDB validation returned an unexpected response";
+    if (key.startsWith("validation_http_")) return "PublicMetaDB validation failed";
+    return "Saving PublicMetaDB key failed";
+  }
+  return "Provider authentication failed";
+}
+
+async function _cwValidateProviderSecret(provider, inst, change) {
+  if (provider !== "publicmetadb" || !change?.changed || !change?.set) return;
+  const url = `/api/publicmetadb/save?instance=${encodeURIComponent(_cwNormInst(inst))}`;
+  const resp = await _cwRequest(url, {
+    method: "POST",
+    headers: _cwJSONHeaders,
+    body: JSON.stringify({ api_key: change.set })
+  }, 15000);
+  const body = await _cwReadBody(resp);
+  if (!resp?.ok || body?.ok === false) {
+    _cwAbortSave(_cwProviderAuthError(provider, body?.error || `http_${resp?.status || 0}`));
+  }
+}
+
+async function _cwValidateTmdbSecret(change) {
+  if (!change?.changed || !change?.set) return;
+  const resp = await _cwRequest("/api/tmdb/save", {
+    method: "POST",
+    headers: _cwJSONHeaders,
+    body: JSON.stringify({ api_key: change.set })
+  }, 15000);
+  const body = await _cwReadBody(resp);
+  if (!resp?.ok || body?.ok === false) {
+    _cwAbortSave(body?.error || body?.detail || `TMDb key check failed (${resp?.status || 0})`);
+  }
+  try {
+    const input = _cwEl("tmdb_api_key");
+    if (input) input.dataset.verified = "1";
+    const msg = _cwEl("tmdb_check_msg");
+    if (msg) {
+      msg.textContent = "Connected";
+      msg.classList.remove("hidden", "warn");
+      msg.classList.add("ok");
+    }
+    window.cwMetaSettingsHubUpdate?.();
+  } catch {}
+}
+
+async function _cwValidateTautulliSecret(inst, payload) {
+  const server = _cwNorm(payload?.server_url);
+  const apiKey = _cwNorm(payload?.api_key);
+  if (!server && !apiKey) return;
+  const url = `/api/tautulli/save?instance=${encodeURIComponent(_cwNormInst(inst))}`;
+  const resp = await _cwRequest(url, {
+    method: "POST",
+    headers: _cwJSONHeaders,
+    body: JSON.stringify(payload || {})
+  }, 15000);
+  const body = await _cwReadBody(resp);
+  if (!resp?.ok || body?.ok === false) {
+    _cwAbortSave(_cwProviderAuthError("tautulli", body?.error || body?.detail || `http_${resp?.status || 0}`));
+  }
+}
+
 async function _cwSaveAppAuth(serverCfg) {
   const MIN_PASSWORD_LENGTH = 8;
   const wantEnabled = true;
@@ -384,6 +462,16 @@ async function saveSettings() {
   const fromFab = !!document.activeElement?.closest?.("#save-fab");
   const readToggle = (id) => _cwTruthy(_cwEl(id)?.value || "");
   let schedChanged = false;
+  const schedulingPaneActive = () => {
+    try {
+      const active = document.querySelector("#page-settings .cw-settings-pane.active, #page-settings .cw-settings-panel.active");
+      const key = _cwNorm(active?.dataset?.pane || active?.dataset?.tab || window.__cwSettingsPane).toLowerCase();
+      if (key === "scheduling") return true;
+      return !!document.activeElement?.closest?.("#sec-scheduling");
+    } catch {
+      return false;
+    }
+  };
   const schedulingSaveError = (message) => {
     const msg = _cwNorm(message) || "Fix the scheduling errors before saving.";
     try {
@@ -457,7 +545,7 @@ async function saveSettings() {
     }
 
     const prevMetaLocale = _cwNorm(serverCfg?.metadata?.locale);
-    const prevMetaTTL = Number.isFinite(serverCfg?.metadata?.ttl_hours) ? Number(serverCfg.metadata.ttl_hours) : 72;
+    const prevMetaTTL = Number.isFinite(serverCfg?.metadata?.ttl_hours) ? Number(serverCfg.metadata.ttl_hours) : 720;
     const uiMetaLocale = _getVal("metadata_locale");
     const uiMetaTTL = _getVal("metadata_ttl_hours");
     if (uiMetaLocale !== prevMetaLocale) {
@@ -470,16 +558,39 @@ async function saveSettings() {
       if (!Number.isNaN(ttl) && ttl !== prevMetaTTL) { ensureObj(cfg, "metadata").ttl_hours = Math.max(1, ttl); mark(); }
     }
 
+    const normalizeUiDisplay = (value, fallbackLimit) => {
+      const raw = _cwNorm(value).toLowerCase();
+      const allowed = new Set(["count:3", "count:4", "count:5", "hours:24", "hours:48", "hours:72"]);
+      if (allowed.has(raw)) return raw;
+      const limit = Math.max(3, Math.min(5, Number.isFinite(fallbackLimit) ? Number(fallbackLimit) : 3));
+      return `count:${limit}`;
+    };
+    const displayLimit = (value) => {
+      const raw = normalizeUiDisplay(value, 3);
+      if (raw.startsWith("count:")) return Math.max(3, Math.min(5, parseInt(raw.slice(6), 10) || 3));
+      return 5;
+    };
+
     const prevUi = {
       show_watchlist_preview: typeof serverCfg?.ui?.show_watchlist_preview === "boolean" ? !!serverCfg.ui.show_watchlist_preview : true,
       show_playingcard: typeof serverCfg?.ui?.show_playingcard === "boolean" ? !!serverCfg.ui.show_playingcard : true,
+      show_recent_activity: typeof serverCfg?.ui?.show_recent_activity === "boolean" ? !!serverCfg.ui.show_recent_activity : true,
+      show_recent_history_widget: typeof serverCfg?.ui?.show_recent_history_widget === "boolean" ? !!serverCfg.ui.show_recent_history_widget : true,
+      show_latest_ratings_widget: typeof serverCfg?.ui?.show_latest_ratings_widget === "boolean" ? !!serverCfg.ui.show_latest_ratings_widget : true,
+      show_recent_scrobble_widget: typeof serverCfg?.ui?.show_recent_scrobble_widget === "boolean" ? !!serverCfg.ui.show_recent_scrobble_widget : true,
+      recent_activity_display: normalizeUiDisplay(serverCfg?.ui?.recent_activity_display, Number(serverCfg?.ui?.recent_activity_limit)),
+      recent_syncs_display: normalizeUiDisplay(serverCfg?.ui?.recent_syncs_display, Number(serverCfg?.ui?.recent_syncs_limit)),
       show_AI: typeof serverCfg?.ui?.show_AI === "boolean" ? !!serverCfg.ui.show_AI : true,
       show_quick_add_desktop: typeof serverCfg?.ui?.show_quick_add_desktop === "boolean" ? !!serverCfg.ui.show_quick_add_desktop : true,
       show_quick_add_mobile: typeof serverCfg?.ui?.show_quick_add_mobile === "boolean" ? !!serverCfg.ui.show_quick_add_mobile : true,
+      theme: (() => {
+        const theme = _cwNorm(serverCfg?.ui?.theme).toLowerCase();
+        return theme === "flat-light" || theme === "original" ? theme : "flat-dark";
+      })(),
       protocol: _cwNorm(serverCfg?.ui?.protocol).toLowerCase() === "https" ? "https" : "http"
     };
 
-    [["ui_show_watchlist_preview", "show_watchlist_preview"], ["ui_show_playingcard", "show_playingcard"], ["ui_show_AI", "show_AI"], ["ui_show_quick_add_desktop", "show_quick_add_desktop"], ["ui_show_quick_add_mobile", "show_quick_add_mobile"]].forEach(([id, key]) => {
+    [["ui_show_watchlist_preview", "show_watchlist_preview"], ["ui_show_playingcard", "show_playingcard"], ["ui_show_recent_activity", "show_recent_activity"], ["ui_show_recent_history_widget", "show_recent_history_widget"], ["ui_show_latest_ratings_widget", "show_latest_ratings_widget"], ["ui_show_recent_scrobble_widget", "show_recent_scrobble_widget"], ["ui_show_AI", "show_AI"], ["ui_show_quick_add_desktop", "show_quick_add_desktop"], ["ui_show_quick_add_mobile", "show_quick_add_mobile"]].forEach(([id, key]) => {
       const el = _cwEl(id);
       if (!el) return;
       const next = el.value !== "false";
@@ -488,6 +599,28 @@ async function saveSettings() {
       if (key === "show_AI") try { window.__cwAskAiChanged = { from: prevUi.show_AI, to: next }; } catch {}
       mark();
     });
+
+    [["ui_recent_activity_display", "recent_activity_display", "recent_activity_limit"], ["ui_recent_syncs_display", "recent_syncs_display", "recent_syncs_limit"]].forEach(([id, key, limitKey]) => {
+      const el = _cwEl(id);
+      if (!el) return;
+      const next = normalizeUiDisplay(el.value, 3);
+      if (next === prevUi[key]) return;
+      const uiCfg = ensureObj(cfg, "ui");
+      uiCfg[key] = next;
+      uiCfg[limitKey] = displayLimit(next);
+      mark();
+    });
+
+    const themeEl = _cwEl("ui_theme");
+    if (themeEl) {
+      const rawTheme = _cwNorm(themeEl.value).toLowerCase();
+      const nextTheme = rawTheme === "flat-light" || rawTheme === "original" ? rawTheme : "flat-dark";
+      if (nextTheme !== prevUi.theme) {
+        ensureObj(cfg, "ui").theme = nextTheme;
+        try { window.CWTheme?.apply?.(nextTheme, { persist: true }); } catch {}
+        mark();
+      }
+    }
 
     const protoEl = _cwEl("ui_protocol");
     if (protoEl) {
@@ -535,15 +668,24 @@ async function saveSettings() {
         simkl: _cwInstBlock(serverCfg?.simkl, _cwSelectedInst("simkl")),
         trakt: _cwInstBlock(serverCfg?.trakt, _cwSelectedInst("trakt", "cw.ui.trakt.auth.instance.v1")),
         anilist: _cwInstBlock(serverCfg?.anilist, _cwSelectedInst("anilist")),
-        mdblist: _cwInstBlock(serverCfg?.mdblist, _cwSelectedInst("mdblist"))
+        mdblist: _cwInstBlock(serverCfg?.mdblist, _cwSelectedInst("mdblist")),
+        publicmetadb: _cwInstBlock(serverCfg?.publicmetadb, _cwSelectedInst("publicmetadb")),
+        tmdb_sync: _cwInstBlock(serverCfg?.tmdb_sync, _cwSelectedInst("tmdb_sync", "cw.ui.tmdb_sync.auth.instance.v1"))
       };
+      const publicmetadbInst = _cwSelectedInst("publicmetadb");
+      const publicmetadbKey = _cwReadSecret("publicmetadb_key", _cwNorm(secrets.publicmetadb?.api_key));
+      const tmdbKey = _cwReadSecret("tmdb_api_key", _cwNorm(serverCfg?.tmdb?.api_key));
+      await _cwValidateProviderSecret("publicmetadb", publicmetadbInst, publicmetadbKey);
+      await _cwValidateTmdbSecret(tmdbKey);
       [
         ["mdblist", _cwSelectedInst("mdblist"), [["api_key", _cwReadSecret("mdblist_key", _cwNorm(secrets.mdblist?.api_key))]]],
-        ["plex", _cwSelectedInst("plex"), [["account_token", _cwReadSecret("plex_token", _cwNorm(secrets.plex?.account_token))], ["home_pin", _cwReadSecret("plex_home_pin", _cwNorm(secrets.plex?.home_pin)), ""]]],
+        ["publicmetadb", publicmetadbInst, [["api_key", publicmetadbKey]]],
+        ["plex", _cwSelectedInst("plex"), [["home_pin", _cwReadSecret("plex_home_pin", _cwNorm(secrets.plex?.home_pin)), ""]]],
         ["simkl", _cwSelectedInst("simkl"), [["client_id", _cwReadSecret("simkl_client_id", _cwNorm(secrets.simkl?.client_id))], ["client_secret", _cwReadSecret("simkl_client_secret", _cwNorm(secrets.simkl?.client_secret))]]],
         ["trakt", _cwSelectedInst("trakt", "cw.ui.trakt.auth.instance.v1"), [["client_id", _cwReadSecret("trakt_client_id", _cwNorm(secrets.trakt?.client_id))], ["client_secret", _cwReadSecret("trakt_client_secret", _cwNorm(secrets.trakt?.client_secret))]]],
         ["anilist", _cwSelectedInst("anilist"), [["client_id", _cwReadSecret("anilist_client_id", _cwNorm(secrets.anilist?.client_id))], ["client_secret", _cwReadSecret("anilist_client_secret", _cwNorm(secrets.anilist?.client_secret))]]],
-        ["tmdb", "default", [["api_key", _cwReadSecret("tmdb_api_key", _cwNorm(serverCfg?.tmdb?.api_key))]]]
+        ["tmdb_sync", _cwSelectedInst("tmdb_sync", "cw.ui.tmdb_sync.auth.instance.v1"), [["api_key", _cwReadSecret("tmdb_sync_api_key", _cwNorm(secrets.tmdb_sync?.api_key))], ["session_id", _cwReadSecret("tmdb_sync_session_id", _cwNorm(secrets.tmdb_sync?.session_id))]]],
+        ["tmdb", "default", [["api_key", tmdbKey]]]
       ].forEach(([rootKey, inst, fields]) => {
         const changes = fields.filter(([, ch]) => ch?.changed);
         if (!changes.length) return;
@@ -552,8 +694,36 @@ async function saveSettings() {
         changes.forEach(([prop, ch, clearValue]) => _cwApplySecret(target, prop, ch, clearValue));
         mark();
       });
+
+      const tautulliInst = _cwSelectedInst("tautulli");
+      const tautulliPrev = _cwInstBlock(serverCfg?.tautulli, tautulliInst);
+      const tautulliServer = _cwNorm(_cwEl("tautulli_server")?.value || "");
+      const tautulliKey = _cwReadSecret("tautulli_key", _cwNorm(tautulliPrev?.api_key));
+      const tautulliUserEl = _cwEl("tautulli_user_id");
+      const tautulliUser = _cwNorm(tautulliUserEl?.value || "");
+      const tautulliUserTouched = !!tautulliUserEl?.dataset?.touched;
+      const tautulliPayload = {};
+      const tautulliServerChanged = !!tautulliServer && tautulliServer !== _cwNorm(tautulliPrev?.server_url);
+      if (tautulliServer) tautulliPayload.server_url = tautulliServer;
+      if (tautulliKey.changed && tautulliKey.set) tautulliPayload.api_key = tautulliKey.set;
+      if (tautulliUser || tautulliUserTouched) tautulliPayload.user_id = tautulliUser;
+      if (tautulliServerChanged || (tautulliKey.changed && tautulliKey.set)) {
+        await _cwValidateTautulliSecret(tautulliInst, tautulliPayload);
+      }
+      if (tautulliServerChanged || tautulliKey.changed || tautulliUser || tautulliUserTouched) {
+        cfg.tautulli = cfg.tautulli && typeof cfg.tautulli === "object" ? cfg.tautulli : {};
+        const ttarget = _cwEnsureInstBlock(cfg.tautulli, tautulliInst);
+        if (tautulliServer) ttarget.server_url = tautulliServer;
+        if (tautulliKey.changed) _cwApplySecret(ttarget, "api_key", tautulliKey);
+        if (tautulliUser || tautulliUserTouched) {
+          ttarget.history = ttarget.history && typeof ttarget.history === "object" ? ttarget.history : {};
+          ttarget.history.user_id = tautulliUser;
+        }
+        mark();
+      }
     } catch (e) {
       console.warn("saveSettings: secret merge failed", e);
+      if (e?.__cwAbortSave) throw e;
     }
 
     try {
@@ -645,8 +815,13 @@ async function saveSettings() {
       if (_cwFn("getSchedulingPatch", window)) {
         const validation = _cwFn("getSchedulingValidation", window)?.() || {};
         const issues = Array.isArray(validation.issues) ? validation.issues.filter(Boolean) : [];
-        if (issues.length) schedulingSaveError(issues[0]);
-        sched = window.getSchedulingPatch({ strict: true }) || sched;
+        if (issues.length) {
+          if (schedulingPaneActive()) schedulingSaveError(issues[0]);
+          console.warn("saveSettings: scheduling has validation issues; preserving existing scheduling config", issues[0]);
+          sched = serverCfg?.scheduling || sched;
+        } else {
+          sched = window.getSchedulingPatch({ strict: true }) || sched;
+        }
       }
       if (!same(sched, serverCfg?.scheduling || {})) {
         cfg.scheduling = sched;

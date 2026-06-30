@@ -12,6 +12,11 @@ import datetime as _dt
 from ..provider_instances import normalize_instance_id
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
+from ..anime_mapping.service import (
+    anime_mapping_pair_feature_options as _anime_pair_feature_options,
+    config_with_pair_feature_options as _anime_config_with_pair_feature_options,
+    enrich_index_for_pair as _anime_enrich_index_for_pair,
+)
 from ._snapshots import (
     build_snapshots_for_feature,
     coerce_suspect_snapshot,
@@ -474,6 +479,8 @@ def run_one_way_feature(
     dst = str(dst).upper()
     src_ops = provs.get(src)
     dst_ops = provs.get(dst)
+    anime_pair_opts = _anime_pair_feature_options(cfg, fcfg, feature, src, dst, anime_only_default=(dst == "ANILIST"))
+    provider_cfg = _anime_config_with_pair_feature_options(cfg, anime_pair_opts) if "ANILIST" in {src, dst} else cfg
 
     emit("feature:start", src=src, dst=dst, feature=feature)
 
@@ -570,11 +577,13 @@ def run_one_way_feature(
 
         if typ == "episode":
             try:
-                s = int(it.get("season") or 0)
-                e = int(it.get("episode") or 0)
+                season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
+                episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
+                s = int(season_raw) if season_raw is not None else -1
+                e = int(episode_raw) if episode_raw is not None else 0
             except Exception:
-                s, e = 0, 0
-            has_frag = bool(s > 0 and e > 0)
+                s, e = -1, 0
+            has_frag = bool(s >= 0 and e > 0)
             if has_frag:
                 frag = f"#s{s:02d}e{e:02d}"
     
@@ -592,10 +601,11 @@ def run_one_way_feature(
 
         elif typ == "season":
             try:
-                s = int(it.get("season") or 0)
+                season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
+                s = int(season_raw) if season_raw is not None else -1
             except Exception:
-                s = 0
-            if s > 0:
+                s = -1
+            if s >= 0:
                 frag = f"#season:{s}"
                 for src_ids in (show_ids, ids):
                     for k, v in src_ids.items():
@@ -729,7 +739,7 @@ def run_one_way_feature(
 
     snaps = build_snapshots_for_feature(
         feature=feature,
-        config=cfg,
+        config=provider_cfg,
         providers=pair_providers,
         snap_cache=ctx.snap_cache,
         snap_ttl_sec=ctx.snap_ttl_sec,
@@ -777,7 +787,7 @@ def run_one_way_feature(
 
     if drop_guard:
         prev_cp_src = prev_checkpoint(prev_state, src, feature, src_inst)
-        now_cp_src = module_checkpoint(src_ops, cfg, feature)
+        now_cp_src = module_checkpoint(src_ops, provider_cfg, feature)
         eff_src, src_suspect, src_reason = coerce_suspect_snapshot(
             config=cfg,
             provider=src, ops=src_ops,
@@ -790,7 +800,7 @@ def run_one_way_feature(
             dbg("snapshot.guard", provider=src, feature=feature, reason=src_reason)
 
         prev_cp_dst = prev_checkpoint(prev_state, dst, feature, dst_inst)
-        now_cp_dst = module_checkpoint(dst_ops, cfg, feature)
+        now_cp_dst = module_checkpoint(dst_ops, provider_cfg, feature)
         eff_dst, dst_suspect, dst_reason = coerce_suspect_snapshot(
             config=cfg,
             provider=dst, ops=dst_ops,
@@ -805,8 +815,8 @@ def run_one_way_feature(
         eff_src, eff_dst = dict(src_cur), dict(dst_cur)
         src_suspect = False
         dst_suspect = False
-        now_cp_src = module_checkpoint(src_ops, cfg, feature)
-        now_cp_dst = module_checkpoint(dst_ops, cfg, feature)
+        now_cp_src = module_checkpoint(src_ops, provider_cfg, feature)
+        now_cp_dst = module_checkpoint(dst_ops, provider_cfg, feature)
 
     libs_src: list[str] = _effective_library_whitelist(cfg, src, feature, fcfg)
     libs_dst: list[str] = _effective_library_whitelist(cfg, dst, feature, fcfg)
@@ -847,6 +857,14 @@ def run_one_way_feature(
     # Keep metadata when the provider index is presence-only.
     dst_full = _enrich_index_payload(dst_full, prev_dst, feature)
     src_idx = _enrich_index_payload(src_idx, prev_src, feature)
+
+    if bool(anime_pair_opts.get("use_anime_mapping", False)):
+        src_before = len(src_idx)
+        dst_before = len(dst_full)
+        src_idx = _anime_enrich_index_for_pair(src_idx, provider_cfg, src, dst)
+        dst_full = _anime_enrich_index_for_pair(dst_full, provider_cfg, src, dst)
+        if len(src_idx) != src_before or len(dst_full) != dst_before:
+            dbg("anime_mapping.rekeyed", feature=feature, src=src, dst=dst, src_items=len(src_idx), dst_items=len(dst_full))
 
     # Repair sparse destination snapshots using the source index.
     if feature in ("history", "ratings", "progress"):
@@ -1046,15 +1064,12 @@ def run_one_way_feature(
 
     if allow_removes:
         if feature == "ratings":
-            if remove_mode == "mirror":
-                removes = list(mirror_removes or [])
-                if removes:
-                    removes = [it for it in removes if not _present(src_idx, src_alias, it)]
-                    if prev_dst:
-                        prev_dst_alias = _alias_index(prev_dst)
-                        removes = [it for it in removes if _present(prev_dst, prev_dst_alias, it)]
-            else:
-                removes = _observed_source_removes()
+            removes = list(mirror_removes or [])
+            if removes:
+                removes = [it for it in removes if not _present(src_idx, src_alias, it)]
+                if prev_dst:
+                    prev_dst_alias = _alias_index(prev_dst)
+                    removes = [it for it in removes if _present(prev_dst, prev_dst_alias, it)]
         elif remove_mode == "mirror":
             removes = list(mirror_removes or [])
             if removes:
@@ -1219,7 +1234,7 @@ def run_one_way_feature(
             unresolved_before = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
             upd_res = apply_update(
                 dst_ops=dst_ops,
-                cfg=cfg,
+                cfg=provider_cfg,
                 dst_name=dst,
                 feature=feature,
                 items=updates,
@@ -1270,7 +1285,7 @@ def run_one_way_feature(
             _ = set(load_blackbox_keys(dst, feature) or [])
             add_res = apply_add(
                 dst_ops=dst_ops,
-                cfg=cfg,
+                cfg=provider_cfg,
                 dst_name=dst,
                 feature=feature,
                 items=adds,
@@ -1416,7 +1431,7 @@ def run_one_way_feature(
         else:
             rem_res = apply_remove(
                 dst_ops=dst_ops,
-                cfg=cfg,
+                cfg=provider_cfg,
                 dst_name=dst,
                 feature=feature,
                 items=removes,

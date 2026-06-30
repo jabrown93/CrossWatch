@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 import base64
 import hashlib
@@ -230,8 +231,6 @@ DEFAULT_CFG: dict[str, Any] = {
 
     "simkl": {
         "access_token": "",                             # OAuth2 access token
-        "refresh_token": "",                            # OAuth2 refresh token
-        "token_expires_at": 0,                          # Epoch when access_token expires
         "client_id": "",                                # From your Simkl app
         "client_secret": "",                            # From your Simkl app
         "date_from": "",                                # YYYY-MM-DD (optional start date for full sync)
@@ -254,6 +253,13 @@ DEFAULT_CFG: dict[str, Any] = {
     },
 
     "mdblist": {
+        "auth_method": "",                              # "", "device_code" (default when new), or "api_key" (legacy/manual)
+        "client_id": "",                                # Deprecated; CrossWatch MDBList app client_id is supplied internally
+        "access_token": "",                             # OAuth access token (Device Code)
+        "refresh_token": "",                            # OAuth refresh token (Device Code)
+        "token_type": "Bearer",                         # OAuth token type
+        "scope": "write",                               # MDBList OAuth scope
+        "expires_at": 0,                                # Epoch when access_token expires
         "api_key": "",                                  # Your MDBList API key
         "timeout": 10,                                  # HTTP timeout (seconds)
         "max_retries": 3,                               # Retry budget
@@ -286,6 +292,33 @@ DEFAULT_CFG: dict[str, Any] = {
         "history_write_delay_ms": 600,                  # Optional pacing between writes
         "history_max_backoff_ms": 8000,                 # Max backoff time for retries
         "history_since": "1900-01-01T00:00:02Z"         # First-run baseline; watermark overrides after
+    },
+
+    "publicmetadb": {
+        "api_key": "",                                  # PublicMetaDB API key (pm-...)
+        "base_url": "https://publicmetadb.com",         # External API base URL
+        "timeout": 15.0,                                # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget
+        "watchlist_list_id": "",                        # Optional list id; empty = discover/create
+        "watchlist_name": "Watchlist",                  # Default PublicMetaDB list name; pair config can override
+        "watchlist_auto_create": True,                  # Create a private CrossWatch watchlist if missing
+        "watchlist_page_size": 100,                     # GET page size for list items
+        "history_per_page": 100,                        # GET page size for watched history
+        "history_max_pages": 1000,                      # Safety cap for watched history fetches
+        "progress_per_page": 100,                       # GET page size for resume/progress
+        "progress_max_pages": 1000,                     # Safety cap for resume/progress fetches
+        "ratings_label": "Overall",                     # PublicMetaDB rating label used by CrossWatch
+        "ratings_submit_per_hour": 200,                 # PublicMetaDB contribution limit for rating creates
+        "ratings_update_per_hour": 100,                 # PublicMetaDB contribution limit for rating updates
+        "rate_limit": {
+            "post_per_sec": 3,
+            "get_per_sec": 20,
+        },
+    },
+
+    "playback_progress": {
+        "disabled_profiles": [],                        # Provider profiles excluded from Continue Watching, e.g. ["trakt:default"]
+        "provider_timeout_seconds": 12.0,               # Max time this screen waits for provider profiles during one refresh
     },
     
      "tautulli": {
@@ -510,9 +543,10 @@ DEFAULT_CFG: dict[str, Any] = {
         "snapshot_ttl_sec": 300,                        # Reuse snapshots within 5 min
         "apply_chunk_size": 100,                        # Sweet spot for apply chunking
         "apply_chunk_pause_ms": 50,                     # Small pause between chunks
-        "apply_chunk_size_by_provider": {               # SIMKL/TRAKT/MDBLIST/ANILIST/TMDB/TAUTULLI/TMDB/PLEX/JELLYFIN/EMBY overrides
+        "apply_chunk_size_by_provider": {               # SIMKL/TRAKT/MDBLIST/PUBLICMETADB/ANILIST/TMDB/TAUTULLI/PLEX/JELLYFIN/EMBY overrides
             "SIMKL": 500,
-            "MDBLIST": 500
+            "MDBLIST": 500,
+            "PUBLICMETADB": 500
         },
         
         # suspect guard (shrinking inventories protection)
@@ -523,19 +557,31 @@ DEFAULT_CFG: dict[str, Any] = {
     # --- Metadata (TMDb resolver) -------------------------------------------
     "metadata": {
         "locale": "en-US",                              # example: "en-US" / "nl-NL"
-        "ttl_hours": 72,                                # Coarse cache TTL
+        "ttl_hours": 720,                               # Metadata cache TTL (30 days)
+    },
+
+    # --- Anime ID Mapping ----------------------------------------------------
+    "anime_mapping": {
+        "enabled": False,                               # Enable local anime ID enrichment for anime-native providers
+        "auto_update": True,                            # Refresh the local AniBridge dataset in the background when enabled
+        "provider": "anibridge",                        # Local dataset provider
+        "release_tag": "v3",                            # AniBridge release tag
+        "refresh_hours": 24,                            # Minimum age before an automatic refresh is considered
+        "stale_after_days": 14,                         # UI/status warning threshold
+        "use_for_pairs": ["anilist"],                   # Providers that activate anime mapping when present in a pair
+        "features": ["watchlist", "ratings"],           # Sync features where anime ID enrichment is applied
     },
 
     # --- Scrobble ------------------------------------------------------------
     "scrobble": {
         "enabled": False,                               # Master toggle
-        "mode": "watch",                                # "watch" | "webhook"
+        "mode": "watch",                                # Legacy fallback: "watch" | "webhook"; new saves use scrobble.sources for independent toggles
         "delete_plex": False,                           # Old name but still valid. Auto-remove movies from all your Watchlists, for all media servers
         "delete_plex_types": ["movie"],                 # Old name but still valid. Movie/show/episode
 
         # Watcher settings
         "watch": {
-            "autostart": False,                         # Start watcher on boot if enabled+mode=watch
+            "autostart": False,                         # Start watcher on boot if the watcher source is enabled
             "routes": [],                               # Route-based config
             "plex_simkl_ratings": False,                # Watch mode: forward Plex ratings to SIMKL
             "plex_trakt_ratings": False,                # Watch mode: forward Plex ratings to Trakt
@@ -544,7 +590,9 @@ DEFAULT_CFG: dict[str, Any] = {
             "suppress_start_at": 99,                    # Kill near-end "start" flaps (credits)
             "filters": {
                 "username_whitelist": [],               # ["name", "id:123", "uuid:abcd…"]
-                "server_uuid": ""                       # Restrict to a specific server
+                "server_uuid": "",                      # Legacy single-server allow filter
+                "server_uuid_whitelist": [],            # Accept only these Plex server UUIDs (empty = allow all unless blacklisted)
+                "server_uuid_blacklist": []             # Always ignore these Plex server UUIDs
             }
         },
 
@@ -558,7 +606,9 @@ DEFAULT_CFG: dict[str, Any] = {
             # Plex-only filters
             "filters_plex": {
                 "username_whitelist": [],               # Restrict accepted Account.title values (empty = allow all)
-                "server_uuid": ""                       # Restrict to a specific server
+                "server_uuid": "",                      # Legacy single-server allow filter
+                "server_uuid_whitelist": [],            # Accept only these Plex server UUIDs (empty = allow all unless blacklisted)
+                "server_uuid_blacklist": []             # Always ignore these Plex server UUIDs
             }
         },
 
@@ -586,8 +636,17 @@ DEFAULT_CFG: dict[str, Any] = {
 
     # --- User Interface ------------------------------------------------------
     "ui": {
+        "theme": "flat-dark",                           # "flat-dark" | "flat-light" | "original"
         "show_watchlist_preview": True,                 # Show Watchlist Preview card on Main tab
         "show_playingcard": True,                       # Show Now Playing card on Main tab
+        "show_recent_activity": True,                   # Show Recent Scrobble card on Main tab
+        "show_recent_history_widget": True,             # Show Recent History widget on Main tab
+        "show_latest_ratings_widget": True,             # Show Latest Ratings widget on Main tab
+        "show_recent_scrobble_widget": True,            # Show Recent Scrobble widget on Main tab
+        "recent_activity_display": "count:3",           # "count:3|4|5" | "hours:24|48|72"
+        "recent_activity_limit": 3,                     # Recent Scrobble rows on Main tab
+        "recent_syncs_display": "count:3",              # "count:3|4|5" | "hours:24|48|72"
+        "recent_syncs_limit": 3,                        # Recent Sync rows on Main tab
         "show_AI": True,                                # Show ASK AI from GitBook
         "show_quick_add_desktop": True,                 # Show the Main-tab quick add drawer on desktop
         "show_quick_add_mobile": True,                  # Show the Main-tab quick add floating button on mobile
@@ -646,6 +705,11 @@ _SECRET_PATHS: list[tuple[str, ...]] = [
     ("anilist", "client_secret"),
     # MDBList
     ("mdblist", "api_key"),
+    ("mdblist", "access_token"),
+    ("mdblist", "refresh_token"),
+    ("mdblist", "_pending_device"),
+    # PublicMetaDB
+    ("publicmetadb", "api_key"),
     # Tautulli
     ("tautulli", "api_key"),
     # Trakt
@@ -662,10 +726,13 @@ _SECRET_PATHS: list[tuple[str, ...]] = [
     ("tmdb", "api_key"),
     # Jellyfin
     ("jellyfin", "access_token"),
+    ("jellyfin", "api_key"),
+    ("jellyfin", "password"),
     ("jellyfin", "webhook_secret"),
     # Emby
     ("emby", "api_key"),
     ("emby", "access_token"),
+    ("emby", "password"),
     ("emby", "webhook_secret"),
     # App auth
     ("app_auth", "password", "hash"),
@@ -1028,6 +1095,77 @@ def _normalize_mdblist(cfg: dict[str, Any]) -> None:
         m = {}
         cfg["mdblist"] = m
 
+    def _norm_method(block: dict[str, Any]) -> str:
+        has_api = bool(str(block.get("api_key") or block.get("key") or "").strip())
+        has_oauth = bool(str(block.get("access_token") or "").strip() or str(block.get("refresh_token") or "").strip())
+        has_pending_device = isinstance(block.get("_pending_device"), dict)
+        if has_api and not has_oauth:
+            if has_pending_device:
+                return "device_code"
+            return "api_key"
+        if has_oauth or has_pending_device:
+            return "device_code"
+        raw = str(block.get("auth_method") or "").strip().lower().replace("-", "_")
+        if raw in ("api", "apikey", "api_key", "key"):
+            return "api_key"
+        if raw in ("device", "device_code", "oauth", "oauth_device", "bearer"):
+            return "device_code"
+        return "device_code"
+
+    def _normalize_auth_block(block: dict[str, Any]) -> None:
+        method = _norm_method(block)
+        has_api_before = bool(str(block.get("api_key") or block.get("key") or "").strip())
+        has_oauth_before = bool(str(block.get("access_token") or "").strip() or str(block.get("refresh_token") or "").strip())
+        # Do not let a passive UI/config save destroy an existing API key just
+        # because the default method is Device Code. The API key becomes
+        # inactive once Device Code has real token state, and is cleared after
+        # MDBList returns tokens. A pending device flow is an explicit switch
+        # in progress, so keep it selected while the user approves the login.
+        has_pending_before = isinstance(block.get("_pending_device"), dict)
+        if method == "device_code" and has_api_before and not has_oauth_before and not has_pending_before:
+            method = "api_key"
+        block["auth_method"] = method
+        block["client_id"] = str(block.get("client_id") or "").strip()
+        block["access_token"] = str(block.get("access_token") or "").strip()
+        block["refresh_token"] = str(block.get("refresh_token") or "").strip()
+        block["token_type"] = str(block.get("token_type") or "Bearer").strip() or "Bearer"
+        block["scope"] = str(block.get("scope") or "write").strip() or "write"
+        try:
+            block["expires_at"] = int(block.get("expires_at") or 0)
+        except Exception:
+            block["expires_at"] = 0
+        block["api_key"] = str(block.get("api_key") or block.get("key") or "").strip()
+        if method == "api_key":
+            block["access_token"] = ""
+            block["refresh_token"] = ""
+            block["expires_at"] = 0
+        else:
+            block["api_key"] = ""
+        pend = block.get("_pending_device")
+        if isinstance(pend, dict):
+            pend["device_code"] = str(pend.get("device_code") or "").strip()
+            pend["user_code"] = str(pend.get("user_code") or "").strip()
+            pend["verification_uri"] = str(pend.get("verification_uri") or pend.get("verification_url") or "https://mdblist.com/oauth/device/").strip()
+            try:
+                pend["interval"] = int(pend.get("interval") or 5)
+            except Exception:
+                pend["interval"] = 5
+            try:
+                pend["expires_at"] = int(pend.get("expires_at") or 0)
+            except Exception:
+                pend["expires_at"] = 0
+            try:
+                pend["created_at"] = int(pend.get("created_at") or 0)
+            except Exception:
+                pend["created_at"] = 0
+
+    _normalize_auth_block(m)
+    insts = m.get("instances")
+    if isinstance(insts, dict):
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _normalize_auth_block(inst)
+
     rl0 = m.get("rate_limit")
     if isinstance(rl0, dict):
         rl = rl0
@@ -1052,6 +1190,59 @@ def _normalize_mdblist(cfg: dict[str, Any]) -> None:
     get_rps = _rate("get_per_sec", 10.0)
     rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
     rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+
+
+def _normalize_publicmetadb(cfg: dict[str, Any]) -> None:
+    p0 = cfg.get("publicmetadb")
+    if isinstance(p0, dict):
+        p = p0
+    else:
+        p = {}
+        cfg["publicmetadb"] = p
+    p["base_url"] = str(p.get("base_url") or "https://publicmetadb.com").strip().rstrip("/")
+    p["watchlist_name"] = str(p.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
+    p["watchlist_auto_create"] = bool(p.get("watchlist_auto_create", True))
+
+    def _int_range(name: str, default: int, lo: int, hi: int) -> None:
+        try:
+            n = int(p.get(name, default) or default)
+        except Exception:
+            n = default
+        p[name] = max(lo, min(n, hi))
+
+    _int_range("watchlist_page_size", 100, 1, 500)
+    _int_range("history_per_page", 100, 1, 500)
+    _int_range("history_max_pages", 1000, 1, 100000)
+    _int_range("progress_per_page", 100, 1, 500)
+    _int_range("progress_max_pages", 1000, 1, 100000)
+    _int_range("ratings_submit_per_hour", 200, 1, 200)
+    _int_range("ratings_update_per_hour", 100, 1, 100)
+    p["ratings_label"] = str(p.get("ratings_label") or "Overall").strip() or "Overall"
+
+    rl0 = p.get("rate_limit")
+    if isinstance(rl0, dict):
+        rl = rl0
+    else:
+        rl = {}
+        p["rate_limit"] = rl
+
+    def _rate(name: str, default: float, *, max_v: float) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    post_rps = _rate("post_per_sec", 3.0, max_v=3.0)
+    get_rps = _rate("get_per_sec", 20.0, max_v=20.0)
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+
 
 def _is_hhmm(v: str) -> bool:
     s = (v or "").strip()
@@ -1080,7 +1271,7 @@ def _normalize_scheduling(cfg: dict[str, Any]) -> None:
         s["every_n_hours"] = 1
     elif mode_raw == "daily_time":
         mode = "daily_time"
-    elif mode_raw == "custom_interval":
+    elif mode_raw in {"custom_interval", "custom"}:
         mode = "custom_interval"
     elif mode_raw == "every_n_hours":
         mode = "every_n_hours"
@@ -1170,14 +1361,100 @@ def _normalize_scheduling(cfg: dict[str, Any]) -> None:
     adv["jobs"] = out
 
 
+def _normalize_anime_mapping(cfg: dict[str, Any]) -> None:
+    am = _ensure_dict(cfg, "anime_mapping")
+    am["enabled"] = bool(am.get("enabled", False))
+    am["auto_update"] = bool(am.get("auto_update", True))
+
+    provider = str(am.get("provider") or "anibridge").strip().lower() or "anibridge"
+    am["provider"] = provider
+
+    tag = str(am.get("release_tag") or "v3").strip() or "v3"
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", tag):
+        tag = "v3"
+    am["release_tag"] = tag
+
+    try:
+        refresh_hours = int(am.get("refresh_hours", 24) or 24)
+    except Exception:
+        refresh_hours = 24
+    am["refresh_hours"] = max(1, refresh_hours)
+
+    try:
+        stale_after_days = int(am.get("stale_after_days", 14) or 14)
+    except Exception:
+        stale_after_days = 14
+    am["stale_after_days"] = max(1, stale_after_days)
+
+    def _string_list(value: Any, default: list[str]) -> list[str]:
+        raw = value if isinstance(value, list) else default
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            name = str(item or "").strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out or list(default)
+
+    am["use_for_pairs"] = _string_list(am.get("use_for_pairs"), ["anilist"])
+    am["features"] = _string_list(am.get("features"), ["watchlist", "ratings"])
+
+
 def _normalize_ui(cfg: dict[str, Any]) -> None:
     ui = _ensure_dict(cfg, "ui")
 
+    theme = str(ui.get("theme", "flat-dark") or "flat-dark").strip().lower()
+    if theme not in {"flat-dark", "flat-light", "original"}:
+        theme = "flat-dark"
+    ui["theme"] = theme
+
     ui["show_watchlist_preview"] = bool(ui.get("show_watchlist_preview", True))
     ui["show_playingcard"] = bool(ui.get("show_playingcard", True))
+    ui["show_recent_activity"] = bool(ui.get("show_recent_activity", True))
+    ui["show_recent_history_widget"] = bool(ui.get("show_recent_history_widget", True))
+    ui["show_latest_ratings_widget"] = bool(ui.get("show_latest_ratings_widget", True))
+    ui["show_recent_scrobble_widget"] = bool(ui.get("show_recent_scrobble_widget", True))
     ui["show_AI"] = bool(ui.get("show_AI", True))
     ui["show_quick_add_desktop"] = bool(ui.get("show_quick_add_desktop", True))
     ui["show_quick_add_mobile"] = bool(ui.get("show_quick_add_mobile", True))
+
+    def _ui_limit(name: str, default: int = 3) -> int:
+        try:
+            n = int(ui.get(name, default) or default)
+        except Exception:
+            n = default
+        ui[name] = max(3, min(n, 5))
+        return int(ui[name])
+
+    def _ui_display(display_name: str, limit_name: str) -> None:
+        legacy_limit = _ui_limit(limit_name)
+        raw = str(ui.get(display_name) or "").strip().lower()
+        mode, _, value = raw.partition(":")
+        if mode == "count":
+            try:
+                n = int(value)
+            except Exception:
+                n = legacy_limit
+            n = max(3, min(n, 5))
+            ui[display_name] = f"count:{n}"
+            ui[limit_name] = n
+            return
+        if mode == "hours":
+            try:
+                n = int(value)
+            except Exception:
+                n = 24
+            if n not in {24, 48, 72}:
+                n = 24
+            ui[display_name] = f"hours:{n}"
+            ui[limit_name] = 5
+            return
+        ui[display_name] = f"count:{legacy_limit}"
+
+    _ui_display("recent_activity_display", "recent_activity_limit")
+    _ui_display("recent_syncs_display", "recent_syncs_limit")
 
     protocol = str(ui.get("protocol", "http") or "http").strip().lower()
     if protocol not in _ALLOWED_UI_PROTOCOLS:
@@ -1319,6 +1596,8 @@ def load_config() -> dict[str, Any]:
     _normalize_trakt(cfg)
     _normalize_simkl(cfg)
     _normalize_mdblist(cfg)
+    _normalize_publicmetadb(cfg)
+    _normalize_anime_mapping(cfg)
     _normalize_scheduling(cfg)
     _normalize_app_auth(cfg)
     pairs = cfg.get("pairs")
@@ -1367,6 +1646,8 @@ def save_config(cfg: dict[str, Any]) -> None:
     _normalize_trakt(data)
     _normalize_simkl(data)
     _normalize_mdblist(data)
+    _normalize_publicmetadb(data)
+    _normalize_anime_mapping(data)
     _normalize_scheduling(data)
     _normalize_app_auth(data)
     _normalize_ui(data)

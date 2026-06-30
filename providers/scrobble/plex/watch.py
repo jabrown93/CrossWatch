@@ -29,6 +29,7 @@ from providers.scrobble.scrobble import (
     mask_account as _mask_account,
 )
 from providers.scrobble.currently_watching import update_from_event as _cw_update, update_from_payload as _cw_update_payload
+from providers.scrobble.sources import source_enabled
 
 
 _CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
@@ -52,6 +53,12 @@ def _cfg(ttl: float = _CFG_TTL_SEC) -> dict[str, Any]:
         cfg2 = {}
     _CFG_CACHE.update({"ts": now, "cfg": cfg2})
     return cfg2
+
+
+def _provider_auth():
+    from providers.auth import runtime as provider_auth
+
+    return provider_auth
 
 
 def _is_debug_cfg(cfg: dict[str, Any]) -> bool:
@@ -1018,8 +1025,7 @@ class WatchService:
         if t in ("timeline", "progress"):
             try:
                 cfg = self._active_cfg()
-                sc = (cfg.get("scrobble") or {})
-                if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "watch":
+                if not source_enabled(cfg, "watcher"):
                     return
                 self._ingest_progress_from_alert(alert, cfg)
             except Exception:
@@ -1033,8 +1039,7 @@ class WatchService:
             except Exception:
                 server_uuid = None
             cfg = self._active_cfg()
-            sc = (cfg.get("scrobble") or {})
-            if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "watch":
+            if not source_enabled(cfg, "watcher"):
                 return
 
             try:
@@ -1246,8 +1251,7 @@ class WatchService:
     def start(self) -> None:
         self._stop.clear()
         cfg = self._cfg_provider() or {}
-        sc = (cfg.get("scrobble") or {})
-        if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "watch":
+        if not source_enabled(cfg, "watcher"):
             self._log("Watcher disabled by config; not starting", "INFO")
             return
         lvl = "DEBUG" if self._quiet_startup else "INFO"
@@ -1322,7 +1326,7 @@ def autostart_from_config() -> WatchService | None:
     global _AUTO_WATCH
     cfg = _cfg() or {}
     sc = (cfg.get("scrobble") or {})
-    if not (sc.get("enabled") and str(sc.get("mode") or "").lower() == "watch"):
+    if not source_enabled(cfg, "watcher"):
         return None
     if not ((sc.get("watch") or {}).get("autostart")):
         return None
@@ -1408,6 +1412,40 @@ def _server_allowed(want_uuid: str, payload: dict[str, Any]) -> bool:
     srv = payload.get("Server") or {}
     got = str((srv.get("uuid") if isinstance(srv, dict) else "") or "").strip()
     return (not got) or got == want_uuid
+
+
+def _as_filter_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    items = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    out: set[str] = set()
+    for item in items:
+        if item is None:
+            continue
+        for part in re.split(r"[\s,]+", str(item)):
+            clean = part.strip()
+            if clean:
+                out.add(clean)
+    return out
+
+
+def _server_uuid_from_payload(payload: dict[str, Any]) -> str:
+    srv = payload.get("Server") or {}
+    return str((srv.get("uuid") if isinstance(srv, dict) else "") or "").strip()
+
+
+def _server_filters_allowed(filt: dict[str, Any], payload: dict[str, Any]) -> bool:
+    got = _server_uuid_from_payload(payload)
+    allow = _as_filter_set(filt.get("server_uuid_whitelist"))
+    legacy = str(filt.get("server_uuid") or "").strip()
+    if legacy:
+        allow.add(legacy)
+    block = _as_filter_set(filt.get("server_uuid_blacklist"))
+    if got and got in block:
+        return False
+    if allow and (not got or got not in allow):
+        return False
+    return True
 
 
 def _gather_guid_candidates(md: dict[str, Any]) -> list[str]:
@@ -1554,8 +1592,9 @@ def _simkl_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: d
 def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: dict[str, Any], logger: Callable[..., None] | None) -> dict[str, Any]:
     md_cfg = (cfg.get("mdblist") or {}) if isinstance(cfg, dict) else {}
     apikey = str(md_cfg.get("api_key") or "").strip()
-    if not apikey:
-        return {"ok": False, "error": "missing_api_key"}
+    provider_auth = _provider_auth()
+    if not provider_auth.is_configured("mdblist", md_cfg):
+        return {"ok": False, "error": "missing_auth"}
     if media_type not in ("movie", "show"):
         return {"ok": True, "ignored": True}
     bucket = "movies" if media_type == "movie" else "shows"
@@ -1584,7 +1623,19 @@ def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg:
     r: requests.Response | None = None
     for attempt in range(max_retries):
         try:
-            r = requests.post(url, params={"apikey": apikey}, json=body, timeout=tmo)
+            sess = requests.Session()
+            r = provider_auth.request_with_auth(
+                "mdblist",
+                sess,
+                "POST",
+                url,
+                cfg=cfg,
+                instance_id=(cfg.get("scrobble") or {}).get("watch", {}).get("route_sink_instance") if isinstance((cfg.get("scrobble") or {}).get("watch"), Mapping) else None,
+                params={"apikey": apikey},
+                json=body,
+                timeout=tmo,
+                max_retries=1,
+            )
         except Exception as e:
             if attempt >= max_retries - 1:
                 _emit(logger, f"mdblist rating request failed: {type(e).__name__}: {e}", "ERROR")
@@ -1630,7 +1681,7 @@ def process_rating_webhook(
 ) -> dict[str, Any]:
     cfg = cfg_override or _cfg() or {}
     sc = (cfg.get("scrobble") or {})
-    if not bool(sc.get("enabled")) or str(sc.get("mode") or "").lower() != "watch":
+    if not source_enabled(cfg, "watcher"):
         return {"ok": True, "ignored": True}
 
     watch_cfg = (sc.get("watch") or {})
@@ -1676,9 +1727,9 @@ def process_rating_webhook(
     filt_raw = watch_cfg.get("filters")
     filt: dict[str, Any] = filt_raw if isinstance(filt_raw, dict) else {}
     wl = filt.get("username_whitelist")
-    want_uuid = str((filt.get("server_uuid") or (cfg.get("plex") or {}).get("server_uuid") or "")).strip()
-
-    if want_uuid and not _server_allowed(want_uuid, payload):
+    if "server_uuid" not in filt and not filt.get("server_uuid_whitelist") and (cfg.get("plex") or {}).get("server_uuid"):
+        filt = {**filt, "server_uuid": (cfg.get("plex") or {}).get("server_uuid")}
+    if not _server_filters_allowed(filt, payload):
         return {"ok": True, "ignored": True}
 
     if not _account_allowed(wl, payload):

@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Any
 
 import requests
 
-from cw_platform.config_base import config_path, load_config, save_config
+from ._auth_base import AuthManifest, AuthStatus
+from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
 
 try:
@@ -58,6 +60,9 @@ _H: dict[str, str] = {
     "trakt-api-version": "2",
 }
 
+_REFRESH_LOCKS: dict[str, threading.Lock] = {}
+_REFRESH_LOCKS_GUARD = threading.Lock()
+
 
 def _now() -> int:
     return int(time.time())
@@ -71,6 +76,16 @@ def _load_config() -> dict[str, Any]:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _refresh_lock(instance_id: Any) -> threading.Lock:
+    inst = normalize_instance_id(instance_id)
+    with _REFRESH_LOCKS_GUARD:
+        lock = _REFRESH_LOCKS.get(inst)
+        if lock is None:
+            lock = threading.Lock()
+            _REFRESH_LOCKS[inst] = lock
+        return lock
 
 
 def _save_config(cfg: dict[str, Any]) -> None:
@@ -111,19 +126,41 @@ class _TraktProvider:
     name = "TRAKT"
     label = "Trakt"
 
-    def manifest(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "label": self.label,
-            "flow": "device_pin",
-            "fields": [
+    def manifest(self) -> AuthManifest:
+        return AuthManifest(
+            name=self.name,
+            label=self.label,
+            flow="device_pin",
+            fields=[
                 {"key": "trakt.client_id", "label": "Client ID", "type": "text", "required": True},
                 {"key": "trakt.client_secret", "label": "Client Secret", "type": "password", "required": True},
             ],
-            "actions": {"start": True, "finish": True, "refresh": True, "disconnect": True},
-            "verify_url": VERIFY_URL,
-            "notes": "Open Trakt, enter the code, then return here. Client ID/Secret are required.",
+            actions={"start": True, "finish": True, "refresh": True, "disconnect": True},
+            verify_url=VERIFY_URL,
+            notes="Open Trakt, enter the code, then return here. Client ID/Secret are required.",
+        )
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "watchlist": True,
+            "ratings": True,
+            "history": True,
+            "device_code": True,
+            "refresh": True,
         }
+
+    def get_status(self, cfg: dict[str, Any] | None = None, *, instance_id: Any = None) -> AuthStatus:
+        cfg = cfg or _load_config()
+        inst, _, tr = _blocks(cfg, instance_id)
+        token = str(tr.get("access_token") or "").strip()
+        label = "Trakt" if inst == "default" else f"Trakt ({inst})"
+        return AuthStatus(
+            connected=bool(token),
+            label=label,
+            user=str(tr.get("username") or "") or None,
+            expires_at=int(tr.get("expires_at") or 0) or None,
+            scopes=[str(tr.get("scope") or "public")],
+        )
 
     def html(self, cfg: dict[str, Any] | None = None) -> str:
         # HTML is static; multi-profile UI is injected by auth.trakt.js
@@ -147,8 +184,8 @@ class _TraktProvider:
     }
   </style>
 
-  <div class="head" onclick="toggleSection && toggleSection('sec-trakt')">
-    <span class="chev">▶</span><strong>Trakt</strong>
+  <div class="head" data-toggle-section="sec-trakt">
+    <span class="chev"></span><strong>Trakt</strong>
   </div>
 
   <div class="body">
@@ -170,15 +207,11 @@ class _TraktProvider:
             <div class="grid2">
               <div>
                 <label for="trakt_client_id">Client ID</label>
-                <input id="trakt_client_id" name="trakt_client_id" placeholder="Enter your Trakt Client ID"
-                  oninput="updateTraktHint()"
-                  onchange="try{saveSetting('trakt.client_id', this.value); updateTraktHint();}catch(_){}">
+                <input id="trakt_client_id" name="trakt_client_id" placeholder="Enter your Trakt Client ID">
               </div>
               <div>
                 <label for="trakt_client_secret">Client Secret</label>
-                <input id="trakt_client_secret" name="trakt_client_secret" type="password" placeholder="Enter your Trakt Client Secret"
-                  oninput="updateTraktHint()"
-                  onchange="try{saveSetting('trakt.client_secret', this.value); updateTraktHint();}catch(_){}">
+                <input id="trakt_client_secret" name="trakt_client_secret" type="password" placeholder="Enter your Trakt Client Secret">
               </div>
             </div>
 
@@ -186,31 +219,22 @@ class _TraktProvider:
               You need a Trakt API application. Create one at
               <a href="https://trakt.tv/oauth/applications" target="_blank" rel="noopener">Trakt Applications</a>.
               Set the Redirect URL to <code id="trakt_redirect_uri_preview">urn:ietf:wg:oauth:2.0:oob</code>.
-              <button class="btn" style="margin-left:8px" onclick="copyTraktRedirect()">Copy Redirect URL</button>
+              <button id="btn-copy-trakt-redirect" class="btn" type="button" style="margin-left:8px">Copy Redirect URL</button>
             </div>
 
             <div class="sep"></div>
 
-            <div class="grid2">
-              <div>
-                <div class="field-label">Current token</div>
-                <div style="display:flex;gap:8px">
-                  <input id="trakt_token" placeholder="empty = not set" readonly>
-                  <button id="btn-copy-trakt-token" class="btn copy" onclick="copyInputValue('trakt_token', this)">Copy</button>
-                </div>
-              </div>
-              <div>
-                <div class="field-label">Link code (PIN)</div>
-                <div style="display:flex;gap:8px">
-                  <input id="trakt_pin" placeholder="" readonly>
-                  <button id="btn-copy-trakt-pin" class="btn copy" onclick="copyInputValue('trakt_pin', this)">Copy</button>
-                </div>
+            <div>
+              <div class="field-label">Link code (PIN)</div>
+              <div style="display:flex;gap:8px">
+                <input id="trakt_pin" placeholder="" readonly>
+                <button id="btn-copy-trakt-pin" class="btn copy" type="button">Copy</button>
               </div>
             </div>
 
             <div class="inline" style="margin-top:10px">
-              <button id="btn-connect-trakt" class="btn" onclick="requestTraktPin()">Connect TRAKT</button>
-              <button class="btn danger" onclick="try{ traktDeleteToken && traktDeleteToken(); }catch(_){;}">Delete</button>
+              <button id="btn-connect-trakt" class="btn" type="button">Connect TRAKT</button>
+              <button id="btn-delete-trakt" class="btn danger" type="button">Delete</button>
               <div class="sub">Open <a href="https://trakt.tv/activate" target="_blank" rel="noopener">trakt.tv/activate</a> and enter your code.</div>
               <div id="trakt_msg" class="msg ok hidden" role="status" aria-live="polite"></div>
             </div>
@@ -337,70 +361,88 @@ class _TraktProvider:
         return {"ok": True, "status": "ok"}
 
     def refresh(self, cfg: dict[str, Any] | None = None, *, instance_id: Any = None) -> dict[str, Any]:
+        inst_key = normalize_instance_id(instance_id)
+        with _refresh_lock(inst_key):
+            cfg = cfg or _load_config()
+            inst, _, tr = _blocks(cfg, inst_key)
+            c = _client(cfg, inst)
+
+            try:
+                exp = int(tr.get("expires_at") or 0)
+            except Exception:
+                exp = 0
+            if str(tr.get("access_token") or "").strip() and exp and exp > (_now() + 120):
+                return {"ok": True, "status": "fresh", "expires_at": exp}
+
+            rt = str(tr.get("refresh_token") or "").strip()
+            cid = str(c.get("client_id") or "").strip()
+            secr = str(c.get("client_secret") or "").strip()
+
+            if not (cid and secr and rt):
+                log("TRAKT: missing client_id/client_secret/refresh_token for refresh", "ERROR")
+                return {"ok": False, "status": "missing_refresh"}
+
+            log("TRAKT: refresh token", level="INFO", module="AUTH")
+
+            payload: dict[str, Any] = {
+                "refresh_token": rt,
+                "client_id": cid,
+                "client_secret": secr,
+                "grant_type": "refresh_token",
+            }
+
+            try:
+                r = requests.post(OAUTH_TOKEN, json=payload, headers=_headers(), timeout=30)
+            except Exception as e:
+                log(f"TRAKT: token refresh network error: {e}", "ERROR")
+                return {"ok": False, "status": "network_error", "error": str(e)}
+
+            if r.status_code >= 400:
+                body: dict[str, Any] = {}
+                try:
+                    body = r.json() or {}
+                except Exception:
+                    body = {}
+                err = str(body.get("error") or "") or str(body.get("error_description") or "") or (r.text or "")[:400]
+                log(f"TRAKT: token refresh failed {r.status_code}: {err}", "ERROR")
+                return {"ok": False, "status": f"refresh_failed:{r.status_code}", "error": err}
+
+            try:
+                tok: dict[str, Any] = r.json() or {}
+            except Exception as e:
+                log(f"TRAKT: token refresh invalid JSON: {e}", "ERROR")
+                return {"ok": False, "status": "bad_json"}
+
+            acc = str(tok.get("access_token") or "").strip()
+            if not acc:
+                log("TRAKT: token refresh succeeded but no access_token in response", "ERROR")
+                return {"ok": False, "status": "no_access_token"}
+
+            new_rt = str(tok.get("refresh_token") or rt or "").strip()
+            exp_in = int(tok.get("expires_in") or 0)
+            expires_at = _now() + exp_in if exp_in > 0 else 0
+
+            tr.update(
+                {
+                    "access_token": acc,
+                    "refresh_token": new_rt,
+                    "scope": tok.get("scope") or tr.get("scope") or "public",
+                    "token_type": tok.get("token_type") or tr.get("token_type") or "bearer",
+                    "expires_at": expires_at,
+                }
+            )
+            _save_config(cfg)
+            log("TRAKT: refresh ok", level="SUCCESS", module="AUTH")
+            return {"ok": True, "status": "ok"}
+
+    def disconnect(self, cfg: dict[str, Any] | None = None, *, instance_id: Any = None) -> AuthStatus:
         cfg = cfg or _load_config()
         inst, _, tr = _blocks(cfg, instance_id)
-        c = _client(cfg, inst)
-
-        rt = str(tr.get("refresh_token") or "").strip()
-        cid = str(c.get("client_id") or "").strip()
-        secr = str(c.get("client_secret") or "").strip()
-
-        if not (cid and secr and rt):
-            log("TRAKT: missing client_id/client_secret/refresh_token for refresh", "ERROR")
-            return {"ok": False, "status": "missing_refresh"}
-
-        log("TRAKT: refresh token", level="INFO", module="AUTH")
-
-        payload: dict[str, Any] = {
-            "refresh_token": rt,
-            "client_id": cid,
-            "client_secret": secr,
-            "grant_type": "refresh_token",
-        }
-
-        try:
-            r = requests.post(OAUTH_TOKEN, json=payload, headers=_headers(), timeout=30)
-        except Exception as e:
-            log(f"TRAKT: token refresh network error: {e}", "ERROR")
-            return {"ok": False, "status": "network_error", "error": str(e)}
-
-        if r.status_code >= 400:
-            body: dict[str, Any] = {}
-            try:
-                body = r.json() or {}
-            except Exception:
-                body = {}
-            err = str(body.get("error") or "") or str(body.get("error_description") or "") or (r.text or "")[:400]
-            log(f"TRAKT: token refresh failed {r.status_code}: {err}", "ERROR")
-            return {"ok": False, "status": f"refresh_failed:{r.status_code}", "error": err}
-
-        try:
-            tok: dict[str, Any] = r.json() or {}
-        except Exception as e:
-            log(f"TRAKT: token refresh invalid JSON: {e}", "ERROR")
-            return {"ok": False, "status": "bad_json"}
-
-        acc = str(tok.get("access_token") or "").strip()
-        if not acc:
-            log("TRAKT: token refresh succeeded but no access_token in response", "ERROR")
-            return {"ok": False, "status": "no_access_token"}
-
-        new_rt = str(tok.get("refresh_token") or rt or "").strip()
-        exp_in = int(tok.get("expires_in") or 0)
-        expires_at = _now() + exp_in if exp_in > 0 else 0
-
-        tr.update(
-            {
-                "access_token": acc,
-                "refresh_token": new_rt,
-                "scope": tok.get("scope") or tr.get("scope") or "public",
-                "token_type": tok.get("token_type") or tr.get("token_type") or "bearer",
-                "expires_at": expires_at,
-            }
-        )
+        for key in ("access_token", "refresh_token", "scope", "token_type", "expires_at", "_pending_device"):
+            tr.pop(key, None)
         _save_config(cfg)
-        log("TRAKT: refresh ok", level="SUCCESS", module="AUTH")
-        return {"ok": True, "status": "ok"}
+        log(f"TRAKT[{inst}]: disconnected", level="INFO", module="AUTH")
+        return self.get_status(cfg, instance_id=inst)
 
 
 PROVIDER = _TraktProvider()

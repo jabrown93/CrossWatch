@@ -27,10 +27,12 @@ from ._common import (
     plex_cfg_get,
     plex_feature_library_ids,
     plex_headers,
+    raise_home_scope_not_applied,
     server_find_rating_key_by_guid,
     plex_worker_count,
     season_rating_key_from_show,
     section_allowed,
+    unresolved_home_scope_not_applied,
     unresolved_store,
     emit,
     make_logger,
@@ -52,15 +54,37 @@ def _preferred_pms_token(adapter: Any) -> tuple[str, str]:
     srv = getattr(cli, "server", None)
 
     for source, value in (
+        ("active_pms_token", active_pms_token(adapter)),
+        ("server._token", getattr(srv, "_token", None)),
         ("client._pms_token", getattr(cli, "_pms_token", None)),
         ("cfg.pms_token", getattr(getattr(cli, "cfg", None), "pms_token", None)),
-        ("server._token", getattr(srv, "_token", None)),
-        ("active_pms_token", active_pms_token(adapter)),
     ):
         tok = str(value or "").strip()
         if tok:
             return tok, source
     return "", "none"
+
+
+def _selected_account_id_for_query(adapter: Any) -> int:
+    def _int_or_zero(v: Any) -> int:
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    cfg_acct_id = _int_or_zero(plex_cfg_get(adapter, "account_id", 0))
+    if not cfg_acct_id:
+        cfg_acct_id = _int_or_zero(getattr(getattr(adapter, "cfg", None), "account_id", None))
+    cli_acct_id = _int_or_zero(getattr(getattr(adapter, "client", None), "user_account_id", None))
+    return cfg_acct_id or cli_acct_id
+
+
+def _shared_user_scope_active(adapter: Any) -> bool:
+    try:
+        cli = getattr(adapter, "client", None)
+        return str(getattr(cli, "_user_scope_kind", "") or "").strip().lower() == "shared" or bool(getattr(cli, "_cloud_token_suppressed", False))
+    except Exception:
+        return False
 
 def _container_from_plex_response(resp: Any) -> Mapping[str, Any] | None:
     try:
@@ -289,6 +313,16 @@ def _rate(srv: Any, rating_key: Any, rating_1to10: int) -> bool:
 def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, Any]]:
     need_scope, did_switch, sel_aid, sel_uname = home_scope_enter(adapter)
     try:
+        if need_scope and not did_switch:
+            raise_home_scope_not_applied("ratings", sel_aid, sel_uname)
+        if _shared_user_scope_active(adapter):
+            _warn(
+                "index_skipped",
+                reason="shared_user_ratings_unsupported",
+                selected=(sel_aid or sel_uname),
+            )
+            return {}
+
         srv = getattr(getattr(adapter, "client", None), "server", None)
         if not srv:
             raise RuntimeError("PLEX server not bound")
@@ -321,6 +355,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
         page_size = int(plex_cfg_get(adapter, "ratings_page_size", 120) or 120)
         page_size = max(10, min(page_size, 200))
         workers = plex_worker_count(adapter, "rating_workers", "CW_PLEX_RATING_WORKERS", 12)
+        account_id = _selected_account_id_for_query(adapter)
 
         allow = plex_feature_library_ids(adapter, "ratings")
     
@@ -414,6 +449,8 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                     "X-Plex-Container-Size": page_size,
                     "userRating>>": 0,
                 }
+                if account_id:
+                    params["accountID"] = int(account_id)
                 r = ses.get(path, params=params, headers=hdrs, timeout=tmo)
                 if not r.ok:
                     raise RuntimeError(f"PLEX ratings fast query failed (status={r.status_code})")
@@ -525,7 +562,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                                         prog.done(ok=True, total=max(total, scanned) if total else None)
                                     except Exception:
                                         pass
-                                _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers, truncated=True, limit=limit)
+                                _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers, truncated=True, limit=limit, account_id=account_id, token_source=tok_source)
                                 return True
                         _tick()
                 finally:
@@ -546,7 +583,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                                     prog.done(ok=True, total=max(total, scanned) if total else None)
                                 except Exception:
                                     pass
-                            _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers, truncated=True, limit=limit)
+                            _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers, truncated=True, limit=limit, account_id=account_id, token_source=tok_source)
                             return True
                     _tick()
             return False
@@ -581,7 +618,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
             except Exception:
                 pass
     
-        _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers)
+        _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers, account_id=account_id, token_source=tok_source)
         return out
     finally:
         home_scope_exit(adapter, did_switch)
@@ -594,7 +631,7 @@ def _get_existing_rating(srv: Any, rating_key: Any) -> int | None:
     return _norm_rating(getattr(it, "userRating", None))
 
 def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
-    _, did_switch, _, _ = home_scope_enter(adapter)
+    need_scope, did_switch, sel_aid, sel_uname = home_scope_enter(adapter)
     try:
         srv = getattr(getattr(adapter, "client", None), "server", None)
         if not srv:
@@ -603,6 +640,18 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 _UNRES.freeze(it, action="add", reasons=["no_plex_server"])
                 unresolved.append({"item": id_minimal(it), "hint": "no_plex_server"})
             _info("write_skipped", op="add", reason="no_server")
+            return 0, unresolved
+
+        if need_scope and not did_switch:
+            unresolved = unresolved_home_scope_not_applied(items, sel_aid, sel_uname)
+            _info("write_skipped", op="add", reason="home_scope_not_applied", selected=(sel_aid or sel_uname), unresolved=len(unresolved))
+            return 0, unresolved
+        if _shared_user_scope_active(adapter):
+            unresolved: list[dict[str, Any]] = []
+            for it in items or []:
+                _UNRES.freeze(it, action="add", reasons=["shared_user_ratings_unsupported"])
+                unresolved.append({"item": id_minimal(it), "hint": "shared_user_ratings_unsupported"})
+            _warn("write_skipped", op="add", reason="shared_user_ratings_unsupported", selected=(sel_aid or sel_uname), unresolved=len(unresolved))
             return 0, unresolved
     
         ok = 0
@@ -645,7 +694,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     finally:
         home_scope_exit(adapter, did_switch)
 def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
-    _, did_switch, _, _ = home_scope_enter(adapter)
+    need_scope, did_switch, sel_aid, sel_uname = home_scope_enter(adapter)
     try:
         srv = getattr(getattr(adapter, "client", None), "server", None)
         if not srv:
@@ -654,6 +703,18 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 _UNRES.freeze(it, action="remove", reasons=["no_plex_server"])
                 unresolved.append({"item": id_minimal(it), "hint": "no_plex_server"})
             _info("write_skipped", op="remove", reason="no_server")
+            return 0, unresolved
+
+        if need_scope and not did_switch:
+            unresolved = unresolved_home_scope_not_applied(items, sel_aid, sel_uname)
+            _info("write_skipped", op="remove", reason="home_scope_not_applied", selected=(sel_aid or sel_uname), unresolved=len(unresolved))
+            return 0, unresolved
+        if _shared_user_scope_active(adapter):
+            unresolved: list[dict[str, Any]] = []
+            for it in items or []:
+                _UNRES.freeze(it, action="remove", reasons=["shared_user_ratings_unsupported"])
+                unresolved.append({"item": id_minimal(it), "hint": "shared_user_ratings_unsupported"})
+            _warn("write_skipped", op="remove", reason="shared_user_ratings_unsupported", selected=(sel_aid or sel_uname), unresolved=len(unresolved))
             return 0, unresolved
     
         ok = 0

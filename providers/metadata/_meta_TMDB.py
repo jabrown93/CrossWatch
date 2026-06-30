@@ -1,4 +1,4 @@
-# providers/metadata/_meta_TMDB.py
+﻿# providers/metadata/_meta_TMDB.py
 # CrossWatch - TMDb Metadata Provider
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
@@ -64,11 +64,11 @@ class TmdbProvider:
     def _ttl_seconds(self) -> int:
         cfg = self.load_cfg() or {}
         md = cfg.get("metadata") or {}
-        hours = md.get("ttl_hours", 72)
+        hours = md.get("ttl_hours", 720)
         try:
             hours = int(hours)
         except Exception:
-            hours = 72
+            hours = 720
         return max(1, hours) * 3600
 
     def _backoff_params(self) -> tuple[int, float, float]:
@@ -462,6 +462,15 @@ class TmdbProvider:
             self._log_exc("TMDb detail fetch failed", e)
             return {}
 
+        vote_count_raw = det.get("vote_count")
+        vote_count = (
+            int(vote_count_raw)
+            if isinstance(vote_count_raw, (int, float))
+            and not isinstance(vote_count_raw, bool)
+            and vote_count_raw >= 0
+            else None
+        )
+
         if kind == "movie":
             title_out = det.get("title") or det.get("original_title")
             year = self._safe_int_year(det.get("release_date"))
@@ -495,7 +504,10 @@ class TmdbProvider:
             detail = {
                 "first_air_date": det.get("first_air_date"),
                 "episode_run_time": run_list,
+                "status": det.get("status"),
                 "number_of_seasons": det.get("number_of_seasons"),
+                "number_of_episodes": det.get("number_of_episodes"),
+                "next_episode_to_air": det.get("next_episode_to_air"),
             }
 
         images: dict[str, list[dict[str, Any]]] = {}
@@ -546,6 +558,7 @@ class TmdbProvider:
             "title": title_out,
             "year": year,
             "runtime_minutes": runtime_minutes,
+            "vote_count": vote_count,
             "images": images or {},
             "detail": detail,
         }
@@ -585,7 +598,7 @@ def html() -> str:
     #sec-tmdb details.advanced .adv-wrap { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   </style>
 
-  <div class="head" onclick="toggleSection('sec-tmdb')">
+  <div class="head" data-toggle-section="sec-tmdb">
     <span class="chev"></span><strong>The Movie Database (TMDb)</strong>
   </div>
 
@@ -615,8 +628,8 @@ def html() -> str:
 
           <div>
             <label for="metadata_ttl_hours">TTL hours (metadata.ttl_hours)</label>
-            <input id="metadata_ttl_hours" name="metadata_ttl_hours" type="number" min="1" step="1" placeholder="72" oninput="this.dataset.dirty='1'">
-            <div class="sub">Resolver cache freshness (coarse). Default 72h.</div>
+            <input id="metadata_ttl_hours" name="metadata_ttl_hours" type="number" min="1" step="1" placeholder="720" oninput="this.dataset.dirty='1'">
+            <div class="sub">Resolver cache freshness (coarse). Default 720h (30 days).</div>
           </div>
 
         </div>

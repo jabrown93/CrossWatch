@@ -13,13 +13,13 @@
   // Tabs
   function showTab(id) {
     try {
-      D.querySelectorAll("#page-main, #page-watchlist, #page-settings, .tab-page")
+      D.querySelectorAll("#page-main, #page-watchlist, #page-playback_progress, #page-settings, .tab-page")
         .forEach(el => el.classList.add("hidden"));
 
       const tgt = D.getElementById("page-" + id) || D.getElementById(id);
       if (tgt) tgt.classList.remove("hidden");
 
-      ["main", "watchlist", "settings"].forEach(n => {
+      ["main", "watchlist", "playback_progress", "snapshots", "editor", "settings"].forEach(n => {
         const th = D.getElementById("tab-" + n);
         if (th) th.classList.toggle("active", n === id);
       });
@@ -29,6 +29,26 @@
 
       if (id === "watchlist") {
         try { window.Watchlist?.mount?.(D.getElementById("page-watchlist")); } catch {}
+      }
+      if (id === "playback_progress") {
+        (async () => {
+          try {
+            if (!window.PlaybackProgress?.mount && window.CW?.PageLoader?.ensure) {
+              await window.CW.PageLoader.ensure({
+                key: "playback_progress",
+                src: "/assets/js/playback_progress.js",
+                namespace: "PlaybackProgress",
+              });
+            }
+            window.PlaybackProgress?.mount?.(D.getElementById("page-playback_progress"));
+          } catch (e) {
+            console.warn("[crosswatch] Playback Progress failed to load", e);
+            const root = D.getElementById("playback-progress-root");
+            if (root && (!root.children.length || root.querySelector(".cw-page-loading"))) {
+              root.innerHTML = '<div class="cw-page-load-error">Playback Progress failed to load. Refresh the page and try again.</div>';
+            }
+          }
+        })();
       }
     } catch (e) {
       console.warn("[crosswatch] showTab failed", e);
@@ -367,6 +387,7 @@ function _cwHasConfiguredValue(v) {
       "anilist.client_secret",
       "anilist.access_token",
       "mdblist.api_key",
+      "mdblist.access_token",
       "tautulli.server_url",
       "tautulli.api_key",
       "tautulli.history.user_id",
@@ -432,8 +453,7 @@ async function _cwFetchBootstrapAuthState() {
     const status = statusResp.ok ? await statusResp.json() : null;
     const blocked = !!(
       status
-      && !status.authenticated
-      && (status.reset_required || !status.configured || meta?.auth_reset_required || meta?.first_run || meta?.autogen)
+      && (status.setup_required || status.reset_required || !status.configured || meta?.auth_setup_required || meta?.auth_reset_required || meta?.first_run || meta?.autogen)
     );
     window.__cwAuthSetupPending = blocked;
     window.__cwAuthBootstrapState = { meta, status, blocked };

@@ -38,7 +38,7 @@
   const raf = (fn) => (window.requestAnimationFrame || ((cb) => setTimeout(cb, 0)))(fn);
 
   const PROVIDER_ORDER = META.order || [
-    "CROSSWATCH", "PLEX", "SIMKL", "TRAKT", "ANILIST", "TMDB", "JELLYFIN", "EMBY", "MDBLIST", "TAUTULLI"
+    "CROSSWATCH", "PLEX", "SIMKL", "TRAKT", "ANILIST", "TMDB", "JELLYFIN", "EMBY", "MDBLIST", "PUBLICMETADB", "TAUTULLI"
   ];
   const STATUS_PROVIDERS = typeof META.statusProviders === "function" ? META.statusProviders() : [
     { key: "PLEX", badgeId: "badge-plex", legacy: ["plex_connected", "plex"] },
@@ -49,13 +49,14 @@
     { key: "JELLYFIN", badgeId: "badge-jellyfin", legacy: ["jellyfin_connected", "jellyfin"] },
     { key: "EMBY", badgeId: "badge-emby", legacy: ["emby_connected", "emby"] },
     { key: "MDBLIST", badgeId: "badge-mdblist", legacy: ["mdblist_connected", "mdblist"] },
+    { key: "PUBLICMETADB", badgeId: "badge-publicmetadb", legacy: ["publicmetadb_connected", "publicmetadb"] },
     { key: "TAUTULLI", badgeId: "badge-tautulli", legacy: ["tautulli_connected", "tautulli"] },
   ];
   const BADGE_IDS = Object.fromEntries([
     ...STATUS_PROVIDERS.map((p) => [p.key, p.badgeId]),
     ["CROSSWATCH", typeof META.badgeId === "function" ? (META.badgeId("CROSSWATCH") || "badge-crosswatch") : "badge-crosswatch"],
   ]);
-  const PAIR_ACTIVE_KEYS = ["PLEX", "SIMKL", "TRAKT", "ANILIST", "TMDB", "JELLYFIN", "EMBY", "MDBLIST", "TAUTULLI", "CROSSWATCH"];
+  const PAIR_ACTIVE_KEYS = ["PLEX", "SIMKL", "TRAKT", "ANILIST", "TMDB", "JELLYFIN", "EMBY", "MDBLIST", "PUBLICMETADB", "TAUTULLI", "CROSSWATCH"];
   const PROVIDER_ALIASES = typeof META.aliasesMap === "function" ? META.aliasesMap() : {
     CROSSWATCH: ["CROSSWATCH"],
     PLEX: ["PLEX"],
@@ -66,6 +67,7 @@
     JELLYFIN: ["JELLYFIN"],
     EMBY: ["EMBY"],
     MDBLIST: ["MDBLIST", "MDB LIST", "MDB-LIST"],
+    PUBLICMETADB: ["PUBLICMETADB", "PUBLIC META DB", "PUBLIC-META-DB", "PMDB"],
     TAUTULLI: ["TAUTULLI"],
   };
   const SIMPLE_PROVIDER_CHECKS = [
@@ -75,7 +77,8 @@
     { key: "ANILIST", paths: [["anilist"], ["auth", "anilist"]], keys: ["access_token", "token"] },
     { key: "JELLYFIN", paths: [["jellyfin"], ["auth", "jellyfin"]], keys: ["access_token"] },
     { key: "EMBY", paths: [["emby"], ["auth", "emby"]], keys: ["access_token", "api_key", "token"] },
-    { key: "MDBLIST", paths: [["mdblist"], ["auth", "mdblist"]], keys: ["api_key"] },
+    { key: "MDBLIST", paths: [["mdblist"], ["auth", "mdblist"]], keys: ["api_key", "access_token"] },
+    { key: "PUBLICMETADB", paths: [["publicmetadb"], ["auth", "publicmetadb"]], keys: ["api_key"] },
   ];
 
   const UI = (window._ui ||= { status: null, summary: null, pairedProviders: null });
@@ -92,6 +95,7 @@
   const AUTO_STATUS = false;
   const STATUS_MIN_INTERVAL = 24 * 60 * 60 * 1000;
   const UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+  const UPDATE_CHECK_RETRY_MS = 5 * 60 * 1000;
   const PAIRS_CACHE_KEY = "cw.pairs.v1";
   const PAIRS_TTL_MS = 15_000;
   const STATUS_CACHE_KEY = "cw.status.v1";
@@ -279,7 +283,7 @@
       if (def.paths.some((path) => hasAnyConfigValue(pathGet(cfg, path), def.keys))) set.add(def.key);
     }
 
-    if ([cfg?.tmdb_sync, cfg?.tmdb, cfg?.auth?.tmdb_sync].some(hasTmdbConfig)) set.add("TMDB");
+    if ([cfg?.tmdb_sync, cfg?.auth?.tmdb_sync].some(hasTmdbConfig)) set.add("TMDB");
     if ([cfg?.tautulli, cfg?.auth?.tautulli].some((block) => hasAnyConfigValue(block, ["api_key", "server_url", "server"]))) set.add("TAUTULLI");
 
     const crosswatch = cfg?.crosswatch || cfg?.CrossWatch || {};
@@ -669,7 +673,10 @@
       renderConnectorStatus(providers, { stale: false });
       saveStatusCache(providers);
       try {
-        document.dispatchEvent(new CustomEvent("cw-status-updated", { detail: { payload, providers } }));
+        const configuredProviders = [...getConfiguredProviders()].filter((key) => Object.prototype.hasOwnProperty.call(providers, key));
+        const detail = { payload, providers, configuredProviders };
+        window.__CW_PROVIDER_STATUS__ = detail;
+        document.dispatchEvent(new CustomEvent("cw-status-updated", { detail }));
       } catch {}
       UI.status = buildStatusUIState(payload, providers);
       recomputeRunDisabled();
@@ -751,6 +758,11 @@
 
   function recomputeRunDisabled() {
     const disabled = !!state.busy || !!UI.summary?.running || !(UI.status ? !!UI.status.can_run : true);
+    const runButton = byId("run");
+    if (runButton) {
+      runButton.classList.toggle("loading", !!state.busy || !!UI.summary?.running);
+      runButton.setAttribute("aria-busy", String(!!state.busy || !!UI.summary?.running));
+    }
     [byId("run"), byId("run-menu")].forEach((btn) => {
       if (btn) btn.disabled = disabled;
     });
@@ -814,15 +826,18 @@
     if (authSetupPending()) return;
     enforceMainLayout();
     state.lastStatusMs = 0;
+    const previewAlreadyRendered = !!(window.wallLoaded || byId("poster-row")?.childElementCount);
     await Promise.allSettled([
       refreshStatus(false),
       Promise.resolve(window.refreshInsights?.(true)),
+      previewAlreadyRendered ? Promise.resolve(window.updatePreviewVisibility?.()) : Promise.resolve(),
     ]);
 
     if (!window.esSum) queueSafe(() => window.openSummaryStream?.());
     if (!window.esLogs) queueSafe(() => window.openLogStream?.());
-    window.wallLoaded = false;
-    try { await window.updatePreviewVisibility?.(); } catch {}
+    if (!previewAlreadyRendered) {
+      try { await window.updatePreviewVisibility?.(); } catch {}
+    }
 
     if (typeof window.refreshSchedulingBanner === "function") {
       window.refreshSchedulingBanner();
@@ -834,7 +849,7 @@
   }
 
   function setTabHeaderState(tab) {
-    ["main", "watchlist", "snapshots", "editor", "settings"].forEach((name) => {
+    ["main", "watchlist", "playback_progress", "snapshots", "editor", "settings"].forEach((name) => {
       byId(`tab-${name}`)?.classList.toggle("active", name === tab);
     });
   }
@@ -845,6 +860,7 @@
     if (tab !== "main") byId("placeholder-card")?.classList.add("hidden");
 
     byId("page-watchlist")?.classList.toggle("hidden", tab !== "watchlist");
+    byId("page-playback_progress")?.classList.toggle("hidden", tab !== "playback_progress");
     byId("page-snapshots")?.classList.toggle("hidden", tab !== "snapshots");
     byId("page-editor")?.classList.toggle("hidden", tab !== "editor");
     byId("page-settings")?.classList.toggle("hidden", tab !== "settings");
@@ -858,6 +874,11 @@
   }
 
   async function hydrateSettingsPage() {
+    try {
+      await ensurePageModule("settings-insight", "/assets/js/settings-insight.js", "SettingsInsight");
+    } catch (e) {
+      console.warn("Settings insight load failed:", e);
+    }
     try { await window.loadConfig?.(); } catch {}
     try { await window.ensureProvidersPaneReady?.(); } catch {}
 
@@ -914,6 +935,21 @@
       return;
     }
 
+    if (tab === "playback_progress") {
+      try {
+        await ensurePageModule("playback_progress", "/assets/js/playback_progress.js", "PlaybackProgress");
+        window.PlaybackProgress?.mount?.(byId("page-playback_progress"));
+      } catch (e) {
+        console.warn("Playback Progress load/refresh failed:", e);
+        const root = byId("playback-progress-root");
+        if (root && (!root.children.length || root.querySelector(".cw-page-loading"))) {
+          root.innerHTML = '<div class="cw-page-load-error">Playback Progress failed to load. Refresh the page and try again.</div>';
+        }
+      }
+      state.currentTab = "playback_progress";
+      return;
+    }
+
     if (tab === "snapshots") {
       try {
         await ensurePageModule("snapshots", "/assets/js/snapshots.js", "Snapshots", {
@@ -923,6 +959,16 @@
         console.warn("Snapshots load/refresh failed:", e);
       }
       state.currentTab = "snapshots";
+      return;
+    }
+
+    if (tab === "editor") {
+      try {
+        await ensurePageModule("editor", "/assets/js/editor.js", "Editor");
+      } catch (e) {
+        console.warn("Editor load failed:", e);
+      }
+      state.currentTab = "editor";
       return;
     }
 
@@ -995,7 +1041,8 @@
     if (!script) {
       script = document.createElement("script");
       script.id = "scrobbler-js";
-      script.src = "/assets/js/scrobbler.js";
+      const version = encodeURIComponent(String(window.APP_VERSION || window.__CW_VERSION__ || ""));
+      script.src = `/assets/js/scrobbler.js${version ? `?v=${version}` : ""}`;
       script.defer = true;
       script.onload = start;
       script.onerror = () => console.warn("[scrobbler] script failed to load");
@@ -1461,11 +1508,15 @@
 
   async function checkForUpdate() {
     try {
-      const payload = await requestJSON("/api/version", {}, 15000);
-      const current = String(payload.current ?? "0.0.0").trim();
-      const latest = payload.latest ? String(payload.latest).trim() : null;
-      const url = payload.html_url || "https://github.com/cenodude/CrossWatch/releases";
+      const payload = await requestJSON("/api/update", {}, 15000);
+      const current = String(payload.current_version ?? payload.current ?? "0.0.0").trim();
+      const latestValue = payload.latest_version ?? payload.latest;
+      const latest = latestValue ? String(latestValue).trim() : null;
+      const url = payload.html_url || payload.url || "https://github.com/cenodude/CrossWatch/releases";
       const hasUpdate = !!payload.update_available;
+      const updateDetail = { current, latest, url, available: hasUpdate, known: true };
+      window.__CW_UPDATE_STATUS__ = updateDetail;
+      try { document.dispatchEvent(new CustomEvent("cw-update-status", { detail: updateDetail })); } catch {}
 
       const versionEl = byId("app-version");
       if (versionEl) versionEl.textContent = `Version ${current}`;
@@ -1493,19 +1544,43 @@
       }
 
       renderMainUpdatePill(hasUpdate, latest, url);
+      return updateDetail;
     } catch (err) {
+      const updateDetail = { current: String(window.CW_CURRENT_VERSION || ""), latest: null, url: "", available: false, known: true, unavailable: true };
+      window.__CW_UPDATE_STATUS__ = updateDetail;
+      try { document.dispatchEvent(new CustomEvent("cw-update-status", { detail: updateDetail })); } catch {}
       console.debug("Version check failed:", err);
+      return null;
     }
   }
 
   (function initUpdateChecks() {
     if (window.__cwUpdateInitDone) return;
     window.__cwUpdateInitDone = true;
-    const run = () => {
-      try { checkForUpdate(); } catch (e) { console.debug("checkForUpdate failed:", e); }
+    let retryTimer = null;
+    const run = async () => {
+      try {
+        if (window.__cwAuthBootstrapPromise) {
+          try { await window.__cwAuthBootstrapPromise; } catch {}
+        }
+        if (authSetupPending()) return;
+        const result = await checkForUpdate();
+        if (result) {
+          if (retryTimer) clearTimeout(retryTimer);
+          retryTimer = null;
+        } else if (!retryTimer) {
+          retryTimer = setTimeout(() => {
+            retryTimer = null;
+            run();
+          }, UPDATE_CHECK_RETRY_MS);
+        }
+      } catch (e) {
+        console.debug("checkForUpdate failed:", e);
+      }
     };
     onReady(run);
     setInterval(run, UPDATE_CHECK_INTERVAL_MS);
+    window.addEventListener("auth-changed", run);
   })();
 
   function renderSummaryCore(summary) {
@@ -1529,6 +1604,7 @@
     setText("det-ver", summary.version || "–");
     setText("det-start", toLocal(summary.started_at));
     setText("det-finish", toLocal(summary.finished_at));
+    recomputeRunDisabled();
   }
 
   const previousRenderSummary = window.renderSummary;
@@ -1741,6 +1817,7 @@ Object.assign(window, {
   copySummary, loadPairs, cxSavePair,
   cwToggleSyncMenu, DETAILS_MAX_LINES,
 });
+CW.checkForUpdate = checkForUpdate;
 
   onReady(() => {
     const authPendingAtReady = authSetupPending();

@@ -436,6 +436,11 @@ def active_pms_token(source: Any) -> str | None:
 def active_cloud_token(source: Any) -> str | None:
     for obj in (source, getattr(source, "client", None)):
         try:
+            if bool(getattr(obj, "_cloud_token_suppressed", False)):
+                return None
+        except Exception:
+            pass
+        try:
             tok = getattr(obj, "cloud_token", None)
             if tok and str(tok).strip():
                 return str(tok).strip()
@@ -1980,26 +1985,39 @@ def home_scope_enter(adapter: Any) -> tuple[bool, bool, int | None, str | None]:
     if not need:
         return False, False, sel_aid, sel_uname
 
+    can_home = False
     try:
-        if not bool(getattr(cli, "can_home_switch")()):
-            return True, False, sel_aid, sel_uname
+        can_home = bool(getattr(cli, "can_home_switch")())
     except Exception:
-        return True, False, sel_aid, sel_uname
+        can_home = False
 
-    pin = (getattr(getattr(cli, "cfg", None), "home_pin", None) or "").strip() or None
-    try:
-        ok = bool(
-            getattr(cli, "enter_home_user_scope")(
-                target_username=(str(desired_uname).strip() if desired_uname else None),
-                target_account_id=(int(desired_aid) if desired_aid is not None else None),
-                pin=pin,
+    ok = False
+    if can_home:
+        pin = (getattr(getattr(cli, "cfg", None), "home_pin", None) or "").strip() or None
+        try:
+            ok = bool(
+                getattr(cli, "enter_home_user_scope")(
+                    target_username=(str(desired_uname).strip() if desired_uname else None),
+                    target_account_id=(int(desired_aid) if desired_aid is not None else None),
+                    pin=pin,
+                )
             )
-        )
-    except Exception:
-        ok = False
+        except Exception:
+            ok = False
 
     if not ok:
-        _warn("home_scope_not_applied", selected=(desired_aid or desired_uname))
+        try:
+            ok = bool(
+                getattr(cli, "enter_shared_user_scope")(
+                    target_username=(str(desired_uname).strip() if desired_uname else None),
+                    target_account_id=(int(desired_aid) if desired_aid is not None else None),
+                )
+            )
+        except Exception:
+            ok = False
+
+    if not ok:
+        _warn("user_scope_not_applied", selected=(desired_aid or desired_uname))
     return True, ok, sel_aid, sel_uname
 
 
@@ -2013,6 +2031,31 @@ def home_scope_exit(adapter: Any, did_switch: bool) -> None:
         getattr(cli, "exit_home_user_scope")()
     except Exception:
         pass
+
+
+def home_scope_selected_label(sel_aid: Any, sel_uname: Any) -> str:
+    v = sel_aid if sel_aid is not None else sel_uname
+    return str(v or "").strip() or "selected user"
+
+
+def raise_home_scope_not_applied(feature: str, sel_aid: Any, sel_uname: Any) -> None:
+    selected = home_scope_selected_label(sel_aid, sel_uname)
+    _warn("home_scope_blocked", target_feature=str(feature or ""), selected=selected)
+    raise RuntimeError(f"Plex selected user scope could not be applied for {feature}: {selected}")
+
+
+def unresolved_home_scope_not_applied(items: Iterable[Mapping[str, Any]] | None, sel_aid: Any, sel_uname: Any) -> list[dict[str, Any]]:
+    from cw_platform.id_map import minimal as id_minimal
+
+    selected = home_scope_selected_label(sel_aid, sel_uname)
+    out: list[dict[str, Any]] = []
+    for item in items or []:
+        try:
+            minimal = id_minimal(item)
+        except Exception:
+            minimal = dict(item or {})
+        out.append({"item": minimal, "hint": "home_scope_not_applied", "selected": selected})
+    return out
 
 
 def as_epoch(v: Any) -> int | None:

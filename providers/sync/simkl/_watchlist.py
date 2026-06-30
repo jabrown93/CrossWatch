@@ -8,6 +8,7 @@ import os
 import time
 from typing import Any, Iterable, Mapping
 
+from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
@@ -18,6 +19,7 @@ from ._common import (
     get_watermark,
     load_json_state,
     normalize_flat_watermarks,
+    simkl_api_params_from_headers,
     key_of as simkl_key_of,
     save_json_state,
     save_watermark,
@@ -195,8 +197,8 @@ def _kind_group(item: Mapping[str, Any]) -> str:
         return "movies"
     if bucket in ("shows", "anime"):
         return "shows"
-    media_type = str(item.get("type") or "movie").strip().lower()
-    return "movies" if media_type in ("movie", "movies") else "shows"
+    media_type = mapped_or_default_media_type(item)
+    return "movies" if media_type == "movie" else "shows"
 
 
 def _sum_processed_from_body(body: Any) -> int:
@@ -532,11 +534,12 @@ def _pull_bucket(
         params: dict[str, Any],
         force: bool,
     ) -> dict[str, dict[str, Any]]:
+        headers = _headers(adapter, force_refresh=force)
         try:
             resp = session.get(
                 url,
-                headers=_headers(adapter, force_refresh=force),
-                params=params,
+                headers=headers,
+                params=simkl_api_params_from_headers(headers, **params),
                 timeout=adapter.cfg.timeout,
             )
             if resp.status_code != 200:
@@ -589,6 +592,7 @@ def _pull_all_watchlist(
     force_refresh: bool = False,
 ) -> dict[str, dict[str, Any]]:
     session = adapter.client.session
+    headers = _headers(adapter, force_refresh=force_refresh)
     params: dict[str, Any] = {}
     if date_from:
         params["date_from"] = date_from
@@ -596,8 +600,8 @@ def _pull_all_watchlist(
     try:
         resp = session.get(
             URL_INDEX_ALL,
-            headers=_headers(adapter, force_refresh=force_refresh),
-            params=params or None,
+            headers=headers,
+            params=simkl_api_params_from_headers(headers, **params),
             timeout=adapter.cfg.timeout,
         )
         if resp.status_code != 200:
@@ -1032,6 +1036,7 @@ def add(
             resp = session.post(
                 URL_ADD,
                 headers=headers,
+                params=simkl_api_params_from_headers(headers),
                 json=body,
                 timeout=adapter.cfg.timeout,
             )
@@ -1132,6 +1137,7 @@ def remove(
             resp = session.post(
                 URL_REMOVE,
                 headers=headers,
+                params=simkl_api_params_from_headers(headers),
                 json=payload,
                 timeout=adapter.cfg.timeout,
             )
