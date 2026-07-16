@@ -44,6 +44,9 @@ _ENC_PREFIX = "enc:v1:"
 def _config_key_file() -> Path:
     return CONFIG / ".cw_master_key"
 
+def setup_token_file() -> Path:
+    return CONFIG / ".setup_token"
+
 def _normalize_fernet_key(raw: str | bytes) -> bytes:
     data = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
     data = data.strip()

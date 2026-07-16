@@ -62,6 +62,7 @@ playwright/.auth/
 # CrossWatch runtime state
 .cw_state/
 .cw_master_key
+.setup_token
 
 # Local test/temp workspaces
 .pytest_tmp*/

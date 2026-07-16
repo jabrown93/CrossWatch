@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from cw_platform.config_base import load_config, save_config
+from cw_platform.config_base import load_config, save_config, setup_token_file
 
 __all__ = [
     "router",
@@ -30,6 +30,7 @@ __all__ = [
     "is_authenticated",
     "reset_pending",
     "setup_lock_required",
+    "verify_setup_token",
     "register_app_auth",
 ]
 
@@ -324,6 +325,27 @@ def setup_lock_required(cfg: dict[str, Any]) -> bool:
     return not auth_required(cfg)
 
 
+def verify_setup_token(candidate: str) -> bool:
+    try:
+        p = setup_token_file()
+        expected = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+    except Exception:
+        expected = ""
+    if not expected:
+        return False
+    got = str(candidate or "").strip()
+    if not got:
+        return False
+    return hmac.compare_digest(expected, got)
+
+
+def _consume_setup_token() -> None:
+    try:
+        setup_token_file().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _find_session(a: dict[str, Any], token: str | None) -> dict[str, Any] | None:
     t = (token or "").strip()
     if not t:
@@ -474,10 +496,19 @@ def _drop_session(cfg: dict[str, Any], token: str | None) -> None:
 
 def _clear_sessions(cfg: dict[str, Any]) -> None:
     a = cfg.get("app_auth")
-    if not isinstance(a, dict):
-        return
-    a["sessions"] = []
-    _sync_legacy_session(a, [])
+    if isinstance(a, dict):
+        a["sessions"] = []
+        _sync_legacy_session(a, [])
+    # Revoke paired mobile devices too, so a device paired during a compromise
+    # can't outlive the credential rotation meant to evict it. Deferred import:
+    # api.mobileAPI imports this module at load time, so a top-level import here
+    # would be circular.
+    try:
+        from api.mobileAPI import revoke_all_devices
+
+        revoke_all_devices(cfg)
+    except Exception:
+        pass
 
 
 def _clear_other_sessions(cfg: dict[str, Any], token: str | None) -> None:
@@ -1165,8 +1196,18 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
     configured0 = auth_required(cfg)
     recovery_mode = reset_pending(cfg)
     token = req.cookies.get(COOKIE_NAME)
+    was_setup_locked = setup_lock_required(cfg)
 
-    if configured0 and not recovery_mode and not is_authenticated(cfg, token):
+    if was_setup_locked:
+        if not verify_setup_token(str(payload.get("setup_token") or "")):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Invalid or missing setup token. Check the boot logs or the .setup_token file under your config directory.",
+                },
+                status_code=401,
+            )
+    elif not is_authenticated(cfg, token):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     if configured0 and token and not _origin_allowed(req):
         return _origin_blocked_response()
@@ -1198,6 +1239,8 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
         a["username"] = username or str(a.get("username") or "")
         _clear_sessions(cfg)
         save_config(cfg)
+        if was_setup_locked:
+            _consume_setup_token()
         resp = JSONResponse({"ok": True, "enabled": False}, headers={"Cache-Control": "no-store"})
         _del_cookie(resp, req)
         return resp
@@ -1240,6 +1283,8 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
 
     token2, exp2 = _issue_session(cfg, req)
     save_config(cfg)
+    if was_setup_locked:
+        _consume_setup_token()
 
     resp = JSONResponse({"ok": True, "enabled": True, "expires_at": exp2}, headers={"Cache-Control": "no-store"})
     _set_cookie(resp, token2, exp2, req, persistent=_cfg_remember_session_enabled(a))
