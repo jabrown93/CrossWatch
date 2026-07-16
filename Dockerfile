@@ -45,6 +45,13 @@ FROM dhi.io/python:3.14.6-alpine3.24
 
 LABEL org.opencontainers.image.description="One brain for all your media syncs A single place to configure everything."
 
+# Baked in by CI (jabrown93/.github/docker-release.yml passes
+# --build-arg APP_VERSION=v<version>); api/versionAPI.py reads this via
+# os.getenv("APP_VERSION", ...) to report the real release instead of the
+# hardcoded fallback. Defaults to "dev" for a local `docker build` without it.
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
