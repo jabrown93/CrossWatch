@@ -153,6 +153,8 @@ def test_bootstrap_credentials_still_work_without_origin(monkeypatch) -> None:
     }
     monkeypatch.setattr(auth, "load_config", lambda: cfg)
     monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
 
     req = _request("/api/app-auth/credentials")
     r = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "secrett1"})
@@ -202,6 +204,8 @@ def test_credentials_clamp_and_store_remember_session_settings(monkeypatch) -> N
     cfg = _auth_cfg(enabled=False)
     monkeypatch.setattr(auth, "load_config", lambda: cfg)
     monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
 
     req = _request("/api/app-auth/credentials")
     resp = auth.api_set_credentials(
@@ -227,6 +231,8 @@ def test_credentials_clear_reset_required_flag(monkeypatch) -> None:
     cfg["app_auth"]["reset_required"] = True
     monkeypatch.setattr(auth, "load_config", lambda: cfg)
     monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
 
     req = _request("/api/app-auth/credentials")
     resp = auth.api_set_credentials(
@@ -250,6 +256,8 @@ def test_credentials_mark_upgrade_pending_when_config_outdated(monkeypatch) -> N
     monkeypatch.setattr(auth, "_current_version_text", lambda: "0.9.14")
     monkeypatch.setattr(auth, "load_config", lambda: cfg)
     monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
 
     req = _request("/api/app-auth/credentials")
     resp = auth.api_set_credentials(
@@ -307,6 +315,8 @@ def test_credentials_reject_too_short_password(monkeypatch) -> None:
     cfg = _auth_cfg(enabled=False)
     monkeypatch.setattr(auth, "load_config", lambda: cfg)
     monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
 
     req = _request("/api/app-auth/credentials")
     resp = auth.api_set_credentials(
@@ -372,3 +382,152 @@ def test_login_timeout_steps_up_to_five_and_ten_minutes(monkeypatch) -> None:
     assert last is not None
     assert last.status_code == 429
     assert _json_body(last)["retry_after"] == 600
+
+
+def test_credentials_rejects_missing_or_wrong_setup_token(monkeypatch, tmp_path) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg(enabled=False)
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "setup_token_file", lambda: tmp_path / ".setup_token")
+    (tmp_path / ".setup_token").write_text("real-token\n", encoding="utf-8")
+
+    req = _request("/api/app-auth/credentials")
+
+    no_token = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "secrett1"})
+    assert no_token.status_code == 401
+
+    wrong_token = auth.api_set_credentials(
+        req,
+        {"enabled": True, "username": "admin", "password": "secrett1", "setup_token": "wrong-token"},
+    )
+    assert wrong_token.status_code == 401
+
+    # Config was never touched by either rejected attempt.
+    assert cfg["app_auth"]["username"] == "admin"
+    assert cfg["app_auth"]["enabled"] is False
+
+
+def test_credentials_accepts_and_consumes_valid_setup_token(monkeypatch, tmp_path) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg(enabled=False)
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    token_path = tmp_path / ".setup_token"
+    monkeypatch.setattr(auth, "setup_token_file", lambda: token_path)
+    token_path.write_text("real-token\n", encoding="utf-8")
+
+    req = _request("/api/app-auth/credentials")
+    resp = auth.api_set_credentials(
+        req,
+        {"enabled": True, "username": "admin", "password": "secrett1", "setup_token": "real-token"},
+    )
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["username"] == "admin"
+
+    # The token is one-time use: the file is gone, so a replay with the same
+    # value now fails even against a still-unconfigured instance.
+    assert not token_path.exists()
+
+
+def test_logout_all_revokes_paired_mobile_devices(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["mobile_auth"] = {
+        "enabled": True,
+        "devices": [{"id": "dev1", "token_hash": "abc", "revoked_at": 0, "expires_at": 9_999_999_999}],
+        "pairings": [],
+    }
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+
+    req = _request("/api/app-auth/logout-all", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+    resp = auth.api_logout_all(req)
+
+    assert resp.status_code == 200
+    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] > 0
+
+
+def test_credentials_password_change_revokes_mobile_devices(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["mobile_auth"] = {
+        "enabled": True,
+        "devices": [{"id": "dev1", "token_hash": "abc", "revoked_at": 0, "expires_at": 9_999_999_999}],
+        "pairings": [],
+    }
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+
+    resp = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "newpassword1"})
+
+    assert resp.status_code == 200
+    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] > 0
+
+
+def test_credentials_save_without_password_change_does_not_revoke_mobile_devices(monkeypatch) -> None:
+    # A benign settings tweak (e.g. remember-session preference) hits this same
+    # endpoint with enabled=True and no password. It must not revoke paired
+    # mobile devices -- only an actual password rotation should.
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["mobile_auth"] = {
+        "enabled": True,
+        "devices": [{"id": "dev1", "token_hash": "abc", "revoked_at": 0, "expires_at": 9_999_999_999}],
+        "pairings": [],
+    }
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+
+    resp = auth.api_set_credentials(
+        req,
+        {
+            "enabled": True,
+            "username": "admin",
+            "password": "",
+            "remember_session_enabled": True,
+            "remember_session_days": 60,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] == 0
+
+
+def test_disabling_auth_mints_a_fresh_setup_token(monkeypatch) -> None:
+    # Once the token that gated the very first setup is consumed, disabling auth
+    # re-enters the setup-locked state. Without minting a new token here, no one
+    # could ever pass the setup-token gate again short of restarting the process.
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    written: dict[str, str] = {}
+    monkeypatch.setattr(auth, "write_setup_token", lambda token: written.setdefault("token", token))
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+
+    resp = auth.api_set_credentials(req, {"enabled": False})
+
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["enabled"] is False
+    assert written.get("token")

@@ -66,9 +66,11 @@ export function syncAppAuthState(root, state) {
   const usernameEl = root.querySelector('[data-field="username"]');
   const passwordEl = root.querySelector('[data-field="password"]');
   const password2El = root.querySelector('[data-field="password2"]');
+  const setupTokenEl = root.querySelector('[data-field="setup_token"]');
   if (usernameEl) state.username = usernameEl.value;
   if (passwordEl) state.password = passwordEl.value;
   if (password2El) state.password2 = password2El.value;
+  if (setupTokenEl) state.setup_token = setupTokenEl.value;
   return state;
 }
 
@@ -77,6 +79,7 @@ export function validateAppAuthState(state) {
   if (!String(state?.password || "")) return "Password is required.";
   if (String(state?.password || "").length < MIN_PASSWORD_LENGTH) return `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`;
   if (state?.password !== state?.password2) return "Passwords do not match.";
+  if (!String(state?.setup_token || "").trim()) return "Setup token is required.";
   return "";
 }
 
@@ -103,7 +106,7 @@ export function wireLiveAppAuthValidation(root, state, errorId = "", saveBtn = n
     errEl.classList.toggle("show", !!next);
   };
 
-  for (const sel of ['[data-field="username"]', '[data-field="password"]', '[data-field="password2"]']) {
+  for (const sel of ['[data-field="username"]', '[data-field="password"]', '[data-field="password2"]', '[data-field="setup_token"]']) {
     const el = root.querySelector(sel);
     if (!el || el.dataset.liveAuthWired === "1") continue;
     el.addEventListener("input", update);
@@ -164,6 +167,11 @@ export function renderAppAuthFields({
         <label for="${escapeHtml(idPrefix)}-pass2">Confirm password</label>
         <input id="${escapeHtml(idPrefix)}-pass2" data-field="password2" type="password" autocomplete="new-password" placeholder="Repeat password" value="${escapeHtml(state?.password2)}">
       </div>
+      <div class="field full">
+        <label for="${escapeHtml(idPrefix)}-setup-token">Setup token</label>
+        <input id="${escapeHtml(idPrefix)}-setup-token" data-field="setup_token" type="text" autocomplete="off" placeholder="Paste the one-time setup token" value="${escapeHtml(state?.setup_token)}">
+        <div class="subtxt">Printed in the server's boot logs and saved to a <code>.setup_token</code> file in your config directory.</div>
+      </div>
     </div>
     <div class="${errCls}"${errAttr}>${escapeHtml(state?.error)}</div>
   `;
@@ -175,17 +183,20 @@ export function renderAppAuthFields({
   `;
 }
 
-export async function saveRequiredAppAuth({ username, password, keepPending = false }) {
+export async function saveRequiredAppAuth({ username, password, setupToken, keepPending = false }) {
   const user = String(username || "").trim();
   const pass = String(password || "");
+  const token = String(setupToken || "").trim();
   if (!user) throw new Error("Username is required");
   if (!pass) throw new Error("Password is required");
   if (pass.length < MIN_PASSWORD_LENGTH) throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+  if (!token) throw new Error("Setup token is required");
 
   const data = await _postJson("/api/app-auth/credentials", {
     enabled: true,
     username: user,
     password: pass,
+    setup_token: token,
   });
   _markAuthSetupPending(keepPending);
   try { window.dispatchEvent(new Event("auth-changed")); } catch {}

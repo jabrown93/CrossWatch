@@ -15,6 +15,7 @@ import sys
 sys.modules.setdefault("crosswatch", sys.modules[__name__])
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -72,7 +73,7 @@ from services.scheduling import SyncScheduler
 from services.statistics import Stats
 
 from cw_platform.orchestrator import Orchestrator, minimal
-from cw_platform.config_base import load_config, save_config, CONFIG as CONFIG_DIR
+from cw_platform.config_base import load_config, save_config, CONFIG as CONFIG_DIR, setup_token_file, write_setup_token
 from cw_platform.tls import ensure_self_signed_cert, resolve_tls_paths
 from cw_platform.orchestrator import canonical_key
 
@@ -194,9 +195,43 @@ def _apply_auth_reset_env_once() -> None:
         a["sessions"] = []
         a["last_login_at"] = 0
         save_config(cfg)
+        # Write a fresh token unconditionally rather than unlinking the old one and
+        # relying on _ensure_setup_token() to regenerate it below -- if the unlink
+        # ever failed, the stale token would silently keep working, defeating the
+        # "old token can't be replayed after a reset" guarantee.
+        write_setup_token(secrets.token_urlsafe(24))
         print("[BOOT] CW_RESET_AUTH_ONCE detected: app authentication was reset. Remove the env var and set a new username/password in the UI.")
     except Exception as exc:
         print(f"[BOOT] CW_RESET_AUTH_ONCE failed: {exc}")
+
+def _ensure_setup_token() -> None:
+    try:
+        cfg = load_config() or {}
+    except Exception as exc:
+        print(f"[BOOT] Could not load config to check setup token: {exc}")
+        return
+    if not app_auth_setup_lock_required(cfg):
+        return
+
+    token_path = setup_token_file()
+    try:
+        if token_path.exists():
+            try:
+                os.chmod(token_path, 0o600)
+            except Exception:
+                pass
+            existing = token_path.read_text(encoding="utf-8").strip()
+            if existing:
+                print(f"[BOOT] Setup required. One-time setup token: {existing}")
+                print(f"[BOOT] Provide this token as \"setup_token\" in POST /api/app-auth/credentials, or read it from {token_path}.")
+                return
+
+        token = secrets.token_urlsafe(24)
+        write_setup_token(token)
+        print(f"[BOOT] Setup required. One-time setup token: {token}")
+        print(f"[BOOT] Provide this token as \"setup_token\" in POST /api/app-auth/credentials, or read it from {token_path}.")
+    except Exception as exc:
+        print(f"[BOOT] Failed to prepare setup token: {exc}")
 
 def _is_static_noise(path: str, status: int) -> bool:
     if path.startswith("/assets/") or path.startswith("/favicon"):
@@ -354,6 +389,7 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
 
 # API
 _apply_auth_reset_env_once()
+_ensure_setup_token()
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
