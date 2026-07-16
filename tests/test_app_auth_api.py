@@ -432,7 +432,7 @@ def test_credentials_accepts_and_consumes_valid_setup_token(monkeypatch, tmp_pat
     assert not token_path.exists()
 
 
-def test_clear_sessions_revokes_paired_mobile_devices(monkeypatch) -> None:
+def test_logout_all_revokes_paired_mobile_devices(monkeypatch) -> None:
     from api import appAuthAPI as auth
 
     cfg = _auth_cfg()
@@ -452,3 +452,82 @@ def test_clear_sessions_revokes_paired_mobile_devices(monkeypatch) -> None:
 
     assert resp.status_code == 200
     assert cfg["mobile_auth"]["devices"][0]["revoked_at"] > 0
+
+
+def test_credentials_password_change_revokes_mobile_devices(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["mobile_auth"] = {
+        "enabled": True,
+        "devices": [{"id": "dev1", "token_hash": "abc", "revoked_at": 0, "expires_at": 9_999_999_999}],
+        "pairings": [],
+    }
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+
+    resp = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "newpassword1"})
+
+    assert resp.status_code == 200
+    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] > 0
+
+
+def test_credentials_save_without_password_change_does_not_revoke_mobile_devices(monkeypatch) -> None:
+    # A benign settings tweak (e.g. remember-session preference) hits this same
+    # endpoint with enabled=True and no password. It must not revoke paired
+    # mobile devices -- only an actual password rotation should.
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["mobile_auth"] = {
+        "enabled": True,
+        "devices": [{"id": "dev1", "token_hash": "abc", "revoked_at": 0, "expires_at": 9_999_999_999}],
+        "pairings": [],
+    }
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+
+    resp = auth.api_set_credentials(
+        req,
+        {
+            "enabled": True,
+            "username": "admin",
+            "password": "",
+            "remember_session_enabled": True,
+            "remember_session_days": 60,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] == 0
+
+
+def test_disabling_auth_mints_a_fresh_setup_token(monkeypatch) -> None:
+    # Once the token that gated the very first setup is consumed, disabling auth
+    # re-enters the setup-locked state. Without minting a new token here, no one
+    # could ever pass the setup-token gate again short of restarting the process.
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+    written: dict[str, str] = {}
+    monkeypatch.setattr(auth, "write_setup_token", lambda token: written.setdefault("token", token))
+
+    seed_req = _request("/api/app-auth/login")
+    session_token, _exp = auth._issue_session(cfg, seed_req)
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session_token}"})
+
+    resp = auth.api_set_credentials(req, {"enabled": False})
+
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["enabled"] is False
+    assert written.get("token")

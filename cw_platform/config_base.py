@@ -47,6 +47,24 @@ def _config_key_file() -> Path:
 def setup_token_file() -> Path:
     return CONFIG / ".setup_token"
 
+def write_setup_token(token: str) -> None:
+    """Persist the one-time setup token with 0600 permissions from the moment the
+    file is created (not chmod'd after the fact), so it's never briefly readable
+    at the umask's default mode. Also re-tightens an existing file's permissions,
+    in case it predates this."""
+    path = setup_token_file()
+    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+    except Exception:
+        os.close(fd)
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
 def _normalize_fernet_key(raw: str | bytes) -> bytes:
     data = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
     data = data.strip()

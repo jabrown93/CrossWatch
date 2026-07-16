@@ -18,7 +18,8 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from cw_platform.config_base import load_config, save_config, setup_token_file
+from cw_platform.config_base import load_config, save_config, setup_token_file, write_setup_token
+from _logging import log
 
 __all__ = [
     "router",
@@ -499,16 +500,22 @@ def _clear_sessions(cfg: dict[str, Any]) -> None:
     if isinstance(a, dict):
         a["sessions"] = []
         _sync_legacy_session(a, [])
-    # Revoke paired mobile devices too, so a device paired during a compromise
-    # can't outlive the credential rotation meant to evict it. Deferred import:
-    # api.mobileAPI imports this module at load time, so a top-level import here
-    # would be circular.
+
+
+def _revoke_mobile_devices(cfg: dict[str, Any]) -> None:
+    """Revoke every paired mobile device, so a device paired during a compromise
+    can't outlive the credential rotation meant to evict it. Called only from the
+    security-sensitive session-clearing paths (password change, disable-auth,
+    logout-all, apply-now) -- not from every credentials save, since that would
+    also fire on benign settings tweaks (e.g. remember-session preference).
+    Deferred import: api.mobileAPI imports this module at load time, so a
+    top-level import here would be circular."""
     try:
         from api.mobileAPI import revoke_all_devices
 
         revoke_all_devices(cfg)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.error("Failed to revoke paired mobile devices during a session-clearing event", exc)
 
 
 def _clear_other_sessions(cfg: dict[str, Any], token: str | None) -> None:
@@ -1146,6 +1153,7 @@ def api_logout_all(request: Request) -> JSONResponse:
         if not _origin_allowed(request):
             return _origin_blocked_response()
     _clear_sessions(cfg)
+    _revoke_mobile_devices(cfg)
     save_config(cfg)
     resp = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
     _del_cookie(resp, request)
@@ -1177,6 +1185,7 @@ def api_apply_now(request: Request, payload: dict[str, Any] | None = Body(None))
         return _origin_blocked_response()
 
     _clear_sessions(cfg)
+    _revoke_mobile_devices(cfg)
     save_config(cfg)
 
     def _kill() -> None:
@@ -1238,9 +1247,17 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
         a["reset_required"] = False
         a["username"] = username or str(a.get("username") or "")
         _clear_sessions(cfg)
+        _revoke_mobile_devices(cfg)
         save_config(cfg)
-        if was_setup_locked:
-            _consume_setup_token()
+        # Disabling auth makes setup_lock_required(cfg) true again (auth_required
+        # flips to False), so this endpoint is now pre-auth-reachable once more.
+        # Mint a fresh token unconditionally -- otherwise, once the token that
+        # gated this very request is consumed, nothing could ever re-lock this
+        # instance down again short of restarting the process.
+        fresh_token = secrets.token_urlsafe(24)
+        write_setup_token(fresh_token)
+        print(f"[AUTH] App authentication disabled. New one-time setup token: {fresh_token}")
+        print(f"[AUTH] Provide this token as \"setup_token\" in POST /api/app-auth/credentials, or read it from {setup_token_file()}.")
         resp = JSONResponse({"ok": True, "enabled": False}, headers={"Cache-Control": "no-store"})
         _del_cookie(resp, req)
         return resp
@@ -1278,6 +1295,8 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
     a["username"] = username
     a["reset_required"] = False
     _clear_sessions(cfg)
+    if password:
+        _revoke_mobile_devices(cfg)
     _clear_setup_autogen_flag(cfg)
     _mark_upgrade_pending_if_needed(cfg)
 
