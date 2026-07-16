@@ -166,11 +166,13 @@ export default {
         await saveRequiredAppAuth({
           username: state.username,
           password: state.password,
+          setupToken: state.setup_token,
         });
         state.saving = false;
         state.error = "";
         state.password = "";
         state.password2 = "";
+        state.setup_token = "";
         try { window.notify?.("Sign-in enabled."); } catch {}
         try {
           const boot = window.__cwAuthBootstrapState || {};

@@ -67,6 +67,20 @@ def _cfg_mobile(cfg: dict[str, Any]) -> dict[str, Any]:
     return block
 
 
+def revoke_all_devices(cfg: dict[str, Any]) -> None:
+    """Revoke every paired mobile device. Called whenever app_auth sessions are
+    cleared (password change, disable-auth, logout-all, apply-now) so a device
+    paired during a compromise can't outlive the credential rotation meant to
+    evict it."""
+    block = _cfg_mobile(cfg)
+    devices_raw = block.get("devices")
+    devices = devices_raw if isinstance(devices_raw, list) else []
+    now = _now()
+    for device in devices:
+        if isinstance(device, dict) and not int(device.get("revoked_at") or 0):
+            device["revoked_at"] = now
+
+
 def _clean_scopes(values: Any) -> list[str]:
     raw = values if isinstance(values, list) else DEFAULT_SCOPES
     out: list[str] = []

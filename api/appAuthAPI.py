@@ -18,7 +18,8 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from cw_platform.config_base import load_config, save_config
+from cw_platform.config_base import load_config, save_config, setup_token_file, write_setup_token
+from _logging import log
 
 __all__ = [
     "router",
@@ -30,6 +31,7 @@ __all__ = [
     "is_authenticated",
     "reset_pending",
     "setup_lock_required",
+    "verify_setup_token",
     "register_app_auth",
 ]
 
@@ -324,6 +326,27 @@ def setup_lock_required(cfg: dict[str, Any]) -> bool:
     return not auth_required(cfg)
 
 
+def verify_setup_token(candidate: str) -> bool:
+    try:
+        p = setup_token_file()
+        expected = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+    except Exception:
+        expected = ""
+    if not expected:
+        return False
+    got = str(candidate or "").strip()
+    if not got:
+        return False
+    return hmac.compare_digest(expected, got)
+
+
+def _consume_setup_token() -> None:
+    try:
+        setup_token_file().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _find_session(a: dict[str, Any], token: str | None) -> dict[str, Any] | None:
     t = (token or "").strip()
     if not t:
@@ -474,10 +497,25 @@ def _drop_session(cfg: dict[str, Any], token: str | None) -> None:
 
 def _clear_sessions(cfg: dict[str, Any]) -> None:
     a = cfg.get("app_auth")
-    if not isinstance(a, dict):
-        return
-    a["sessions"] = []
-    _sync_legacy_session(a, [])
+    if isinstance(a, dict):
+        a["sessions"] = []
+        _sync_legacy_session(a, [])
+
+
+def _revoke_mobile_devices(cfg: dict[str, Any]) -> None:
+    """Revoke every paired mobile device, so a device paired during a compromise
+    can't outlive the credential rotation meant to evict it. Called only from the
+    security-sensitive session-clearing paths (password change, disable-auth,
+    logout-all, apply-now) -- not from every credentials save, since that would
+    also fire on benign settings tweaks (e.g. remember-session preference).
+    Deferred import: api.mobileAPI imports this module at load time, so a
+    top-level import here would be circular."""
+    try:
+        from api.mobileAPI import revoke_all_devices
+
+        revoke_all_devices(cfg)
+    except Exception as exc:
+        log.error("Failed to revoke paired mobile devices during a session-clearing event", exc)
 
 
 def _clear_other_sessions(cfg: dict[str, Any], token: str | None) -> None:
@@ -1115,6 +1153,7 @@ def api_logout_all(request: Request) -> JSONResponse:
         if not _origin_allowed(request):
             return _origin_blocked_response()
     _clear_sessions(cfg)
+    _revoke_mobile_devices(cfg)
     save_config(cfg)
     resp = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
     _del_cookie(resp, request)
@@ -1146,6 +1185,7 @@ def api_apply_now(request: Request, payload: dict[str, Any] | None = Body(None))
         return _origin_blocked_response()
 
     _clear_sessions(cfg)
+    _revoke_mobile_devices(cfg)
     save_config(cfg)
 
     def _kill() -> None:
@@ -1165,8 +1205,18 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
     configured0 = auth_required(cfg)
     recovery_mode = reset_pending(cfg)
     token = req.cookies.get(COOKIE_NAME)
+    was_setup_locked = setup_lock_required(cfg)
 
-    if configured0 and not recovery_mode and not is_authenticated(cfg, token):
+    if was_setup_locked:
+        if not verify_setup_token(str(payload.get("setup_token") or "")):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Invalid or missing setup token. Check the boot logs or the .setup_token file under your config directory.",
+                },
+                status_code=401,
+            )
+    elif not is_authenticated(cfg, token):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     if configured0 and token and not _origin_allowed(req):
         return _origin_blocked_response()
@@ -1197,7 +1247,17 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
         a["reset_required"] = False
         a["username"] = username or str(a.get("username") or "")
         _clear_sessions(cfg)
+        _revoke_mobile_devices(cfg)
         save_config(cfg)
+        # Disabling auth makes setup_lock_required(cfg) true again (auth_required
+        # flips to False), so this endpoint is now pre-auth-reachable once more.
+        # Mint a fresh token unconditionally -- otherwise, once the token that
+        # gated this very request is consumed, nothing could ever re-lock this
+        # instance down again short of restarting the process.
+        fresh_token = secrets.token_urlsafe(24)
+        write_setup_token(fresh_token)
+        print(f"[AUTH] App authentication disabled. New one-time setup token: {fresh_token}")
+        print(f"[AUTH] Provide this token as \"setup_token\" in POST /api/app-auth/credentials, or read it from {setup_token_file()}.")
         resp = JSONResponse({"ok": True, "enabled": False}, headers={"Cache-Control": "no-store"})
         _del_cookie(resp, req)
         return resp
@@ -1235,11 +1295,15 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
     a["username"] = username
     a["reset_required"] = False
     _clear_sessions(cfg)
+    if password:
+        _revoke_mobile_devices(cfg)
     _clear_setup_autogen_flag(cfg)
     _mark_upgrade_pending_if_needed(cfg)
 
     token2, exp2 = _issue_session(cfg, req)
     save_config(cfg)
+    if was_setup_locked:
+        _consume_setup_token()
 
     resp = JSONResponse({"ok": True, "enabled": True, "expires_at": exp2}, headers={"Cache-Control": "no-store"})
     _set_cookie(resp, token2, exp2, req, persistent=_cfg_remember_session_enabled(a))

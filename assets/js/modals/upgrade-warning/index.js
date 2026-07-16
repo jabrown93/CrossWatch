@@ -204,12 +204,14 @@ export default {
         await saveRequiredAppAuth({
           username: state.username,
           password: state.password,
+          setupToken: state.setup_token,
         });
         state.authReady = true;
         state.saving = false;
         state.error = "";
         state.password = "";
         state.password2 = "";
+        state.setup_token = "";
         state.step = requiresCleanReset ? "cleanup" : "migrate";
         notify(requiresCleanReset
           ? "Sign-in saved. You can now run the clean reset."

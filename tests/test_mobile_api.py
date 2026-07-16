@@ -122,6 +122,31 @@ def test_mobile_pairing_qr_requires_qrcode(monkeypatch) -> None:
     assert missing.value.detail == "mobile_qr_dependency_missing"
 
 
+def test_revoke_all_devices_locks_out_a_paired_device(monkeypatch) -> None:
+    from api import mobileAPI as mobile
+
+    mobile._PAIRING_CLAIM_FAILS.clear()
+    cfg: dict = {"mobile_auth": {"enabled": True, "devices": [], "pairings": []}}
+    monkeypatch.setattr(mobile, "load_config", lambda: cfg)
+    monkeypatch.setattr(mobile, "save_config", lambda next_cfg: cfg.update(next_cfg))
+    monkeypatch.setattr(mobile, "_activity_payload", lambda: ([], 0))
+    monkeypatch.setattr(mobile, "_scheduler_label", lambda: ("Disabled", "Not scheduled"))
+    monkeypatch.setattr(mobile, "_watching_label", lambda: "Nothing playing")
+    monkeypatch.setattr(mobile, "_library_payload", lambda: [])
+
+    start_data = _json_body(mobile.mobile_pairing_start(_request("/api/mobile/pairing/start"), {"device_name": "Tablet"}))
+    token = _json_body(mobile.mobile_pairing_claim(_request("/api/mobile/pairing/claim"), {"code": start_data["code"], "device_name": "Tablet"}))["token"]
+
+    authed = _request("/api/mobile/summary", method="GET", headers={"authorization": f"Bearer {token}"})
+    assert _json_body(mobile.mobile_summary(authed))["server_name"] == "CrossWatch"
+
+    mobile.revoke_all_devices(cfg)
+
+    with pytest.raises(HTTPException) as missing:
+        mobile.mobile_summary(authed)
+    assert missing.value.status_code == 401
+
+
 def test_mobile_pairing_claim_rate_limits_bad_codes(monkeypatch) -> None:
     from api import mobileAPI as mobile
 
