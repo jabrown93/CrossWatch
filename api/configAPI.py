@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from packaging.version import InvalidVersion, Version
 
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 from providers.scrobble.sources import source_enabled
 from _logging import log as BASE_LOG
@@ -422,28 +422,22 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     cfg: dict[str, Any] = dict(merged or {})
 
-    # Warn on suspicious server URLs (SSRF guard — log only, don't reject)
-    try:
-        from cw_platform.url_validation import validate_server_url
-        _url_checks = [
-            ((cfg.get("plex") or {}).get("server_url", ""), "plex.server_url"),
-            ((cfg.get("jellyfin") or {}).get("server", ""), "jellyfin.server"),
-            ((cfg.get("emby") or {}).get("server", ""), "emby.server"),
-            ((cfg.get("tautulli") or {}).get("server_url", ""), "tautulli.server_url"),
-        ]
-        for _url_val, _url_field in _url_checks:
-            for _w in validate_server_url(_url_val, _url_field):
-                try:
-                    from _logging import log as _log
-                    _log(_w, level="WARN", module="CONFIG")
-                except Exception:
-                    pass
-    except Exception as e:
+    # SSRF guard — reject the save outright for a dangerous server URL
+    # (bad scheme, path traversal, or a host that is/resolves to a cloud
+    # metadata or link-local address). Private/RFC-1918 IPs are still
+    # allowed — that's the normal case for local media servers.
+    from cw_platform.url_validation import assert_server_url_safe
+    _url_checks = [
+        ((cfg.get("plex") or {}).get("server_url", ""), "plex.server_url"),
+        ((cfg.get("jellyfin") or {}).get("server", ""), "jellyfin.server"),
+        ((cfg.get("emby") or {}).get("server", ""), "emby.server"),
+        ((cfg.get("tautulli") or {}).get("server_url", ""), "tautulli.server_url"),
+    ]
+    for _url_val, _url_field in _url_checks:
         try:
-            from _logging import log as _log
-            _log(f"Error during URL validation: {e}", level="WARN", module="CONFIG")
-        except Exception:
-            pass
+            assert_server_url_safe(_url_val, _url_field)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Scrobble watcher: ensure routes exist when legacy fields are used
     try:
