@@ -40,9 +40,10 @@ jobs:
         # they are pre-existing upstream bugs (cenodude/CrossWatch), not caused
         # by this fork. Deselecting keeps CI green without modifying upstream
         # source files; drop a line here once upstream fixes the corresponding test.
+        # (test_app_auth_api.py::test_setup_lock_not_required_when_up_to_date_without_auth
+        # was a fork-local bug, not an upstream one — fixed and removed from this list.)
         run: |
           python -m pytest \
             --deselect "tests/test_dashboard_widgets.py::test_recent_scrobble_widget_uses_nested_history_sync_item_art" \
             --deselect "tests/test_meta_api_episode_stills.py::test_episode_still_art_is_fetched_and_cached" \
-            --deselect "tests/test_playback_progress.py::test_same_title_with_matching_progress_can_still_combine_across_profiles" \
-            --deselect "tests/test_app_auth_api.py::test_setup_lock_not_required_when_up_to_date_without_auth"
+            --deselect "tests/test_playback_progress.py::test_same_title_with_matching_progress_can_still_combine_across_profiles"
