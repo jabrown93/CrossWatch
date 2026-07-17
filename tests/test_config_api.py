@@ -41,6 +41,27 @@ def test_config_save_rejects_metadata_server_url(monkeypatch) -> None:
     assert not saved  # save() must never be reached for a rejected config
 
 
+def test_config_save_rejects_metadata_server_url_in_instance(monkeypatch) -> None:
+    from api import configAPI as cfg_api
+
+    saved: dict = {}
+    _stub_env(monkeypatch, cfg_api, lambda: {}, lambda cfg: saved.update(cfg))
+
+    payload = {
+        "jellyfin": {
+            "server": "http://media.local:8096",
+            "instances": {"evil": {"server": "http://169.254.169.254"}},
+        }
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        cfg_api.api_config_save(payload)
+
+    assert exc_info.value.status_code == 400
+    assert "jellyfin.instances.evil.server" in str(exc_info.value.detail)
+    assert not saved
+
+
 def test_config_save_allows_lan_server_url(monkeypatch) -> None:
     from api import configAPI as cfg_api
 
