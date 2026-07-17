@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from urllib.parse import unquote, urlparse
+from typing import Any
+from urllib.parse import unquote, urljoin, urlparse
 
 # Cloud metadata hostnames that should never be contacted by a media-server URL.
 # Checked as a literal-hostname match; IP-literal and DNS-resolved cases are
@@ -116,3 +117,37 @@ def assert_server_url_safe(url: str, field_name: str = "server_url") -> None:
     warnings = validate_server_url(url, field_name)
     if warnings:
         raise ValueError("; ".join(warnings))
+
+
+def guarded_request(method: str, url: str, *, field_name: str = "server_url", max_redirects: int = 5, **kwargs: Any):
+    """requests.request() wrapper that re-validates the target host on every
+    redirect hop, not just the initial URL.
+
+    A URL that passes assert_server_url_safe() once (e.g. at login/save time)
+    can still be turned into an SSRF: requests follows redirects by default
+    and never re-checks the new Location, so a server that looks safe at
+    validation time can 302 the actual request to a metadata/link-local
+    address. This disables automatic redirect-following and instead
+    validates + follows each hop manually, raising ValueError (like
+    assert_server_url_safe) if any hop is unsafe or the chain is too long.
+    """
+    import requests
+
+    current_method = method
+    current_url = url
+    body_kwargs = dict(kwargs)
+    body_kwargs.pop("allow_redirects", None)
+    for _ in range(max_redirects + 1):
+        assert_server_url_safe(current_url, field_name)
+        resp = requests.request(current_method, current_url, allow_redirects=False, **body_kwargs)
+        if not resp.is_redirect:
+            return resp
+        location = resp.headers.get("Location")
+        if not location:
+            return resp
+        current_url = urljoin(current_url, location)
+        if resp.status_code == 303 and current_method != "GET":
+            current_method = "GET"
+            body_kwargs.pop("json", None)
+            body_kwargs.pop("data", None)
+    raise ValueError(f"{field_name}: exceeded {max_redirects} redirects while validating target host")

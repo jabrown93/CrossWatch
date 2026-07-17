@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from cw_platform.config_base import DEFAULT_CFG, load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
-from cw_platform.url_validation import assert_server_url_safe
+from cw_platform.url_validation import assert_server_url_safe, guarded_request
 from providers.sync.emby._utils import (
     ensure_whitelist_defaults as emby_ensure_whitelist_defaults,
     fetch_libraries_from_cfg as emby_fetch_libraries_from_cfg,
@@ -147,13 +147,17 @@ def _validate_tautulli_credentials(server_url: str, api_key: str, *, timeout: fl
     if not server.startswith(("http://", "https://")):
         server = "http://" + server
     try:
-        r = requests.get(
+        r = guarded_request(
+            "GET",
             f"{server}/api/v2",
+            field_name="tautulli.server_url",
             params={"apikey": key, "cmd": "get_server_info"},
             headers={"Accept": "application/json", "User-Agent": "CrossWatch/TautulliAuth"},
             timeout=timeout,
             verify=bool(verify_ssl),
         )
+    except ValueError:
+        return False, "unsafe_redirect_target"
     except requests.Timeout:
         return False, "validation_timeout"
     except requests.RequestException:

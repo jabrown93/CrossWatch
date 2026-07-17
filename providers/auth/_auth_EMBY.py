@@ -9,6 +9,7 @@ from typing import Any, cast
 from urllib.parse import urljoin
 
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
+from cw_platform.url_validation import guarded_request
 
 try:
     from _logging import log as _real_log
@@ -154,7 +155,9 @@ class EmbyAuth(AuthProvider):
 
         log("Emby: authenticating...", level="INFO", module="AUTH")
         try:
-            r = requests.post(url, data=payload, headers=headers, timeout=(5, 10))
+            r = guarded_request("POST", url, field_name="emby.server", data=payload, headers=headers, timeout=(5, 10))
+        except ValueError as e:
+            raise RuntimeError(f"Blocked: {e}")
         except rx.ConnectTimeout:
             raise RuntimeError("Server not reachable: timeout")
         except rx.ReadTimeout:
@@ -185,8 +188,10 @@ class EmbyAuth(AuthProvider):
         display = (user_obj.get("Name") or user).strip()
 
         try:
-            me = requests.get(
+            me = guarded_request(
+                "GET",
                 urljoin(base, "Users/Me"),
+                field_name="emby.server",
                 headers=_headers(token, dev_id),
                 timeout=10,
             )

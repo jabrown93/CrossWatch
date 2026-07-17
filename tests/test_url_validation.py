@@ -4,8 +4,9 @@ from __future__ import annotations
 import socket
 
 import pytest
+import responses
 
-from cw_platform.url_validation import assert_server_url_safe, validate_server_url
+from cw_platform.url_validation import assert_server_url_safe, guarded_request, validate_server_url
 
 
 def test_valid_http_url():
@@ -125,3 +126,65 @@ def test_assert_server_url_safe_raises_on_finding():
 def test_assert_server_url_safe_passes_on_clean_url():
     assert_server_url_safe("http://192.168.1.100:32400", "test")  # no raise
     assert_server_url_safe("", "test")  # empty is not a finding
+
+
+class TestGuardedRequest:
+    @responses.activate
+    def test_no_redirect_passes_through(self):
+        responses.add(responses.GET, "http://192.168.1.100:32400/Users", json={"ok": True}, status=200)
+        r = guarded_request("GET", "http://192.168.1.100:32400/Users", field_name="test")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+    @responses.activate
+    def test_redirect_to_safe_host_is_followed(self):
+        responses.add(
+            responses.GET,
+            "http://192.168.1.100:32400/Users",
+            status=302,
+            headers={"Location": "http://192.168.1.100:32400/Users/"},
+        )
+        responses.add(responses.GET, "http://192.168.1.100:32400/Users/", json={"ok": True}, status=200)
+        r = guarded_request("GET", "http://192.168.1.100:32400/Users", field_name="test")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+    @responses.activate
+    def test_redirect_to_metadata_ip_is_blocked(self):
+        """A server that passes the initial host check but 302s the actual
+        request to a metadata address must not have that redirect followed."""
+        responses.add(
+            responses.GET,
+            "http://media.example.com/Users",
+            status=302,
+            headers={"Location": "http://169.254.169.254/latest/meta-data/"},
+        )
+        with pytest.raises(ValueError):
+            guarded_request("GET", "http://media.example.com/Users", field_name="test")
+
+    @responses.activate
+    def test_redirect_to_link_local_via_relative_location_is_blocked(self):
+        responses.add(
+            responses.GET,
+            "http://media.example.com/Users",
+            status=302,
+            headers={"Location": "//169.254.169.254/latest/meta-data/"},
+        )
+        with pytest.raises(ValueError):
+            guarded_request("GET", "http://media.example.com/Users", field_name="test")
+
+    def test_unsafe_initial_url_is_blocked_before_any_request(self):
+        with pytest.raises(ValueError):
+            guarded_request("GET", "http://169.254.169.254/", field_name="test")
+
+    @responses.activate
+    def test_redirect_chain_too_long_is_blocked(self):
+        for i in range(7):
+            responses.add(
+                responses.GET,
+                f"http://192.168.1.100/{i}",
+                status=302,
+                headers={"Location": f"http://192.168.1.100/{i + 1}"},
+            )
+        with pytest.raises(ValueError):
+            guarded_request("GET", "http://192.168.1.100/0", field_name="test", max_redirects=5)

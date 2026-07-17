@@ -9,6 +9,7 @@ from typing import Any, cast
 from urllib.parse import urljoin
 
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
+from cw_platform.url_validation import guarded_request
 
 try:
     from _logging import log as _real_log
@@ -160,7 +161,9 @@ class JellyfinAuth(AuthProvider):
 
         log("Jellyfin: authenticating...", level="INFO", module="AUTH")
         try:
-            r = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT_POST)
+            r = guarded_request("POST", url, field_name="jellyfin.server", json=payload, headers=headers, timeout=HTTP_TIMEOUT_POST)
+        except ValueError as e:
+            raise RuntimeError(f"Blocked: {e}")
         except rx.ConnectTimeout:
             raise RuntimeError("Server not reachable: timeout")
         except rx.ReadTimeout:
@@ -191,8 +194,10 @@ class JellyfinAuth(AuthProvider):
         display = (user_obj.get("Name") or user).strip()
 
         try:
-            me = requests.get(
+            me = guarded_request(
+                "GET",
                 urljoin(base, "Users/Me"),
+                field_name="jellyfin.server",
                 headers=_headers(token, dev_id),
                 timeout=HTTP_TIMEOUT_GET,
             )
