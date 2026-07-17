@@ -4,29 +4,30 @@
 //   * push to `main` -> stable release (feat -> minor, fix/perf -> patch, ! -> major)
 //   * push to `beta` -> prerelease (vX.Y.Z-beta.N)
 //
-// Dependency bumps intentionally do NOT cut a release on ordinary pushes. Renovate
-// labels them fix(deps) (runtime deps), chore(deps) (dev deps / lock maintenance),
-// or build(deps) — fix would otherwise trigger a patch via the default rules, so it
-// is explicitly suppressed here. A weekly scheduled workflow run (add one in
-// release.yml if desired, mirroring AURA's) can set RELEASE_DEPS=true to promote
-// accumulated dependency commits to a single patch release.
+// Routine runtime dependency bumps (fix(deps), from Renovate via the shared
+// preset) intentionally do NOT cut a release on ordinary pushes -- fix would
+// otherwise trigger a patch via the default rules, so it is explicitly
+// suppressed here. The weekly scheduled run in .github/workflows/release.yml
+// sets RELEASE_DEPS=true, which promotes the accumulated bumps into one patch
+// release. Vulnerability fixes are typed fix(security) by the preset, not
+// fix(deps), so they are unaffected by the suppression and still release
+// immediately. See jabrown93/.github's README, "Weekly dependency releases".
 //
 // This file is CommonJS (there is no root package.json with "type": "module");
 // semantic-release loads it via cosmiconfig.
 
 const releaseDeps = process.env.RELEASE_DEPS === "true";
 
-// Custom rules are evaluated before commit-analyzer's defaults, and the first
-// match wins — so `release: false` on fix(deps) suppresses the default fix->patch.
-// chore/build already don't release by default; they only need promotion when
-// RELEASE_DEPS is set.
-const depReleaseRules = releaseDeps
-  ? [
-      { type: "fix", scope: "deps", release: "patch" },
-      { type: "chore", scope: "deps", release: "patch" },
-      { type: "build", scope: "deps", release: "patch" },
-    ]
-  : [{ type: "fix", scope: "deps", release: false }];
+const depReleaseRules = [
+  // Required: commit-analyzer evaluates every matching custom rule and keeps
+  // the highest release type, so without this a breaking fix(deps)! would
+  // match ONLY the suppression rule below and never release. Listed first so
+  // the analyzer short-circuits on major.
+  { type: "fix", scope: "deps", breaking: true, release: "major" },
+  releaseDeps
+    ? { type: "fix", scope: "deps", release: "patch" }
+    : { type: "fix", scope: "deps", release: false },
+];
 
 module.exports = {
   branches: ["main", { name: "beta", prerelease: true }],
