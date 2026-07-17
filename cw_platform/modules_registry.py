@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from importlib import import_module
 from typing import Any
 
 # Global module registry
@@ -43,11 +42,13 @@ def get_sync_module_path_by_name(name: str) -> str | None:
 
 
 def load_sync_ops(name: str) -> Any | None:
-    path = get_sync_module_path_by_name(name)
-    if not path:
-        return None
-    mod = import_module(path)
-    return getattr(mod, "OPS", None)
+    # Resolve via the orchestrator's dynamic provider discovery (pkgutil-scanned
+    # providers/sync/_mod_*.py) instead of importing the static MODULES["SYNC"]
+    # path by hand — keeps this the single source of truth for "what ops does
+    # provider X have" so the two registries can't silently drift apart.
+    from cw_platform.orchestrator._providers import load_sync_providers
+
+    return load_sync_providers().get((name or "").strip().upper())
 
 
 def state_read_features(ops: Any) -> dict[str, bool]:

@@ -299,13 +299,37 @@ def test_setup_lock_required_for_upgrade_without_auth(monkeypatch) -> None:
     assert auth.setup_lock_required(cfg) is True
 
 
-def test_setup_lock_not_required_when_up_to_date_without_auth(monkeypatch) -> None:
+def test_setup_lock_required_for_fresh_install_without_credentials() -> None:
+    """Mandatory setup: a fresh install with no app_auth credentials
+    configured must always be setup-locked, regardless of the raw
+    (pre-normalization) `enabled` flag — auth is not opt-in."""
     from api import appAuthAPI as auth
+    from cw_platform.config_base import _normalize_app_auth
 
-    cfg = _auth_cfg(enabled=False)
-    cfg["version"] = "0.9.14"
-    monkeypatch.setattr(auth, "_current_version_text", lambda: "0.9.14")
+    cfg: dict = {"app_auth": {}}
+    _normalize_app_auth(cfg)
 
+    assert auth.credentials_configured(cfg) is False
+    assert auth.setup_lock_required(cfg) is True
+
+
+def test_setup_lock_not_required_once_credentials_configured() -> None:
+    """Once credentials are configured, enabled, and no reset is pending,
+    the setup lock is released. Config is passed through the real
+    normalization path (not hand-assembled) so this reflects an actually
+    reachable state — a raw `enabled=False` with credentials already
+    configured is NOT such a state: _normalize_app_auth forces
+    reset_required=True for it (see test_setup_lock_required_for_upgrade_
+    without_auth above), which is the correct "you disabled auth after
+    setting it up, re-confirm" behavior, not an unlock."""
+    from api import appAuthAPI as auth
+    from cw_platform.config_base import _normalize_app_auth
+
+    cfg = _auth_cfg(enabled=True)
+    _normalize_app_auth(cfg)
+
+    assert auth.credentials_configured(cfg) is True
+    assert auth.reset_pending(cfg) is False
     assert auth.setup_lock_required(cfg) is False
 
 
