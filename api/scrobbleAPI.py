@@ -21,7 +21,6 @@ from cw_platform.provider_instances import build_provider_config_view, normalize
 from providers.scrobble.routes import build_route_cfg_by_id, normalize_route_options, normalize_routes
 from providers.scrobble.scrobble import mask_account as _mask_account
 from providers.scrobble.sources import scrobble_sources
-from providers.webhooks._utils import webhook_result_status
 from services.activity import add_event as _activity_add_event
 
 try:
@@ -1255,11 +1254,6 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
         log(f"jf-webhook: process_webhook raised: {e}", "ERROR")
         return JSONResponse({"ok": True, "error": "internal"}, status_code=200)
 
-    _status = webhook_result_status(res)
-    if _status != 200:
-        log(f"jf-webhook: rejected error={res.get('error')}", "WARN")
-        return JSONResponse({"ok": False, "error": res.get("error")}, status_code=_status)
-
     if res.get("error"):
         log(f"jf-webhook: result error={res['error']}", "WARN")
     elif res.get("ignored"):
@@ -1413,11 +1407,6 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
         log(f"emby-webhook: process_webhook raised: {e}", "ERROR")
         return JSONResponse({"ok": True, "error": "internal"}, status_code=200)
 
-    _status = webhook_result_status(res)
-    if _status != 200:
-        log(f"emby-webhook: rejected error={res.get('error')}", "WARN")
-        return JSONResponse({"ok": False, "error": res.get("error")}, status_code=_status)
-
     if res.get("error"):
         log(f"emby-webhook: result error={res['error']}", "WARN")
     elif res.get("ignored"):
@@ -1542,11 +1531,6 @@ async def webhook_trakt(request: Request) -> JSONResponse:
     except Exception as e:
         log(f"webhook: process_webhook raised: {e}", "ERROR")
         return JSONResponse({"ok": True, "error": "internal"}, status_code=200)
-
-    _status = webhook_result_status(res)
-    if _status != 200:
-        log(f"plex-webhook: rejected error={res.get('error')}", "WARN")
-        return JSONResponse({"ok": False, "error": res.get("error")}, status_code=_status)
 
     if res.get("error"):
         log(f"plex-webhook: result error={res['error']}", "WARN")

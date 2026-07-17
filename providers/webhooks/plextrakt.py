@@ -1012,17 +1012,14 @@ _PLEX_SECRET_WARNED_LOCK = threading.Lock()
 
 
 def _verify_signature(raw: bytes | None, headers: Mapping[str, str], secret: str, logger: Callable[..., None] | None = None) -> bool:
-    # Fails CLOSED: a webhook with no secret configured is rejected, not
-    # silently accepted. Configure plex.webhook_secret to receive Plex
-    # scrobble webhooks.
     global _PLEX_SECRET_WARNED
     if not secret:
         with _PLEX_SECRET_WARNED_LOCK:
             if not _PLEX_SECRET_WARNED:
                 _PLEX_SECRET_WARNED = True
-                _emit(logger, "plex.webhook_secret is empty — all Plex webhooks will be rejected. "
-                              "Set a webhook_secret in config to receive scrobble webhooks.", "ERROR")
-        return False
+                _emit(logger, "plex.webhook_secret is empty — signature verification disabled. "
+                              "Set a webhook_secret in config for payload authentication.", "WARN")
+        return True
     if not raw:
         return False
     sig = headers.get("X-Plex-Signature") or headers.get("x-plex-signature")
