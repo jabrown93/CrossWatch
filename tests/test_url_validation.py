@@ -188,3 +188,111 @@ class TestGuardedRequest:
             )
         with pytest.raises(ValueError):
             guarded_request("GET", "http://192.168.1.100/0", field_name="test", max_redirects=5)
+
+    @responses.activate
+    def test_cross_host_redirect_does_not_leak_credentials(self):
+        """A malicious media server must not be able to redirect a login POST
+        to a host of its choosing and collect the username/password."""
+        responses.add(
+            responses.POST,
+            "http://media.example.com/Users/AuthenticateByName",
+            status=307,
+            headers={"Location": "http://attacker.example.net/collect"},
+        )
+        responses.add(responses.POST, "http://attacker.example.net/collect", json={}, status=200)
+        with pytest.raises(ValueError, match="off the configured host"):
+            guarded_request(
+                "POST",
+                "http://media.example.com/Users/AuthenticateByName",
+                field_name="test",
+                json={"Username": "u", "Pw": "hunter2"},
+            )
+        # The redirect target must never have been contacted at all.
+        assert [c.request.url for c in responses.calls] == [
+            "http://media.example.com/Users/AuthenticateByName"
+        ]
+
+    @responses.activate
+    def test_cross_host_redirect_to_safe_public_host_is_still_rejected(self):
+        """Rejection is about leaving the configured host, not about the target
+        being an SSRF address — a perfectly routable third party still gets the
+        credentials if we follow it."""
+        responses.add(
+            responses.GET,
+            "http://media.example.com/api/v2",
+            status=302,
+            headers={"Location": "http://other.example.com/api/v2"},
+        )
+        with pytest.raises(ValueError, match="off the configured host"):
+            guarded_request("GET", "http://media.example.com/api/v2", field_name="test", params={"apikey": "secret"})
+        assert len(responses.calls) == 1
+
+    @responses.activate
+    def test_https_to_http_downgrade_on_same_host_is_rejected(self):
+        responses.add(
+            responses.GET,
+            "https://media.example.com/Users",
+            status=302,
+            headers={"Location": "http://media.example.com/Users"},
+        )
+        with pytest.raises(ValueError, match="off the configured host"):
+            guarded_request("GET", "https://media.example.com/Users", field_name="test")
+
+    @responses.activate
+    def test_http_to_https_upgrade_on_same_host_is_followed(self):
+        """The common real-world case: the server redirects a plain-http probe
+        to its TLS endpoint. Same host, strictly safer wire — must still work."""
+        responses.add(
+            responses.GET,
+            "http://media.example.com/Users",
+            status=301,
+            headers={"Location": "https://media.example.com/Users"},
+        )
+        responses.add(responses.GET, "https://media.example.com/Users", json={"ok": True}, status=200)
+        r = guarded_request("GET", "http://media.example.com/Users", field_name="test")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+    @responses.activate
+    def test_same_host_302_rewrites_post_to_get_and_drops_body(self):
+        """requests turns a 302'd POST into a bodyless GET; guarded_request
+        drives redirects by hand and has to reproduce that."""
+        responses.add(
+            responses.POST,
+            "http://192.168.1.100:8096/Users/AuthenticateByName",
+            status=302,
+            headers={"Location": "http://192.168.1.100:8096/Users/Auth"},
+        )
+        responses.add(responses.GET, "http://192.168.1.100:8096/Users/Auth", json={"ok": True}, status=200)
+        r = guarded_request(
+            "POST",
+            "http://192.168.1.100:8096/Users/AuthenticateByName",
+            field_name="test",
+            json={"Username": "u", "Pw": "hunter2"},
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 200
+        followed = responses.calls[1].request
+        assert followed.method == "GET"
+        assert not followed.body
+        assert "Content-Type" not in followed.headers
+
+    @responses.activate
+    def test_same_host_307_preserves_method_and_body(self):
+        responses.add(
+            responses.POST,
+            "http://192.168.1.100:8096/Users/AuthenticateByName",
+            status=307,
+            headers={"Location": "http://192.168.1.100:8096/Users/Auth"},
+        )
+        responses.add(responses.POST, "http://192.168.1.100:8096/Users/Auth", json={"ok": True}, status=200)
+        r = guarded_request(
+            "POST",
+            "http://192.168.1.100:8096/Users/AuthenticateByName",
+            field_name="test",
+            json={"Username": "u", "Pw": "hunter2"},
+        )
+        assert r.status_code == 200
+        followed = responses.calls[1].request
+        assert followed.method == "POST"
+        assert b"hunter2" in followed.body

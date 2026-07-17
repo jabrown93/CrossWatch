@@ -119,6 +119,48 @@ def assert_server_url_safe(url: str, field_name: str = "server_url") -> None:
         raise ValueError("; ".join(warnings))
 
 
+def _redirect_stays_on_host(current: str, target: str) -> bool:
+    """True if *target* is the same host as *current* and doesn't downgrade
+    https to http.
+
+    Callers attach credentials to every hop — Jellyfin/Emby send the user's
+    password in the request body, Tautulli sends its apikey as a query param,
+    and both send provider tokens as headers. requests' own redirect handling
+    only strips the Authorization header, which covers none of those, so any
+    hop off the user's configured host is refused rather than sanitised. Port
+    changes are allowed (same machine); an https->http downgrade is not, since
+    it would put those credentials on the wire in the clear.
+    """
+    cur = urlparse(current)
+    nxt = urlparse(target)
+    cur_host = (cur.hostname or "").lower().rstrip(".")
+    nxt_host = (nxt.hostname or "").lower().rstrip(".")
+    if not nxt_host or nxt_host != cur_host:
+        return False
+    return not (cur.scheme == "https" and nxt.scheme != "https")
+
+
+def _rebuild_redirect(method: str, kwargs: dict[str, Any], status: int) -> tuple[str, dict[str, Any]]:
+    """Apply requests' own method/body redirect semantics to a hop.
+
+    guarded_request drives redirects by hand, so requests.Session's
+    rebuild_method()/resolve_redirects() never run and their behaviour has to
+    be reproduced here: 302/303 turn any non-HEAD request into a GET, 301
+    turns a POST into a GET, and anything other than 307/308 drops the body.
+    """
+    if status in (301, 302, 303) and method != "HEAD":
+        # 302/303 rewrite any method; 301 only rewrites POST (browser behaviour).
+        if status != 301 or method == "POST":
+            method = "GET"
+    if status not in (307, 308):
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("json", "data", "files")}
+        headers = kwargs.get("headers")
+        if isinstance(headers, dict):
+            dropped = ("content-length", "content-type", "transfer-encoding")
+            kwargs["headers"] = {k: v for k, v in headers.items() if k.lower() not in dropped}
+    return method, kwargs
+
+
 def guarded_request(method: str, url: str, *, field_name: str = "server_url", max_redirects: int = 5, **kwargs: Any):
     """requests.request() wrapper that re-validates the target host on every
     redirect hop, not just the initial URL.
@@ -129,7 +171,8 @@ def guarded_request(method: str, url: str, *, field_name: str = "server_url", ma
     validation time can 302 the actual request to a metadata/link-local
     address. This disables automatic redirect-following and instead
     validates + follows each hop manually, raising ValueError (like
-    assert_server_url_safe) if any hop is unsafe or the chain is too long.
+    assert_server_url_safe) if any hop is unsafe, leaves the configured host
+    (see _redirect_stays_on_host), or the chain is too long.
     """
     import requests
 
@@ -145,9 +188,13 @@ def guarded_request(method: str, url: str, *, field_name: str = "server_url", ma
         location = resp.headers.get("Location")
         if not location:
             return resp
-        current_url = urljoin(current_url, location)
-        if resp.status_code == 303 and current_method != "GET":
-            current_method = "GET"
-            body_kwargs.pop("json", None)
-            body_kwargs.pop("data", None)
+        next_url = urljoin(current_url, location)
+        if not _redirect_stays_on_host(current_url, next_url):
+            raise ValueError(
+                f"{field_name}: refusing to follow a redirect off the configured host "
+                f"({urlparse(current_url).hostname} -> {urlparse(next_url).hostname or location}) "
+                "— this request carries credentials"
+            )
+        current_method, body_kwargs = _rebuild_redirect(current_method, body_kwargs, resp.status_code)
+        current_url = next_url
     raise ValueError(f"{field_name}: exceeded {max_redirects} redirects while validating target host")
