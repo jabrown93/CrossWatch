@@ -73,6 +73,18 @@ def test_metadata_ip_aws_imdsv2_ipv6():
     assert any("metadata" in w.lower() for w in warnings)
 
 
+def test_ipv4_mapped_ipv6_metadata_ip_is_flagged():
+    """An IPv4-mapped IPv6 literal wrapping a blocked metadata IP must not
+    bypass the check just because it isn't itself in the link-local range."""
+    warnings = validate_server_url("http://[::ffff:100.100.100.200]/", "test")
+    assert any("metadata" in w.lower() or "link-local" in w.lower() for w in warnings)
+
+
+def test_ipv4_mapped_ipv6_link_local_is_flagged():
+    warnings = validate_server_url("http://[::ffff:169.254.169.254]/", "test")
+    assert any("metadata" in w.lower() or "link-local" in w.lower() for w in warnings)
+
+
 def test_hostname_resolving_to_metadata_ip_is_flagged(monkeypatch):
     """A hostname that isn't itself a metadata name/IP but resolves to one
     should still be caught (defeats a DNS-based bypass of the literal checks)."""

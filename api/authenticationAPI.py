@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from cw_platform.config_base import DEFAULT_CFG, load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
+from cw_platform.url_validation import assert_server_url_safe
 from providers.sync.emby._utils import (
     ensure_whitelist_defaults as emby_ensure_whitelist_defaults,
     fetch_libraries_from_cfg as emby_fetch_libraries_from_cfg,
@@ -748,6 +749,11 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return JSONResponse({"ok": False, "error": "Missing: server/username"}, 400)
 
         try:
+            assert_server_url_safe(server, "jellyfin.server")
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, 400)
+
+        try:
             prov = _import_provider("providers.auth._auth_JELLYFIN")
             if not prov:
                 return JSONResponse({"ok": False, "error": "Provider missing"}, 500)
@@ -921,6 +927,11 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         username = str(em.get("username") or "").strip()
         if not server or not username:
             return JSONResponse({"ok": False, "error": "Missing: server/username"}, 400)
+
+        try:
+            assert_server_url_safe(server, "emby.server")
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, 400)
 
         try:
             prov = _import_provider("providers.auth._auth_EMBY")
@@ -1614,6 +1625,11 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             raise HTTPException(status_code=400, detail="server_url required")
         if not final_key:
             raise HTTPException(status_code=400, detail="api_key required")
+        try:
+            assert_server_url_safe(final_server, "tautulli.server_url")
+        except ValueError as e:
+            _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] rejected unsafe server_url instance={inst}: {e}")
+            return {"ok": False, "error": str(e), "instance": inst}
         ok, reason = _validate_tautulli_credentials(final_server, final_key, verify_ssl=bool(t.get("verify_ssl", True)))
         if not ok:
             _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] validation failed reason={reason} instance={inst}")

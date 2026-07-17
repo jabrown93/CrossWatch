@@ -29,6 +29,11 @@ def _is_dangerous_ip(host: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
+    # Unwrap IPv4-mapped IPv6 literals (e.g. ::ffff:100.100.100.200) so they're
+    # checked against the same blocklist/link-local rules as their IPv4 form.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
     if str(ip) in _METADATA_IPS:
         return True
     # Covers 169.254.0.0/16 (incl. 169.254.169.254) and fe80::/10.
