@@ -1,0 +1,1842 @@
+# /api/insight_analytics.py
+# CrossWatch - /api/insights analytics pipeline, split out of insightAPI.py.
+# This is a verbatim relocation of the original api_insights route body - no logic
+# was changed as part of the split (see tests/test_insight_api.py for the
+# characterization tests that pinned its behavior beforehand).
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import re
+import time
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Callable
+
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+
+from ._insight_env import _env
+
+
+def register_insight_analytics(app: FastAPI) -> None:
+    @app.get("/api/insights", tags=["insight"])
+    def api_insights(
+        limit_samples: int = Query(60),
+        history: int = Query(3),
+        runtime: int = Query(0),
+    ) -> JSONResponse:
+        CW, load_config, _, get_runtime = _env()
+        STATS = getattr(CW, "STATS", None)
+        REPORT_DIR = getattr(CW, "REPORT_DIR", None)
+        CACHE_DIR = getattr(CW, "CACHE_DIR", None)
+        _load_wall_snapshot = getattr(CW, "_load_wall_snapshot", lambda: [])
+        _get_orchestrator = getattr(CW, "_get_orchestrator", None)
+        _append_log = getattr(CW, "_append_log", lambda *a, **k: None)
+        _load_state = getattr(CW, "_load_state", lambda: {})
+        
+        def _series_title_for_event(e: dict[str, Any]) -> str:
+            series_title = (
+                e.get("series_title")
+                or e.get("show_title")
+                or ""
+            )
+            return str(series_title).strip()
+
+        def _format_event_title(e: dict[str, Any]) -> dict[str, Any]:
+            out = dict(e)
+            t = str(e.get("type") or "").lower()
+            raw = (e.get("title") or "").strip()
+            key = str(e.get("key") or "").strip()
+
+            def _to_int(v: Any) -> int | None:
+                if isinstance(v, int):
+                    return v
+                if isinstance(v, float) and v.is_integer():
+                    return int(v)
+                if isinstance(v, str):
+                    s = v.strip()
+                    if s.isdigit():
+                        return int(s)
+                return None
+
+            m_key = re.search(r"#s(\d{1,3})e(\d{1,3})", key, flags=re.I)
+
+            if not t:
+                if m_key or re.match(r"^s\d{1,3}e\d{1,3}$", raw.lower()):
+                    t = "episode"
+
+            if t == "movie":
+                title = (e.get("title") or e.get("name") or "").strip()
+                year = e.get("year")
+                if title:
+                    out["display_title"] = f"{title} ({year})" if year else title
+                else:
+                    out["display_title"] = "Movie"
+
+            elif t == "episode":
+                series_title = _series_title_for_event(e)
+                season = _to_int(e.get("season"))
+                episode = _to_int(e.get("episode"))
+
+                if m_key:
+                    season = season if season is not None else int(m_key.group(1))
+                    episode = episode if episode is not None else int(m_key.group(2))
+                    out.setdefault("season", season)
+                    out.setdefault("episode", episode)
+
+                m_raw = re.match(r"^s(\d{1,3})e(\d{1,3})$", raw.lower())
+                if m_raw:
+                    season = season if season is not None else int(m_raw.group(1))
+                    episode = episode if episode is not None else int(m_raw.group(2))
+                    out.setdefault("season", season)
+                    out.setdefault("episode", episode)
+
+                code = ""
+                if season is not None and episode is not None:
+                    code = f"S{int(season):02d}E{int(episode):02d}"
+
+                if series_title and code:
+                    out["display_title"] = f"{series_title} - {code}"
+                elif series_title:
+                    out["display_title"] = series_title
+                elif code:
+                    out["display_title"] = code
+                else:
+                    out["display_title"] = "Episode"
+
+                ep_title = (e.get("episode_title") or "").strip()
+                if ep_title:
+                    low = ep_title.lower()
+                    if series_title and low == series_title.lower():
+                        pass
+                    elif code and low == code.lower():
+                        pass
+                    else:
+                        out["display_subtitle"] = ep_title
+
+            elif t == "season":
+                series_title = _series_title_for_event(e)
+                season_title = (e.get("title") or "").strip()
+                season_num = _to_int(e.get("season"))
+
+                if not season_title and season_num is not None:
+                    season_title = f"Season {season_num}"
+
+                if series_title and season_title:
+                    out["display_title"] = f"{series_title} - {season_title}"
+                elif series_title:
+                    out["display_title"] = series_title
+                elif season_title:
+                    out["display_title"] = season_title
+                else:
+                    out["display_title"] = "Season"
+
+            else:
+                title = (e.get("title") or e.get("name") or "").strip()
+                out["display_title"] = title or "Item"
+
+            return out
+
+        def _sort_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            def _rank_action(v: Any) -> int:
+                a = str(v or "").strip().lower()
+                if a == "add":
+                    return 0
+                if a == "remove":
+                    return 1
+                if a == "update":
+                    return 2
+                return 3
+
+            def _rank_feature(v: Any) -> int:
+                f = str(v or "").strip().lower()
+                if f == "history":
+                    return 0
+                if f == "watchlist":
+                    return 1
+                if f == "ratings":
+                    return 2
+                if f == "playlists":
+                    return 3
+                return 9
+
+            def _rank_source(v: Any) -> int:
+                s = str(v or "").strip().lower()
+                if s in ("both", "union"):
+                    return 0
+                if s == "plex":
+                    return 1
+                if s == "jellyfin":
+                    return 2
+                if s == "emby":
+                    return 3
+                if s == "simkl":
+                    return 4
+                if s == "trakt":
+                    return 5
+                return 9
+
+            def _has_episode_code(e: dict[str, Any]) -> int:
+                if str(e.get("type") or "").lower() != "episode":
+                    return 1
+                return 0 if (e.get("season") is not None and e.get("episode") is not None) else 1
+
+            def _key(e: dict[str, Any], idx: int) -> tuple[int, int, int, int, int, int]:
+                ts = 0
+                try:
+                    ts = int(e.get("ts") or 0)
+                except Exception:
+                    ts = 0
+                feat = _rank_feature(e.get("feature"))
+                act = _rank_action(e.get("action"))
+                src = _rank_source(e.get("source") or e.get("provider") or e.get("side"))
+                code = _has_episode_code(e)
+                return (-ts, feat, act, src, code, idx)
+
+            try:
+                indexed = list(enumerate(events))
+                indexed.sort(key=lambda pair: _key(pair[1], pair[0]))
+                events[:] = [e for _, e in indexed]
+            except Exception:
+                pass
+            return events
+
+        def _build_show_title_maps(state: dict[str, Any] | None) -> tuple[dict[str, str], dict[str, str]]:
+            key_map: dict[str, str] = {}
+            id_map: dict[str, str] = {}
+
+            state = state or {}
+
+            provs = (state or {}).get("providers") or {}
+            if not isinstance(provs, dict):
+                return key_map, id_map
+
+            def _iter_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                node = pdata.get(feat)
+                if isinstance(node, dict):
+                    out.append(node)
+                insts = pdata.get("instances")
+                if isinstance(insts, dict):
+                    for _iid, idata in insts.items():
+                        if not isinstance(idata, dict):
+                            continue
+                        node2 = idata.get(feat)
+                        if isinstance(node2, dict):
+                            out.append(node2)
+                return out
+
+            for _, pdata in provs.items():
+                if not isinstance(pdata, dict):
+                    continue
+
+                for feat in ("history", "ratings", "watchlist", "playlists"):
+                    for node in _iter_nodes(pdata, feat):
+                        baseline = node.get("baseline")
+                        base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
+                        items = base.get("items")
+
+                        if isinstance(items, dict):
+                            iters = items.items()
+                        elif isinstance(items, list):
+                            iters = ((it.get("key"), it) for it in items if isinstance(it, dict))
+                        else:
+                            continue
+
+                        for k, it in iters:
+                            if not isinstance(it, dict):
+                                continue
+
+                            typ = str(it.get("type") or "").lower()
+                            title = (it.get("series_title") or it.get("show_title") or "").strip()
+                            if not title and typ in ("show", "series", "anime"):
+                                title = (it.get("title") or it.get("name") or "").strip()
+                            if not title:
+                                continue
+
+                            for kk in (k, it.get("key")):
+                                if not kk:
+                                    continue
+                                kk0 = str(kk).strip().lower()
+                                key_map[kk0] = title
+                                if "#" in kk0:
+                                    key_map[kk0.split("#", 1)[0]] = title
+
+                            raw_show_ids = it.get("show_ids")
+                            show_ids = raw_show_ids if isinstance(raw_show_ids, dict) else {}
+                            raw_item_ids = it.get("ids")
+                            item_ids = raw_item_ids if isinstance(raw_item_ids, dict) else {}
+                            for ids in (show_ids, item_ids):
+                                if not isinstance(ids, dict):
+                                    continue
+                                for idk in ("tmdb", "imdb", "tvdb", "simkl", "slug"):
+                                    v = ids.get(idk)
+                                    if v:
+                                        id_map[f"{idk}:{str(v).lower()}"] = title
+
+            return key_map, id_map
+
+        def _build_movie_title_maps(
+            state: dict[str, Any] | None,
+        ) -> tuple[dict[str, tuple[str, int | None]], dict[str, tuple[str, int | None]]]:
+            key_map: dict[str, tuple[str, int | None]] = {}
+            id_map: dict[str, tuple[str, int | None]] = {}
+
+            state = state or {}
+            provs = (state or {}).get("providers") or {}
+            if not isinstance(provs, dict):
+                return key_map, id_map
+
+            def _to_year(v: Any) -> int | None:
+                try:
+                    n = int(v)
+                    return n if 1800 <= n <= 3000 else None
+                except Exception:
+                    return None
+
+            def _iter_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                node = pdata.get(feat)
+                if isinstance(node, dict):
+                    out.append(node)
+                insts = pdata.get("instances")
+                if isinstance(insts, dict):
+                    for _iid, idata in insts.items():
+                        if not isinstance(idata, dict):
+                            continue
+                        node2 = idata.get(feat)
+                        if isinstance(node2, dict):
+                            out.append(node2)
+                return out
+
+            for _, pdata in provs.items():
+                if not isinstance(pdata, dict):
+                    continue
+                for feat in ("history", "ratings", "watchlist", "playlists"):
+                    for node in _iter_nodes(pdata, feat):
+                        baseline = node.get("baseline")
+                        base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
+                        items = base.get("items")
+
+                        if isinstance(items, dict):
+                            iters = items.items()
+                        elif isinstance(items, list):
+                            iters = ((it.get("key"), it) for it in items if isinstance(it, dict))
+                        else:
+                            continue
+
+                        for k, it in iters:
+                            if not isinstance(it, dict):
+                                continue
+
+                            if str(it.get("type") or "").lower() != "movie":
+                                continue
+
+                            title = (it.get("title") or it.get("name") or "").strip()
+                            if not title:
+                                continue
+
+                            year = _to_year(it.get("year"))
+
+                            for kk in (k, it.get("key")):
+                                if not kk:
+                                    continue
+                                kk0 = str(kk).strip().lower()
+                                key_map[kk0] = (title, year)
+                                if "#" in kk0:
+                                    key_map[kk0.split("#", 1)[0]] = (title, year)
+
+                            raw_item_ids = it.get("ids")
+                            item_ids = raw_item_ids if isinstance(raw_item_ids, dict) else {}
+                            if isinstance(item_ids, dict):
+                                for idk in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "slug", "plex", "guid"):
+                                    v = item_ids.get(idk)
+                                    if v:
+                                        id_map[f"{idk}:{str(v).strip().lower()}"] = (title, year)
+
+            return key_map, id_map
+
+        def _extend_movie_title_maps_from_cw_state(
+            movie_key_map: dict[str, tuple[str, int | None]],
+            movie_id_map: dict[str, tuple[str, int | None]],
+        ) -> None:
+            try:
+                cw_state_dir = getattr(CW, "CW_STATE_DIR", None) or Path("/config/.cw_state")
+                root = Path(cw_state_dir)
+                if not root.is_dir():
+                    return
+
+                pats = (
+                    "plex_history.marked_watched*.json",
+                    "plex_history.shadow*.json",
+                    "plex_history*.json",
+                    "trakt_history*.json",
+                    "simkl_history*.json",
+                    "jellyfin_history*.json",
+                    "emby_history*.json",
+                )
+
+                files: list[Path] = []
+                for pat in pats:
+                    try:
+                        files.extend(list(root.glob(pat)))
+                    except Exception:
+                        continue
+
+                if not files:
+                    return
+
+                files = sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+                key_prio: dict[str, int] = {k: 0 for k in movie_key_map}
+                id_prio: dict[str, int] = {k: 0 for k in movie_id_map}
+
+                def _prio_for_file(name: str) -> int:
+                    n = str(name or "").lower()
+                    if n.startswith("plex_"):
+                        return 100
+                    if n.startswith("trakt_"):
+                        return 80
+                    if n.startswith("simkl_"):
+                        return 70
+                    if n.startswith("jellyfin_") or n.startswith("emby_"):
+                        return 60
+                    return 50
+
+                def _put_key(key: Any, val: tuple[str, int | None], prio: int) -> None:
+                    k0 = str(key or "").strip().lower()
+                    if not k0:
+                        return
+                    if prio > key_prio.get(k0, -1):
+                        movie_key_map[k0] = val
+                        key_prio[k0] = prio
+
+                def _put_id(key: Any, val: tuple[str, int | None], prio: int) -> None:
+                    k0 = str(key or "").strip().lower()
+                    if not k0:
+                        return
+                    if prio > id_prio.get(k0, -1):
+                        movie_id_map[k0] = val
+                        id_prio[k0] = prio
+
+                def _to_year(v: Any) -> int | None:
+                    try:
+                        n = int(v)
+                        return n if 1800 <= n <= 3000 else None
+                    except Exception:
+                        return None
+
+                def _iter_items(obj: Any) -> list[tuple[str | None, dict[str, Any]]]:
+                    if isinstance(obj, dict):
+                        out: list[tuple[str | None, dict[str, Any]]] = []
+                        for k, v in obj.items():
+                            if isinstance(v, dict):
+                                out.append((str(k), v))
+                        return out
+                    if isinstance(obj, list):
+                        return [(None, v) for v in obj if isinstance(v, dict)]
+                    return []
+
+                for p in files:
+                    prio = _prio_for_file(p.name)
+                    try:
+                        raw = json.loads(p.read_text(encoding="utf-8") or "{}")
+                    except Exception:
+                        continue
+                    if not isinstance(raw, dict):
+                        continue
+
+                    for dict_key, rec in _iter_items(raw.get("items")):
+                        if str(rec.get("type") or "").lower().strip() != "movie":
+                            continue
+
+                        title = str(rec.get("title") or rec.get("name") or "").strip()
+                        if not title:
+                            continue
+                        year = _to_year(rec.get("year"))
+                        tup = (title, year)
+
+                        k = rec.get("key") or dict_key
+                        if k:
+                            k0 = str(k).strip().lower()
+                            _put_key(k0, tup, prio)
+                            if "#" in k0:
+                                _put_key(k0.split("#", 1)[0], tup, prio)
+
+                        raw_ids = rec.get("ids")
+                        ids = raw_ids if isinstance(raw_ids, dict) else {}
+                        if not isinstance(ids, dict):
+                            continue
+
+                        plex_id = ids.get("plex")
+                        if plex_id:
+                            pv = str(plex_id).strip().lower()
+                            _put_id(f"plex:{pv}", tup, prio)
+                            _put_id(f"plex:movie:{pv}", tup, prio)
+
+                        for idk in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "slug", "guid"):
+                            v = ids.get(idk)
+                            if not v:
+                                continue
+                            vv = str(v).strip().lower()
+                            _put_id(f"{idk}:{vv}", tup, prio)
+            except Exception:
+                return
+
+        def _enrich_movie_event_from_state(
+            e: dict[str, Any],
+            movie_key_map: dict[str, tuple[str, int | None]],
+            movie_id_map: dict[str, tuple[str, int | None]],
+        ) -> dict[str, Any]:
+            out = dict(e)
+            if str(out.get("type") or "").lower().strip() != "movie":
+                return out
+
+            title = str(out.get("title") or out.get("name") or "").strip()
+            if title and title.lower() not in ("movie", "film"):
+                if out.get("year") is None:
+                    for k in _key_lookup_candidates(out.get("key")):
+                        if k in movie_key_map:
+                            _, y = movie_key_map[k]
+                            if y is not None:
+                                out["year"] = y
+                                break
+                        if k in movie_id_map:
+                            _, y = movie_id_map[k]
+                            if y is not None:
+                                out["year"] = y
+                                break
+                return out
+
+            def _apply(tup: tuple[str, int | None]) -> None:
+                t, y = tup
+                if t:
+                    out["title"] = t
+                if out.get("year") is None and y is not None:
+                    out["year"] = y
+
+            for k in _key_lookup_candidates(out.get("key")):
+                if k in movie_key_map:
+                    _apply(movie_key_map[k])
+                    return out
+                if k in movie_id_map:
+                    _apply(movie_id_map[k])
+                    return out
+
+            raw_item_ids = out.get("ids")
+            item_ids = raw_item_ids if isinstance(raw_item_ids, dict) else {}
+            if isinstance(item_ids, dict):
+                for idk in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "slug", "plex", "guid"):
+                    v = item_ids.get(idk)
+                    if not v:
+                        continue
+                    kk = f"{idk}:{str(v).strip().lower()}"
+                    if kk in movie_id_map:
+                        _apply(movie_id_map[kk])
+                        return out
+
+            return out
+
+        def _extend_show_title_maps_from_cw_state(id_map: dict[str, str]) -> None:
+            try:
+                cw_state_dir = getattr(CW, "CW_STATE_DIR", None) or Path("/config/.cw_state")
+                root = Path(cw_state_dir)
+                if not root.is_dir():
+                    return
+
+                pats = (
+                    "plex_history.marked_watched*.json",
+                    "plex_history.shadow*.json",
+                    "plex_history*.json",
+                    "trakt_history*.json",
+                    "simkl_history*.json",
+                    "jellyfin_history*.json",
+                    "emby_history*.json",
+                )
+
+                files: list[Path] = []
+                for pat in pats:
+                    try:
+                        files.extend(list(root.glob(pat)))
+                    except Exception:
+                        continue
+
+                if not files:
+                    return
+
+                # Newest files are the most relevant.
+                files = sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+
+                def _iter_items(obj: Any) -> list[dict[str, Any]]:
+                    if isinstance(obj, dict):
+                        return [v for v in obj.values() if isinstance(v, dict)]
+                    if isinstance(obj, list):
+                        return [v for v in obj if isinstance(v, dict)]
+                    return []
+
+                def _pick_series_title(rec: dict[str, Any]) -> str:
+                    t = str(rec.get("type") or "").lower().strip()
+                    title = (
+                        rec.get("series_title")
+                        or rec.get("show_title")
+                        or rec.get("grandparentTitle")
+                        or rec.get("SeriesName")
+                        or ""
+                    )
+                    title = str(title).strip()
+                    if title:
+                        return title
+                    if t in ("show", "series", "anime"):
+                        return str(rec.get("title") or rec.get("name") or "").strip()
+                    return ""
+
+                for p in files:
+                    try:
+                        raw = json.loads(p.read_text(encoding="utf-8") or "{}")
+                    except Exception:
+                        continue
+
+                    if not isinstance(raw, dict):
+                        continue
+
+                    for rec in _iter_items(raw.get("items")):
+                        series_title = _pick_series_title(rec)
+                        if not series_title:
+                            continue
+
+                        for ids_any in (rec.get("show_ids"), rec.get("ids")):
+                            if not isinstance(ids_any, dict):
+                                continue
+                            for idk in ("tmdb", "imdb", "tvdb", "simkl", "slug", "plex", "guid"):
+                                v = ids_any.get(idk)
+                                if not v:
+                                    continue
+                                kk = f"{idk}:{str(v).strip().lower()}"
+                                id_map.setdefault(kk, series_title)
+            except Exception:
+                return
+
+
+
+        def _key_lookup_candidates(raw_key: Any) -> list[str]:
+            k = str(raw_key or "").strip().lower()
+            if not k:
+                return []
+
+            out: list[str] = []
+
+            def add(x: str) -> None:
+                x = str(x or "").strip().lower()
+                if x and x not in out:
+                    out.append(x)
+
+            def add_guid_imdb(x: str) -> None:
+                if x.startswith("plex://"):
+                    add(f"guid:{x}")
+                if x.startswith("tt") and x[2:].isdigit():
+                    add(f"imdb:{x}")
+
+            add(k)
+            add_guid_imdb(k)
+
+            if "#" in k:
+                base = k.split("#", 1)[0]
+                add(base)
+                add_guid_imdb(base)
+
+            parts = k.split(":")
+            if len(parts) >= 3:
+                add(f"{parts[0]}:{parts[-1]}")
+                if parts[0] == "plex":
+                    add(f"plex:movie:{parts[-1]}")
+
+            if "#" in k:
+                parts2 = k.split("#", 1)[0].split(":")
+                if len(parts2) >= 3:
+                    add(f"{parts2[0]}:{parts2[-1]}")
+                    if parts2[0] == "plex":
+                        add(f"plex:movie:{parts2[-1]}")
+
+            if len(parts) == 2 and parts[0] == "plex":
+                add(f"plex:movie:{parts[1]}")
+
+            return out
+
+        def _enrich_event_from_state(
+            e: dict[str, Any],
+            key_map: dict[str, str],
+            id_map: dict[str, str],
+        ) -> dict[str, Any]:
+            out = dict(e)
+            if out.get("series_title"):
+                return out
+            if out.get("show_title"):
+                out["series_title"] = str(out.get("show_title") or "").strip()
+                return out
+
+            for k in _key_lookup_candidates(out.get("key")):
+                if k in key_map:
+                    out["series_title"] = key_map[k]
+                    return out
+                if k in id_map:
+                    out["series_title"] = id_map[k]
+                    return out
+
+            raw_show_ids = out.get("show_ids")
+            show_ids = raw_show_ids if isinstance(raw_show_ids, dict) else {}
+            raw_item_ids = out.get("ids")
+            item_ids = raw_item_ids if isinstance(raw_item_ids, dict) else {}
+            for ids in (show_ids, item_ids):
+                if not isinstance(ids, dict):
+                    continue
+                for idk in ("tmdb", "imdb", "tvdb", "simkl", "slug"):
+                    v = ids.get(idk)
+                    if not v:
+                        continue
+                    kk = f"{idk}:{str(v).lower()}"
+                    if kk in id_map:
+                        out["series_title"] = id_map[kk]
+                        return out
+
+            return out
+
+        base_feats: tuple[str, ...] = ("watchlist", "ratings", "history", "progress", "playlists")
+
+        def _features_from(obj: Any) -> list[str]:
+            keys: list[str] = []
+            try:
+                if isinstance(obj, dict):
+                    feats = obj.get("features")
+                    if isinstance(feats, dict):
+                        keys.extend(str(k) for k in feats.keys())
+                    stats = obj.get("stats")
+                    if isinstance(stats, dict):
+                        keys.extend(str(k) for k in stats.keys())
+            except Exception:
+                pass
+
+            merged: list[str] = []
+            seen: set[str] = set()
+            for name in [*keys, *base_feats]:
+                if not name:
+                    continue
+                s = str(name)
+                if s not in seen:
+                    seen.add(s)
+                    merged.append(s)
+
+            if "watchlist" in merged:
+                merged = ["watchlist"] + [k for k in merged if k != "watchlist"]
+
+            return merged or list(base_feats)
+
+        feature_keys = _features_from(getattr(STATS, "data", {}) or {})
+        events_raw: list[dict[str, Any]] = []
+        _lane_cache: dict[tuple[int, int, int], tuple[dict[str, dict[str, Any]], dict[str, bool]]] = {}
+
+        def _safe_parse_epoch(v: Any) -> int:
+            try:
+                if v is None:
+                    return 0
+                if isinstance(v, (int, float)):
+                    return int(v)
+                s = str(v).strip()
+                if s.isdigit():
+                    return int(s)
+                return int(_dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+            except Exception:
+                return 0
+
+        def _as_int(v: Any) -> int:
+            try:
+                return int(v)
+            except Exception:
+                return 0
+
+        def _zero_lane() -> dict[str, Any]:
+            return {
+                "added": 0,
+                "removed": 0,
+                "updated": 0,
+                "spotlight_add": [],
+                "spotlight_remove": [],
+                "spotlight_update": [],
+            }
+            
+
+        def _empty_feats() -> dict[str, dict[str, Any]]:
+            return {k: _zero_lane() for k in feature_keys}
+
+        def _empty_enabled() -> dict[str, bool]:
+            return {k: False for k in feature_keys}
+
+        def _event_epoch(e: dict[str, Any]) -> int:
+            for k in ("sync_ts", "ingested_ts", "seen_ts", "ts"):
+                try:
+                    v = e.get(k)
+                    if v is not None:
+                        n = int(v)
+                        if n:
+                            return n
+                except Exception:
+                    pass
+            for k in ("watched_at", "last_watched_at", "rated_at", "user_rated_at"):
+                n = _safe_parse_epoch(e.get(k))
+                if n:
+                    return n
+            return 0
+
+        def _event_sig(e: dict[str, Any]) -> str:
+            key = str(e.get("key") or "").strip().lower()
+            if key:
+                if "@" in key:
+                    key = key.split("@", 1)[0]
+                if "|" in key:
+                    key = key.split("|")[-1]
+                return key
+            ids = (e.get("ids") or {}) if isinstance(e.get("ids"), dict) else {}
+            for idk in ("tmdb", "imdb", "tvdb", "slug"):
+                v = ids.get(idk)
+                if v:
+                    return f"{idk}:{str(v).lower()}"
+            title = str(e.get("title") or e.get("name") or "").strip().lower()
+            year = str(e.get("year") or e.get("release_year") or "")
+            typ = str(e.get("type") or "").strip().lower()
+            return f"{typ}|title:{title}|year:{year}"
+
+        def _spot_item_for_event(e: dict[str, Any]) -> dict[str, Any]:
+            slim = {
+                k: e.get(k)
+                for k in (
+                    "title",
+                    "series_title",
+                    "show_title",
+                    "name",
+                    "key",
+                    "type",
+                    "source",
+                    "year",
+                    "season",
+                    "episode",
+                    "added_at",
+                    "listed_at",
+                    "watched_at",
+                    "rated_at",
+                    "last_watched_at",
+                    "user_rated_at",
+                    "ts",
+                    "seen_ts",
+                    "sync_ts",
+                    "ingested_ts",
+                )
+                if k in e and e.get(k) is not None
+            }
+            if "title" not in slim:
+                slim["title"] = e.get("title") or e.get("key") or "item"
+            return _format_event_title(slim)
+        
+        def _is_presence_stub(rec: dict[str, Any]) -> bool:
+            if not rec:
+                return True
+            if set(rec.keys()) <= {"watched"}:
+                return True
+            if rec.get("watched") is True and not any(
+                rec.get(k)
+                for k in (
+                    "type", "title", "name", "ids", "show_ids", "series_title", "show_title",
+                    "season", "episode", "year", "series_year",
+                    "watched_at", "last_watched_at",
+                    "rated_at", "user_rated_at", "rating", "user_rating",
+                )
+            ):
+                return True
+            return False
+
+        def _compute_history_breakdown(
+            state_obj: dict[str, Any] | None,
+            feature: str = "history",
+        ) -> dict[str, int]:
+            movies: set[str] = set()
+            shows: set[str] = set()
+            anime: set[str] = set()
+            episodes: set[str] = set()
+
+            def _iter_feature_nodes(prov_data: dict[str, Any]) -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+                node = (prov_data or {}).get(feature)
+                if isinstance(node, dict):
+                    out.append(node)
+                insts = (prov_data or {}).get("instances")
+                if isinstance(insts, dict):
+                    for _iid, idata in insts.items():
+                        if not isinstance(idata, dict):
+                            continue
+                        node2 = idata.get(feature)
+                        if isinstance(node2, dict):
+                            out.append(node2)
+                return out
+
+            try:
+                prov_block = (state_obj or {}).get("providers") or {}
+                for _prov_name, prov_data in prov_block.items():
+                    if not isinstance(prov_data, dict):
+                        continue
+
+                    for feat_block in _iter_feature_nodes(prov_data):
+                        node = feat_block.get("baseline") or feat_block
+                        items = (node.get("items") if isinstance(node, dict) else None) or {}
+
+                        if isinstance(items, dict):
+                            it = items.values()
+                        elif isinstance(items, list):
+                            it = items
+                        else:
+                            continue
+
+                        for rec in it:
+                            if not isinstance(rec, dict):
+                                continue
+                            if _is_presence_stub(rec):
+                                continue
+
+                            if feature == "history" and not (rec.get("watched_at") or rec.get("last_watched_at")):
+                                continue
+                            if feature == "ratings" and not (
+                                rec.get("rated_at") or rec.get("user_rated_at") or rec.get("rating") or rec.get("user_rating")
+                            ):
+                                continue
+
+                            typ = str(rec.get("type") or "").strip().lower()
+                            ids = (rec.get("ids") or {}) or {}
+                            show_ids_field = (rec.get("show_ids") or {}) or {}
+                            has_show_meta = bool(
+                                show_ids_field
+                                or rec.get("series_title")
+                                or rec.get("show_title")
+                            )
+                            is_anime = bool(
+                                typ == "anime"
+                                or ids.get("anilist") or ids.get("mal")
+                                or show_ids_field.get("anilist") or show_ids_field.get("mal")
+                            )
+
+                            if typ == "episode":
+                                s = int(rec.get("season") or 0)
+                                ep = int(rec.get("episode") or 0)
+
+                                ep_sig: str | None = None
+                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
+                                    v = ids.get(idk)
+                                    if v:
+                                        ep_sig = f"{idk}:{str(v).lower()}|s{s}e{ep}"
+                                        break
+                                if ep_sig is None:
+                                    t = str(rec.get("title") or rec.get("name") or "").strip().lower()
+                                    y = str(rec.get("year") or "")
+                                    ep_sig = f"{t}|year:{y}|s{s}e{ep}"
+                                if ep_sig:
+                                    episodes.add(ep_sig)
+
+                                show_ids = show_ids_field or ids
+                                show_sig: str | None = None
+                                for idk in ("tmdb", "imdb", "tvdb", "anilist", "mal", "slug"):
+                                    v = show_ids.get(idk)
+                                    if v:
+                                        show_sig = f"{idk}:{str(v).lower()}"
+                                        break
+                                if show_sig is None:
+                                    title = (
+                                        rec.get("series_title")
+                                        or rec.get("show_title")
+                                        or rec.get("title")
+                                        or rec.get("name")
+                                    )
+                                    if title:
+                                        y = rec.get("series_year") or rec.get("year")
+                                        show_sig = f"{str(title).strip().lower()}|year:{y}"
+                                if show_sig:
+                                    (anime if is_anime else shows).add(show_sig)
+                                continue
+
+                            if is_anime:
+                                sig: str | None = None
+                                ids_anime = show_ids_field if (show_ids_field.get("anilist") or show_ids_field.get("mal")) else ids
+                                for idk in ("anilist", "mal", "slug","tmdb", "imdb", "tvdb"):
+                                    v = ids_anime.get(idk)
+                                    if v:
+                                        sig = f"{idk}:{str(v).lower()}"
+                                        break
+                                if sig is None:
+                                    title = str(rec.get("title") or rec.get("name") or "").strip().lower()
+                                    y = str(rec.get("year") or "")
+                                    sig = f"{title}|year:{y}"
+                                if sig:
+                                    anime.add(sig)
+                                continue
+
+                            if typ == "movie" and not has_show_meta:
+                                sig: str | None = None
+                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
+                                    v = ids.get(idk)
+                                    if v:
+                                        sig = f"{idk}:{str(v).lower()}"
+                                        break
+                                if sig is None:
+                                    title = str(rec.get("title") or rec.get("name") or "").strip().lower()
+                                    y = str(rec.get("year") or "")
+                                    sig = f"{title}|year:{y}"
+                                movies.add(sig)
+                                continue
+
+                            if typ == "show" or (typ == "movie" and has_show_meta):
+                                ids_show = show_ids_field or ids
+                                show_sig: str | None = None
+                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
+                                    v = ids_show.get(idk)
+                                    if v:
+                                        show_sig = f"{idk}:{str(v).lower()}"
+                                        break
+                                if show_sig is None:
+                                    title = (
+                                        rec.get("series_title")
+                                        or rec.get("show_title")
+                                        or rec.get("title")
+                                        or rec.get("name")
+                                    )
+                                    if title:
+                                        y = rec.get("series_year") or rec.get("year")
+                                        show_sig = f"{str(title).strip().lower()}|year:{y}"
+                                if show_sig:
+                                    shows.add(show_sig)
+                                continue
+
+                            if has_show_meta:
+                                ids_show = show_ids_field or ids
+                                show_sig: str | None = None
+                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
+                                    v = ids_show.get(idk)
+                                    if v:
+                                        show_sig = f"{idk}:{str(v).lower()}"
+                                        break
+                                if show_sig is None:
+                                    title = (
+                                        rec.get("series_title")
+                                        or rec.get("show_title")
+                                        or rec.get("title")
+                                        or rec.get("name")
+                                    )
+                                    if title:
+                                        y = rec.get("series_year") or rec.get("year")
+                                        show_sig = f"{str(title).strip().lower()}|year:{y}"
+                                if show_sig:
+                                    shows.add(show_sig)
+            except Exception as exc:
+                _append_log(
+                    "INSIGHTS",
+                    f"[!] {feature} breakdown failed: {exc}",
+                )
+
+            return {
+                "movies": len(movies),
+                "shows": len(shows),
+                "anime": len(anime),
+                "episodes": len(episodes),
+            }
+
+
+
+        def _safe_compute_lanes(
+            since: int,
+            until: int,
+        ) -> tuple[dict[str, dict[str, Any]], dict[str, bool]]:
+            key = (int(since or 0), int(until or 0), len(events_raw))
+            if key in _lane_cache:
+                return _lane_cache[key]
+
+            feats = _empty_feats()
+            enabled = _empty_enabled()
+            if not events_raw:
+                _lane_cache[key] = (feats, enabled)
+                return feats, enabled
+
+            rows = [
+                e for e in events_raw
+                if isinstance(e, dict) and key[0] <= _event_epoch(e) <= key[1]
+            ]
+            if not rows:
+                _lane_cache[key] = (feats, enabled)
+                return feats, enabled
+
+            anyin = lambda s, toks: any(t in s for t in toks)
+            seen = {
+                name: {"add": set(), "remove": set(), "update": set()}
+                for name in feature_keys
+            }
+
+            for e in rows:
+                action = (
+                    str(e.get("action") or e.get("op") or e.get("change") or "")
+                    .lower()
+                    .replace(":", "_")
+                    .replace("-", "_")
+                )
+                feat = (
+                    str(e.get("feature") or e.get("feat") or "")
+                    .lower()
+                    .replace(":", "_")
+                    .replace("-", "_")
+                )
+                sig = _event_sig(e)
+                spot = _spot_item_for_event(e)
+
+                lane_name = None
+                bucket = "add"
+                if ("watchlist" in action) or feat == "watchlist":
+                    lane_name = "watchlist"
+                    if anyin(action, ("remove", "unwatchlist", "delete", "del", "rm", "clear")):
+                        bucket = "remove"
+                    elif anyin(action, ("update", "rename", "edit", "move", "reorder", "relist")):
+                        bucket = "update"
+                elif action in ("rate", "rating", "update_rating", "unrate") or ("rating" in action) or ("rating" in feat):
+                    lane_name = "ratings"
+                    if anyin(action, ("unrate", "remove", "clear", "delete", "unset", "erase")):
+                        bucket = "remove"
+                    elif anyin(action, ("update", "edit", "correct", "fix")):
+                        bucket = "update"
+                elif feat == "progress" or ("progress" in feat) or ("resume" in action):
+                    lane_name = "progress"
+                    bucket = "remove" if anyin(action, ("remove", "clear", "reset")) else "update"
+                elif feat == "playlists" or "playlist" in action or "playlists" in action:
+                    lane_name = "playlists"
+                    if anyin(action, ("remove", "delete", "del", "rm", "clear")):
+                        bucket = "remove"
+                    elif anyin(action, ("update", "edit", "rename", "move", "reorder")):
+                        bucket = "update"
+                else:
+                    is_history_feat = feat in ("history", "watch", "watched") or ("history" in action)
+                    is_add_like = anyin(action, ("watch", "scrobble", "checkin", "mark_watched", "history_add", "add_history"))
+                    is_remove_like = anyin(action, ("unwatch", "remove_history", "history_remove", "delete_watch", "del_history"))
+                    if is_history_feat or is_add_like or is_remove_like:
+                        lane_name = "history"
+                        if is_remove_like:
+                            bucket = "remove"
+                        elif anyin(action, ("update", "edit", "fix", "repair", "adjust", "correct")):
+                            bucket = "update"
+
+                if lane_name not in feats:
+                    continue
+                lane = feats[lane_name]
+                if sig in seen[lane_name][bucket]:
+                    continue
+                if bucket == "update" and (sig in seen[lane_name]["add"] or sig in seen[lane_name]["remove"]):
+                    continue
+                seen[lane_name][bucket].add(sig)
+                lane["added" if bucket == "add" else "removed" if bucket == "remove" else "updated"] += 1
+                lane[f"spotlight_{bucket if bucket != 'remove' else 'remove'}"].append(spot)
+                enabled[lane_name] = True
+
+            for lane in feats.values():
+                lane["spotlight_add"] = list((lane.get("spotlight_add") or [])[-25:])[::-1]
+                lane["spotlight_remove"] = list((lane.get("spotlight_remove") or [])[-25:])[::-1]
+                lane["spotlight_update"] = list((lane.get("spotlight_update") or [])[-25:])[::-1]
+
+            _lane_cache[key] = (feats, enabled)
+            return feats, enabled
+
+        series: list[dict[str, int]] = []
+        generated_at: str | None = None
+        events: list[dict[str, Any]] = []
+        http_block: dict[str, Any] = {}
+
+        if STATS is not None:
+            lock = getattr(STATS, "lock", None) or nullcontext()
+            try:
+                with lock:
+                    data = STATS.data or {}
+                samples_raw = list((data or {}).get("samples") or [])
+                
+                events_raw = list((data or {}).get("events") or [])
+                try:
+                    state = _load_state() or {}
+                except Exception:
+                    state = {}
+                key_map, id_map = _build_show_title_maps(state)
+                movie_key_map, movie_id_map = _build_movie_title_maps(state)
+                _extend_show_title_maps_from_cw_state(id_map)
+                _extend_movie_title_maps_from_cw_state(movie_key_map, movie_id_map)
+
+                events = [
+                    _format_event_title(
+                        _enrich_event_from_state(
+                            _enrich_movie_event_from_state(e, movie_key_map, movie_id_map),
+                            key_map,
+                            id_map,
+                        )
+                    )
+                    for e in events_raw
+                    if isinstance(e, dict) and not str(e.get("key", "")).startswith("agg:")
+                ]
+                events = _sort_events(events)
+                http_block = dict((data or {}).get("http") or {})
+                generated_at = (data or {}).get("generated_at")
+
+                samples: list[dict[str, Any]] = [r for r in samples_raw if isinstance(r, dict)]
+                samples.sort(key=lambda r: int(r.get("ts") or 0))
+                if int(limit_samples) > 0:
+                    samples = samples[-int(limit_samples):]
+                series = [
+                    {"ts": int(r.get("ts") or 0), "count": int(r.get("count") or 0)}
+                    for r in samples
+                ]
+            except Exception as e:
+                _append_log("INSIGHTS", f"[!] samples load failed: {e}")
+                series, events, http_block = [], [], {}
+
+        series_by_feature: dict[str, list[dict[str, int]]] = {k: [] for k in feature_keys}
+        series_by_feature["watchlist"] = list(series)
+
+        rows: list[dict[str, Any]] = []
+        try:
+            files: list[Path] = []
+            if REPORT_DIR is not None:
+                try:
+                    files = sorted(
+                        REPORT_DIR.glob("sync-*.json"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )[: max(1, int(history))]
+                except Exception as e:
+                    _append_log("INSIGHTS", f"[!] report glob failed: {e}")
+                    files = []
+
+            for p in files:
+                try:
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    if not isinstance(d, dict):
+                        continue
+
+                    lanes_raw = d.get("features")
+                    lanes_in: dict[str, Any] = lanes_raw if isinstance(lanes_raw, dict) else {}
+                    lanes: dict[str, dict[str, Any]] = {}
+                    for name in feature_keys:
+                        lane_val = lanes_in.get(name)
+                        lanes[name] = lane_val if isinstance(lane_val, dict) else _zero_lane()
+
+                    since = _safe_parse_epoch(d.get("raw_started_ts") or d.get("started_at"))
+                    until = _safe_parse_epoch(d.get("finished_at")) or int(p.stat().st_mtime)
+
+                    stats_feats, stats_enabled = _safe_compute_lanes(since, until)
+                    for name in feature_keys:
+                        lane_in = lanes_in.get(name)
+                        if not isinstance(lane_in, dict):
+                            lanes[name] = stats_feats.get(name) or _zero_lane()
+
+                    enabled_raw = d.get("features_enabled") or d.get("enabled") or {}
+                    enabled: dict[str, bool] = (
+                        enabled_raw if isinstance(enabled_raw, dict) else dict(stats_enabled)
+                    )
+
+                    provider_posts = {
+                        str(k[:-5]).strip().lower(): v
+                        for k, v in d.items()
+                        if isinstance(k, str) and k.endswith("_post")
+                    }
+                    pc = d.get("provider_counts") or d.get("provider_counts_post") or d.get("provider_counts_pre")
+                    if isinstance(pc, dict):
+                        for k0, v0 in pc.items():
+                            kk = str(k0 or "").strip().lower()
+                            if kk and kk not in provider_posts:
+                                provider_posts[kk] = v0
+                    plex_post = d.get("plex_post")
+                    simkl_post = d.get("simkl_post")
+                    trakt_post = d.get("trakt_post")
+                    tmdb_post = d.get("tmdb_post")
+                    jellyfin_post = d.get("jellyfin_post")
+                    emby_post = d.get("emby_post")
+                    mdblist_post = d.get("mdblist_post")
+                    crosswatch_post = d.get("crosswatch_post")
+
+                    if plex_post is None:
+                        plex_post = provider_posts.get("plex")
+                    if simkl_post is None:
+                        simkl_post = provider_posts.get("simkl")
+                    if trakt_post is None:
+                        trakt_post = provider_posts.get("trakt")
+                    if tmdb_post is None:
+                        tmdb_post = provider_posts.get("tmdb")
+                    if jellyfin_post is None:
+                        jellyfin_post = provider_posts.get("jellyfin")
+                    if emby_post is None:
+                        emby_post = provider_posts.get("emby")
+                    if mdblist_post is None:
+                        mdblist_post = provider_posts.get("mdblist")
+                    if crosswatch_post is None:
+                        crosswatch_post = provider_posts.get("crosswatch")
+
+
+                    rows.append(
+                        {
+                            "started_at": d.get("started_at"),
+                            "finished_at": d.get("finished_at"),
+                            "duration_sec": d.get("duration_sec"),
+                            "result": d.get("result") or "",
+                            "exit_code": d.get("exit_code"),
+                            "added": _as_int(d.get("added_last")),
+                            "removed": _as_int(d.get("removed_last")),
+                            "features": lanes,
+                            "features_enabled": enabled,
+                            "updated_total": _as_int(d.get("updated_last")),
+                            "provider_posts": provider_posts,
+                            "plex_post": plex_post,
+                            "simkl_post": simkl_post,
+                            "trakt_post": trakt_post,
+                            "tmdb_post": tmdb_post,
+                            "jellyfin_post": jellyfin_post,
+                            "emby_post": emby_post,
+                            "mdblist_post": mdblist_post,
+                            "crosswatch_post": crosswatch_post,
+                        }
+                    )
+                except Exception as e:
+                    _append_log("INSIGHTS", f"[!] report parse failed {p.name}: {e}")
+        except Exception as e:
+            _append_log("INSIGHTS", f"[!] report scan failed: {e}")
+
+        wall_raw = _load_wall_snapshot()
+        wall: list[Any]
+        if isinstance(wall_raw, list):
+            wall = wall_raw
+        else:
+            wall = []
+
+        state: dict[str, Any] | None = None
+        if not wall and callable(_get_orchestrator):
+            try:
+                orc = _get_orchestrator()
+                files_obj = getattr(orc, "files", None)
+                if files_obj is not None and hasattr(files_obj, "load_state"):
+                    state_candidate = files_obj.load_state()
+                    if isinstance(state_candidate, dict):
+                        state = state_candidate
+                        wall = list(state.get("wall") or [])
+            except Exception as e:
+                _append_log("SYNC", f"[!] insights: orchestrator init failed: {e}")
+                wall = []
+
+        cfg = load_config() or {}
+        api_key = str(((cfg.get("tmdb") or {}).get("api_key") or "")).strip()
+        use_tmdb = bool(api_key) and bool(int(runtime)) and CACHE_DIR is not None
+
+        def _build_crosswatch_snapshot_info() -> dict[str, Any]:
+            info: dict[str, Any] = {}
+            try:
+                cw_cfg = (cfg.get("crosswatch") or cfg.get("CrossWatch") or {}) or {}
+                root_dir = str(cw_cfg.get("root_dir") or "/config/.cw_provider").strip() or "/config/.cw_provider"
+                snap_dir = Path(root_dir).joinpath("snapshots")
+
+                selected: dict[str, str] = {
+                    "watchlist": str(cw_cfg.get("restore_watchlist") or "latest").strip() or "latest",
+                    "history": str(cw_cfg.get("restore_history") or "latest").strip() or "latest",
+                    "ratings": str(cw_cfg.get("restore_ratings") or "latest").strip() or "latest",
+                }
+
+                files: list[Path] = []
+                if snap_dir.is_dir():
+                    files = list(snap_dir.glob("*.json"))
+
+                by_feat: dict[str, list[str]] = {"watchlist": [], "history": [], "ratings": [], "progress": [], "playlists": []}
+                for p in files:
+                    name = p.name
+                    for feat in by_feat.keys():
+                        if name.endswith(f"-{feat}.json"):
+                            by_feat[feat].append(name)
+
+                for feat, arr in by_feat.items():
+                    arr.sort()
+                    sel = selected.get(feat, "latest")
+                    actual: str | None = None
+                    if arr:
+                        if sel == "latest":
+                            actual = arr[-1]
+                        elif sel in arr:
+                            actual = sel
+                        else:
+                            actual = arr[-1]
+
+                    human: str | None = None
+                    iso_ts: str | None = None
+                    if actual:
+                        try:
+                            stem = actual.split("-", 1)[0]
+                            dt = _dt.datetime.strptime(stem, "%Y%m%dT%H%M%SZ").replace(
+                                tzinfo=_dt.timezone.utc
+                            )
+                            iso_ts = dt.isoformat()
+                            human = dt.strftime("%d-%b-%y")
+                        except Exception:
+                            pass
+
+                    info[feat] = {
+                        "selected": sel,
+                        "actual": actual,
+                        "human": human,
+                        "ts": iso_ts,
+                        "has_snapshots": bool(arr),
+                    }
+            except Exception:
+                pass
+            return info
+
+        def _try_runtime_both(api_key_val: str, typ: str, tmdb_id: int) -> int | None:
+            for t in (typ, ("movie" if typ == "tv" else "tv")):
+                try:
+                    m = get_runtime(api_key_val, t, int(tmdb_id), CACHE_DIR)
+                    if m is not None:
+                        return int(m)
+                except Exception:
+                    pass
+            return None
+
+        movies = 0
+        shows = 0
+        total_min = 0
+        tmdb_hits = 0
+        tmdb_misses = 0
+        fetched = 0
+        fetch_cap = 50 if use_tmdb else 0
+
+        for meta in wall:
+            if not isinstance(meta, dict):
+                continue
+            typ = "movie" if str((meta.get("type") or "")).lower() == "movie" else "tv"
+            if typ == "movie":
+                movies += 1
+            else:
+                shows += 1
+
+            minutes: int | None = None
+            tmdb_id = (meta.get("ids") or {}).get("tmdb")
+            if use_tmdb and tmdb_id and fetched < fetch_cap:
+                try:
+                    minutes = _try_runtime_both(api_key, typ, int(str(tmdb_id)))
+                except Exception:
+                    minutes = None
+                fetched += 1
+                if minutes is not None:
+                    tmdb_hits += 1
+                else:
+                    tmdb_misses += 1
+            if minutes is None:
+                minutes = 115 if typ == "movie" else 45
+            total_min += int(minutes)
+
+        watchtime = {
+            "movies": int(movies),
+            "shows": int(shows),
+            "minutes": total_min,
+            "hours": round(total_min / 60, 1),
+            "days": round(total_min / 1440, 1),
+            "method": "tmdb" if tmdb_hits and not tmdb_misses else ("mixed" if tmdb_hits else "estimate"),
+        }
+
+        if state is None and callable(_get_orchestrator):
+            try:
+                orc = _get_orchestrator()
+                files_obj = getattr(orc, "files", None)
+                if files_obj is not None and hasattr(files_obj, "load_state"):
+                    st2 = files_obj.load_state()
+                    if isinstance(st2, dict):
+                        state = st2
+            except Exception:
+                state = None
+
+        prov_block: dict[str, Any] = (state or {}).get("providers") or {}
+        _PROVIDER_ORDER = ("plex", "simkl", "trakt", "jellyfin", "emby", "mdblist", "publicmetadb", "tmdb", "crosswatch", "anilist")
+        providers_set: set[str] = set(_PROVIDER_ORDER)
+        try:
+            providers_set.update(
+                str(k).strip().lower()
+                for k in prov_block.keys()
+                if isinstance(k, str) and str(k).strip()
+            )
+        except Exception:
+            pass
+
+        try:
+            raw_pairs = (cfg.get("pairs") or cfg.get("connections") or [])
+            cfg_pairs: list[Any] = raw_pairs if isinstance(raw_pairs, list) else []
+            for p in cfg_pairs:
+                if not isinstance(p, dict):
+                    continue
+                s = str(p.get("source") or "").strip().lower()
+                t = str(p.get("target") or "").strip().lower()
+                if s:
+                    providers_set.add(s)
+                if t:
+                    providers_set.add(t)
+        except Exception:
+            cfg_pairs = []
+
+        active: dict[str, bool] = {k: False for k in providers_set}
+        try:
+            for p in (cfg_pairs or []):
+                if not isinstance(p, dict):
+                    continue
+                s = str(p.get("source") or "").strip().lower()
+                t = str(p.get("target") or "").strip().lower()
+                if s in active:
+                    active[s] = True
+                if t in active:
+                    active[t] = True
+        except Exception:
+            pass
+
+        def _iter_feature_items(node: Any) -> list[dict[str, Any]]:
+            try:
+                if not isinstance(node, dict):
+                    return []
+                base = node.get("baseline")
+                if isinstance(base, dict):
+                    items = base.get("items")
+                    if isinstance(items, dict):
+                        return [v for v in items.values() if isinstance(v, dict)]
+                    if isinstance(items, list):
+                        return [v for v in items if isinstance(v, dict)]
+                items = node.get("items")
+                if isinstance(items, dict):
+                    return [v for v in items.values() if isinstance(v, dict)]
+                if isinstance(items, list):
+                    return [v for v in items if isinstance(v, dict)]
+            except Exception:
+                pass
+            return []
+
+        def _count_items(node: Any, feature: str | None = None) -> int:
+            try:
+                if feature in ("history", "ratings") and isinstance(node, dict):
+                    recs = _iter_feature_items(node)
+                    if feature == "history":
+                        return sum(
+                            1
+                            for r in recs
+                            if (not _is_presence_stub(r)) and (r.get("watched_at") or r.get("last_watched_at"))
+                        )
+                    return sum(
+                        1
+                        for r in recs
+                        if (not _is_presence_stub(r))
+                        and (r.get("rated_at") or r.get("user_rated_at") or r.get("rating") or r.get("user_rating"))
+                    )
+
+                if isinstance(node, dict):
+                    base = node.get("baseline") or {}
+                    chk = node.get("checkpoint") or {}
+                    pres = node.get("present") or {}
+
+                    for cand in (
+                        (chk.get("items") if isinstance(chk, dict) else None),
+                        (base.get("items") if isinstance(base, dict) else None),
+                        (pres.get("items") if isinstance(pres, dict) else None),
+                        node.get("items"),
+                    ):
+                        if isinstance(cand, dict):
+                            return len(cand)
+                        if isinstance(cand, list):
+                            return len(cand)
+                        if isinstance(cand, (int, str)):
+                            try:
+                                return int(cand)
+                            except Exception:
+                                return 0
+                    return 0
+                if isinstance(node, list):
+                    return len(node)
+                if isinstance(node, (int, str)):
+                    return int(node)
+            except Exception:
+                return 0
+            return 0
+
+        def _iter_provider_feature_nodes(
+            pdata: dict[str, Any] | None,
+            feature: str,
+        ) -> list[tuple[str, dict[str, Any]]]:
+            out: list[tuple[str, dict[str, Any]]] = []
+            pdata = pdata or {}
+            node = pdata.get(feature)
+            if isinstance(node, dict):
+                out.append(("default", node))
+
+            insts = pdata.get("instances")
+            if isinstance(insts, dict):
+                for iid, idata in insts.items():
+                    if not isinstance(idata, dict):
+                        continue
+                    node2 = idata.get(feature)
+                    if isinstance(node2, dict):
+                        inst_id = str(iid or "").strip() or "default"
+                        out.append((inst_id, node2))
+
+            if not out:
+                out.append(("default", {}))
+            return out
+
+        def _sum_mse(parts: list[dict[str, int]]) -> dict[str, int]:
+            out = {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}
+            for p in parts:
+                if not isinstance(p, dict):
+                    continue
+                out["movies"] += int(p.get("movies") or 0)
+                out["shows"] += int(p.get("shows") or 0)
+                out["anime"] += int(p.get("anime") or 0)
+                out["episodes"] += int(p.get("episodes") or 0)
+            return out
+
+        instances_by_provider: dict[str, list[str]] = {k: ["default"] for k in providers_set}
+        try:
+            for prov_upper, pdata in (prov_block or {}).items():
+                key = str(prov_upper or "").strip().lower()
+                if not key:
+                    continue
+                insts: list[str] = ["default"]
+                inst_block = (pdata or {}).get("instances")
+                if isinstance(inst_block, dict):
+                    for iid in inst_block.keys():
+                        s = str(iid or "").strip()
+                        if s and s not in insts:
+                            insts.append(s)
+                instances_by_provider[key] = insts
+        except Exception:
+            pass
+
+        providers_instances_by_feature: dict[str, dict[str, dict[str, int]]] = {
+            feat: {k: {"default": 0} for k in providers_set} for feat in feature_keys
+        }
+        providers_by_feature: dict[str, dict[str, int]] = {
+            feat: {k: 0 for k in providers_set} for feat in feature_keys
+        }
+
+        try:
+            for prov_upper, pdata in (prov_block or {}).items():
+                key = str(prov_upper or "").strip().lower()
+                if not key:
+                    continue
+                for feat in feature_keys:
+                    inst_counts: dict[str, int] = {}
+                    for inst_id, node in _iter_provider_feature_nodes(pdata, feat):
+                        inst_counts[inst_id] = _count_items(node, feat)
+                    if "default" not in inst_counts:
+                        inst_counts["default"] = 0
+                    providers_instances_by_feature[feat][key] = inst_counts
+                    providers_by_feature[feat][key] = sum(int(v or 0) for v in inst_counts.values())
+        except Exception:
+            pass
+
+        providers_instances_mse_by_feature: dict[str, dict[str, dict[str, dict[str, int]]]] = {
+            feat: {k: {"default": {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}} for k in providers_set}
+            for feat in feature_keys
+        }
+        providers_mse_by_feature: dict[str, dict[str, dict[str, int]]] = {
+            feat: {k: {"movies": 0, "shows": 0, "anime": 0, "episodes": 0} for k in providers_set}
+            for feat in feature_keys
+        }
+
+        try:
+            for prov_upper, pdata in (prov_block or {}).items():
+                key = str(prov_upper or "").strip().lower()
+                if not key:
+                    continue
+
+                for feat in feature_keys:
+                    inst_mse: dict[str, dict[str, int]] = {}
+                    for inst_id, node in _iter_provider_feature_nodes(pdata, feat):
+                        try:
+                            per_counts = _compute_history_breakdown(
+                                {"providers": {prov_upper: {feat: node}}},
+                                feat,
+                            ) or {}
+                        except Exception:
+                            per_counts = {}
+
+                        inst_mse[inst_id] = {
+                            "movies": int(per_counts.get("movies") or 0),
+                            "shows": int(per_counts.get("shows") or 0),
+                            "anime": int(per_counts.get("anime") or 0),
+                            "episodes": int(per_counts.get("episodes") or 0),
+                        }
+
+                    if "default" not in inst_mse:
+                        inst_mse["default"] = {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}
+
+                    providers_instances_mse_by_feature[feat][key] = inst_mse
+                    providers_mse_by_feature[feat][key] = _sum_mse(list(inst_mse.values()))
+        except Exception:
+            pass
+
+
+
+        now_ts = int(time.time())
+        week_floor = now_ts - 7 * 86400
+        month_floor = now_ts - 30 * 86400
+
+        def _last_run_lane(feat: str) -> dict[str, Any]:
+            for row in rows:
+                try:
+                    en = row.get("features_enabled") or {}
+                    if isinstance(en, dict) and en.get(feat) is False:
+                        continue
+                    feats_map = row.get("features") or {}
+                    lane = feats_map.get(feat) if isinstance(feats_map, dict) else {}
+                    if not isinstance(lane, dict):
+                        lane = {}
+                    return {
+                        "added": int(lane.get("added") or 0),
+                        "removed": int(lane.get("removed") or 0),
+                        "updated": int(lane.get("updated") or 0),
+                        "spotlight_add": list(lane.get("spotlight_add") or []),
+                        "spotlight_remove": list(lane.get("spotlight_remove") or []),
+                        "spotlight_update": list(lane.get("spotlight_update") or []),
+                    }
+                except Exception:
+                    continue
+            return {
+                "added": 0,
+                "removed": 0,
+                "updated": 0,
+                "spotlight_add": [],
+                "spotlight_remove": [],
+                "spotlight_update": [],
+            }
+
+        def _union_now(feat: str) -> int:
+            counts = providers_by_feature.get(feat) or {}
+            return max(counts.values()) if counts else 0
+
+        def _lane_totals(days: int) -> dict[str, tuple[int, int, int]]:
+            feats_any, _enabled_any = _safe_compute_lanes(now_ts - days * 86400, now_ts)
+            feats = feats_any if isinstance(feats_any, dict) else {}
+            out: dict[str, tuple[int, int, int]] = {}
+            for f in feature_keys:
+                lane = feats.get(f) or {}
+                if not isinstance(lane, dict):
+                    lane = {}
+                out[f] = (
+                    int(lane.get("added") or 0),
+                    int(lane.get("removed") or 0),
+                    int(lane.get("updated") or 0),
+                )
+            return out
+
+        week_tot = _lane_totals(7)
+
+        ts_grid = [r["ts"] for r in series_by_feature.get("watchlist", [])]
+        if len(ts_grid) < 2:
+            base_ts = now_ts - 11 * 3600
+            ts_grid = [base_ts + i * 3600 for i in range(12)]
+        if ts_grid[-1] < now_ts:
+            ts_grid = ts_grid + [now_ts]
+
+        win: list[dict[str, tuple[int, int]]] = []
+        for i in range(len(ts_grid) - 1):
+            feats_any, _enabled_any = _safe_compute_lanes(ts_grid[i], ts_grid[i + 1])
+            feats = feats_any if isinstance(feats_any, dict) else {}
+            d: dict[str, tuple[int, int]] = {}
+            for f in feature_keys:
+                ln = feats.get(f) or {}
+                if not isinstance(ln, dict):
+                    ln = {}
+                d[f] = (
+                    int(ln.get("added") or 0),
+                    int(ln.get("removed") or 0),
+                )
+            win.append(d)
+
+        for f in [x for x in feature_keys if x != "watchlist"]:
+            v = max(0, _union_now(f))
+            out_series: list[dict[str, int]] = [{"ts": ts_grid[-1], "count": v}]
+            for i in range(len(ts_grid) - 2, -1, -1):
+                a, r = win[i].get(f, (0, 0))
+                v = max(0, v - (a - r))
+                out_series.append({"ts": ts_grid[i], "count": v})
+            series_by_feature[f] = list(reversed(out_series))
+
+        def _val_at(series_list: list[dict[str, int]], floor_ts: int) -> int:
+            try:
+                arr = sorted(series_list or [], key=lambda r: int(r.get("ts") or 0))
+                if not arr:
+                    return 0
+                val = int(arr[0].get("count") or 0)
+                for r in arr:
+                    t = int(r.get("ts") or 0)
+                    if t <= floor_ts:
+                        val = int(r.get("count") or 0)
+                    else:
+                        break
+                return val
+            except Exception:
+                return 0
+            
+        history_counts = _compute_history_breakdown(state)
+
+        feats_out: dict[str, dict[str, Any]] = {}
+        for feat in feature_keys:
+            last_lane = _last_run_lane(feat)
+            add_last = int(last_lane.get("added") or 0)
+            rem_last = int(last_lane.get("removed") or 0)
+            upd_last = int(last_lane.get("updated") or 0)
+            t = week_tot.get(feat)
+            if isinstance(t, tuple) and len(t) == 3:
+                wa, wr, wu = t
+            else:
+                wa, wr, wu = (0, 0, 0)
+
+            s = series_by_feature.get(feat, [])
+            feats_out[feat] = {
+                "now": _union_now(feat),
+                "week": _val_at(s, week_floor),
+                "month": _val_at(s, month_floor),
+                "added": add_last,
+                "removed": rem_last,
+                "updated": upd_last,
+                "spotlight_add": list(last_lane.get("spotlight_add") or []),
+                "spotlight_remove": list(last_lane.get("spotlight_remove") or []),
+                "spotlight_update": list(last_lane.get("spotlight_update") or []),
+                "series": s,
+                "providers": providers_by_feature.get(feat, {}),
+                "providers_active": active.copy(),
+                "providers_mse": providers_mse_by_feature.get(feat, {}),
+                "providers_instances": providers_instances_by_feature.get(feat, {}),
+                "providers_instances_mse": providers_instances_mse_by_feature.get(feat, {}),
+            }
+
+            if feat == "history":
+                feats_out[feat]["breakdown"] = history_counts
+
+        wl = feats_out.get(
+            "watchlist",
+            {"now": 0, "week": 0, "month": 0, "added": 0, "removed": 0},
+        )
+        cw_snapshots = _build_crosswatch_snapshot_info()
+        payload: dict[str, Any] = {
+            "series": series_by_feature.get("watchlist", []),
+            "series_by_feature": series_by_feature,
+            "history": rows,
+            "watchtime": watchtime,
+            "providers": feats_out.get("watchlist", {}).get("providers", {}),
+            "providers_by_feature": providers_by_feature,
+            "instances_by_provider": instances_by_provider,
+            "providers_instances_by_feature": providers_instances_by_feature,
+            "providers_instances_mse_by_feature": providers_instances_mse_by_feature,
+            "providers_active": active,
+            "events": events,
+            "http": http_block,
+            "generated_at": generated_at,
+            "features": feats_out,
+            "crosswatch_snapshots": cw_snapshots,
+            "now": int(wl.get("now", 0) or 0),
+            "week": int(wl.get("week", 0) or 0),
+            "month": int(wl.get("month", 0) or 0),
+            "added": int(wl.get("added", 0) or 0),
+            "removed": int(wl.get("removed", 0) or 0),
+        }
+        return JSONResponse(payload)
