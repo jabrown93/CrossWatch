@@ -1297,69 +1297,217 @@ def _two_way_sync(
         except Exception:
             pass
 
-    if rem_from_A:
-        if a_down:
-            record_unresolved(a, feature, rem_from_A, hint="provider_down:remove")
-            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="remove", count=len(rem_from_A))
-        else:
-            emit("two:apply:remove:A:start", dst=a, feature=feature, count=len(rem_from_A))
-            resA_rem = apply_remove(
-                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=rem_from_A,
-                dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
-            )
-            prov_count_A = _confirmed(resA_rem)
-            if prov_count_A and not dry_run_flag:
-                removed_now = 0
-                for k in remA_keys:
-                    if k in A_eff:
-                        A_eff.pop(k, None)
-                        removed_now += 1
-                        if removed_now >= prov_count_A:
-                            break
-                _mark_tombs(rem_from_A)
-                _bust_snapshot(a)
+    # _apply_remove_side / _apply_update_side / _apply_add_side: side A and side B used
+    # to run near-identical copy-pasted blocks here (only names differed - a/b, aops/bops,
+    # A_eff/B_eff, etc; confirmed via a name-normalized diff before extracting). Each is
+    # called once per side below; being nested closures they still reach `feature`,
+    # `provider_cfg`, `dry_run_flag`, `emit`, `dbg`, `ctx`, `pair_key`, `cfg`,
+    # `verify_after_write`, `use_phantoms`, `_mark_tombs`, and `_bust_snapshot` from the
+    # enclosing scope exactly as the inline blocks did.
 
-            emit("two:apply:remove:A:done", dst=a, feature=feature,
-                 count=_confirmed(resA_rem),
-                 attempted=int(resA_rem.get("attempted", 0)),
-                 removed=_confirmed(resA_rem),
-                 skipped=int(resA_rem.get("skipped", 0)),
-                 unresolved=int(resA_rem.get("unresolved", 0)),
-                 errors=int(resA_rem.get("errors", 0)),
-                 result=resA_rem)
+    def _apply_remove_side(
+        side: str, ops: Any, name: str, down: bool,
+        items: list[dict[str, Any]], rem_keys: list[str], eff_index: dict[str, Any],
+    ) -> dict[str, Any]:
+        if down:
+            record_unresolved(name, feature, items, hint="provider_down:remove")
+            emit("writes:skipped", dst=name, feature=feature, reason="provider_down", op="remove", count=len(items))
+            return {"ok": True, "count": 0}
+
+        emit(f"two:apply:remove:{side}:start", dst=name, feature=feature, count=len(items))
+        res = apply_remove(
+            dst_ops=ops, cfg=provider_cfg, dst_name=name, feature=feature, items=items,
+            dry_run=dry_run_flag, emit=emit, dbg=dbg,
+            chunk_size=effective_chunk_size(ctx, name), chunk_pause_ms=_pause_for(name),
+        )
+        prov_count = _confirmed(res)
+        if prov_count and not dry_run_flag:
+            removed_now = 0
+            for k in rem_keys:
+                if k in eff_index:
+                    eff_index.pop(k, None)
+                    removed_now += 1
+                    if removed_now >= prov_count:
+                        break
+            _mark_tombs(items)
+            _bust_snapshot(name)
+
+        emit(f"two:apply:remove:{side}:done", dst=name, feature=feature,
+             count=_confirmed(res),
+             attempted=int(res.get("attempted", 0)),
+             removed=_confirmed(res),
+             skipped=int(res.get("skipped", 0)),
+             unresolved=int(res.get("unresolved", 0)),
+             errors=int(res.get("errors", 0)),
+             result=res)
+        return res
+
+    def _apply_update_side(
+        side: str, ops: Any, name: str, down: bool,
+        items: list[dict[str, Any]], eff_index: dict[str, Any],
+    ) -> tuple[dict[str, Any], int, int]:
+        if down:
+            record_unresolved(name, feature, items, hint="provider_down:update")
+            emit("writes:skipped", dst=name, feature=feature, reason="provider_down", op="update", count=len(items))
+            return {"ok": True, "count": 0}, 0, len(items)
+
+        emit(f"two:apply:update:{side}:start", dst=name, feature=feature, count=len(items))
+        unresolved_before = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+        res = apply_update(
+            dst_ops=ops, cfg=provider_cfg, dst_name=name, feature=feature, items=items,
+            dry_run=dry_run_flag, emit=emit, dbg=dbg,
+            chunk_size=effective_chunk_size(ctx, name), chunk_pause_ms=_pause_for(name),
+        )
+        unresolved_after = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+        prov_unresolved_keys_raw = (res or {}).get("unresolved_keys")
+        prov_unresolved_keys: list[str] = (
+            [str(x) for x in prov_unresolved_keys_raw if x] if isinstance(prov_unresolved_keys_raw, list) else []
+        )
+        new_unresolved = (unresolved_after - unresolved_before) | (set(prov_unresolved_keys) - unresolved_before)
+        eff = int((res or {}).get("confirmed", (res or {}).get("count", 0)) or 0)
+        if eff and not dry_run_flag:
+            upd_map = {(_ck(_minimal(it)) or ""): _minimal(it) for it in items}
+            confirmed_keys = [str(x) for x in ((res or {}).get("confirmed_keys") or []) if x]
+            keys_to_write = confirmed_keys if confirmed_keys else (list(upd_map.keys()) if eff >= len(upd_map) else [])
+            for k in keys_to_write:
+                v = upd_map.get(k)
+                if v:
+                    eff_index[k] = v
+            if keys_to_write:
+                _bust_snapshot(name)
+        emit(f"two:apply:update:{side}:done", dst=name, feature=feature,
+             count=eff,
+             attempted=int(res.get("attempted", 0)),
+             updated=eff,
+             skipped=int(res.get("skipped", 0)),
+             unresolved=int(res.get("unresolved", 0)),
+             errors=int(res.get("errors", 0)),
+             result=res)
+        return res, eff, len(new_unresolved)
+
+    def _apply_add_side(
+        side: str, ops: Any, name: str, down: bool,
+        items: list[dict[str, Any]], eff_index: dict[str, Any], guard: Any,
+    ) -> tuple[dict[str, Any], int, int]:
+        if down:
+            record_unresolved(name, feature, items, hint="provider_down:add")
+            emit("writes:skipped", dst=name, feature=feature, reason="provider_down", op="add", count=len(items))
+            return {"ok": True, "count": 0}, 0, len(items)
+
+        emit(f"two:apply:add:{side}:start", dst=name, feature=feature, count=len(items))
+        unresolved_before = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+        _ = set(load_blackbox_keys(name, feature, pair=pair_key) or [])
+        attempted: list[str] = []
+        seen: set[str] = set()
+        k2i: dict[str, Any] = {}
+        for it in items:
+            k = _ck(_minimal(it))
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            attempted.append(k)
+            k2i[k] = _minimal(it)
+
+        res = apply_add(
+            dst_ops=ops, cfg=provider_cfg, dst_name=name, feature=feature, items=items,
+            dry_run=dry_run_flag, emit=emit, dbg=dbg,
+            chunk_size=effective_chunk_size(ctx, name), chunk_pause_ms=_pause_for(name),
+        )
+        unresolved_after = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+        prov_unresolved_keys_raw = (res or {}).get("unresolved_keys")
+        prov_unresolved_keys: list[str] = (
+            [str(x) for x in prov_unresolved_keys_raw if x] if isinstance(prov_unresolved_keys_raw, list) else []
+        )
+        prov_unresolved_set: set[str] = set(prov_unresolved_keys)
+
+        new_unresolved = (unresolved_after - unresolved_before) | (prov_unresolved_set - unresolved_before)
+        still_unresolved = set(attempted) & (unresolved_after | prov_unresolved_set)
+
+        prov_confirmed_keys_raw = (res or {}).get("confirmed_keys")
+        prov_skipped_keys_raw = (res or {}).get("skipped_keys")
+
+        prov_confirmed_keys: list[str] = (
+            [str(x) for x in prov_confirmed_keys_raw if x] if isinstance(prov_confirmed_keys_raw, list) else []
+        )
+        prov_skipped_keys: list[str] = (
+            [str(x) for x in prov_skipped_keys_raw if x] if isinstance(prov_skipped_keys_raw, list) else []
+        )
+
+        skipped_keys: set[str] = set(prov_skipped_keys)
+
+        have_exact_keys = bool(prov_confirmed_keys)
+        if have_exact_keys:
+            attempted_set = set(attempted)
+            confirmed = [k for k in prov_confirmed_keys if k in attempted_set]
+        else:
+            confirmed = [k for k in attempted if k not in still_unresolved]
+
+        prov_count = _confirmed(res)
+        if have_exact_keys:
+            prov_count = min(prov_count or len(confirmed), len(confirmed))
+
+        ambiguous_partial = False
+        if verify_after_write and _apply_verify_after_write_supported(ops):
+            try:
+                unresolved_again = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+                confirmed = [k for k in confirmed if k not in unresolved_again]
+            except Exception:
+                pass
+            eff = len(confirmed)
+        else:
+            ambiguous_partial = (not have_exact_keys) and bool((res or {}).get("skipped")) and prov_count and (prov_count < len(confirmed))
+            eff = 0 if still_unresolved or ambiguous_partial else min(prov_count, len(confirmed))
+
+        if eff != prov_count and not have_exact_keys:
+            dbg("two:apply:add:corrected", dst=name, feature=feature,
+                provider_count=prov_count, effective=eff, newly_unresolved=len(new_unresolved))
+
+        success = confirmed if (verify_after_write or have_exact_keys) else confirmed[:eff]
+        try:
+            failed = [k for k in attempted if k not in set(success) and k not in skipped_keys]
+            if failed and not ambiguous_partial:
+                record_attempts(name, feature, failed,
+                    reason="two:apply:add:failed", op="add",
+                    pair=pair_key, cfg=cfg)
+                failed_items = [k2i[k] for k in failed if k in k2i]
+                if failed_items:
+                    record_unresolved(name, feature, failed_items, hint="apply:add:failed")
+
+            if success:
+                record_success(name, feature, success, pair=pair_key, cfg=cfg)
+                clear_items_for_feature(
+                    ctx.state_store,
+                    dbg,
+                    feature,
+                    [k2i[k] for k in success if k in k2i],
+                    pair=pair_key,
+                )
+            if use_phantoms and guard and success:
+                guard.record_success(set(success))
+        except Exception:
+            pass
+
+        if success and not dry_run_flag:
+            for k in success:
+                v = k2i.get(k)
+                if v:
+                    eff_index[k] = v
+            _bust_snapshot(name)
+        emit(f"two:apply:add:{side}:done", dst=name, feature=feature,
+             count=_confirmed(res),
+             attempted=int(res.get("attempted", 0)),
+             added=_confirmed(res),
+             skipped=int(res.get("skipped", 0)),
+             unresolved=int(res.get("unresolved", 0)),
+             errors=int(res.get("errors", 0)),
+             result=res)
+        return res, eff, len(new_unresolved)
+
+    if rem_from_A:
+        resA_rem = _apply_remove_side("A", aops, a, a_down, rem_from_A, remA_keys, A_eff)
 
     if rem_from_B:
-        if b_down:
-            record_unresolved(b, feature, rem_from_B, hint="provider_down:remove")
-            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="remove", count=len(rem_from_B))
-        else:
-            emit("two:apply:remove:B:start", dst=b, feature=feature, count=len(rem_from_B))
-            resB_rem = apply_remove(
-                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=rem_from_B,
-                dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
-            )
-            prov_count_B = _confirmed(resB_rem)
-            if prov_count_B and not dry_run_flag:
-                removed_now = 0
-                for k in remB_keys:
-                    if k in B_eff:
-                        B_eff.pop(k, None)
-                        removed_now += 1
-                        if removed_now >= prov_count_B:
-                            break
-                _mark_tombs(rem_from_B)
-                _bust_snapshot(b)
-
-            emit("two:apply:remove:B:done", dst=b, feature=feature,
-                 count=_confirmed(resB_rem),
-                 attempted=int(resB_rem.get("attempted", 0)),
-                 removed=_confirmed(resB_rem),
-                 skipped=int(resB_rem.get("skipped", 0)),
-                 unresolved=int(resB_rem.get("unresolved", 0)),
-                 errors=int(resB_rem.get("errors", 0)),
-                 result=resB_rem)
+        resB_rem = _apply_remove_side("B", bops, b, b_down, rem_from_B, remB_keys, B_eff)
 
     resA_add: dict[str, Any] = {"ok": True, "count": 0}
     resB_add: dict[str, Any] = {"ok": True, "count": 0}
@@ -1373,316 +1521,20 @@ def _two_way_sync(
     unresolved_new_B_total = 0
 
     if upd_to_A:
-        if a_down:
-            record_unresolved(a, feature, upd_to_A, hint="provider_down:update")
-            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="update", count=len(upd_to_A))
-            unresolved_new_A_total += len(upd_to_A)
-        else:
-            emit("two:apply:update:A:start", dst=a, feature=feature, count=len(upd_to_A))
-            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            resA_upd = apply_update(
-                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=upd_to_A,
-                dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
-            )
-            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            prov_unresolved_keys_A_raw = (resA_upd or {}).get("unresolved_keys")
-            prov_unresolved_keys_A: list[str] = (
-                [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
-            )
-            new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (set(prov_unresolved_keys_A) - unresolved_before_A)
-            unresolved_new_A_total += len(new_unresolved_A)
-            eff_upd_A = int((resA_upd or {}).get("confirmed", (resA_upd or {}).get("count", 0)) or 0)
-            if eff_upd_A and not dry_run_flag:
-                upd_map_A = {(_ck(_minimal(it)) or ""): _minimal(it) for it in upd_to_A}
-                confirmed_keys_A = [str(x) for x in ((resA_upd or {}).get("confirmed_keys") or []) if x]
-                keys_to_write_A = confirmed_keys_A if confirmed_keys_A else (list(upd_map_A.keys()) if eff_upd_A >= len(upd_map_A) else [])
-                for k in keys_to_write_A:
-                    v = upd_map_A.get(k)
-                    if v:
-                        A_eff[k] = v
-                if keys_to_write_A:
-                    _bust_snapshot(a)
-            emit("two:apply:update:A:done", dst=a, feature=feature,
-                 count=eff_upd_A,
-                 attempted=int(resA_upd.get("attempted", 0)),
-                 updated=eff_upd_A,
-                 skipped=int(resA_upd.get("skipped", 0)),
-                 unresolved=int(resA_upd.get("unresolved", 0)),
-                 errors=int(resA_upd.get("errors", 0)),
-                 result=resA_upd)
+        resA_upd, eff_upd_A, new_unres = _apply_update_side("A", aops, a, a_down, upd_to_A, A_eff)
+        unresolved_new_A_total += new_unres
 
     if upd_to_B:
-        if b_down:
-            record_unresolved(b, feature, upd_to_B, hint="provider_down:update")
-            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="update", count=len(upd_to_B))
-            unresolved_new_B_total += len(upd_to_B)
-        else:
-            emit("two:apply:update:B:start", dst=b, feature=feature, count=len(upd_to_B))
-            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            resB_upd = apply_update(
-                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=upd_to_B,
-                dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
-            )
-            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            prov_unresolved_keys_B_raw = (resB_upd or {}).get("unresolved_keys")
-            prov_unresolved_keys_B: list[str] = (
-                [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
-            )
-            new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (set(prov_unresolved_keys_B) - unresolved_before_B)
-            unresolved_new_B_total += len(new_unresolved_B)
-            eff_upd_B = int((resB_upd or {}).get("confirmed", (resB_upd or {}).get("count", 0)) or 0)
-            if eff_upd_B and not dry_run_flag:
-                upd_map_B = {(_ck(_minimal(it)) or ""): _minimal(it) for it in upd_to_B}
-                confirmed_keys_B = [str(x) for x in ((resB_upd or {}).get("confirmed_keys") or []) if x]
-                keys_to_write_B = confirmed_keys_B if confirmed_keys_B else (list(upd_map_B.keys()) if eff_upd_B >= len(upd_map_B) else [])
-                for k in keys_to_write_B:
-                    v = upd_map_B.get(k)
-                    if v:
-                        B_eff[k] = v
-                if keys_to_write_B:
-                    _bust_snapshot(b)
-            emit("two:apply:update:B:done", dst=b, feature=feature,
-                 count=eff_upd_B,
-                 attempted=int(resB_upd.get("attempted", 0)),
-                 updated=eff_upd_B,
-                 skipped=int(resB_upd.get("skipped", 0)),
-                 unresolved=int(resB_upd.get("unresolved", 0)),
-                 errors=int(resB_upd.get("errors", 0)),
-                 result=resB_upd)
+        resB_upd, eff_upd_B, new_unres = _apply_update_side("B", bops, b, b_down, upd_to_B, B_eff)
+        unresolved_new_B_total += new_unres
 
     if add_to_A:
-        if a_down:
-            record_unresolved(a, feature, add_to_A, hint="provider_down:add")
-            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="add", count=len(add_to_A))
-            unresolved_new_A_total += len(add_to_A)
-        else:
-            emit("two:apply:add:A:start", dst=a, feature=feature, count=len(add_to_A))
-            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            _ = set(load_blackbox_keys(a, feature, pair=pair_key) or [])
-            attempted_A: list[str] = []
-            seen_A: set[str] = set()
-            k2i_A: dict[str, Any] = {}
-            for it in add_to_A:
-                k = _ck(_minimal(it))
-                if not k or k in seen_A:
-                    continue
-                seen_A.add(k)
-                attempted_A.append(k)
-                k2i_A[k] = _minimal(it)
-            
-            resA_add = apply_add(
-                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=add_to_A,
-                dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
-            )
-            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            prov_unresolved_keys_A_raw = (resA_add or {}).get("unresolved_keys")
-            prov_unresolved_keys_A: list[str] = (
-                [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
-            )
-            prov_unresolved_set_A: set[str] = set(prov_unresolved_keys_A)
-
-            new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (prov_unresolved_set_A - unresolved_before_A)
-            unresolved_new_A_total += len(new_unresolved_A)
-            still_unresolved_A = set(attempted_A) & (unresolved_after_A | prov_unresolved_set_A)
-            
-            prov_confirmed_keys_A_raw = (resA_add or {}).get("confirmed_keys")
-            prov_skipped_keys_A_raw = (resA_add or {}).get("skipped_keys")
-
-            prov_confirmed_keys_A: list[str] = (
-                [str(x) for x in prov_confirmed_keys_A_raw if x] if isinstance(prov_confirmed_keys_A_raw, list) else []
-            )
-            prov_skipped_keys_A: list[str] = (
-                [str(x) for x in prov_skipped_keys_A_raw if x] if isinstance(prov_skipped_keys_A_raw, list) else []
-            )
-
-            skipped_keys_A: set[str] = set(prov_skipped_keys_A)
-
-            have_exact_keys_A = bool(prov_confirmed_keys_A)
-            if have_exact_keys_A:
-                attempted_set_A = set(attempted_A)
-                confirmed_A = [k for k in prov_confirmed_keys_A if k in attempted_set_A]
-            else:
-                confirmed_A = [k for k in attempted_A if k not in still_unresolved_A]
-
-        
-            prov_count_A = _confirmed(resA_add)
-            if have_exact_keys_A:
-                prov_count_A = min(prov_count_A or len(confirmed_A), len(confirmed_A))
-            
-            ambiguous_partial_A = False
-            if verify_after_write and _apply_verify_after_write_supported(aops):
-                try:
-                    unresolved_again = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-                    confirmed_A = [k for k in confirmed_A if k not in unresolved_again]
-                except Exception:
-                    pass
-                eff_add_A = len(confirmed_A)
-            else:
-                ambiguous_partial_A = (not have_exact_keys_A) and bool((resA_add or {}).get("skipped")) and prov_count_A and (prov_count_A < len(confirmed_A))
-                eff_add_A = 0 if still_unresolved_A or ambiguous_partial_A else min(prov_count_A, len(confirmed_A))
-            
-            if eff_add_A != prov_count_A and not have_exact_keys_A:
-                dbg("two:apply:add:corrected", dst=a, feature=feature,
-                    provider_count=prov_count_A, effective=eff_add_A, newly_unresolved=len(new_unresolved_A))
-            
-            success_A = confirmed_A if (verify_after_write or have_exact_keys_A) else confirmed_A[:eff_add_A]
-            try:
-                failed_A = [k for k in attempted_A if k not in set(success_A) and k not in skipped_keys_A]
-                if failed_A and not ambiguous_partial_A:
-                    record_attempts(a, feature, failed_A,
-                        reason="two:apply:add:failed", op="add",
-                        pair=pair_key, cfg=cfg)
-                    failed_items_A = [k2i_A[k] for k in failed_A if k in k2i_A]
-                    if failed_items_A:
-                        record_unresolved(a, feature, failed_items_A, hint="apply:add:failed")
-            
-                if success_A:
-                    record_success(a, feature, success_A, pair=pair_key, cfg=cfg)
-                    clear_items_for_feature(
-                        ctx.state_store,
-                        dbg,
-                        feature,
-                        [k2i_A[k] for k in success_A if k in k2i_A],
-                        pair=pair_key,
-                    )
-                if use_phantoms and guardA and success_A:
-                    guardA.record_success(set(success_A))
-            except Exception:
-                pass
-            
-            if success_A and not dry_run_flag:
-                for k in success_A:
-                    v = k2i_A.get(k)
-                    if v:
-                        A_eff[k] = v
-                _bust_snapshot(a)
-            emit("two:apply:add:A:done", dst=a, feature=feature,
-                 count=_confirmed(resA_add),
-                 attempted=int(resA_add.get("attempted", 0)),
-                 added=_confirmed(resA_add),
-                 skipped=int(resA_add.get("skipped", 0)),
-                 unresolved=int(resA_add.get("unresolved", 0)),
-                 errors=int(resA_add.get("errors", 0)),
-                 result=resA_add)
+        resA_add, eff_add_A, new_unres = _apply_add_side("A", aops, a, a_down, add_to_A, A_eff, guardA)
+        unresolved_new_A_total += new_unres
 
     if add_to_B:
-        if b_down:
-            record_unresolved(b, feature, add_to_B, hint="provider_down:add")
-            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="add", count=len(add_to_B))
-            unresolved_new_B_total += len(add_to_B)
-        else:
-            emit("two:apply:add:B:start", dst=b, feature=feature, count=len(add_to_B))
-            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            _ = set(load_blackbox_keys(b, feature, pair=pair_key) or [])
-            attempted_B: list[str] = []
-            seen_B: set[str] = set()
-            k2i_B: dict[str, Any] = {}
-            for it in add_to_B:
-                k = _ck(_minimal(it))
-                if not k or k in seen_B:
-                    continue
-                seen_B.add(k)
-                attempted_B.append(k)
-                k2i_B[k] = _minimal(it)
-            
-            resB_add = apply_add(
-                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=add_to_B,
-                dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
-            )
-            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            prov_unresolved_keys_B_raw = (resB_add or {}).get("unresolved_keys")
-            prov_unresolved_keys_B: list[str] = (
-                [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
-            )
-            prov_unresolved_set_B: set[str] = set(prov_unresolved_keys_B)
-
-            new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (prov_unresolved_set_B - unresolved_before_B)
-            unresolved_new_B_total += len(new_unresolved_B)
-            still_unresolved_B = set(attempted_B) & (unresolved_after_B | prov_unresolved_set_B)
-            
-            prov_confirmed_keys_B_raw = (resB_add or {}).get("confirmed_keys")
-            prov_skipped_keys_B_raw = (resB_add or {}).get("skipped_keys")
-
-            prov_confirmed_keys_B: list[str] = (
-                [str(x) for x in prov_confirmed_keys_B_raw if x] if isinstance(prov_confirmed_keys_B_raw, list) else []
-            )
-            prov_skipped_keys_B: list[str] = (
-                [str(x) for x in prov_skipped_keys_B_raw if x] if isinstance(prov_skipped_keys_B_raw, list) else []
-            )
-
-            skipped_keys_B: set[str] = set(prov_skipped_keys_B)
-
-            have_exact_keys_B = bool(prov_confirmed_keys_B)
-            if have_exact_keys_B:
-                attempted_set_B = set(attempted_B)
-                confirmed_B = [k for k in prov_confirmed_keys_B if k in attempted_set_B]
-            else:
-                confirmed_B = [k for k in attempted_B if k not in still_unresolved_B]
-
-        
-            prov_count_B = _confirmed(resB_add)
-            if have_exact_keys_B:
-                prov_count_B = min(prov_count_B or len(confirmed_B), len(confirmed_B))
-            
-            ambiguous_partial_B = False
-            if verify_after_write and _apply_verify_after_write_supported(bops):
-                try:
-                    unresolved_again = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-                    confirmed_B = [k for k in confirmed_B if k not in unresolved_again]
-                except Exception:
-                    pass
-                eff_add_B = len(confirmed_B)
-            else:
-                ambiguous_partial_B = (not have_exact_keys_B) and bool((resB_add or {}).get("skipped")) and prov_count_B and (prov_count_B < len(confirmed_B))
-                eff_add_B = 0 if still_unresolved_B or ambiguous_partial_B else min(prov_count_B, len(confirmed_B))
-            
-            if eff_add_B != prov_count_B and not have_exact_keys_B:
-                dbg("two:apply:add:corrected", dst=b, feature=feature,
-                    provider_count=prov_count_B, effective=eff_add_B, newly_unresolved=len(new_unresolved_B))
-            
-            success_B = confirmed_B if (verify_after_write or have_exact_keys_B) else confirmed_B[:eff_add_B]
-            try:
-                failed_B = [k for k in attempted_B if k not in set(success_B) and k not in skipped_keys_B]
-                if failed_B and not ambiguous_partial_B:
-                    record_attempts(b, feature, failed_B,
-                        reason="two:apply:add:failed", op="add",
-                        pair=pair_key, cfg=cfg)
-                    failed_items_B = [k2i_B[k] for k in failed_B if k in k2i_B]
-                    if failed_items_B:
-                        record_unresolved(b, feature, failed_items_B, hint="apply:add:failed")
-            
-                if success_B:
-                    record_success(b, feature, success_B, pair=pair_key, cfg=cfg)
-                    clear_items_for_feature(
-                        ctx.state_store,
-                        dbg,
-                        feature,
-                        [k2i_B[k] for k in success_B if k in k2i_B],
-                        pair=pair_key,
-                    )
-                if use_phantoms and guardB and success_B:
-                    guardB.record_success(set(success_B))
-            except Exception:
-                pass
-            
-            if success_B and not dry_run_flag:
-                for k in success_B:
-                    v = k2i_B.get(k)
-                    if v:
-                        B_eff[k] = v
-                _bust_snapshot(b)
-            emit("two:apply:add:B:done", dst=b, feature=feature,
-                 count=_confirmed(resB_add),
-                 attempted=int(resB_add.get("attempted", 0)),
-                 added=_confirmed(resB_add),
-                 skipped=int(resB_add.get("skipped", 0)),
-                 unresolved=int(resB_add.get("unresolved", 0)),
-                 errors=int(resB_add.get("errors", 0)),
-                 result=resB_add)
+        resB_add, eff_add_B, new_unres = _apply_add_side("B", bops, b, b_down, add_to_B, B_eff, guardB)
+        unresolved_new_B_total += new_unres
 
     try:
         st = ctx.state_store.load_state() or {}
