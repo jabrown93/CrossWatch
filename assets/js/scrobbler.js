@@ -482,11 +482,9 @@ serverUUID: async (instanceId) => {
     },
   };
 
-  async function persistConfigPaths(pairs, noteId) {
+  // POSTs cfg to /api/config; on failure logs + surfaces noteId and returns false (never throws).
+  async function saveConfig(cfg, noteId, warnLabel = "save failed") {
     try {
-      const serverCfg = await API.cfgGet();
-      const cfg = typeof structuredClone === "function" ? structuredClone(serverCfg || {}) : JSON.parse(JSON.stringify(serverCfg || {}));
-      for (const [path, value] of pairs || []) deepSet(cfg, String(path || ""), value);
       const r = await fetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -494,6 +492,20 @@ serverUUID: async (instanceId) => {
         body: JSON.stringify(cfg),
       });
       if (!r.ok) throw new Error(`POST /api/config ${r.status}`);
+      return true;
+    } catch (e) {
+      console.warn(`[scrobbler] ${warnLabel}:`, e);
+      if (noteId) setNote(noteId, "Couldn't save settings. Hit Save or check logs.", "err");
+      return false;
+    }
+  }
+
+  async function persistConfigPaths(pairs, noteId) {
+    try {
+      const serverCfg = await API.cfgGet();
+      const cfg = typeof structuredClone === "function" ? structuredClone(serverCfg || {}) : JSON.parse(JSON.stringify(serverCfg || {}));
+      for (const [path, value] of pairs || []) deepSet(cfg, String(path || ""), value);
+      await saveConfig(cfg, noteId);
     } catch (e) {
       console.warn("[scrobbler] save failed:", e);
       if (noteId) setNote(noteId, "Couldn't save settings. Hit Save or check logs.", "err");
@@ -509,13 +521,7 @@ serverUUID: async (instanceId) => {
       cfg.plex = Object.assign({}, cfg.plex || {}, rootPatch.plex || {});
       cfg.emby = Object.assign({}, cfg.emby || {}, rootPatch.emby || {});
       cfg.jellyfin = Object.assign({}, cfg.jellyfin || {}, rootPatch.jellyfin || {});
-      const r = await fetch("/api/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify(cfg),
-      });
-      if (!r.ok) throw new Error(`POST /api/config ${r.status}`);
+      await saveConfig(cfg, noteId);
     } catch (e) {
       console.warn("[scrobbler] save failed:", e);
       if (noteId) setNote(noteId, "Couldn't save settings. Hit Save or check logs.", "err");
@@ -1170,31 +1176,43 @@ try {
     applyModeDisable();
   }
 
-  function ensureRouteOptionsModal() {
-    if (STATE.routeOptionsModal?.overlay?.isConnected) return STATE.routeOptionsModal;
+  // Shared "gradient box" panel styles reused across the route options/filters modals.
+  const ROUTE_MODAL_NOTE_STYLE = "margin:0 0 14px;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.018))";
+  const ROUTE_MODAL_FIELD_BOX_STYLE = "display:grid;gap:10px;padding:16px 18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015))";
 
+  // Builds the shared overlay/card/head/close scaffolding used by the route options and
+  // route filters modals. Callers append their own content into `card` and wire `close`.
+  function buildRouteModalShell({ title: titleText, width, subtitleMaxWidth }) {
     const overlay = el("div", {
       className: "sc-route-modal hidden",
       style: "position:fixed;inset:0;z-index:10000;background:rgba(4,7,14,.62);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;padding:20px",
     });
     const card = el("div", {
       className: "sc-route-modal-card",
-      style: "width:min(560px,calc(100vw - 32px));max-height:min(88vh,820px);overflow:auto;border-radius:22px;background:linear-gradient(180deg,rgba(12,14,23,.98),rgba(6,8,12,.99));border:1px solid rgba(255,255,255,.10);box-shadow:0 24px 60px rgba(0,0,0,.45);padding:18px 18px 16px",
+      style: `width:min(${width},calc(100vw - 32px));max-height:min(88vh,820px);overflow:auto;border-radius:22px;background:linear-gradient(180deg,rgba(12,14,23,.98),rgba(6,8,12,.99));border:1px solid rgba(255,255,255,.10);box-shadow:0 24px 60px rgba(0,0,0,.45);padding:18px 18px 16px`,
     });
     overlay.appendChild(card);
 
     const head = el("div", { style: "display:flex;align-items:flex-start;gap:12px;justify-content:space-between;margin-bottom:14px" });
     const headText = el("div", { style: "display:grid;gap:6px" });
-    const title = el("div", { style: "font-size:20px;font-weight:900;color:#f4f7ff", textContent: "Route Options" });
-    const subtitle = el("div", { className: "micro-note", style: "max-width:420px" });
+    const title = el("div", { style: "font-size:20px;font-weight:900;color:#f4f7ff", textContent: titleText });
+    const subtitle = el("div", { className: "micro-note", style: `max-width:${subtitleMaxWidth}` });
     headText.append(title, subtitle);
     const close = el("button", { type: "button", className: "btn small", textContent: "Close" });
     head.append(headText, close);
     card.appendChild(head);
 
+    return { overlay, card, head, headText, title, subtitle, close };
+  }
+
+  function ensureRouteOptionsModal() {
+    if (STATE.routeOptionsModal?.overlay?.isConnected) return STATE.routeOptionsModal;
+
+    const { overlay, card, title, subtitle, close } = buildRouteModalShell({ title: "Route Options", width: "560px", subtitleMaxWidth: "420px" });
+
     const defaultsNote = el("div", {
       className: "micro-note",
-      style: "margin:0 0 14px;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.018))",
+      style: ROUTE_MODAL_NOTE_STYLE,
     });
     card.appendChild(defaultsNote);
 
@@ -1444,37 +1462,20 @@ try {
   function ensureRouteFiltersModal() {
     if (STATE.routeFiltersModal?.overlay?.isConnected) return STATE.routeFiltersModal;
 
-    const overlay = el("div", {
-      className: "sc-route-modal hidden",
-      style: "position:fixed;inset:0;z-index:10000;background:rgba(4,7,14,.62);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;padding:20px",
-    });
-    const card = el("div", {
-      className: "sc-route-modal-card",
-      style: "width:min(1080px,calc(100vw - 32px));max-height:min(88vh,820px);overflow:auto;border-radius:22px;background:linear-gradient(180deg,rgba(12,14,23,.98),rgba(6,8,12,.99));border:1px solid rgba(255,255,255,.10);box-shadow:0 24px 60px rgba(0,0,0,.45);padding:18px 18px 16px",
-    });
-    overlay.appendChild(card);
-
-    const head = el("div", { style: "display:flex;align-items:flex-start;gap:12px;justify-content:space-between;margin-bottom:14px" });
-    const headText = el("div", { style: "display:grid;gap:6px" });
-    const title = el("div", { style: "font-size:20px;font-weight:900;color:#f4f7ff", textContent: "Route Filters" });
-    const subtitle = el("div", { className: "micro-note", style: "max-width:480px" });
-    headText.append(title, subtitle);
-    const close = el("button", { type: "button", className: "btn small", textContent: "Close" });
-    head.append(headText, close);
-    card.appendChild(head);
+    const { overlay, card, title, subtitle, close } = buildRouteModalShell({ title: "Route Filters", width: "1080px", subtitleMaxWidth: "480px" });
 
     const note = el("div", {
       className: "micro-note",
-      style: "margin:0 0 14px;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.018))",
+      style: ROUTE_MODAL_NOTE_STYLE,
       textContent: "Filters are route-specific. Only playback that matches this route's filters will be scrobbled through this route.",
     });
     card.appendChild(note);
 
     const grid = el("div", { className: "sc-route-filter-grid", style: "display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px" });
-    const namesBox = el("div", { style: "display:grid;gap:10px;padding:16px 18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015))" });
-    const idBox = el("div", { style: "display:grid;gap:10px;padding:16px 18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015))" });
-    const uuidAllowBox = el("div", { style: "display:grid;gap:10px;padding:16px 18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015))" });
-    const uuidBlockBox = el("div", { style: "display:grid;gap:10px;padding:16px 18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015))" });
+    const namesBox = el("div", { style: ROUTE_MODAL_FIELD_BOX_STYLE });
+    const idBox = el("div", { style: ROUTE_MODAL_FIELD_BOX_STYLE });
+    const uuidAllowBox = el("div", { style: ROUTE_MODAL_FIELD_BOX_STYLE });
+    const uuidBlockBox = el("div", { style: ROUTE_MODAL_FIELD_BOX_STYLE });
     grid.append(namesBox, idBox, uuidAllowBox, uuidBlockBox);
     card.appendChild(grid);
 
@@ -1980,6 +1981,33 @@ function chip(text, onRemove, onClick) {
     return `<div class="field"><label for="${id}">${label}</label>${helpBtn(tipId)}<input id="${id}" class="input" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" placeholder="${placeholder}"></div>`;
   }
 
+  // Wires a sub-tile/sub-panel tab group under `root`: click-to-select, active-state
+  // toggling, and localStorage persistence keyed by `storageKey`. `normalize(sub)` maps
+  // a raw sub id (or undefined) to the canonical tab id, including the default tab.
+  // Returns the selectTab(sub, {persist}) function.
+  function wireSubTabs(root, storageKey, normalize) {
+    const selectTab = (sub, opts = {}) => {
+      const want = normalize(sub);
+      root.querySelectorAll('.cw-subtile[data-sub]').forEach((btn) => {
+        btn.classList.toggle("active", (btn.dataset.sub || "").toLowerCase() === want);
+      });
+      root.querySelectorAll('.cw-subpanel[data-sub]').forEach((sp) => {
+        sp.classList.toggle("active", (sp.dataset.sub || "").toLowerCase() === want);
+      });
+      if (opts.persist !== false) {
+        try { localStorage.setItem(storageKey, want); } catch {}
+      }
+    };
+
+    root.querySelectorAll('.cw-subtile[data-sub]').forEach((btn) => {
+      btn.addEventListener("click", () => selectTab(btn.dataset.sub));
+    });
+
+    try { selectTab(localStorage.getItem(storageKey), { persist: false }); } catch { selectTab(undefined, { persist: false }); }
+
+    return selectTab;
+  }
+
   function buildUI() {
     injectStyles();
 
@@ -1992,25 +2020,7 @@ function chip(text, onRemove, onClick) {
       // Tabs: Plex / Jellyfin / Emby / Advanced
       const tabKey = "cw.ui.scrobbler.webhook.tab.v1";
       const root = STATE.webhookHost;
-      const selectTab = (sub, opts = {}) => {
-        const want = (sub || "plex").toLowerCase();
-        root.querySelectorAll('.cw-subtile[data-sub]').forEach((btn) => {
-          btn.classList.toggle("active", (btn.dataset.sub || "").toLowerCase() === want);
-        });
-        root.querySelectorAll('.cw-subpanel[data-sub]').forEach((sp) => {
-          sp.classList.toggle("active", (sp.dataset.sub || "").toLowerCase() === want);
-        });
-        if (opts.persist !== false) {
-          try { localStorage.setItem(tabKey, want); } catch {}
-        }
-      };
-      STATE._watcherSelectTab = selectTab;
-
-      root.querySelectorAll('.cw-subtile[data-sub]').forEach((btn) => {
-        btn.addEventListener("click", () => selectTab(btn.dataset.sub || "plex"));
-      });
-
-      try { selectTab(localStorage.getItem(tabKey) || "plex", { persist: false }); } catch { selectTab("plex", { persist: false }); }
+      STATE._watcherSelectTab = wireSubTabs(root, tabKey, (sub) => (sub || "plex").toLowerCase());
     }
 
     if (STATE.watcherHost) {
@@ -2029,28 +2039,10 @@ function chip(text, onRemove, onClick) {
       // Tabs: Watcher / Advanced
       const tabKey = "cw.ui.scrobbler.watcher.tab.v1";
       const root = STATE.watcherHost;
-      const selectTab = (sub, opts = {}) => {
+      STATE._watcherSelectTab = wireSubTabs(root, tabKey, (sub) => {
         const raw = (sub || "watcher").toLowerCase();
-        const want = raw === "advanced" ? "advanced" : "watcher";
-        root.querySelectorAll('.cw-subtile[data-sub]').forEach((btn) => {
-          btn.classList.toggle("active", (btn.dataset.sub || "").toLowerCase() === want);
-        });
-        root.querySelectorAll('.cw-subpanel[data-sub]').forEach((sp) => {
-          sp.classList.toggle("active", (sp.dataset.sub || "").toLowerCase() === want);
-        });
-        if (opts.persist !== false) {
-          try { localStorage.setItem(tabKey, want); } catch {}
-        }
-      };
-      STATE._watcherSelectTab = selectTab;
-
-
-      root.querySelectorAll('.cw-subtile[data-sub]').forEach((btn) => {
-        btn.addEventListener("click", () => selectTab(btn.dataset.sub || "watcher"));
+        return raw === "advanced" ? "advanced" : "watcher";
       });
-
-      try { selectTab(localStorage.getItem(tabKey) || "watcher", { persist: false }); } catch { selectTab("watcher", { persist: false }); }
-
     }
 
     bindHelpTips(STATE.mount || d);
@@ -2697,13 +2689,8 @@ function chip(text, onRemove, onClick) {
     cfg.emby = Object.assign({}, cfg.emby || {}, rootPatch.emby || {});
     cfg.jellyfin = Object.assign({}, cfg.jellyfin || {}, rootPatch.jellyfin || {});
 
-    const r = await fetch("/api/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      cache: "no-store",
-      body: JSON.stringify(cfg),
-    });
-    if (!r.ok) throw new Error(`POST /api/config ${r.status}`);
+    const ok = await saveConfig(cfg, "sc-pms-note", "pre-start save failed");
+    if (!ok) return;
 
     w._cfgCache = cfg;
     STATE.cfg = cfg;

@@ -1,11 +1,11 @@
-function escapeHtml(s) {
-  return String(s || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
+const _cwV = (() => {
+  try { return new URL(import.meta.url).searchParams.get("v") || window.__CW_VERSION__ || Date.now(); }
+  catch { return window.__CW_VERSION__ || Date.now(); }
+})();
+
+const _cwVer = (u) => u + (u.includes("?") ? "&" : "?") + "v=" + encodeURIComponent(String(_cwV));
+
+const { escapeHtml } = await import(_cwVer("../core/app-auth-setup.js"));
 
 function renderInlineMarkup(text) {
   const linkLabel = (url) => {

@@ -960,6 +960,42 @@ def _load_state() -> dict[str, Any]:
         _STATE_CACHE["data"] = data
         _STATE_CACHE["checked_ts"] = now
     return data
+def _iter_feature_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
+    """Collect a provider's `feat` node from its state entry, plus the same feature
+    node under each of its `instances` sub-entries. Shared by _show_title_maps_from_state
+    and _episode_code_map_from_state."""
+    out: list[dict[str, Any]] = []
+    node = pdata.get(feat)
+    if isinstance(node, dict):
+        out.append(node)
+    insts = pdata.get("instances")
+    if isinstance(insts, dict):
+        for _iid, idata in insts.items():
+            if not isinstance(idata, dict):
+                continue
+            node2 = idata.get(feat)
+            if isinstance(node2, dict):
+                out.append(node2)
+    return out
+
+
+def _iter_baseline_items(node: dict[str, Any]) -> Iterator[tuple[Any, dict[str, Any]]]:
+    """Yield (key, item) pairs from a feature node's baseline.items, accepting either the
+    dict-of-items or list-of-items shape. Shared by _show_title_maps_from_state and
+    _episode_code_map_from_state."""
+    baseline = node.get("baseline")
+    base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
+    items = base.get("items")
+    if isinstance(items, dict):
+        for k, it in items.items():
+            if isinstance(it, dict):
+                yield k, it
+    elif isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict):
+                yield it.get("key"), it
+
+
 def _show_title_maps_from_state(state: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
     key_map: dict[str, str] = {}
     id_map: dict[str, str] = {}
@@ -979,42 +1015,13 @@ def _show_title_maps_from_state(state: dict[str, Any]) -> tuple[dict[str, str], 
         if k0 not in d:
             d[k0] = v0
 
-    def _iter_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        node = pdata.get(feat)
-        if isinstance(node, dict):
-            out.append(node)
-        insts = pdata.get("instances")
-        if isinstance(insts, dict):
-            for _iid, idata in insts.items():
-                if not isinstance(idata, dict):
-                    continue
-                node2 = idata.get(feat)
-                if isinstance(node2, dict):
-                    out.append(node2)
-        return out
-
     for _, pdata in provs.items():
         if not isinstance(pdata, dict):
             continue
 
         for feat in ("history", "ratings", "watchlist", "playlists"):
-            for node in _iter_nodes(pdata, feat):
-                baseline = node.get("baseline")
-                base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
-                items = base.get("items")
-
-                if isinstance(items, dict):
-                    iters = items.items()
-                elif isinstance(items, list):
-                    iters = ((it.get("key"), it) for it in items if isinstance(it, dict))
-                else:
-                    continue
-
-                for k, it in iters:
-                    if not isinstance(it, dict):
-                        continue
-
+            for node in _iter_feature_nodes(pdata, feat):
+                for k, it in _iter_baseline_items(node):
                     typ = str(it.get("type") or "").lower()
                     is_show = typ in ("show", "series", "anime")
 
@@ -1083,38 +1090,12 @@ def _episode_code_map_from_state(state: dict[str, Any]) -> dict[str, tuple[int, 
         if len(parts) >= 3:
             out.setdefault(f"{parts[0]}:{parts[-1]}", (s, e))
 
-    def _iter_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
-        out_nodes: list[dict[str, Any]] = []
-        node = pdata.get(feat)
-        if isinstance(node, dict):
-            out_nodes.append(node)
-        insts = pdata.get("instances")
-        if isinstance(insts, dict):
-            for _iid, idata in insts.items():
-                if not isinstance(idata, dict):
-                    continue
-                node2 = idata.get(feat)
-                if isinstance(node2, dict):
-                    out_nodes.append(node2)
-        return out_nodes
-
     for _, pdata in provs.items():
         if not isinstance(pdata, dict):
             continue
         for feat in ("history", "ratings", "watchlist", "playlists"):
-            for node in _iter_nodes(pdata, feat):
-                baseline = node.get("baseline")
-                base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
-                items = base.get("items")
-                if isinstance(items, dict):
-                    iters = items.items()
-                elif isinstance(items, list):
-                    iters = ((it.get("key"), it) for it in items if isinstance(it, dict))
-                else:
-                    continue
-                for k, it in iters:
-                    if not isinstance(it, dict):
-                        continue
+            for node in _iter_feature_nodes(pdata, feat):
+                for k, it in _iter_baseline_items(node):
                     typ = str(it.get("type") or "").strip().lower()
                     if typ != "episode":
                         continue

@@ -13,18 +13,14 @@ const _cwVer = (u) => u + (u.includes("?") ? "&" : "?") + "v=" + encodeURICompon
 const {
   appAuthFormCss,
   escapeHtml,
-  saveRequiredAppAuth,
   setModalDismissible,
   setModalShellInline,
+  submitAppAuthCredentials,
   syncAppAuthState,
-  validateAppAuthState,
   wireLiveAppAuthValidation,
   renderAppAuthFields,
+  _norm,
 } = await import(_cwVer("../core/app-auth-setup.js"));
-
-function _norm(v) {
-  return String(v || "").replace(/^v/i, "").trim();
-}
 
 function _collapseByDefault() {
   const ids = ["sec-auth", "sec-meta", "sec-sync", "sec-scrobbler", "sc-sec-webhook", "sc-sec-watch"];
@@ -151,28 +147,8 @@ export default {
 
     setModalDismissible(false);
 
-    async function submitCredentials(btn) {
-      syncAppAuthState(hostEl, state);
-      state.error = validateAppAuthState(state);
-      if (state.error) {
-        render();
-        return;
-      }
-
-      state.saving = true;
-      render();
-
-      try {
-        await saveRequiredAppAuth({
-          username: state.username,
-          password: state.password,
-          setupToken: state.setup_token,
-        });
-        state.saving = false;
-        state.error = "";
-        state.password = "";
-        state.password2 = "";
-        state.setup_token = "";
+    async function submitCredentials() {
+      await submitAppAuthCredentials(hostEl, state, render, async () => {
         try { window.notify?.("Sign-in enabled."); } catch {}
         try {
           const boot = window.__cwAuthBootstrapState || {};
@@ -183,12 +159,7 @@ export default {
           try { _openSettings(); } catch {}
           try { window.cwSettingsSelect?.("overview"); } catch {}
         }, 0);
-        return;
-      } catch (err) {
-        state.error = String(err?.message || "Failed to save sign-in settings.");
-        state.saving = false;
-        render();
-      }
+      });
     }
 
     function renderIntro() {
@@ -306,9 +277,9 @@ export default {
       }
       const saveBtn = hostEl.querySelector('[data-x="save"]');
       wireLiveAppAuthValidation(hostEl, state, "sw-auth-error", saveBtn);
-      saveBtn?.addEventListener("click", (e) => submitCredentials(e.currentTarget));
+      saveBtn?.addEventListener("click", () => submitCredentials());
       hostEl.querySelector("#sw-auth-pass2")?.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" && !state.saving) submitCredentials(hostEl.querySelector('[data-x="save"]'));
+        if (e.key === "Enter" && !state.saving) submitCredentials();
       });
     }
 

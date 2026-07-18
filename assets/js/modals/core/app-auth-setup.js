@@ -40,6 +40,21 @@ function _markAuthSetupPending(flag) {
   } catch {}
 }
 
+export function _norm(v) {
+  return String(v || "").replace(/^v/i, "").trim();
+}
+
+export function _cmp(a, b) {
+  const pa = _norm(a).split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = _norm(b).split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const da = pa[i] || 0;
+    const db = pb[i] || 0;
+    if (da !== db) return da > db ? 1 : -1;
+  }
+  return 0;
+}
+
 export function escapeHtml(s) {
   return String(s || "")
     .replaceAll("&", "&amp;")
@@ -201,4 +216,46 @@ export async function saveRequiredAppAuth({ username, password, setupToken, keep
   _markAuthSetupPending(keepPending);
   try { window.dispatchEvent(new Event("auth-changed")); } catch {}
   return data;
+}
+
+/**
+ * Shared "submit sign-in credentials" flow used by the setup wizard and upgrade-warning
+ * modals: syncs the form into `state`, validates, saves via saveRequiredAppAuth, and on
+ * success resets the password/token fields on `state`. `render` is called after every
+ * state change except on success, where callers differ (e.g. closing the modal vs moving
+ * to another step) - `onSuccess` owns rendering (and any other state changes) for that case.
+ *
+ * @param {HTMLElement} hostEl - modal host element the auth fields live in
+ * @param {object} state - mutable modal state (username/password/password2/setup_token/error/saving)
+ * @param {() => void} render - re-renders the modal from current state
+ * @param {() => void|Promise<void>} onSuccess - called once the shared fields are reset after a successful save
+ */
+export async function submitAppAuthCredentials(hostEl, state, render, onSuccess) {
+  syncAppAuthState(hostEl, state);
+  state.error = validateAppAuthState(state);
+  if (state.error) {
+    render();
+    return;
+  }
+
+  state.saving = true;
+  render();
+
+  try {
+    await saveRequiredAppAuth({
+      username: state.username,
+      password: state.password,
+      setupToken: state.setup_token,
+    });
+    state.saving = false;
+    state.error = "";
+    state.password = "";
+    state.password2 = "";
+    state.setup_token = "";
+    await onSuccess();
+  } catch (err) {
+    state.saving = false;
+    state.error = String(err?.message || "Failed to save sign-in settings.");
+    render();
+  }
 }

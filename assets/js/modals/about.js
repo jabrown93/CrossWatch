@@ -15,24 +15,9 @@ const _cwV = (() => {
 const _cwVer = (u) => u + (u.includes("?") ? "&" : "?") + "v=" + encodeURIComponent(String(_cwV));
 
 const { getJson } = await import(_cwVer("./core/net.js"));
-const { escapeHtml, setModalShellInline } = await import(_cwVer("./core/app-auth-setup.js"));
+const { _cmp, _norm, escapeHtml, setModalShellInline } = await import(_cwVer("./core/app-auth-setup.js"));
 
 const cache = { at: 0, data: null, inflight: null };
-
-function _norm(v) {
-  return String(v || "").replace(/^v/i, "").trim();
-}
-
-function _cmp(a, b) {
-  const pa = _norm(a).split(".").map((n) => parseInt(n, 10) || 0);
-  const pb = _norm(b).split(".").map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
-    const da = pa[i] || 0;
-    const db = pb[i] || 0;
-    if (da !== db) return da > db ? 1 : -1;
-  }
-  return 0;
-}
 
 function _providerName(key) {
   const tail = String(key || "").split("_").pop() || key || "-";

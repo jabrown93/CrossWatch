@@ -213,6 +213,42 @@ def test_cfg_delete_enabled_type_not_in_allowed_list():
     assert _sink_common._cfg_delete_enabled(cfg, "movie") is False
 
 
+def test_cfg_num_reads_section_value_and_casts_to_default_type():
+    cfg = {"scrobble": {"trakt": {"stop_pause_threshold": "45"}}}
+    assert _sink_common._cfg_num(cfg, "trakt", "stop_pause_threshold", 30) == 45
+
+
+def test_cfg_num_missing_section_returns_default():
+    assert _sink_common._cfg_num({}, "trakt", "stop_pause_threshold", 30) == 30
+
+
+def test_cfg_num_none_value_falls_back_to_fallback_section():
+    cfg = {"scrobble": {"simkl": {"progress_step": None}, "trakt": {"progress_step": 5}}}
+    assert _sink_common._cfg_num(cfg, "simkl", "progress_step", 1, fallback_section="trakt") == 5
+
+
+def test_cfg_num_no_fallback_section_returns_default_when_absent():
+    cfg = {"scrobble": {"simkl": {}}}
+    assert _sink_common._cfg_num(cfg, "simkl", "progress_step", 1) == 1
+
+
+def test_cfg_num_explicit_value_wins_over_fallback_section():
+    cfg = {"scrobble": {"simkl": {"progress_step": 9}, "trakt": {"progress_step": 5}}}
+    assert _sink_common._cfg_num(cfg, "simkl", "progress_step", 1, fallback_section="trakt") == 9
+
+
+def test_cfg_num_non_numeric_value_returns_default():
+    cfg = {"scrobble": {"trakt": {"stop_pause_threshold": "not-a-number"}}}
+    assert _sink_common._cfg_num(cfg, "trakt", "stop_pause_threshold", 30) == 30
+
+
+@pytest.mark.parametrize("default,expected_type", [(30, int), (99.0, float)])
+def test_cfg_num_casts_to_type_of_default(default, expected_type):
+    cfg = {"scrobble": {"trakt": {"k": "12"}}}
+    out = _sink_common._cfg_num(cfg, "trakt", "k", default)
+    assert isinstance(out, expected_type)
+
+
 def test_extract_skeleton_from_body_strips_volatile_fields():
     body = {"progress": 50, "app_version": "1.0", "app_date": "x", "action": "start"}
     assert _sink_common._extract_skeleton_from_body(body) == {"action": "start"}

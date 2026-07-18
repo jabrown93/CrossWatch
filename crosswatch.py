@@ -110,27 +110,25 @@ RUNNING_PROCS: Dict[str, threading.Thread] = {}
 SYNC_PROC_LOCK = threading.Lock()
 
 # Debug helpers
-def _is_http_debug_enabled() -> bool:
+def _cached_runtime_flag(cache: Dict[str, Any], key: str) -> bool:
+    """TTL-cached (2s) read of cfg["runtime"][key] as a bool. `cache` is one of the
+    per-flag dicts below ({"ts": ..., "val": ...}); shared by the debug/debug_http/
+    debug_mods flag readers, which differ only in which cache dict and config key they use."""
     try:
         now = time.time()
-        if now - _DEBUG_HTTP_CACHE["ts"] > 2.0:
+        if now - cache["ts"] > 2.0:
             cfg = load_config()
-            _DEBUG_HTTP_CACHE["val"] = bool(((cfg.get("runtime") or {}).get("debug_http") or False))
-            _DEBUG_HTTP_CACHE["ts"] = now
-        return _DEBUG_HTTP_CACHE["val"]
+            cache["val"] = bool(((cfg.get("runtime") or {}).get(key) or False))
+            cache["ts"] = now
+        return cache["val"]
     except Exception:
         return False
 
+def _is_http_debug_enabled() -> bool:
+    return _cached_runtime_flag(_DEBUG_HTTP_CACHE, "debug_http")
+
 def _is_debug_enabled() -> bool:
-    try:
-        now = time.time()
-        if now - _DEBUG_CACHE["ts"] > 2.0:
-            cfg = load_config()
-            _DEBUG_CACHE["val"] = bool(((cfg.get("runtime") or {}).get("debug") or False))
-            _DEBUG_CACHE["ts"] = now
-        return _DEBUG_CACHE["val"]
-    except Exception:
-        return False
+    return _cached_runtime_flag(_DEBUG_CACHE, "debug")
 
 
 def _resolve_config_scoped_path(raw_path: str) -> Path:
@@ -320,15 +318,7 @@ def _redact_secrets_in_text(s: str) -> str:
     return out
 
 def _is_mods_debug_enabled() -> bool:
-    try:
-        now = time.time()
-        if now - _DEBUG_MODS_CACHE["ts"] > 2.0:
-            cfg = load_config()
-            _DEBUG_MODS_CACHE["val"] = bool(((cfg.get("runtime") or {}).get("debug_mods") or False))
-            _DEBUG_MODS_CACHE["ts"] = now
-        return _DEBUG_MODS_CACHE["val"]
-    except Exception:
-        return False
+    return _cached_runtime_flag(_DEBUG_MODS_CACHE, "debug_mods")
 
 def _apply_debug_env_from_config() -> None:
     on = _is_mods_debug_enabled()

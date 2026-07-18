@@ -323,6 +323,49 @@ def api_config() -> JSONResponse:
     cfg = base.redact_config(cfg)  # type: ignore[attr-defined]
     return _nostore(JSONResponse(cfg))
 
+def _finalize_config(env: dict[str, Any], cfg: dict[str, Any], *, ensure: bool = False) -> None:
+    """Normalize scrobble mode/features.watch, prune+norm pairs, and clear setup-wizard markers.
+
+    Shared by api_config_save and api_config_migrate; `ensure=True` additionally
+    runs env["ensure"](cfg) after pruning (migrate-only step).
+    """
+    sc = cfg.setdefault("scrobble", {})
+    sc_enabled = bool(sc.get("enabled", False))
+    mode = str(sc.get("mode") or "").strip().lower()
+    if mode not in {"webhook","watch"}:
+        legacy_webhook = bool((cfg.get("webhook") or {}).get("enabled"))
+        mode = "webhook" if legacy_webhook else ("watch" if sc_enabled else "")
+        if mode: sc["mode"] = mode
+    if mode == "webhook":
+        sc.setdefault("watch", {}).setdefault("autostart", bool(sc.get("watch", {}).get("autostart", False)))
+    elif mode != "watch":
+        sc["enabled"] = False
+
+    features = cfg.setdefault("features", {})
+    watch_feat = features.setdefault("watch", {})
+    watch_feat["enabled"] = bool(source_enabled(cfg, "watcher") and sc.get("watch", {}).get("autostart", False))
+
+    try:
+        env["prune"](cfg)
+        if ensure:
+            env["ensure"](cfg)
+        for p in (cfg.get("pairs") or []):
+            try: env["norm_pair"](p)
+            except Exception: pass
+    except Exception:
+        pass
+
+    # Setup-wizard marker: saved config then clear any auto-generated flag.
+    try:
+        ui = cfg.get("ui")
+        if isinstance(ui, dict):
+            ui.pop("_autogen", None)
+            ui.pop("_pending_upgrade_from_version", None)
+            _set_cfg_version_current(env, cfg)
+    except Exception:
+        pass
+
+
 @router.post("/config")
 def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     env = _env()
@@ -460,39 +503,7 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     except Exception:
         pass
 
-    sc = cfg.setdefault("scrobble", {})
-    sc_enabled = bool(sc.get("enabled", False))
-    mode = str(sc.get("mode") or "").strip().lower()
-    if mode not in {"webhook","watch"}:
-        legacy_webhook = bool((cfg.get("webhook") or {}).get("enabled"))
-        mode = "webhook" if legacy_webhook else ("watch" if sc_enabled else "")
-        if mode: sc["mode"] = mode
-    if mode == "webhook":
-        sc.setdefault("watch", {}).setdefault("autostart", bool(sc.get("watch", {}).get("autostart", False)))
-    elif mode != "watch":
-        sc["enabled"] = False
-
-    features = cfg.setdefault("features", {})
-    watch_feat = features.setdefault("watch", {})
-    watch_feat["enabled"] = bool(source_enabled(cfg, "watcher") and sc.get("watch", {}).get("autostart", False))
-
-    try:
-        env["prune"](cfg)
-        for p in (cfg.get("pairs") or []):
-            try: env["norm_pair"](p)
-            except Exception: pass
-    except Exception:
-        pass
-
-    # Setup-wizard marker: saved config then clear any auto-generated flag.
-    try:
-        ui = cfg.get("ui")
-        if isinstance(ui, dict):
-            ui.pop("_autogen", None)
-            ui.pop("_pending_upgrade_from_version", None)
-            _set_cfg_version_current(env, cfg)
-    except Exception:
-        pass
+    _finalize_config(env, cfg)
 
     env["save"](cfg)
 
@@ -552,42 +563,7 @@ def api_config_migrate() -> dict[str, Any]:
     except Exception:
         return {"ok": False, "error": "migration_overrides_failed"}
 
-    sc = cfg.setdefault("scrobble", {})
-    sc_enabled = bool(sc.get("enabled", False))
-    mode = str(sc.get("mode") or "").strip().lower()
-    if mode not in {"webhook","watch"}:
-        legacy_webhook = bool((cfg.get("webhook") or {}).get("enabled"))
-        mode = "webhook" if legacy_webhook else ("watch" if sc_enabled else "")
-        if mode:
-            sc["mode"] = mode
-    if mode == "webhook":
-        sc.setdefault("watch", {}).setdefault("autostart", bool(sc.get("watch", {}).get("autostart", False)))
-    elif mode != "watch":
-        sc["enabled"] = False
-
-    features = cfg.setdefault("features", {})
-    watch_feat = features.setdefault("watch", {})
-    watch_feat["enabled"] = bool(source_enabled(cfg, "watcher") and sc.get("watch", {}).get("autostart", False))
-
-    try:
-        env["prune"](cfg)
-        env["ensure"](cfg)
-        for p in (cfg.get("pairs") or []):
-            try:
-                env["norm_pair"](p)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    try:
-        ui = cfg.get("ui")
-        if isinstance(ui, dict):
-            ui.pop("_autogen", None)
-            ui.pop("_pending_upgrade_from_version", None)
-            _set_cfg_version_current(env, cfg)
-    except Exception:
-        pass
+    _finalize_config(env, cfg, ensure=True)
 
     try:
         env["save"](cfg)
