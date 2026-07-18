@@ -961,20 +961,14 @@ class SyncScheduler:
                 err = "event_rule_failed"
                 ok = False
 
-            with self._lock:
-                self._status["last_run_ok"] = ok
-                self._status["last_run_at"] = _now_ts()
-                self._status["last_error"] = err if err else ("" if ok else "event rule failed")
-                self._status["last_job_id"] = ""
-                self._status["last_pair_id"] = pair_id
-                self._status["last_capture_job_id"] = ""
-                self._status["last_capture_provider"] = ""
-                self._status["last_capture_feature"] = ""
-                self._status["last_backup_job_id"] = ""
-                self._status["last_backup_scope"] = ""
-                self._status["last_rule_id"] = str(rule.get("id") or "")
-                self._status["last_event_source"] = str(event.get("source") or "")
-                self._status["last_event_name"] = str(event.get("event") or "")
+            self._set_last_run_status(
+                ok,
+                err if err else ("" if ok else "event rule failed"),
+                last_pair_id=pair_id,
+                last_rule_id=str(rule.get("id") or ""),
+                last_event_source=str(event.get("source") or ""),
+                last_event_name=str(event.get("event") or ""),
+            )
 
             if not ok:
                 skipped.append({"rule_id": str(rule.get("id") or ""), "reason": "run_failed"})
@@ -1123,6 +1117,46 @@ class SyncScheduler:
         due.sort(key=lambda x: (x[0], str(x[1].get("id") or "")))
         return due
 
+    def _wait_until_sync_free(self, busy_msg: str) -> bool:
+        """Poll every 2s until sync is free or stop is requested.
+
+        Returns True if a poke fired mid-wait (config changed), meaning the
+        caller should return early so due jobs get re-evaluated; returns
+        False once sync is free (or stop was requested).
+        """
+        waited = 0
+        while self.is_sync_running_fn() and not self._stop.is_set():
+            if waited == 0:
+                self._log(busy_msg, level="INFO")
+            waited += 1
+            self._sleep_or_poke(2.0)
+            if self._poke.is_set():
+                self._poke.clear()
+                return True
+        return False
+
+    def _set_last_run_status(self, ok: bool, error: str, **overrides: Any) -> None:
+        """Reset the last-run status fields under the scheduler lock.
+
+        Unset last_* keys default to "" per existing convention; pass
+        overrides (e.g. last_job_id=..., last_pair_id=...) to set the
+        identifiers relevant to this run.
+        """
+        with self._lock:
+            self._status["last_run_ok"] = ok
+            self._status["last_run_at"] = _now_ts()
+            self._status["last_error"] = error
+            self._status["last_job_id"] = overrides.get("last_job_id", "")
+            self._status["last_pair_id"] = overrides.get("last_pair_id", "")
+            self._status["last_capture_job_id"] = overrides.get("last_capture_job_id", "")
+            self._status["last_capture_provider"] = overrides.get("last_capture_provider", "")
+            self._status["last_capture_feature"] = overrides.get("last_capture_feature", "")
+            self._status["last_backup_job_id"] = overrides.get("last_backup_job_id", "")
+            self._status["last_backup_scope"] = overrides.get("last_backup_scope", "")
+            self._status["last_rule_id"] = overrides.get("last_rule_id", "")
+            self._status["last_event_source"] = overrides.get("last_event_source", "")
+            self._status["last_event_name"] = overrides.get("last_event_name", "")
+
     def _adv_run_due(self, sch: dict[str, Any], tz: Any | None) -> bool:
         due = self._adv_due_jobs(sch, tz)
         due_capture = self._adv_due_capture_jobs(sch, tz)
@@ -1146,16 +1180,8 @@ class SyncScheduler:
                 continue
 
             # Wait until sync is free
-            waited = 0
-            while self.is_sync_running_fn() and not self._stop.is_set():
-                if waited == 0:
-                    self._log("advanced: sync is busy; waiting to run due job(s)", level="INFO")
-                waited += 1
-                self._sleep_or_poke(2.0)
-                if self._poke.is_set():
-                    self._poke.clear()
-                    # re-check due after config change
-                    return True
+            if self._wait_until_sync_free("advanced: sync is busy; waiting to run due job(s)"):
+                return True
 
             payload = {
                 "source": "scheduler",
@@ -1172,20 +1198,12 @@ class SyncScheduler:
             else:
                 self._log(f"advanced: job {j['id']} ok", level="INFO")
 
-            with self._lock:
-                self._status["last_run_ok"] = ok
-                self._status["last_run_at"] = _now_ts()
-                self._status["last_error"] = "" if ok else "advanced job failed"
-                self._status["last_job_id"] = j["id"]
-                self._status["last_pair_id"] = j["pair_id"] or ""
-                self._status["last_capture_job_id"] = ""
-                self._status["last_capture_provider"] = ""
-                self._status["last_capture_feature"] = ""
-                self._status["last_backup_job_id"] = ""
-                self._status["last_backup_scope"] = ""
-                self._status["last_rule_id"] = ""
-                self._status["last_event_source"] = ""
-                self._status["last_event_name"] = ""
+            self._set_last_run_status(
+                ok,
+                "" if ok else "advanced job failed",
+                last_job_id=j["id"],
+                last_pair_id=j["pair_id"] or "",
+            )
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
             executed.add(j["id"])
@@ -1194,15 +1212,8 @@ class SyncScheduler:
             if self._stop.is_set():
                 break
 
-            waited = 0
-            while self.is_sync_running_fn() and not self._stop.is_set():
-                if waited == 0:
-                    self._log("advanced capture: sync is busy; waiting to run due capture job(s)", level="INFO")
-                waited += 1
-                self._sleep_or_poke(2.0)
-                if self._poke.is_set():
-                    self._poke.clear()
-                    return True
+            if self._wait_until_sync_free("advanced capture: sync is busy; waiting to run due capture job(s)"):
+                return True
 
             payload = {
                 "source": "scheduler",
@@ -1230,35 +1241,21 @@ class SyncScheduler:
             else:
                 self._log(f"advanced capture: job {j['id']} ok", level="INFO")
 
-            with self._lock:
-                self._status["last_run_ok"] = ok
-                self._status["last_run_at"] = _now_ts()
-                self._status["last_error"] = "" if ok else "advanced capture job failed"
-                self._status["last_job_id"] = ""
-                self._status["last_pair_id"] = ""
-                self._status["last_capture_job_id"] = j["id"]
-                self._status["last_capture_provider"] = j["provider"] or ""
-                self._status["last_capture_feature"] = j["feature"] or ""
-                self._status["last_backup_job_id"] = ""
-                self._status["last_backup_scope"] = ""
-                self._status["last_rule_id"] = ""
-                self._status["last_event_source"] = ""
-                self._status["last_event_name"] = ""
+            self._set_last_run_status(
+                ok,
+                "" if ok else "advanced capture job failed",
+                last_capture_job_id=j["id"],
+                last_capture_provider=j["provider"] or "",
+                last_capture_feature=j["feature"] or "",
+            )
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
         for _, j in due_backup:
             if self._stop.is_set():
                 break
 
-            waited = 0
-            while self.is_sync_running_fn() and not self._stop.is_set():
-                if waited == 0:
-                    self._log("advanced backup: sync is busy; waiting to run due backup job(s)", level="INFO")
-                waited += 1
-                self._sleep_or_poke(2.0)
-                if self._poke.is_set():
-                    self._poke.clear()
-                    return True
+            if self._wait_until_sync_free("advanced backup: sync is busy; waiting to run due backup job(s)"):
+                return True
 
             payload = {
                 "source": "scheduler",
@@ -1287,20 +1284,12 @@ class SyncScheduler:
             else:
                 self._log(f"advanced backup: job {j['id']} ok", level="INFO")
 
-            with self._lock:
-                self._status["last_run_ok"] = ok
-                self._status["last_run_at"] = _now_ts()
-                self._status["last_error"] = "" if ok else "advanced backup job failed"
-                self._status["last_job_id"] = ""
-                self._status["last_pair_id"] = ""
-                self._status["last_capture_job_id"] = ""
-                self._status["last_capture_provider"] = ""
-                self._status["last_capture_feature"] = ""
-                self._status["last_backup_job_id"] = j["id"]
-                self._status["last_backup_scope"] = j["scope"] or ""
-                self._status["last_rule_id"] = ""
-                self._status["last_event_source"] = ""
-                self._status["last_event_name"] = ""
+            self._set_last_run_status(
+                ok,
+                "" if ok else "advanced backup job failed",
+                last_backup_job_id=j["id"],
+                last_backup_scope=j["scope"] or "",
+            )
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
         return ok_all
@@ -1309,20 +1298,7 @@ class SyncScheduler:
         payload = {"source": "scheduler", "scheduler_mode": "standard"}
         self._log("standard: triggering sync run", level="INFO")
         ok = self._run_sync(payload)
-        with self._lock:
-            self._status["last_run_ok"] = ok
-            self._status["last_run_at"] = _now_ts()
-            self._status["last_error"] = "" if ok else "standard run failed"
-            self._status["last_job_id"] = ""
-            self._status["last_pair_id"] = ""
-            self._status["last_capture_job_id"] = ""
-            self._status["last_capture_provider"] = ""
-            self._status["last_capture_feature"] = ""
-            self._status["last_backup_job_id"] = ""
-            self._status["last_backup_scope"] = ""
-            self._status["last_rule_id"] = ""
-            self._status["last_event_source"] = ""
-            self._status["last_event_name"] = ""
+        self._set_last_run_status(ok, "" if ok else "standard run failed")
         self._log("standard: run ok" if ok else "standard: run failed", level="INFO" if ok else "ERROR")
         return ok
 

@@ -16,6 +16,7 @@ from providers.scrobble._sink_common import (
     _ar_state_file,
     _cfg,
     _cfg_delete_enabled,
+    _cfg_num,
     _extract_skeleton_from_body,
     _is_debug,
     _merged_provider_block,
@@ -209,45 +210,27 @@ def _clamp(p: Any) -> int:
 
 
 def _stop_pause_threshold(cfg: dict[str, Any]) -> int:
-    try:
-        return int(((cfg.get("scrobble") or {}).get("trakt") or {}).get("stop_pause_threshold", 85))
-    except Exception:
-        return 85
+    return _cfg_num(cfg, "trakt", "stop_pause_threshold", 85)
 
 
 def _force_stop_at(cfg: dict[str, Any]) -> int:
-    try:
-        return int(((cfg.get("scrobble") or {}).get("trakt") or {}).get("force_stop_at", 95))
-    except Exception:
-        return 95
+    return _cfg_num(cfg, "trakt", "force_stop_at", 95)
 
 
 def _complete_at(cfg: dict[str, Any]) -> int:
-    try:
-        return int(((cfg.get("scrobble") or {}).get("trakt") or {}).get("complete_at", 0))
-    except Exception:
-        return 0
+    return _cfg_num(cfg, "trakt", "complete_at", 0)
 
 
 def _regress_tol(cfg: dict[str, Any]) -> int:
-    try:
-        return int(((cfg.get("scrobble") or {}).get("trakt") or {}).get("regress_tolerance_percent", 5))
-    except Exception:
-        return 5
+    return _cfg_num(cfg, "trakt", "regress_tolerance_percent", 5)
 
 
 def _watch_pause_debounce(cfg: dict[str, Any]) -> int:
-    try:
-        return int(((cfg.get("scrobble") or {}).get("watch") or {}).get("pause_debounce_seconds", 5))
-    except Exception:
-        return 5
+    return _cfg_num(cfg, "watch", "pause_debounce_seconds", 5)
 
 
 def _watch_suppress_start_at(cfg: dict[str, Any]) -> float:
-    try:
-        return float(((cfg.get("scrobble") or {}).get("watch") or {}).get("suppress_start_at", 99))
-    except Exception:
-        return 99.0
+    return _cfg_num(cfg, "watch", "suppress_start_at", 99.0)
 
 def _trakt_progress_step(cfg: dict[str, Any]) -> int:
     try:

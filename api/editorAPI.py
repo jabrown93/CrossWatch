@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import io
 import json
@@ -114,12 +114,33 @@ def _merge_blocks(a: list[str], b: list[str]) -> list[str]:
 
 
 
-def _load_policy_manual(kind: Kind, provider: str, provider_instance: str | None = None) -> tuple[dict[str, Any], list[str]]:
-    raw = _load_policy()
-    providers = raw.get("providers") or {}
-    if not isinstance(providers, dict):
-        return {}, []
+def _dedupe_block_list(blocks_raw: Any) -> list[str]:
+    """Case-insensitive de-dupe of a manual-block list, accepting either a list/tuple/set
+    of ids or a dict whose keys are ids (both shapes occur in stored policy/state json)."""
+    if isinstance(blocks_raw, (list, tuple, set)):
+        keys: Any = blocks_raw
+    elif isinstance(blocks_raw, dict):
+        keys = blocks_raw.keys()
+    else:
+        return []
 
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for x in keys:
+        s = str(x).strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if sl in seen:
+            continue
+        seen.add(sl)
+        blocks.append(s)
+    return blocks
+
+
+def _find_manual_node(providers: dict[str, Any], provider: str, provider_instance: str | None) -> dict[str, Any] | None:
+    """Look up a provider's node (case-insensitive), then descend into its instance
+    sub-node if `provider_instance` is not the default. Returns None if any step misses."""
     node = providers.get(provider)
     if not isinstance(node, dict):
         pl = str(provider).lower()
@@ -128,68 +149,21 @@ def _load_policy_manual(kind: Kind, provider: str, provider_instance: str | None
                 node = v
                 break
     if not isinstance(node, dict):
-        return {}, []
+        return None
 
     inst = normalize_instance_id(provider_instance)
     if inst != "default":
         insts = node.get("instances") or {}
         if not isinstance(insts, dict):
-            return {}, []
+            return None
         node = insts.get(inst)
         if not isinstance(node, dict):
-            return {}, []
-
-    f = node.get(kind) or {}
-    if not isinstance(f, dict):
-        return {}, []
-
-    blocks_raw = f.get("blocks") or []
-    blocks: list[str] = []
-    seen: set[str] = set()
-    if isinstance(blocks_raw, (list, tuple, set)):
-        for x in blocks_raw:
-            s = str(x).strip()
-            if not s:
-                continue
-            sl = s.lower()
-            if sl in seen:
-                continue
-            seen.add(sl)
-            blocks.append(s)
-    elif isinstance(blocks_raw, dict):
-        for k in blocks_raw.keys():
-            s = str(k).strip()
-            if not s:
-                continue
-            sl = s.lower()
-            if sl in seen:
-                continue
-            seen.add(sl)
-            blocks.append(s)
-
-    adds_raw = f.get("adds") or {}
-    adds_items: dict[str, Any] = {}
-    if isinstance(adds_raw, dict):
-        items = adds_raw.get("items") or {}
-        if isinstance(items, dict):
-            adds_items = {str(k): v for k, v in items.items()}
-    return adds_items, blocks
+            return None
+    return node
 
 
-def _save_policy_manual(
-    kind: Kind,
-    provider: str,
-    adds_items: dict[str, Any],
-    blocks: list[str],
-    provider_instance: str | None = None,
-) -> None:
-    adds_items = _canonicalize_manual_items(adds_items)
-    raw = _load_policy()
-    providers = raw.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        raw["providers"] = providers
-
+def _find_or_create_manual_node(providers: dict[str, Any], provider: str, provider_instance: str | None) -> dict[str, Any]:
+    """Same lookup as `_find_manual_node`, but creates the provider/instance node(s) when missing."""
     key = None
     if provider in providers:
         key = provider
@@ -219,11 +193,87 @@ def _save_policy_manual(
             in_node = {}
             insts[inst] = in_node
         node = in_node
+    return node
 
-    f = node.get(kind)
+
+def _load_manual_entry(
+    loader: Callable[[], dict[str, Any]],
+    kind: Kind,
+    provider: str,
+    provider_instance: str | None,
+    *,
+    wrap_in_manual: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Shared core for `_load_policy_manual`/`_load_state_manual`: read `kind`'s adds/blocks
+    for a provider(+instance) out of the doc returned by `loader`. `wrap_in_manual` selects
+    whether `kind` lives directly under the provider node (policy doc) or under a "manual"
+    sub-key (state doc)."""
+    raw = loader()
+    providers = raw.get("providers") or {}
+    if not isinstance(providers, dict):
+        return {}, []
+
+    node = _find_manual_node(providers, provider, provider_instance)
+    if node is None:
+        return {}, []
+
+    if wrap_in_manual:
+        manual = node.get("manual") or {}
+        if not isinstance(manual, dict):
+            return {}, []
+        f = manual.get(kind) or {}
+    else:
+        f = node.get(kind) or {}
+    if not isinstance(f, dict):
+        return {}, []
+
+    blocks = _dedupe_block_list(f.get("blocks") or [])
+
+    adds_raw = f.get("adds") or {}
+    adds_items: dict[str, Any] = {}
+    if isinstance(adds_raw, dict):
+        items = adds_raw.get("items") or {}
+        if isinstance(items, dict):
+            adds_items = {str(k): v for k, v in items.items()}
+    return adds_items, blocks
+
+
+def _save_manual_entry(
+    loader: Callable[[], dict[str, Any]],
+    write_path: Path,
+    kind: Kind,
+    provider: str,
+    adds_items: dict[str, Any],
+    blocks: list[str],
+    provider_instance: str | None,
+    *,
+    wrap_in_manual: bool,
+) -> None:
+    """Shared core for `_save_policy_manual`/`_save_state_manual`: write `kind`'s adds/blocks
+    for a provider(+instance) into the doc returned by `loader`, then atomically write it
+    back to `write_path`. `wrap_in_manual` mirrors `_load_manual_entry`."""
+    adds_items = _canonicalize_manual_items(adds_items)
+    raw = loader()
+    providers = raw.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        raw["providers"] = providers
+
+    node = _find_or_create_manual_node(providers, provider, provider_instance)
+
+    if wrap_in_manual:
+        manual = node.get("manual")
+        if not isinstance(manual, dict):
+            manual = {}
+            node["manual"] = manual
+        container = manual
+    else:
+        container = node
+
+    f = container.get(kind)
     if not isinstance(f, dict):
         f = {}
-        node[kind] = f
+        container[kind] = f
 
     f["blocks"] = list(blocks or [])
 
@@ -233,7 +283,21 @@ def _save_policy_manual(
         f["adds"] = adds
     adds["items"] = dict(adds_items or {})
 
-    _atomic_write_json(_POLICY_PATH, raw)
+    _atomic_write_json(write_path, raw)
+
+
+def _load_policy_manual(kind: Kind, provider: str, provider_instance: str | None = None) -> tuple[dict[str, Any], list[str]]:
+    return _load_manual_entry(_load_policy, kind, provider, provider_instance, wrap_in_manual=False)
+
+
+def _save_policy_manual(
+    kind: Kind,
+    provider: str,
+    adds_items: dict[str, Any],
+    blocks: list[str],
+    provider_instance: str | None = None,
+) -> None:
+    _save_manual_entry(_load_policy, _POLICY_PATH, kind, provider, adds_items, blocks, provider_instance, wrap_in_manual=False)
 
 
 def _policy_from_state() -> dict[str, Any]:
@@ -633,68 +697,7 @@ def _save_state_items(kind: Kind, provider: str, items: dict[str, Any], provider
 
 
 def _load_state_manual(kind: Kind, provider: str, provider_instance: str | None = None) -> tuple[dict[str, Any], list[str]]:
-    raw = _load_current_state()
-    providers = raw.get("providers") or {}
-    if not isinstance(providers, dict):
-        return {}, []
-    node = providers.get(provider)
-    if not isinstance(node, dict):
-        pl = str(provider).lower()
-        for k, v in providers.items():
-            if str(k).lower() == pl and isinstance(v, dict):
-                node = v
-                break
-    if not isinstance(node, dict):
-        return {}, []
-
-    inst = normalize_instance_id(provider_instance)
-    if inst != "default":
-        insts = node.get("instances") or {}
-        if not isinstance(insts, dict):
-            return {}, []
-        node = insts.get(inst)
-        if not isinstance(node, dict):
-            return {}, []
-
-    manual = node.get("manual") or {}
-    if not isinstance(manual, dict):
-        return {}, []
-    f = manual.get(kind) or {}
-    if not isinstance(f, dict):
-        return {}, []
-
-    blocks_raw = f.get("blocks") or []
-    blocks: list[str] = []
-    seen: set[str] = set()
-    if isinstance(blocks_raw, (list, tuple, set)):
-        for x in blocks_raw:
-            s = str(x).strip()
-            if not s:
-                continue
-            sl = s.lower()
-            if sl in seen:
-                continue
-            seen.add(sl)
-            blocks.append(s)
-    elif isinstance(blocks_raw, dict):
-        for k in blocks_raw.keys():
-            s = str(k).strip()
-            if not s:
-                continue
-            sl = s.lower()
-            if sl in seen:
-                continue
-            seen.add(sl)
-            blocks.append(s)
-
-    adds_raw = f.get("adds") or {}
-    adds_items: dict[str, Any] = {}
-    if isinstance(adds_raw, dict):
-        items = adds_raw.get("items") or {}
-        if isinstance(items, dict):
-            adds_items = {str(k): v for k, v in items.items()}
-
-    return adds_items, blocks
+    return _load_manual_entry(_load_current_state, kind, provider, provider_instance, wrap_in_manual=True)
 
 
 def _save_state_manual(
@@ -704,62 +707,7 @@ def _save_state_manual(
     blocks: list[str],
     provider_instance: str | None = None,
 ) -> None:
-    adds_items = _canonicalize_manual_items(adds_items)
-    raw = _load_current_state()
-    providers = raw.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        raw["providers"] = providers
-
-    key = None
-    if provider in providers:
-        key = provider
-    else:
-        pl = str(provider).lower()
-        for k in providers.keys():
-            if str(k).lower() == pl:
-                key = str(k)
-                break
-    if key is None:
-        key = provider
-        providers[key] = {}
-
-    node = providers.get(key)
-    if not isinstance(node, dict):
-        node = {}
-        providers[key] = node
-
-    inst = normalize_instance_id(provider_instance)
-    if inst != "default":
-        insts = node.get("instances")
-        if not isinstance(insts, dict):
-            insts = {}
-            node["instances"] = insts
-        in_node = insts.get(inst)
-        if not isinstance(in_node, dict):
-            in_node = {}
-            insts[inst] = in_node
-        node = in_node
-
-    manual = node.get("manual")
-    if not isinstance(manual, dict):
-        manual = {}
-        node["manual"] = manual
-
-    f = manual.get(kind)
-    if not isinstance(f, dict):
-        f = {}
-        manual[kind] = f
-
-    f["blocks"] = list(blocks or [])
-
-    adds = f.get("adds")
-    if not isinstance(adds, dict):
-        adds = {}
-        f["adds"] = adds
-    adds["items"] = dict(adds_items or {})
-
-    _atomic_write_json(_STATE_PATH, raw)
+    _save_manual_entry(_load_current_state, _STATE_PATH, kind, provider, adds_items, blocks, provider_instance, wrap_in_manual=True)
 
 def _normalize_kind(val: str | None) -> Kind:
     k = (val or "watchlist").strip().lower()
@@ -1002,29 +950,7 @@ def api_editor_save_state(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
 
         inst = normalize_instance_id(payload.get("provider_instance"))
 
-        blocks_raw = payload.get("blocks") or []
-        blocks: list[str] = []
-        seen: set[str] = set()
-        if isinstance(blocks_raw, (list, tuple, set)):
-            for x in blocks_raw:
-                s = str(x).strip()
-                if not s:
-                    continue
-                sl = s.lower()
-                if sl in seen:
-                    continue
-                seen.add(sl)
-                blocks.append(s)
-        elif isinstance(blocks_raw, dict):
-            for k in blocks_raw.keys():
-                s = str(k).strip()
-                if not s:
-                    continue
-                sl = s.lower()
-                if sl in seen:
-                    continue
-                seen.add(sl)
-                blocks.append(s)
+        blocks = _dedupe_block_list(payload.get("blocks") or [])
 
         _save_policy_manual(kind, provider, items, blocks, inst)
         if _STATE_PATH.exists():

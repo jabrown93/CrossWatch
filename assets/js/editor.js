@@ -1826,6 +1826,96 @@
       resultsBox.className = "cw-search-results";
       pop.appendChild(resultsBox);
 
+      // Applies a metadata-resolve result's ids onto row/refs. Shared by the picked-result
+      // handler below since the same tmdb-key-rewrite logic is needed in both call sites.
+      function applyResolvedIds(row, refs, ids) {
+        row.raw.ids = row.raw.ids || {};
+
+        if (ids.imdb) {
+          row.imdb = ids.imdb;
+          row.raw.ids.imdb = ids.imdb;
+          refs.imdbIn.value = ids.imdb;
+        }
+        if (ids.tmdb) {
+          const tVal = String(ids.tmdb);
+          row.tmdb = tVal;
+          row.raw.ids.tmdb = ids.tmdb;
+          if (refs.tmdbIn) refs.tmdbIn.value = tVal;
+          const prevKey = (row.key || "").trim();
+          if (!prevKey || /^(tmdb|imdb|trakt|tvdb|slug):/i.test(prevKey)) {
+            row.key = `tmdb:${tVal}`;
+            if (refs.keyIn) refs.keyIn.value = row.key;
+          }
+        }
+        if (ids.trakt) {
+          const trVal = String(ids.trakt);
+          row.trakt = trVal;
+          row.raw.ids.trakt = ids.trakt;
+          if (refs.traktIn) refs.traktIn.value = trVal;
+        }
+      }
+
+      // Applies a picked search result onto row/refs, then resolves and merges full ids.
+      async function applyPickedResult(item) {
+        const picked = item;
+        const newTitle = picked.title || row.title || "";
+        row.title = newTitle;
+        row.raw.title = newTitle || null;
+        refs.titleIn.value = newTitle;
+
+        if (picked.year) {
+          row.year = String(picked.year);
+          row.raw.year = picked.year;
+          refs.yearIn.value = row.year;
+        }
+
+        const wantsAnime = String(typeSelect.value || "").toLowerCase() === "anime";
+        const pickedType = String(picked.type || "movie").toLowerCase();
+
+        const newType = wantsAnime ? "anime" : pickedType;
+        const resolveEntity = wantsAnime ? picked._resolve_entity || pickedType || "movie" : newType;
+
+        row.type = newType;
+        row.raw.type = newType;
+        row.episode = false;
+        updateTypeDisplay(row, refs.typeBtn);
+
+        const tmdbId = picked.tmdb;
+        if (tmdbId != null) {
+          const tmdbStr = String(tmdbId);
+          row.tmdb = tmdbStr;
+          row.raw.ids = row.raw.ids || {};
+          row.raw.ids.tmdb = tmdbId;
+          if (refs.tmdbIn) refs.tmdbIn.value = tmdbStr;
+          const prevKey = (row.key || "").trim();
+          if (!prevKey || /^(tmdb|imdb|trakt|tvdb|slug):/i.test(prevKey)) {
+            row.key = `tmdb:${tmdbStr}`;
+            if (refs.keyIn) refs.keyIn.value = row.key;
+          }
+        }
+
+        if (tmdbId != null) {
+          try {
+            const metaRes = await fetchJSON("/api/metadata/resolve", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ entity: resolveEntity, ids: { tmdb: tmdbId } }),
+            });
+
+            if (metaRes && metaRes.ok && metaRes.result && metaRes.result.ids) {
+              applyResolvedIds(row, refs, metaRes.result.ids || {});
+            }
+          } catch (err) {
+            console.error("metadata resolve failed", err);
+          }
+        }
+
+        markChanged();
+        setStatusSticky("Row updated from metadata", 2500);
+        close();
+        renderRows();
+      }
+
       async function doSearch() {
         const q = (qInput.value || "").trim();
         const yearVal = parseInt(yearInput.value || "", 10);
@@ -1950,89 +2040,7 @@
 
             btn.appendChild(content);
 
-            btn.onclick = async () => {
-              const picked = item;
-              const newTitle = picked.title || row.title || "";
-              row.title = newTitle;
-              row.raw.title = newTitle || null;
-              refs.titleIn.value = newTitle;
-
-              if (picked.year) {
-                row.year = String(picked.year);
-                row.raw.year = picked.year;
-                refs.yearIn.value = row.year;
-              }
-
-              const wantsAnime = String(typeSelect.value || "").toLowerCase() === "anime";
-              const pickedType = String(picked.type || "movie").toLowerCase();
-
-              const newType = wantsAnime ? "anime" : pickedType;
-              const resolveEntity = wantsAnime ? picked._resolve_entity || pickedType || "movie" : newType;
-
-              row.type = newType;
-              row.raw.type = newType;
-              row.episode = false;
-              updateTypeDisplay(row, refs.typeBtn);
-
-              const tmdbId = picked.tmdb;
-              if (tmdbId != null) {
-                const tmdbStr = String(tmdbId);
-                row.tmdb = tmdbStr;
-                row.raw.ids = row.raw.ids || {};
-                row.raw.ids.tmdb = tmdbId;
-                if (refs.tmdbIn) refs.tmdbIn.value = tmdbStr;
-                const prevKey = (row.key || "").trim();
-                if (!prevKey || /^(tmdb|imdb|trakt|tvdb|slug):/i.test(prevKey)) {
-                  row.key = `tmdb:${tmdbStr}`;
-                  if (refs.keyIn) refs.keyIn.value = row.key;
-                }
-              }
-
-              if (tmdbId != null) {
-                try {
-                  const metaRes = await fetchJSON("/api/metadata/resolve", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ entity: resolveEntity, ids: { tmdb: tmdbId } }),
-                  });
-
-                  if (metaRes && metaRes.ok && metaRes.result && metaRes.result.ids) {
-                    const ids = metaRes.result.ids || {};
-                    row.raw.ids = row.raw.ids || {};
-
-                    if (ids.imdb) {
-                      row.imdb = ids.imdb;
-                      row.raw.ids.imdb = ids.imdb;
-                      refs.imdbIn.value = ids.imdb;
-                    }
-                    if (ids.tmdb) {
-                      const tVal = String(ids.tmdb);
-                      row.tmdb = tVal;
-                      row.raw.ids.tmdb = ids.tmdb;
-                      if (refs.tmdbIn) refs.tmdbIn.value = tVal;
-                      const prevKey = (row.key || "").trim();
-                      if (!prevKey || /^(tmdb|imdb|trakt|tvdb|slug):/i.test(prevKey)) {
-                        row.key = `tmdb:${tVal}`;
-                        if (refs.keyIn) refs.keyIn.value = row.key;
-                      }
-                    }
-                    if (ids.trakt) {
-                      const trVal = String(ids.trakt);
-                      row.trakt = trVal;
-                      row.raw.ids.trakt = ids.trakt;
-                      if (refs.traktIn) refs.traktIn.value = trVal;
-                    }
-                  }
-                } catch (err) {
-                  console.error("metadata resolve failed", err);
-                }
-              }
-
-              markChanged();
-              setStatusSticky("Row updated from metadata", 2500);
-              close();
-              renderRows();
-            };
+            btn.onclick = () => applyPickedResult(item);
 
             resultsBox.appendChild(btn);
           });

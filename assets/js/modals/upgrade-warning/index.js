@@ -12,33 +12,19 @@ const _cwVer = (u) => u + (u.includes("?") ? "&" : "?") + "v=" + encodeURICompon
 const { getJson, postJson } = await import(_cwVer("../core/net.js"));
 const { renderNotesMarkup } = await import(_cwVer("./notes.js"));
 const {
+  _cmp,
+  _norm,
   appAuthFormCss,
   escapeHtml,
   fetchAppAuthStatus,
   hasEnabledAppAuth,
   renderAppAuthFields,
-  saveRequiredAppAuth,
   setModalDismissible,
   setModalShellInline,
+  submitAppAuthCredentials,
   syncAppAuthState,
-  validateAppAuthState,
   wireLiveAppAuthValidation,
 } = await import(_cwVer("../core/app-auth-setup.js"));
-
-function _norm(v) {
-  return String(v || "").replace(/^v/i, "").trim();
-}
-
-function _cmp(a, b) {
-  const pa = _norm(a).split(".").map((n) => parseInt(n, 10) || 0);
-  const pb = _norm(b).split(".").map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
-    const da = pa[i] || 0;
-    const db = pb[i] || 0;
-    if (da !== db) return da > db ? 1 : -1;
-  }
-  return 0;
-}
 
 async function _runConfigMigration() {
   return postJson("/api/config/migrate");
@@ -190,40 +176,15 @@ export default {
     }
 
     async function submitCredentials() {
-      syncAppAuthState(hostEl, state);
-      state.error = validateAppAuthState(state);
-      if (state.error) {
-        render();
-        return;
-      }
-
-      state.saving = true;
-      render();
-
-      try {
-        await saveRequiredAppAuth({
-          username: state.username,
-          password: state.password,
-          setupToken: state.setup_token,
-        });
+      await submitAppAuthCredentials(hostEl, state, render, async () => {
         state.authReady = true;
-        state.saving = false;
-        state.error = "";
-        state.password = "";
-        state.password2 = "";
-        state.setup_token = "";
         state.step = requiresCleanReset ? "cleanup" : "migrate";
         notify(requiresCleanReset
           ? "Sign-in saved. You can now run the clean reset."
           : "Sign-in saved. CrossWatch is updating the config in the background.");
         render();
         if (!requiresCleanReset) ensureAutoSaved();
-        return;
-      } catch (err) {
-        state.saving = false;
-        state.error = String(err?.message || "Failed to save sign-in settings.");
-        render();
-      }
+      });
     }
 
     function layout(body, foot) {

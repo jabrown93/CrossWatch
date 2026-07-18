@@ -1005,6 +1005,41 @@ def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return d
 
 
+def _normalize_rate_limit(
+    block: dict[str, Any],
+    post_default: float,
+    get_default: float,
+    *,
+    post_max: float = 1000.0,
+    get_max: float = 1000.0,
+) -> dict[str, Any]:
+    """Normalize the ``rate_limit`` sub-block of a provider config in place.
+
+    Coerces ``post_per_sec``/``get_per_sec`` to floats (falling back to their
+    defaults on bad input), clamps them to ``[0, post_max]``/``[0, get_max]``
+    (0 disables throttling), and collapses whole-number floats to ``int``.
+    """
+    rl = _ensure_dict(block, "rate_limit")
+
+    def _rate(name: str, default: float, max_v: float) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    post_rps = _rate("post_per_sec", post_default, post_max)
+    get_rps = _rate("get_per_sec", get_default, get_max)
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+    return rl
+
+
 def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
     t0 = cfg.get("tmdb_sync")
     if isinstance(t0, dict):
@@ -1065,80 +1100,17 @@ def _tmdb_api_key(cfg: dict[str, Any]) -> str:
 
 
 def _normalize_trakt(cfg: dict[str, Any]) -> None:
-    t0 = cfg.get("trakt")
-    if isinstance(t0, dict):
-        t = t0
-    else:
-        t = {}
-        cfg["trakt"] = t
-
-    rl0 = t.get("rate_limit")
-    if isinstance(rl0, dict):
-        rl = rl0
-    else:
-        rl = {}
-        t["rate_limit"] = rl
-
-    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
-        v = rl.get(name, default)
-        try:
-            f = float(v)
-        except Exception:
-            f = float(default)
-        if f < 0:
-            f = 0.0
-        if f > max_v:
-            f = max_v
-        return f
-
-    # Allow 0 to disable throttling.
-    post_rps = _rate("post_per_sec", 1.0)
-    get_rps = _rate("get_per_sec", 3.33)
-    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
-    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+    t = _ensure_dict(cfg, "trakt")
+    _normalize_rate_limit(t, 1.0, 3.33)
 
 
 def _normalize_simkl(cfg: dict[str, Any]) -> None:
-    s0 = cfg.get("simkl")
-    if isinstance(s0, dict):
-        s = s0
-    else:
-        s = {}
-        cfg["simkl"] = s
-
-    rl0 = s.get("rate_limit")
-    if isinstance(rl0, dict):
-        rl = rl0
-    else:
-        rl = {}
-        s["rate_limit"] = rl
-
-    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
-        v = rl.get(name, default)
-        try:
-            f = float(v)
-        except Exception:
-            f = float(default)
-        if f < 0:
-            f = 0.0
-        if f > max_v:
-            f = max_v
-        return f
-
-    # Allow 0 to disable throttling.
-    post_rps = _rate("post_per_sec", 1.0)
-    get_rps = _rate("get_per_sec", 10.0)
-    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
-    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+    s = _ensure_dict(cfg, "simkl")
+    _normalize_rate_limit(s, 1.0, 10.0)
 
 
 def _normalize_mdblist(cfg: dict[str, Any]) -> None:
-    m0 = cfg.get("mdblist")
-    if isinstance(m0, dict):
-        m = m0
-    else:
-        m = {}
-        cfg["mdblist"] = m
+    m = _ensure_dict(cfg, "mdblist")
 
     def _norm_method(block: dict[str, Any]) -> str:
         has_api = bool(str(block.get("api_key") or block.get("key") or "").strip())
@@ -1211,39 +1183,11 @@ def _normalize_mdblist(cfg: dict[str, Any]) -> None:
             if isinstance(inst, dict):
                 _normalize_auth_block(inst)
 
-    rl0 = m.get("rate_limit")
-    if isinstance(rl0, dict):
-        rl = rl0
-    else:
-        rl = {}
-        m["rate_limit"] = rl
-
-    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
-        v = rl.get(name, default)
-        try:
-            f = float(v)
-        except Exception:
-            f = float(default)
-        if f < 0:
-            f = 0.0
-        if f > max_v:
-            f = max_v
-        return f
-
-    # Allow 0 to disable throttling.
-    post_rps = _rate("post_per_sec", 1.0)
-    get_rps = _rate("get_per_sec", 10.0)
-    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
-    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+    _normalize_rate_limit(m, 1.0, 10.0)
 
 
 def _normalize_publicmetadb(cfg: dict[str, Any]) -> None:
-    p0 = cfg.get("publicmetadb")
-    if isinstance(p0, dict):
-        p = p0
-    else:
-        p = {}
-        cfg["publicmetadb"] = p
+    p = _ensure_dict(cfg, "publicmetadb")
     p["base_url"] = str(p.get("base_url") or "https://publicmetadb.com").strip().rstrip("/")
     p["watchlist_name"] = str(p.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
     p["watchlist_auto_create"] = bool(p.get("watchlist_auto_create", True))
@@ -1264,29 +1208,7 @@ def _normalize_publicmetadb(cfg: dict[str, Any]) -> None:
     _int_range("ratings_update_per_hour", 100, 1, 100)
     p["ratings_label"] = str(p.get("ratings_label") or "Overall").strip() or "Overall"
 
-    rl0 = p.get("rate_limit")
-    if isinstance(rl0, dict):
-        rl = rl0
-    else:
-        rl = {}
-        p["rate_limit"] = rl
-
-    def _rate(name: str, default: float, *, max_v: float) -> float:
-        v = rl.get(name, default)
-        try:
-            f = float(v)
-        except Exception:
-            f = float(default)
-        if f < 0:
-            f = 0.0
-        if f > max_v:
-            f = max_v
-        return f
-
-    post_rps = _rate("post_per_sec", 3.0, max_v=3.0)
-    get_rps = _rate("get_per_sec", 20.0, max_v=20.0)
-    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
-    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+    _normalize_rate_limit(p, 3.0, 20.0, post_max=3.0, get_max=20.0)
 
 
 def _is_hhmm(v: str) -> bool:

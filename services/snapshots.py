@@ -1307,16 +1307,16 @@ def _with_feature_tag(item: Any, feature: str) -> Any:
     return {"feature": feature, **dict(item)}
 
 
+def _load_and_classify(a_path: str, b_path: str) -> dict[str, Any]:
+    """Load two snapshots, validate they're comparable, and classify items.
 
-
-def diff_snapshots(
-    a_path: str,
-    b_path: str,
-    *,
-    limit: int = 200,
-    max_depth: int = 4,
-    max_changes: int = 25,
-) -> dict[str, Any]:
+    Shared by `diff_snapshots` and `diff_snapshots_extended`. Always
+    validates provider/instance match and detects bundle captures. For
+    bundle captures, returns early (only `a`/`b`/`bundle_a`/`bundle_b` are
+    populated) since each caller aggregates per-feature bundles differently.
+    For single-feature captures, also canonicalizes items and classifies
+    them into added/removed/updated/unchanged keys.
+    """
     a = read_snapshot(a_path)
     b = read_snapshot(b_path)
 
@@ -1334,6 +1334,136 @@ def diff_snapshots(
 
     bundle_a = kind_a == SNAPSHOT_BUNDLE_KIND or feat_a == "all"
     bundle_b = kind_b == SNAPSHOT_BUNDLE_KIND or feat_b == "all"
+
+    out: dict[str, Any] = {"a": a, "b": b, "bundle_a": bundle_a, "bundle_b": bundle_b}
+    if bundle_a or bundle_b:
+        return out
+
+    items_a_raw = a.get("items") or {}
+    items_b_raw = b.get("items") or {}
+    if not isinstance(items_a_raw, Mapping) or not isinstance(items_b_raw, Mapping):
+        raise ValueError("Invalid capture contents")
+
+    if feat_a != feat_b:
+        raise ValueError("Compare Captures only supports the same feature.")
+
+    feat = _norm_feature(feat_a)
+    items_a_raw = _canonicalize_index(prov_a, feat, items_a_raw)
+    items_b_raw = _canonicalize_index(prov_a, feat, items_b_raw)
+
+    history_multi = False
+    if feat_a == "history":
+        items_a = _history_items_by_base_key(items_a_raw)
+        items_b = _history_items_by_base_key(items_b_raw)
+        history_multi = True
+    else:
+        items_a = dict(items_a_raw)
+        items_b = dict(items_b_raw)
+
+    keys_a = set(str(k) for k in items_a.keys())
+    keys_b = set(str(k) for k in items_b.keys())
+    added_keys = sorted(keys_b - keys_a)
+    removed_keys = sorted(keys_a - keys_b)
+    common = sorted(keys_a & keys_b)
+
+    updated_keys: list[str] = []
+    unchanged_keys: list[str] = []
+    for k in common:
+        va = items_a.get(k)
+        vb = items_b.get(k)
+        if history_multi:
+            oa = va if isinstance(va, Mapping) else {}
+            ob = vb if isinstance(vb, Mapping) else {}
+            a_tmp = oa.get("watched_ats")
+            b_tmp = ob.get("watched_ats")
+            a_dates = a_tmp if isinstance(a_tmp, list) else []
+            b_dates = b_tmp if isinstance(b_tmp, list) else []
+            a_set = _minute_set([str(x) for x in a_dates])
+            b_set = _minute_set([str(x) for x in b_dates])
+            if a_set != b_set:
+                updated_keys.append(k)
+                continue
+            oa2 = dict(oa)
+            ob2 = dict(ob)
+            oa2.pop("watched_ats", None)
+            ob2.pop("watched_ats", None)
+            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
+                updated_keys.append(k)
+            else:
+                unchanged_keys.append(k)
+            continue
+        if va != vb:
+            updated_keys.append(k)
+        else:
+            unchanged_keys.append(k)
+
+    out.update(
+        {
+            "feat": feat,
+            "items_a_raw": items_a_raw,
+            "items_b_raw": items_b_raw,
+            "items_a": items_a,
+            "items_b": items_b,
+            "history_multi": history_multi,
+            "keys_a": keys_a,
+            "keys_b": keys_b,
+            "added_keys": added_keys,
+            "removed_keys": removed_keys,
+            "updated_keys": updated_keys,
+            "unchanged_keys": unchanged_keys,
+            "common": common,
+        }
+    )
+    return out
+
+
+def _history_watched_changes(va: Any, vb: Any, *, max_depth: int, max_changes: int) -> list[dict[str, Any]]:
+    """Build the `changes` list for a history_multi 'updated' row.
+
+    Reports watched_ats differences at minute precision as add/remove
+    markers, then diffs the remaining fields (with watched_ats stripped)
+    via `_diff_any` if they differ.
+    """
+    oa = va if isinstance(va, Mapping) else {}
+    ob = vb if isinstance(vb, Mapping) else {}
+    a_tmp = oa.get("watched_ats")
+    b_tmp = ob.get("watched_ats")
+    a_dates = a_tmp if isinstance(a_tmp, list) else []
+    b_dates = b_tmp if isinstance(b_tmp, list) else []
+    a_set = _minute_set([str(x) for x in a_dates])
+    b_set = _minute_set([str(x) for x in b_dates])
+    added_dates = sorted(b_set - a_set)
+    removed_dates = sorted(a_set - b_set)
+
+    changes: list[dict[str, Any]] = []
+    if added_dates:
+        changes.append({"path": "watched_ats.added", "old": [], "new": added_dates})
+    if removed_dates:
+        changes.append({"path": "watched_ats.removed", "old": removed_dates, "new": []})
+
+    oa2 = dict(oa)
+    ob2 = dict(ob)
+    oa2.pop("watched_ats", None)
+    ob2.pop("watched_ats", None)
+    if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
+        _diff_any(oa2, ob2, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
+    return changes
+
+
+
+def diff_snapshots(
+    a_path: str,
+    b_path: str,
+    *,
+    limit: int = 200,
+    max_depth: int = 4,
+    max_changes: int = 25,
+) -> dict[str, Any]:
+    loaded = _load_and_classify(a_path, b_path)
+    a = loaded["a"]
+    b = loaded["b"]
+    bundle_a = loaded["bundle_a"]
+    bundle_b = loaded["bundle_b"]
     if bundle_a or bundle_b:
         if bundle_a and bundle_b:
             a_children, b_children, features, _ = _bundle_compare_setup(a, b, "all")
@@ -1384,60 +1514,17 @@ def diff_snapshots(
             }
         raise ValueError("Compare Captures only supports two full captures or two matching feature captures.")
 
-    items_a_raw = a.get("items") or {}
-    items_b_raw = b.get("items") or {}
-    if not isinstance(items_a_raw, Mapping) or not isinstance(items_b_raw, Mapping):
-        raise ValueError("Invalid capture contents")
-
-    if feat_a != feat_b:
-        raise ValueError("Compare Captures only supports the same feature.")
-
-    items_a_raw = _canonicalize_index(prov_a, _norm_feature(feat_a), items_a_raw)
-    items_b_raw = _canonicalize_index(prov_a, _norm_feature(feat_a), items_b_raw)
-
-    history_multi = False
-    if feat_a == "history":
-        items_a = _history_items_by_base_key(items_a_raw)
-        items_b = _history_items_by_base_key(items_b_raw)
-        history_multi = True
-    else:
-        items_a = dict(items_a_raw)
-        items_b = dict(items_b_raw)
-
-    keys_a = set(str(k) for k in items_a.keys())
-    keys_b = set(str(k) for k in items_b.keys())
-
-    added_keys = sorted(keys_b - keys_a)
-    removed_keys = sorted(keys_a - keys_b)
-
-    common = sorted(keys_a & keys_b)
-    updated_keys: list[str] = []
-    for k in common:
-        va = items_a.get(k)
-        vb = items_b.get(k)
-        if history_multi:
-            oa = va if isinstance(va, Mapping) else {}
-            ob = vb if isinstance(vb, Mapping) else {}
-            a_tmp = oa.get("watched_ats")
-            b_tmp = ob.get("watched_ats")
-            a_dates = a_tmp if isinstance(a_tmp, list) else []
-            b_dates = b_tmp if isinstance(b_tmp, list) else []
-            a_set = set(_iso_minute(x) or str(x) for x in a_dates)
-            b_set = set(_iso_minute(x) or str(x) for x in b_dates)
-            if a_set != b_set:
-                updated_keys.append(k)
-                continue
-            oa2 = dict(oa)
-            ob2 = dict(ob)
-            oa2.pop("watched_ats", None)
-            ob2.pop("watched_ats", None)
-            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
-                updated_keys.append(k)
-            continue
-        if va != vb:
-            updated_keys.append(k)
-
-    unchanged = len(common) - len(updated_keys)
+    items_a_raw = loaded["items_a_raw"]
+    items_b_raw = loaded["items_b_raw"]
+    items_a = loaded["items_a"]
+    items_b = loaded["items_b"]
+    history_multi = loaded["history_multi"]
+    keys_a = loaded["keys_a"]
+    keys_b = loaded["keys_b"]
+    added_keys = loaded["added_keys"]
+    removed_keys = loaded["removed_keys"]
+    updated_keys = loaded["updated_keys"]
+    unchanged = len(loaded["common"]) - len(updated_keys)
 
     lim = max(1, min(int(limit or 200), 2000))
 
@@ -1451,28 +1538,7 @@ def diff_snapshots(
         changes: list[dict[str, Any]] = []
 
         if history_multi:
-            oa = va if isinstance(va, Mapping) else {}
-            ob = vb if isinstance(vb, Mapping) else {}
-            a_tmp = oa.get("watched_ats")
-            b_tmp = ob.get("watched_ats")
-            a_dates = a_tmp if isinstance(a_tmp, list) else []
-            b_dates = b_tmp if isinstance(b_tmp, list) else []
-            a_set = _minute_set([str(x) for x in a_dates])
-            b_set = _minute_set([str(x) for x in b_dates])
-            added_dates = sorted(b_set - a_set)
-            removed_dates = sorted(a_set - b_set)
-
-            if added_dates:
-                changes.append({"path": "watched_ats.added", "old": [], "new": added_dates})
-            if removed_dates:
-                changes.append({"path": "watched_ats.removed", "old": removed_dates, "new": []})
-
-            oa2 = dict(oa)
-            ob2 = dict(ob)
-            oa2.pop("watched_ats", None)
-            ob2.pop("watched_ats", None)
-            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
-                _diff_any(oa2, ob2, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
+            changes = _history_watched_changes(va, vb, max_depth=max_depth, max_changes=max_changes)
         else:
             _diff_any(va, vb, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
 
@@ -1522,23 +1588,11 @@ def diff_snapshots_extended(
     max_changes: int = 250,
 ) -> dict[str, Any]:
 
-    a = read_snapshot(a_path)
-    b = read_snapshot(b_path)
-
-    kind_a = str(a.get("kind") or "").strip().lower()
-    kind_b = str(b.get("kind") or "").strip().lower()
-    feat_a = str(a.get("feature") or "").strip().lower()
-    feat_b = str(b.get("feature") or "").strip().lower()
-
-    prov_a = str(a.get("provider") or "").strip().upper()
-    prov_b = str(b.get("provider") or "").strip().upper()
-    inst_a = str(a.get("instance") or a.get("instance_id") or a.get("profile") or "default").strip().lower()
-    inst_b = str(b.get("instance") or b.get("instance_id") or b.get("profile") or "default").strip().lower()
-    if prov_a != prov_b or inst_a != inst_b:
-        raise ValueError("Compare Captures only supports the same provider and instance.")
-
-    bundle_a = kind_a == SNAPSHOT_BUNDLE_KIND or feat_a == "all"
-    bundle_b = kind_b == SNAPSHOT_BUNDLE_KIND or feat_b == "all"
+    loaded = _load_and_classify(a_path, b_path)
+    a = loaded["a"]
+    b = loaded["b"]
+    bundle_a = loaded["bundle_a"]
+    bundle_b = loaded["bundle_b"]
     selected_feature = str(feature or "").strip().lower()
     if bundle_a or bundle_b:
         if not (bundle_a and bundle_b):
@@ -1570,64 +1624,18 @@ def diff_snapshots_extended(
         child_res["selected_feature"] = selected_feature
         return child_res
 
-    items_a_raw = a.get("items") or {}
-    items_b_raw = b.get("items") or {}
-    if not isinstance(items_a_raw, Mapping) or not isinstance(items_b_raw, Mapping):
-        raise ValueError("Invalid capture contents")
-
-    if feat_a != feat_b:
-        raise ValueError("Compare Captures only supports the same feature.")
-
-    feat = _norm_feature(feat_a)
-    items_a_raw = _canonicalize_index(prov_a, feat, items_a_raw)
-    items_b_raw = _canonicalize_index(prov_a, feat, items_b_raw)
-
-    history_multi = False
-    if feat_a == "history":
-        items_a = _history_items_by_base_key(items_a_raw)
-        items_b = _history_items_by_base_key(items_b_raw)
-        history_multi = True
-    else:
-        items_a = dict(items_a_raw)
-        items_b = dict(items_b_raw)
-
-    keys_a = set(str(k) for k in items_a.keys())
-    keys_b = set(str(k) for k in items_b.keys())
-    common = sorted(keys_a & keys_b)
-
-    added_keys = sorted(keys_b - keys_a)
-    removed_keys = sorted(keys_a - keys_b)
-
-    updated_keys: list[str] = []
-    unchanged_keys: list[str] = []
-    for k in common:
-        va = items_a.get(k)
-        vb = items_b.get(k)
-        if history_multi:
-            oa = va if isinstance(va, Mapping) else {}
-            ob = vb if isinstance(vb, Mapping) else {}
-            a_tmp = oa.get("watched_ats")
-            b_tmp = ob.get("watched_ats")
-            a_dates = a_tmp if isinstance(a_tmp, list) else []
-            b_dates = b_tmp if isinstance(b_tmp, list) else []
-            a_set = _minute_set([str(x) for x in a_dates])
-            b_set = _minute_set([str(x) for x in b_dates])
-            if a_set != b_set:
-                updated_keys.append(k)
-                continue
-            oa2 = dict(oa)
-            ob2 = dict(ob)
-            oa2.pop("watched_ats", None)
-            ob2.pop("watched_ats", None)
-            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
-                updated_keys.append(k)
-            else:
-                unchanged_keys.append(k)
-            continue
-        if va != vb:
-            updated_keys.append(k)
-        else:
-            unchanged_keys.append(k)
+    feat = loaded["feat"]
+    items_a_raw = loaded["items_a_raw"]
+    items_b_raw = loaded["items_b_raw"]
+    items_a = loaded["items_a"]
+    items_b = loaded["items_b"]
+    history_multi = loaded["history_multi"]
+    keys_a = loaded["keys_a"]
+    keys_b = loaded["keys_b"]
+    added_keys = loaded["added_keys"]
+    removed_keys = loaded["removed_keys"]
+    updated_keys = loaded["updated_keys"]
+    unchanged_keys = loaded["unchanged_keys"]
 
     # Filter helpers
     want = str(kind or "all").strip().lower()
@@ -1678,26 +1686,7 @@ def diff_snapshots_extended(
             row["new"] = vb
             changes: list[dict[str, Any]] = []
             if history_multi:
-                oa = va if isinstance(va, Mapping) else {}
-                ob = vb if isinstance(vb, Mapping) else {}
-                a_tmp = oa.get("watched_ats")
-                b_tmp = ob.get("watched_ats")
-                a_dates = a_tmp if isinstance(a_tmp, list) else []
-                b_dates = b_tmp if isinstance(b_tmp, list) else []
-                a_set = _minute_set([str(x) for x in a_dates])
-                b_set = _minute_set([str(x) for x in b_dates])
-                add_dates = sorted(b_set - a_set)
-                del_dates = sorted(a_set - b_set)
-                if add_dates:
-                    changes.append({"path": "watched_ats.added", "old": [], "new": add_dates})
-                if del_dates:
-                    changes.append({"path": "watched_ats.removed", "old": del_dates, "new": []})
-                oa2 = dict(oa)
-                ob2 = dict(ob)
-                oa2.pop("watched_ats", None)
-                ob2.pop("watched_ats", None)
-                if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
-                    _diff_any(oa2, ob2, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
+                changes = _history_watched_changes(va, vb, max_depth=max_depth, max_changes=max_changes)
             else:
                 _diff_any(va, vb, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
             row["changes"] = changes

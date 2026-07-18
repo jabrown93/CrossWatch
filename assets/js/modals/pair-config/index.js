@@ -1531,6 +1531,33 @@ left.innerHTML = `
   }
 }
 
+// Builds the 8-field state.globals payload from the Globals panel's DOM fields, given the
+// already-computed drop-guard/suspect-percent/blackbox inputs (their derivation differs
+// slightly between the "input" and "change" handlers in bindChangeHandlers below).
+function collectGlobals(dropOn,minPrev,pct,bb){
+  return {
+    dry_run:!!Q("#gl-dry")?.checked,
+    verify_after_write:!!Q("#gl-verify")?.checked,
+    drop_guard:dropOn,
+    allow_mass_delete:!!Q("#gl-mass")?.checked && !dropOn,
+    tombstone_ttl_days:parseInt(Q("#gl-ttl")?.value||"0",10)||0,
+    include_observed_deletes:!!Q("#gl-observed")?.checked,
+    runtime:{suspect_min_prev:minPrev,suspect_shrink_ratio:pct/100},
+    blackbox:bb
+  };
+}
+
+// Reads the jellyfin/emby watchlist-mode fields for the given id prefix ("jf"/"em"); the
+// query/delay/guid fields (cx-wl-*) are shared between both providers.
+function readServerWatchlist(prefix){
+  const mode=ID(`cx-${prefix}-wl-mode-pl`)?.checked?"playlist":ID(`cx-${prefix}-wl-mode-col`)?.checked?"collection":"favorites";
+  const name=(ID(`cx-${prefix}-wl-pl-name`)?.value||"").trim()||"Watchlist";
+  const q=parseInt(ID("cx-wl-q")?.value||"25",10)||25;
+  const d=parseInt(ID("cx-wl-delay")?.value||"0",10)||0;
+  const gp=(ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
+  return {mode,playlist_name:name,watchlist_query_limit:q,watchlist_write_delay_ms:d,watchlist_guid_priority:gp.length?gp:undefined};
+}
+
 function bindChangeHandlers(state,root){
   const syncGlobalsUI = () => {
     const drop = ID("gl-drop");
@@ -1572,16 +1599,7 @@ function bindChangeHandlers(state,root){
       const vp=ID("gl-sus-pct-val"); if(vp) vp.textContent=String(pct);
       const vm=ID("gl-sus-min-val"); if(vm) vm.textContent=String(minPrev);
 
-      state.globals=Object.assign({},state.globals,{
-        dry_run:!!Q("#gl-dry")?.checked,
-        verify_after_write:!!Q("#gl-verify")?.checked,
-        drop_guard:dropOn,
-        allow_mass_delete:!!Q("#gl-mass")?.checked && !dropOn,
-        tombstone_ttl_days:parseInt(Q("#gl-ttl")?.value||"0",10)||0,
-        include_observed_deletes:!!Q("#gl-observed")?.checked,
-        runtime:{suspect_min_prev:minPrev,suspect_shrink_ratio:pct/100},
-        blackbox:bb
-      });
+      state.globals=Object.assign({},state.globals,collectGlobals(dropOn,minPrev,pct,bb));
       const adv=ID("gl-drop-adv");
       if(adv){adv.style.opacity=dropOn?"":"0.5";adv.style.pointerEvents=dropOn?"auto":"none"}
     }
@@ -1848,37 +1866,15 @@ function bindChangeHandlers(state,root){
       const adv=ID("gl-drop-adv");
       if(adv){adv.style.opacity=dropOn?"":"0.5";adv.style.pointerEvents=dropOn?"auto":"none"}
 
-      state.globals={
-        dry_run:!!Q("#gl-dry")?.checked,
-        verify_after_write:!!Q("#gl-verify")?.checked,
-        drop_guard:dropOn,
-        allow_mass_delete:!!Q("#gl-mass")?.checked && !dropOn,
-        tombstone_ttl_days:parseInt(Q("#gl-ttl")?.value||"0",10)||0,
-        include_observed_deletes:!!Q("#gl-observed")?.checked,
-        runtime:{suspect_min_prev:minPrev,suspect_shrink_ratio:pct/100},
-        blackbox:bb
-      };
+      state.globals=collectGlobals(dropOn,minPrev,pct,bb);
     }
 
-    if(id==="cx-jf-wl-mode-fav"||id==="cx-jf-wl-mode-pl"||id==="cx-jf-wl-mode-col"||id==="cx-jf-wl-pl-name"||id==="cx-wl-q"||id==="cx-wl-delay"||id==="cx-wl-guid"){
-      const jf=state.jellyfin||(state.jellyfin={});
-      const mode=ID("cx-jf-wl-mode-pl")?.checked?"playlist":ID("cx-jf-wl-mode-col")?.checked?"collection":"favorites";
-      const name=(ID("cx-jf-wl-pl-name")?.value||"").trim()||"Watchlist";
-      const q=parseInt(ID("cx-wl-q")?.value||"25",10)||25;
-      const d=parseInt(ID("cx-wl-delay")?.value||"0",10)||0;
-      const gp=(ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
-      jf.watchlist={mode,playlist_name:name,watchlist_query_limit:q,watchlist_write_delay_ms:d,watchlist_guid_priority:gp.length?gp:undefined};
-    }
-
-    if(id==="cx-em-wl-mode-fav"||id==="cx-em-wl-mode-pl"||id==="cx-em-wl-mode-col"||id==="cx-em-wl-pl-name"||id==="cx-wl-q"||id==="cx-wl-delay"||id==="cx-wl-guid"){
-      const em=state.emby||(state.emby={});
-      const mode=ID("cx-em-wl-mode-pl")?.checked?"playlist":ID("cx-em-wl-mode-col")?.checked?"collection":"favorites";
-      const name=(ID("cx-em-wl-pl-name")?.value||"").trim()||"Watchlist";
-      const q=parseInt(ID("cx-wl-q")?.value||"25",10)||25;
-      const d=parseInt(ID("cx-wl-delay")?.value||"0",10)||0;
-      const gp=(ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
-      em.watchlist={mode,playlist_name:name,watchlist_query_limit:q,watchlist_write_delay_ms:d,watchlist_guid_priority:gp.length?gp:undefined};
-    }
+    [["jellyfin","jf"],["emby","em"]].forEach(([providerKey,prefix])=>{
+      if(id===`cx-${prefix}-wl-mode-fav`||id===`cx-${prefix}-wl-mode-pl`||id===`cx-${prefix}-wl-mode-col`||id===`cx-${prefix}-wl-pl-name`||id==="cx-wl-q"||id==="cx-wl-delay"||id==="cx-wl-guid"){
+        const target=state[providerKey]||(state[providerKey]={});
+        target.watchlist=readServerWatchlist(prefix);
+      }
+    });
 
     if(id==="cx-pmdb-wl-name"){
       state.pairProviders=state.pairProviders||{};

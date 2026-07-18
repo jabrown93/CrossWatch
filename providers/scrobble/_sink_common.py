@@ -79,6 +79,31 @@ def _cfg_delete_enabled(cfg: dict[str, Any], media_type: str) -> bool:
     return mt in allowed
 
 
+def _cfg_num(
+    cfg: dict[str, Any],
+    section: str,
+    key: str,
+    default: int | float,
+    fallback_section: str | None = None,
+) -> int | float:
+    """Read cfg["scrobble"][section][key], falling back to
+    cfg["scrobble"][fallback_section][key] when unset, else `default`.
+    Casts the result to the type of `default` (int or float); any lookup
+    or cast failure (missing/None/non-numeric) returns `default` as-is.
+    """
+    cast = type(default)
+    try:
+        s = cfg.get("scrobble") or {}
+        val = (s.get(section) or {}).get(key)
+        if val is None and fallback_section:
+            val = (s.get(fallback_section) or {}).get(key)
+        if val is None:
+            val = default
+        return cast(val)
+    except Exception:
+        return default
+
+
 def _extract_skeleton_from_body(b: dict[str, Any]) -> dict[str, Any]:
     out = dict(b)
     out.pop("progress", None)

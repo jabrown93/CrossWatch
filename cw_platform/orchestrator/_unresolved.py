@@ -62,6 +62,46 @@ def _pending_path(dst: str, feature: str) -> Path:
     return scoped_file(STATE_DIR, f"{dst_lower}_{feat_lower}.unresolved.pending.json")
 
 
+def _iter_unresolved_files(dst: str) -> Iterable[tuple[Path, bool]]:
+    """Yield ``(path, is_pending)`` for every unresolved-state file belonging to ``dst`` in STATE_DIR.
+
+    Legacy (unscoped) filenames are migrated to their scope-qualified equivalent
+    on the fly via ``scoped_file``. Callers are responsible for reading each path.
+    """
+    if not STATE_DIR.exists():
+        return
+
+    dst_lower = str(dst).strip().lower()
+    scope = scope_safe()
+
+    prefix = f"{dst_lower}_"
+    suffix = ".unresolved.json"
+    pending_suffix = ".unresolved.pending.json"
+    scoped1 = f".unresolved.{scope}.json"
+    scoped2 = f".{scope}.unresolved.json"
+    scopedp1 = f".unresolved.pending.{scope}.json"
+    scopedp2 = f".{scope}.unresolved.pending.json"
+    for p in STATE_DIR.iterdir():
+        if not p.is_file():
+            continue
+        name = p.name
+        if not name.startswith(prefix):
+            continue
+        is_blocking = (name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(suffix))
+        is_pending = (name.endswith(scopedp1) or name.endswith(scopedp2) or name.endswith(pending_suffix))
+        if not (is_blocking or is_pending):
+            continue
+
+        # Migrate legacy (unscoped) files to scoped when needed.
+        rp = p
+        if (name.endswith(suffix) or name.endswith(pending_suffix)) and not (
+            name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(scopedp1) or name.endswith(scopedp2)
+        ):
+            rp = scoped_file(STATE_DIR, name)
+
+        yield rp, is_pending
+
+
 # Blocking
 def load_unresolved_keys(
     dst: str,
@@ -74,7 +114,6 @@ def load_unresolved_keys(
         return keys
 
     dst_lower = str(dst).strip().lower()
-    scope = scope_safe()
 
     if feature and not cross_features:
         p = _blocking_path(dst_lower, feature)
@@ -82,45 +121,19 @@ def load_unresolved_keys(
             keys |= set(_read_json(p).keys())
         return keys
 
-    if not STATE_DIR.exists():
-        return keys
+    for rp, is_pending in _iter_unresolved_files(dst_lower):
+        data = _read_json(rp)
 
-    prefix = f"{dst_lower}_"
-    suffix = ".unresolved.json"
-    pending_suffix = ".unresolved.pending.json"
-    scoped1 = f".unresolved.{scope}.json"
-    scoped2 = f".{scope}.unresolved.json"
-    scopedp1 = f".unresolved.pending.{scope}.json"
-    scopedp2 = f".{scope}.unresolved.pending.json"
-    for p in STATE_DIR.iterdir():
-        if p.is_file():
-            name = p.name
-            if not name.startswith(prefix):
-                continue
-            is_blocking = (name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(suffix))
-            is_pending = (name.endswith(scopedp1) or name.endswith(scopedp2) or name.endswith(pending_suffix))
-            if not (is_blocking or is_pending):
-                continue
-
-            # Migrate legacy (unscoped) files to scoped when needed.
-            rp = p
-            if (name.endswith(suffix) or name.endswith(pending_suffix)) and not (
-                name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(scopedp1) or name.endswith(scopedp2)
-            ):
-                rp = scoped_file(STATE_DIR, name)
-
-            data = _read_json(rp)
-
-            if is_pending and isinstance(data, dict):
-                lst = data.get("keys")
-                if isinstance(lst, list):
-                    keys |= {str(x) for x in lst if x}
-                else:
-                    im = data.get("items")
-                    if isinstance(im, dict):
-                        keys |= {str(k) for k in im.keys()}
+        if is_pending and isinstance(data, dict):
+            lst = data.get("keys")
+            if isinstance(lst, list):
+                keys |= {str(x) for x in lst if x}
             else:
-                keys |= {str(k) for k in (data or {}).keys()}
+                im = data.get("items")
+                if isinstance(im, dict):
+                    keys |= {str(k) for k in im.keys()}
+        else:
+            keys |= {str(k) for k in (data or {}).keys()}
     return keys
 
 
@@ -135,7 +148,6 @@ def load_unresolved_map(
         return out
 
     dst_lower = str(dst).strip().lower()
-    scope = scope_safe()
 
     if feature and not cross_features:
         p = _blocking_path(dst_lower, feature)
@@ -145,46 +157,21 @@ def load_unresolved_map(
                 out[str(k)] = v if isinstance(v, dict) else {}
         return out
 
-    if not STATE_DIR.exists():
-        return out
-
-    prefix = f"{dst_lower}_"
-    suffix = ".unresolved.json"
-    pending_suffix = ".unresolved.pending.json"
-    scoped1 = f".unresolved.{scope}.json"
-    scoped2 = f".{scope}.unresolved.json"
-    scopedp1 = f".unresolved.pending.{scope}.json"
-    scopedp2 = f".{scope}.unresolved.pending.json"
-    for p in STATE_DIR.iterdir():
-        if p.is_file():
-            name = p.name
-            if not name.startswith(prefix):
-                continue
-            is_blocking = (name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(suffix))
-            is_pending = (name.endswith(scopedp1) or name.endswith(scopedp2) or name.endswith(pending_suffix))
-            if not (is_blocking or is_pending):
-                continue
-
-            rp = p
-            if (name.endswith(suffix) or name.endswith(pending_suffix)) and not (
-                name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(scopedp1) or name.endswith(scopedp2)
-            ):
-                rp = scoped_file(STATE_DIR, name)
-
-            data = _read_json(rp)
-            if is_pending and isinstance(data, dict):
-                raw_hints = data.get("hints")
-                hints = raw_hints if isinstance(raw_hints, dict) else {}
-                raw_keys = data.get("keys")
-                keys = raw_keys if isinstance(raw_keys, list) else []
-                for k in keys:
-                    if not k:
-                        continue
-                    v = (hints or {}).get(k) or {}
-                    out[str(k)] = v if isinstance(v, dict) else {}
-            else:
-                for k, v in (data or {}).items():
-                    out[str(k)] = v if isinstance(v, dict) else {}
+    for rp, is_pending in _iter_unresolved_files(dst_lower):
+        data = _read_json(rp)
+        if is_pending and isinstance(data, dict):
+            raw_hints = data.get("hints")
+            hints = raw_hints if isinstance(raw_hints, dict) else {}
+            raw_keys = data.get("keys")
+            keys = raw_keys if isinstance(raw_keys, list) else []
+            for k in keys:
+                if not k:
+                    continue
+                v = (hints or {}).get(k) or {}
+                out[str(k)] = v if isinstance(v, dict) else {}
+        else:
+            for k, v in (data or {}).items():
+                out[str(k)] = v if isinstance(v, dict) else {}
     return out
 
 

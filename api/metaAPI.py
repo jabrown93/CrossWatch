@@ -609,6 +609,50 @@ def _art_candidates(
     return []
 
 
+def _cached_art_lookup(cache_root: Path, base: Path) -> tuple[str, str] | None:
+    """Return (path, mime) if `base`'s cache entry (sidecar meta json plus its matching
+    art file) is already fully cached, else None. Shared by get_art_file / get_episode_still_file."""
+    meta_path = base.with_suffix(".json")
+    if not (meta_path.exists() and _read_json(meta_path).get("url")):
+        return None
+    for f in _cache_matches(cache_root, base.name):
+        if f.suffix.lower() != ".json" and f.exists():
+            ext = f.suffix.lower()
+            mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
+            return str(f), mime
+    return None
+
+
+def _store_art(
+    cache_root: Path,
+    base: Path,
+    meta_path: Path,
+    dest: Path,
+    src_url: str,
+    *,
+    debug_fields: dict[str, Any],
+) -> tuple[str, str]:
+    """Purge any stale cached file(s) for `base` whose recorded url no longer matches
+    `src_url`, log an art_cache_hit/miss debug event, then download (or reuse) `dest` and
+    refresh its sidecar meta json. Shared tail of get_art_file / get_episode_still_file —
+    callers must have already validated `meta_path`/`dest` via _ensure_under_root."""
+    prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
+    if (prev_url and prev_url != src_url) or (not meta_path.exists()):
+        for f in _cache_matches(cache_root, base.name):
+            if f.name != meta_path.name:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+    art_hit = bool(dest.exists() and prev_url == src_url)
+    _meta_debug("art_cache_hit" if art_hit else "art_cache_miss", **debug_fields)
+
+    path, mime = _cache_download(src_url, dest)
+    _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
+    return str(path), mime
+
+
 def get_art_file(
     api_key: str,
     typ: str,
@@ -636,15 +680,8 @@ def get_art_file(
     base = cache_root / f"{safe_typ}_{safe_tmdb_id}_{safe_kind}_{loc_tag}_{safe_size}"
     meta_path = base.with_suffix(".json")
 
-    cached_art = None
-    if meta_path.exists() and _read_json(meta_path).get("url"):
-        for f in cache_root.glob(base.name + ".*"):
-            if f.suffix.lower() != ".json" and f.exists():
-                cached_art = f
-                break
-    if cached_art:
-        ext = cached_art.suffix.lower()
-        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
+    cached = _cached_art_lookup(cache_root, base)
+    if cached:
         _meta_debug(
             "art_cache_hit",
             type=typ,
@@ -653,7 +690,7 @@ def get_art_file(
             size=safe_size,
             locale=eff_locale or "any",
         )
-        return str(cached_art), mime
+        return cached
 
     meta = get_meta(api_key, typ, str(tmdb_id), cache_dir=cache_dir, need={art_kind: True}, locale=eff_locale) or {}
     eff_locale = eff_locale or meta.get("locale") or None
@@ -675,9 +712,6 @@ def get_art_file(
     if not src_url:
         return str(_placeholder_poster()), "image/svg+xml"
 
-    base = cache_root / f"{safe_typ}_{safe_tmdb_id}_{safe_kind}_{loc_tag}_{safe_size}"
-    meta_path = base.with_suffix(".json")
-
     ext = Path(src_url.split("?", 1)[0]).suffix.lower() or ".jpg"
     if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
         ext = ".jpg"
@@ -687,28 +721,10 @@ def get_art_file(
     _ensure_under_root(cache_root, meta_path)
     _ensure_under_root(cache_root, dest)
 
-    prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
-    if (prev_url and prev_url != src_url) or (not meta_path.exists()):
-        for f in cache_root.glob(base.name + ".*"):
-            if f.name != meta_path.name:
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
-
-    art_hit = bool(dest.exists() and prev_url == src_url)
-    _meta_debug(
-        "art_cache_hit" if art_hit else "art_cache_miss",
-        type=typ,
-        tmdb_id=tmdb_id,
-        kind=art_kind,
-        size=size_tag,
-        locale=eff_locale or "any",
+    return _store_art(
+        cache_root, base, meta_path, dest, src_url,
+        debug_fields=dict(type=typ, tmdb_id=tmdb_id, kind=art_kind, size=size_tag, locale=eff_locale or "any"),
     )
-
-    path, mime = _cache_download(src_url, dest)
-    _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
-    return str(path), mime
 
 
 def get_episode_still_file(
@@ -727,15 +743,8 @@ def get_episode_still_file(
     base = _cache_base_path(cache_root, cache_stem)
     meta_path = base.with_suffix(".json")
 
-    cached_art = None
-    if meta_path.exists() and _read_json(meta_path).get("url"):
-        for f in _cache_matches(cache_root, cache_stem):
-            if f.suffix.lower() != ".json" and f.exists():
-                cached_art = f
-                break
-    if cached_art:
-        ext = cached_art.suffix.lower()
-        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
+    cached = _cached_art_lookup(cache_root, base)
+    if cached:
         _meta_debug(
             "art_cache_hit",
             type="tv",
@@ -745,7 +754,7 @@ def get_episode_still_file(
             episode=episode,
             size=safe_size,
         )
-        return str(cached_art), mime
+        return cached
 
     def show_art_fallback() -> tuple[str, str]:
         last: tuple[str, str] | None = None
@@ -780,40 +789,11 @@ def get_episode_still_file(
     meta_path = _ensure_under_root(cache_root, meta_path)
     dest = _ensure_under_root(cache_root, dest)
 
-    prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
-    if (prev_url and prev_url != src_url) or (not meta_path.exists()):
-        for f in _cache_matches(cache_root, cache_stem):
-            if f.name != meta_path.name:
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
-
-    art_hit = bool(dest.exists() and prev_url == src_url)
-    _meta_debug(
-        "art_cache_hit" if art_hit else "art_cache_miss",
-        type="tv",
-        tmdb_id=show_tmdb_id,
-        kind="still",
-        season=season,
-        episode=episode,
-        size=safe_size,
+    return _store_art(
+        cache_root, base, meta_path, dest, src_url,
+        debug_fields=dict(type="tv", tmdb_id=show_tmdb_id, kind="still", season=season, episode=episode, size=safe_size),
     )
 
-    path, mime = _cache_download(src_url, dest)
-    _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
-    return str(path), mime
-
-
-def get_poster_file(
-    api_key: str,
-    typ: str,
-    tmdb_id: str | int,
-    size: str,
-    cache_dir: Path | str,
-    locale: str | None = None,
-) -> tuple[str, str]:
-    return get_art_file(api_key, typ, tmdb_id, size, cache_dir, locale=locale, kind="poster")
 
 def _tmdb_external_ids(entity: str, tmdb_id: str | int) -> dict[str, str]:
     try:
