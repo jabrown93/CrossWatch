@@ -295,6 +295,62 @@ def _apply_chunked(
     agg["count"] = agg["confirmed"]
     return agg
 
+def _apply_op(
+    verb: str,
+    *,
+    dst_ops,
+    cfg,
+    dst_name: str,
+    feature: str,
+    items: Sequence[Mapping[str, Any]],
+    dry_run: bool,
+    emit,
+    dbg,
+    chunk_size: int,
+    chunk_pause_ms: int,
+    payload_key: str,
+    call: Callable[[Sequence[Mapping[str, Any]]], dict[str, Any] | None],
+) -> dict[str, Any]:
+    tag = f"apply:{verb}"
+    emit(f"{tag}:start", dst=dst_name, feature=feature, count=len(items))
+    res = _apply_chunked(
+        tag,
+        dst=dst_name,
+        feature=feature,
+        items=items,
+        call=call,
+        emit=emit,
+        dbg=dbg,
+        chunk_size=chunk_size,
+        chunk_pause_ms=chunk_pause_ms,
+    )
+    _conf = int(res.get("confirmed", 0))
+    payload: dict[str, Any] = {
+        "dst": dst_name,
+        "feature": feature,
+        "count": _conf,
+        "attempted": int(res.get("attempted", 0)),
+        payload_key: _conf,
+        "skipped": int(res.get("skipped", 0)),
+        "skipped_exact": int(res.get("skipped_exact", 0)),
+        "skipped_inferred": int(res.get("skipped_inferred", 0)),
+        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
+        "unresolved": int(res.get("unresolved", 0)),
+        "errors": int(res.get("errors", 0)),
+    }
+    emit(f"{tag}:done", **payload)
+    try:
+        spotlight = _ui_spotlight_items(
+            items,
+            cast(Sequence[str], res.get("confirmed_keys") or []),
+            fallback_count=_conf,
+        )
+        if spotlight:
+            emit("ui:spotlight", feature=feature, action=verb, items=spotlight, count=len(spotlight))
+    except Exception:
+        pass
+    return res
+
 def apply_add(
     *,
     dst_ops,
@@ -308,44 +364,21 @@ def apply_add(
     chunk_size: int,
     chunk_pause_ms: int,
 ) -> dict[str, Any]:
-    emit("apply:add:start", dst=dst_name, feature=feature, count=len(items))
-    res = _apply_chunked(
-        "apply:add",
-        dst=dst_name,
+    return _apply_op(
+        "add",
+        dst_ops=dst_ops,
+        cfg=cfg,
+        dst_name=dst_name,
         feature=feature,
         items=items,
-        call=lambda ch: dst_ops.add(cfg, ch, feature=feature, dry_run=dry_run),
+        dry_run=dry_run,
         emit=emit,
         dbg=dbg,
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
+        payload_key="added",
+        call=lambda ch: dst_ops.add(cfg, ch, feature=feature, dry_run=dry_run),
     )
-    _conf = int(res.get("confirmed", 0))
-    payload: dict[str, Any] = {
-        "dst": dst_name,
-        "feature": feature,
-        "count": _conf,
-        "attempted": int(res.get("attempted", 0)),
-        "added": _conf,
-        "skipped": int(res.get("skipped", 0)),
-        "skipped_exact": int(res.get("skipped_exact", 0)),
-        "skipped_inferred": int(res.get("skipped_inferred", 0)),
-        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
-        "unresolved": int(res.get("unresolved", 0)),
-        "errors": int(res.get("errors", 0)),
-    }
-    emit("apply:add:done", **payload)
-    try:
-        spotlight = _ui_spotlight_items(
-            items,
-            cast(Sequence[str], res.get("confirmed_keys") or []),
-            fallback_count=_conf,
-        )
-        if spotlight:
-            emit("ui:spotlight", feature=feature, action="add", items=spotlight, count=len(spotlight))
-    except Exception:
-        pass
-    return res
 
 def apply_update(
     *,
@@ -360,44 +393,21 @@ def apply_update(
     chunk_size: int,
     chunk_pause_ms: int,
 ) -> dict[str, Any]:
-    emit("apply:update:start", dst=dst_name, feature=feature, count=len(items))
-    res = _apply_chunked(
-        "apply:update",
-        dst=dst_name,
+    return _apply_op(
+        "update",
+        dst_ops=dst_ops,
+        cfg=cfg,
+        dst_name=dst_name,
         feature=feature,
         items=items,
-        call=lambda ch: dst_ops.add(cfg, ch, feature=feature, dry_run=dry_run),
+        dry_run=dry_run,
         emit=emit,
         dbg=dbg,
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
+        payload_key="updated",
+        call=lambda ch: dst_ops.add(cfg, ch, feature=feature, dry_run=dry_run),
     )
-    _conf = int(res.get("confirmed", 0))
-    payload: dict[str, Any] = {
-        "dst": dst_name,
-        "feature": feature,
-        "count": _conf,
-        "attempted": int(res.get("attempted", 0)),
-        "updated": _conf,
-        "skipped": int(res.get("skipped", 0)),
-        "skipped_exact": int(res.get("skipped_exact", 0)),
-        "skipped_inferred": int(res.get("skipped_inferred", 0)),
-        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
-        "unresolved": int(res.get("unresolved", 0)),
-        "errors": int(res.get("errors", 0)),
-    }
-    emit("apply:update:done", **payload)
-    try:
-        spotlight = _ui_spotlight_items(
-            items,
-            cast(Sequence[str], res.get("confirmed_keys") or []),
-            fallback_count=_conf,
-        )
-        if spotlight:
-            emit("ui:spotlight", feature=feature, action="update", items=spotlight, count=len(spotlight))
-    except Exception:
-        pass
-    return res
 
 def apply_remove(
     *,
@@ -412,41 +422,18 @@ def apply_remove(
     chunk_size: int,
     chunk_pause_ms: int,
 ) -> dict[str, Any]:
-    emit("apply:remove:start", dst=dst_name, feature=feature, count=len(items))
-    res = _apply_chunked(
-        "apply:remove",
-        dst=dst_name,
+    return _apply_op(
+        "remove",
+        dst_ops=dst_ops,
+        cfg=cfg,
+        dst_name=dst_name,
         feature=feature,
         items=items,
-        call=lambda ch: dst_ops.remove(cfg, ch, feature=feature, dry_run=dry_run),
+        dry_run=dry_run,
         emit=emit,
         dbg=dbg,
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
+        payload_key="removed",
+        call=lambda ch: dst_ops.remove(cfg, ch, feature=feature, dry_run=dry_run),
     )
-    _conf = int(res.get("confirmed", 0))
-    payload: dict[str, Any] = {
-        "dst": dst_name,
-        "feature": feature,
-        "count": _conf,
-        "attempted": int(res.get("attempted", 0)),
-        "removed": _conf,
-        "skipped": int(res.get("skipped", 0)),
-        "skipped_exact": int(res.get("skipped_exact", 0)),
-        "skipped_inferred": int(res.get("skipped_inferred", 0)),
-        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
-        "unresolved": int(res.get("unresolved", 0)),
-        "errors": int(res.get("errors", 0)),
-    }
-    emit("apply:remove:done", **payload)
-    try:
-        spotlight = _ui_spotlight_items(
-            items,
-            cast(Sequence[str], res.get("confirmed_keys") or []),
-            fallback_count=_conf,
-        )
-        if spotlight:
-            emit("ui:spotlight", feature=feature, action="remove", items=spotlight, count=len(spotlight))
-    except Exception:
-        pass
-    return res

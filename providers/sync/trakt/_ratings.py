@@ -21,9 +21,9 @@ from ._common import (
     _pair_scope,
     _is_capture_mode,
     _now_iso,
-    _chunk,
     headers_for_adapter,
 )
+from .._mod_common import _chunk_items as _chunk
 from cw_platform.id_map import minimal as id_minimal
 from .._log import log as cw_log
 

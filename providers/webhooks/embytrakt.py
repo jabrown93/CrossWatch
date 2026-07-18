@@ -21,6 +21,14 @@ from providers.scrobble.currently_watching import update_from_payload as _cw_upd
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
 from providers.webhooks._utils import verify_webhook_secret as _verify_webhook_secret
+from providers.webhooks._utils import (
+    _cache_get,
+    _cache_put,
+    _del_trakt,
+    _headers,
+    _load_config,
+    _save_config,
+)
 from providers.scrobble.sources import source_enabled
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
@@ -188,20 +196,6 @@ def _emby_passes_scrobble_library(
     _emit(logger, f"event filtered by scrobble whitelist: view=none allowed={sorted(libs)} item={name}", 'DEBUG')
     return False
 
-def _load_config() -> dict[str, Any]:
-    try:
-        return load_config()
-    except Exception:
-        return {}
-
-
-def _save_config(cfg: dict[str, Any]) -> None:
-    try:
-        save_config(cfg)
-    except Exception:
-        pass
-
-
 def _is_debug() -> bool:
     try:
         rt = _load_config().get("runtime") or {}
@@ -307,38 +301,6 @@ def _app_meta(cfg: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def _headers(cfg: dict[str, Any]) -> dict[str, str]:
-    t = _tokens(cfg)
-    h = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "trakt-api-version": "2",
-        "trakt-api-key": t["client_id"],
-        "User-Agent": "CrossWatch/Scrobble",
-    }
-    if t["access_token"]:
-        h["Authorization"] = f"Bearer {t['access_token']}"
-    return h
-
-
-def _del_trakt(path: str, cfg: dict[str, Any]) -> requests.Response:
-    url = f"{TRAKT_API}{path}"
-    r = requests.delete(url, headers=_headers(cfg), timeout=12)
-    if r.status_code == 401:
-        try:
-            from providers.auth._auth_TRAKT import PROVIDER as TRAKT_AUTH
-
-            TRAKT_AUTH.refresh(cfg)
-            _save_config(cfg)
-        except Exception:
-            return r
-        try:
-            r = requests.delete(url, headers=_headers(cfg), timeout=12)
-        except Exception:
-            pass
-    return r
-
-
 def _post_trakt(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> requests.Response:
     url = f"{TRAKT_API}{path}"
     body = {**body, **_app_meta(cfg)}
@@ -355,20 +317,6 @@ def _post_trakt(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> request
     return r
 
 
-def _cache_get(key: tuple[Any, ...]) -> Any | None:
-    try:
-        return _TRAKT_ID_CACHE.get(key)
-    except Exception:
-        return None
-
-
-def _cache_put(key: tuple[Any, ...], value: Any) -> None:
-    try:
-        if len(_TRAKT_ID_CACHE) > 2048:
-            _TRAKT_ID_CACHE.clear()
-        _TRAKT_ID_CACHE[key] = value
-    except Exception:
-        pass
 
 
 def _as_bool(v: Any) -> bool | None:
@@ -553,7 +501,7 @@ def _show_ids_from_episode_hint(
         ids_hint.get("tvdb"),
     )
 
-    c = _cache_get(cache_key)
+    c = _cache_get(_TRAKT_ID_CACHE, cache_key)
     if isinstance(c, dict):
         return c
     if c is not None:
@@ -562,7 +510,7 @@ def _show_ids_from_episode_hint(
     try:
         out = _guid_search_episode(ids_hint, cfg, logger=logger)
         if out:
-            _cache_put(cache_key, out)
+            _cache_put(_TRAKT_ID_CACHE, cache_key, out)
             return out
     except Exception:
         pass
@@ -589,10 +537,10 @@ def _show_ids_from_episode_hint(
             out = {k: show_ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if show_ids.get(k)}
             if out:
                 _emit(logger, f"resolved SHOW ids from episode hint: {out}", "DEBUG")
-                _cache_put(cache_key, out)
+                _cache_put(_TRAKT_ID_CACHE, cache_key, out)
                 return out
 
-    _cache_put(cache_key, None)
+    _cache_put(_TRAKT_ID_CACHE, cache_key, None)
     return {}
 
 

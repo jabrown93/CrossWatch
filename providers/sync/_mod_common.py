@@ -7,10 +7,13 @@ import json
 import os
 import time
 import threading
-from typing import Any, Callable, Mapping
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 import requests
+
+from cw_platform.provider_instances import normalize_instance_id
 
 from ._log import log as cw_log
 
@@ -30,6 +33,16 @@ __all__ = [
     "label_jellyfin",
     "label_emby",
     "SimpleRateLimiter",
+    "_confirmed_keys",
+    "_pair_scope",
+    "_safe_scope",
+    "_is_capture_mode",
+    "_chunk_items",
+    "_pick_instance_id",
+    "_merge_instance_block",
+    "_iso_ok",
+    "_iso_z",
+    "_max_iso",
 ]
 
 EmitFn = Callable[[str, Mapping[str, Any]], None]
@@ -637,3 +650,135 @@ def request_with_retries(
         msg = f"{msg} ({type(last).__name__}: {last})"
     _http_log(session, "error", "http_request_failed", method=method, url=url, api_feature=api_feature, max_retries=max_retries, error=msg)
     raise requests.RequestException(msg)
+
+
+def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
+    attempted: list[str] = []
+    for it in items or []:
+        try:
+            k = str(key_of(it) or "").strip()
+        except Exception:
+            k = ""
+        if k:
+            attempted.append(k)
+
+    unresolved_keys: set[str] = set()
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                if isinstance(u.get("key"), str) and u.get("key"):
+                    unresolved_keys.add(str(u.get("key")))
+                    continue
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                unresolved_keys.add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                try:
+                    k = str(key_of(obj) or "").strip()
+                except Exception:
+                    k = ""
+                if k:
+                    unresolved_keys.add(k)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in attempted:
+        if k in unresolved_keys or k in seen:
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
+
+
+def _chunk_items(seq: list[Any], n: int) -> Iterable[list[Any]]:
+    size = max(1, int(n or 1))
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _pick_instance_id(provider: str) -> str:
+    prov = str(provider or "").upper().strip()
+    for k in ("CW_SNAPSHOT_INSTANCE", "CW_INSTANCE_ID", "CW_PROFILE", "CW_PROVIDER_INSTANCE", "CW_INSTANCE"):
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return normalize_instance_id(v)
+    if (os.environ.get("CW_PAIR_SRC") or "").upper().strip() == prov:
+        v = (os.environ.get("CW_PAIR_SRC_INSTANCE") or os.environ.get("CW_SRC_INSTANCE") or "").strip()
+        if v:
+            return normalize_instance_id(v)
+    if (os.environ.get("CW_PAIR_DST") or "").upper().strip() == prov:
+        v = (os.environ.get("CW_PAIR_DST_INSTANCE") or os.environ.get("CW_DST_INSTANCE") or "").strip()
+        if v:
+            return normalize_instance_id(v)
+    v = (os.environ.get("CW_PAIR_INSTANCE") or "").strip()
+    return normalize_instance_id(v)
+
+
+def _merge_instance_block(raw: Any, inst: str) -> dict[str, Any]:
+    base = dict(raw or {}) if isinstance(raw, Mapping) else {}
+    if inst == "default":
+        base.pop("instances", None)
+        return base
+    insts = base.get("instances")
+    if isinstance(insts, Mapping) and isinstance(insts.get(inst), Mapping):
+        merged = dict(base)
+        merged.update(dict(insts.get(inst) or {}))
+        merged.pop("instances", None)
+        return merged
+    base.pop("instances", None)
+    return base
+
+
+def _iso_ok(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except Exception:
+        return False
+
+
+def _iso_z(value: str | None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid ISO timestamp")
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _max_iso(a: str | None, b: str | None) -> str | None:
+    if not _iso_ok(a):
+        return _iso_z(b) if _iso_ok(b) else None
+    if not _iso_ok(b):
+        return _iso_z(a)
+    a_z = _iso_z(a)
+    b_z = _iso_z(b)
+    dt_a = datetime.fromisoformat(a_z.replace("Z", "+00:00"))
+    dt_b = datetime.fromisoformat(b_z.replace("Z", "+00:00"))
+    return _iso_z(a if dt_a >= dt_b else b)

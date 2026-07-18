@@ -206,31 +206,31 @@ def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens:
 def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None, provider: str = "") -> str:
     return provider_index_semantics(ops, cfg or {}, feature)
 
+def _iso_to_epoch(v: Any) -> int | None:
+    if not v:
+        return None
+    try:
+        s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+        dt = _dt.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+def _pick_newest(a: Any, b: Any) -> Any:
+    ae = _iso_to_epoch(a)
+    be = _iso_to_epoch(b)
+    if be is None:
+        return a
+    if ae is None or be > ae:
+        return b
+    return a
+
 # Enrichment and hydration of index payloads
 def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
     if not cur or not prev:
         return dict(cur or {})
-
-    def _iso_to_epoch(v: Any) -> int | None:
-        if not v:
-            return None
-        try:
-            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
-            dt = _dt.datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            return int(dt.timestamp())
-        except Exception:
-            return None
-
-    def _pick_newest(a: Any, b: Any) -> Any:
-        ae = _iso_to_epoch(a)
-        be = _iso_to_epoch(b)
-        if be is None:
-            return a
-        if ae is None or be > ae:
-            return b
-        return a
 
     out: dict[str, Any] = {}
     for k, cv in (cur or {}).items():
@@ -279,27 +279,6 @@ def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: st
 def _hydrate_missing_fields(cur: dict[str, Any], donor: dict[str, Any], feature: str) -> dict[str, Any]:
     if not cur or not donor:
         return dict(cur or {})
-
-    def _iso_to_epoch(v: Any) -> int | None:
-        if not v:
-            return None
-        try:
-            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
-            dt = _dt.datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            return int(dt.timestamp())
-        except Exception:
-            return None
-
-    def _pick_newest(a: Any, b: Any) -> Any:
-        ae = _iso_to_epoch(a)
-        be = _iso_to_epoch(b)
-        if be is None:
-            return a
-        if ae is None or be > ae:
-            return b
-        return a
 
     out: dict[str, Any] = {}
     for k, cv in (cur or {}).items():

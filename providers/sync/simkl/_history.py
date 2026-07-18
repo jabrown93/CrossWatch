@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, cast
 from cw_platform.id_map import canonical_key as _canonical_key, minimal as id_minimal
 
 from .._log import log as cw_log
+from .._mod_common import _chunk_items
 from ._common import (
     adapter_headers,
     fetch_activities,
@@ -144,11 +145,6 @@ def _int_or_none(value: Any) -> int | None:
     except Exception:
         return None
 
-
-def _chunk_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
-    size = max(1, int(n or 1))
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
 
 def _log(msg: str, *, level: str = "debug", **fields: Any) -> None:
     cw_log("SIMKL", "history", level, msg, **fields)

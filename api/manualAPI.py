@@ -10,32 +10,11 @@ import requests
 from fastapi import APIRouter, Body
 from fastapi.responses import JSONResponse
 
+from cw_platform.config_base import _tmdb_api_key
 from cw_platform.modules_registry import load_sync_ops
 from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id
 
 router = APIRouter(prefix="/api/manual", tags=["manual"])
-
-
-def _tmdb_api_key(cfg: dict[str, Any]) -> str:
-    def _pick_from_block(blk: Any) -> str:
-        if not isinstance(blk, dict):
-            return ""
-        k = str(blk.get("api_key") or "").strip()
-        if k:
-            return k
-        insts = blk.get("instances")
-        if isinstance(insts, dict):
-            for v in insts.values():
-                kk = str((v or {}).get("api_key") or "").strip() if isinstance(v, dict) else ""
-                if kk:
-                    return kk
-        return ""
-
-    for key in ("tmdb", "tmdb_sync"):
-        found = _pick_from_block(cfg.get(key))
-        if found:
-            return found
-    return ""
 
 
 def _normalize_media_type(value: Any) -> str:

@@ -6,14 +6,20 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
 
-from .._mod_common import request_with_retries
+from .._mod_common import (
+    request_with_retries,
+    _pair_scope,
+    _is_capture_mode,
+    _safe_scope,
+    _iso_ok,
+    _max_iso,
+)
 from .._log import log as cw_log
 
 # headers
@@ -26,27 +32,6 @@ def _user_agent() -> str:
 
 STATE_DIR = Path("/config/.cw_state")
 _ACT_MEMO: tuple[float, dict[str, Any] | None] = (0.0, None)
-
-
-def _pair_scope() -> str | None:
-    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return None
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -81,12 +66,6 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _chunk(seq: list[Any], n: int) -> Iterable[list[Any]]:
-    n = max(1, int(n or 1))
-    for i in range(0, len(seq), n):
-        yield seq[i : i + n]
 
 
 def _last_limit_path() -> Path:
@@ -157,37 +136,6 @@ def update_watermark_if_new(feature: str, iso_ts: str | None) -> str | None:
     if new and new != current:
         save_watermark(feature, new)
     return new
-
-
-def _iso_ok(value: object) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return True
-    except Exception:
-        return False
-
-
-def _iso_z(value: str | None) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("invalid ISO timestamp")
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _max_iso(a: str | None, b: str | None) -> str | None:
-    if not _iso_ok(a):
-        return _iso_z(b) if _iso_ok(b) else None
-    if not _iso_ok(b):
-        return _iso_z(a)
-    a_z = _iso_z(a)
-    b_z = _iso_z(b)
-    dt_a = datetime.fromisoformat(a_z.replace("Z", "+00:00"))
-    dt_b = datetime.fromisoformat(b_z.replace("Z", "+00:00"))
-    return _iso_z(a if dt_a >= dt_b else b)
 
 
 def fetch_last_activities(

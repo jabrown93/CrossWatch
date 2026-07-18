@@ -7,7 +7,7 @@ import threading
 from typing import Any
 from fastapi import FastAPI, Query
 
-from cw_platform.config_base import config_path, load_config
+from cw_platform.config_base import _tmdb_api_key, config_path, load_config
 from services.watchlist import build_watchlist, detect_available_watchlist_providers
 from .syncAPI import _load_state, _peek_state_key
 
@@ -35,27 +35,6 @@ def _cache_key(*, both_only: bool, active_only: bool, limit: int) -> tuple[Any, 
         int(limit or 0),
     )
 
-
-def _tmdb_api_key(cfg: dict[str, Any]) -> str:
-    def _pick_from_block(blk: Any) -> str:
-        if not isinstance(blk, dict):
-            return ""
-        k = str(blk.get("api_key") or "").strip()
-        if k:
-            return k
-        insts = blk.get("instances")
-        if isinstance(insts, dict):
-            for v in insts.values():
-                kk = str((v or {}).get("api_key") or "").strip() if isinstance(v, dict) else ""
-                if kk:
-                    return kk
-        return ""
-
-    for key in ("tmdb", "tmdb_sync"):
-        found = _pick_from_block(cfg.get(key))
-        if found:
-            return found
-    return ""
 
 def _load_wall_snapshot() -> list[dict[str, Any]]:
     try:

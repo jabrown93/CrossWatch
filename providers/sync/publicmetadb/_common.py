@@ -19,6 +19,7 @@ from cw_platform.metadata_cache import (
 )
 
 from .._log import log as cw_log
+from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 
 STATE_DIR = CONFIG_BASE() / ".cw_state"
 # STATE_DIR is created lazily on first write (see write_json). Don't mkdir at
@@ -26,27 +27,6 @@ STATE_DIR = CONFIG_BASE() / ".cw_state"
 # provider discovery, and a failed mkdir (non-root / source installs / CI where
 # /config is absent or unwritable) would crash the import and silently drop
 # PUBLICMETADB from the available providers.
-
-
-def _pair_scope() -> str | None:
-    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return None
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:

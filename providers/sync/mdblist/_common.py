@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, TypeGuard
 import requests
 
 from .._log import log as cw_log
+from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 from ._auth import is_configured as auth_configured
 from ._auth import request_with_auth as mdblist_request_with_auth
 
@@ -23,29 +24,6 @@ START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 # STATE_DIR is created lazily on first write (see write_json / _migrate_legacy_json).
 # Don't mkdir at import time — it crashes when /config is absent or unwritable (e.g. CI),
 # and the other sync providers already defer directory creation the same way.
-
-
-def _pair_scope() -> str | None:
-    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return None
-
-
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def _scoped_watermark_path(path: Path) -> Path:

@@ -23,7 +23,7 @@ from ._common import (
     _record_limit_error,
     headers_for_adapter,
 )
-from .._mod_common import request_with_retries
+from .._mod_common import request_with_retries, _chunk_items as _chunked_items
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 from .._log import log as cw_log
 
@@ -179,11 +179,6 @@ def _cfg_num(adapter: Any, key: str, default: Any, cast: Callable[[Any], Any] = 
     except Exception:
         return cast(default)
 
-
-def _chunked_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
-    size = max(1, int(n or 1))
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
 
 
 def _freeze_enabled(adapter: Any) -> bool:

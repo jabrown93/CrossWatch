@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 from fastapi import APIRouter, Body, Path as FPath, Query
 from fastapi.responses import JSONResponse
 
+from cw_platform.config_base import _tmdb_api_key
 from services.watchlist import (
     _feat_enabled,
     _find_item_in_state,
@@ -115,27 +116,6 @@ def _active_pair_watchlist_providers(cfg: dict[str, Any]) -> list[str]:
                 out.append(prov)
     return out
 
-
-def _tmdb_api_key(cfg: dict[str, Any]) -> str:
-    def _pick_from_block(blk: Any) -> str:
-        if not isinstance(blk, dict):
-            return ""
-        k = str(blk.get("api_key") or "").strip()
-        if k:
-            return k
-        insts = blk.get("instances")
-        if isinstance(insts, dict):
-            for v in insts.values():
-                kk = str((v or {}).get("api_key") or "").strip() if isinstance(v, dict) else ""
-                if kk:
-                    return kk
-        return ""
-
-    for key in ("tmdb", "tmdb_sync"):
-        found = _pick_from_block(cfg.get(key))
-        if found:
-            return found
-    return ""
 
 def _type_from_item_or_guess(item: dict[str, Any], key: str = "") -> str:
     t = str(item.get("type") or item.get("media_type") or item.get("entity") or "").lower().strip()

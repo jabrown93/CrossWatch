@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
 
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 
+from .._mod_common import _safe_scope
 
 _PAIR_SCOPE_ENV: tuple[str, ...] = ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR")
 
@@ -45,14 +46,6 @@ def _pair_scope() -> str | None:
         if v and str(v).strip():
             return str(v).strip()
     return "unscoped"
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def scope_safe() -> str:

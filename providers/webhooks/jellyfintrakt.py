@@ -18,6 +18,19 @@ from providers.scrobble.currently_watching import update_from_payload as _cw_upd
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
 from providers.webhooks._utils import verify_webhook_secret as _verify_webhook_secret
+from providers.webhooks._utils import (
+    _app_meta,
+    _best_id_key_order,
+    _call_remove_across,
+    _cache_get,
+    _cache_put,
+    _del_trakt,
+    _headers,
+    _is_debug,
+    _load_config,
+    _save_config,
+    _tokens,
+)
 from providers.scrobble.sources import source_enabled
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
@@ -188,61 +201,6 @@ def _jf_passes_scrobble_library(
     _emit(logger, f"event filtered by scrobble whitelist: view=none allowed={sorted(libs)} item={name}", 'DEBUG')
     return False
 
-def _load_config() -> dict[str, Any]:
-    try:
-        return load_config()
-    except Exception:
-        return {}
-
-
-def _save_config(cfg: dict[str, Any]) -> None:
-    try:
-        save_config(cfg)
-    except Exception:
-        pass
-
-
-def _call_remove_across(ids: dict[str, Any], media_type: str) -> None:
-    if not isinstance(ids, dict) or not ids:
-        return
-    try:
-        cfg = _load_config()
-        s = (cfg.get("scrobble") or {})
-        if not s.get("delete_plex"):
-            return
-        tps = s.get("delete_plex_types") or []
-        mt = (media_type or "").strip().lower()
-        allow = False
-        if isinstance(tps, list):
-            allow = (mt in tps) or ((mt.rstrip("s") + "s") in tps)
-        elif isinstance(tps, str):
-            allow = mt in tps
-        if not allow:
-            return
-    except Exception:
-        pass
-    try:
-        if callable(_rm_across):
-            _rm_across(ids, media_type)
-            return
-    except Exception:
-        pass
-    try:
-        if callable(_rm_across_api):
-            _rm_across_api(ids, media_type)  # type: ignore[arg-type]
-            return
-    except Exception:
-        pass
-
-
-def _is_debug() -> bool:
-    try:
-        rt = (_load_config().get("runtime") or {})
-        return bool(rt.get("debug") or rt.get("debug_mods"))
-    except Exception:
-        return False
-
-
 def _emit(logger: Callable[..., None] | Any | None, msg: str, level: str = "INFO") -> None:
     lvl_raw = str(level or "INFO")
     lvl_up = lvl_raw.upper()
@@ -324,59 +282,6 @@ def _ensure_scrobble(cfg: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
-def _tokens(cfg: dict[str, Any]) -> dict[str, str]:
-    tr = cfg.get("trakt") or {}
-    au = ((cfg.get("auth") or {}).get("trakt") or {})
-    return {
-        "client_id": (tr.get("client_id") or "").strip(),
-        "client_secret": (tr.get("client_secret") or "").strip(),
-        "access_token": (au.get("access_token") or tr.get("access_token") or "").strip(),
-        "refresh_token": (au.get("refresh_token") or tr.get("refresh_token") or "").strip(),
-    }
-
-
-def _app_meta(cfg: dict[str, Any]) -> dict[str, str]:
-    rt = (cfg.get("runtime") or {})
-    av = str(rt.get("version") or "CrossWatch/Scrobble")
-    ad = (rt.get("build_date") or "").strip()
-    meta: dict[str, str] = {"app_version": av}
-    if ad:
-        meta["app_date"] = ad
-    return meta
-
-
-def _headers(cfg: dict[str, Any]) -> dict[str, str]:
-    t = _tokens(cfg)
-    h = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "trakt-api-version": "2",
-        "trakt-api-key": t["client_id"],
-        "User-Agent": "CrossWatch/Scrobble",
-    }
-    if t["access_token"]:
-        h["Authorization"] = f"Bearer {t['access_token']}"
-    return h
-
-
-def _del_trakt(path: str, cfg: dict[str, Any]) -> requests.Response:
-    url = f"{TRAKT_API}{path}"
-    r = requests.delete(url, headers=_headers(cfg), timeout=12)
-    if r.status_code == 401:
-        try:
-            from providers.auth._auth_TRAKT import PROVIDER as TRAKT_AUTH
-
-            TRAKT_AUTH.refresh(cfg)
-            _save_config(cfg)
-        except Exception:
-            return r
-        try:
-            r = requests.delete(url, headers=_headers(cfg), timeout=12)
-        except Exception:
-            pass
-    return r
-
-
 def _get_trakt_watching(cfg: dict[str, Any]) -> None:
     try:
         r = requests.get(f"{TRAKT_API}/users/me/watching", headers=_headers(cfg), timeout=8)
@@ -431,20 +336,6 @@ def _post_trakt(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> request
     return r
 
 
-def _cache_get(key: tuple[Any, ...]) -> Any | None:
-    try:
-        return _TRAKT_ID_CACHE.get(key)
-    except Exception:
-        return None
-
-
-def _cache_put(key: tuple[Any, ...], value: Any) -> None:
-    try:
-        if len(_TRAKT_ID_CACHE) > 2048:
-            _TRAKT_ID_CACHE.clear()
-        _TRAKT_ID_CACHE[key] = value
-    except Exception:
-        pass
 
 
 def _grab(d: Mapping[str, Any], keys: list[str]) -> Any:
@@ -543,7 +434,7 @@ def _guid_search_episode(ids_hint: dict[str, Any], cfg: dict[str, Any], logger: 
 
 def _resolve_trakt_movie_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger: Callable[..., None] | Any | None = None) -> int | None:
     key = ("movie", ids_all.get("imdb"), ids_all.get("tmdb"), ids_all.get("tvdb"))
-    c = _cache_get(key)
+    c = _cache_get(_TRAKT_ID_CACHE, key)
     if c is not None:
         return c
     for k in ("tmdb", "imdb", "tvdb"):
@@ -564,17 +455,17 @@ def _resolve_trakt_movie_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger
                 continue
             tid = (((arr[0] or {}).get("movie") or {}).get("ids") or {}).get("trakt")
             if tid:
-                _cache_put(key, int(tid))
+                _cache_put(_TRAKT_ID_CACHE, key, int(tid))
                 return int(tid)
         except Exception as e:
             _emit(logger, f"trakt movie id resolve error: {e}", "DEBUG")
-    _cache_put(key, None)
+    _cache_put(_TRAKT_ID_CACHE, key, None)
     return None
 
 
 def _resolve_trakt_show_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger: Callable[..., None] | Any | None = None) -> int | None:
     key = ("show", ids_all.get("imdb"), ids_all.get("tmdb"), ids_all.get("tvdb"))
-    c = _cache_get(key)
+    c = _cache_get(_TRAKT_ID_CACHE, key)
     if c is not None:
         return c
     for k in ("tmdb", "imdb", "tvdb"):
@@ -595,11 +486,11 @@ def _resolve_trakt_show_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger:
                 continue
             tid = (((arr[0] or {}).get("show") or {}).get("ids") or {}).get("trakt")
             if tid:
-                _cache_put(key, int(tid))
+                _cache_put(_TRAKT_ID_CACHE, key, int(tid))
                 return int(tid)
         except Exception as e:
             _emit(logger, f"trakt show id resolve error: {e}", "DEBUG")
-    _cache_put(key, None)
+    _cache_put(_TRAKT_ID_CACHE, key, None)
     return None
 
 
@@ -609,7 +500,7 @@ def _trakt_show_ids_from_imdb_show(imdb_show: str, cfg: dict[str, Any], logger: 
         return {}
 
     key = ("show_ids_imdb", imdb_show)
-    c = _cache_get(key)
+    c = _cache_get(_TRAKT_ID_CACHE, key)
     if isinstance(c, dict):
         return c
     if c is not None:
@@ -623,21 +514,21 @@ def _trakt_show_ids_from_imdb_show(imdb_show: str, cfg: dict[str, Any], logger: 
             timeout=10,
         )
         if r.status_code != 200:
-            _cache_put(key, None)
+            _cache_put(_TRAKT_ID_CACHE, key, None)
             return {}
         arr = r.json() or []
         if not arr:
-            _cache_put(key, None)
+            _cache_put(_TRAKT_ID_CACHE, key, None)
             return {}
         ids = (((arr[0] or {}).get("show") or {}).get("ids") or {})
         out = {k: ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if ids.get(k)}
-        _cache_put(key, out if out else None)
+        _cache_put(_TRAKT_ID_CACHE, key, out if out else None)
         if out:
             _emit(logger, f"trakt show ids from imdb_show {imdb_show}: {out}", "DEBUG")
         return out
     except Exception as e:
         _emit(logger, f"trakt show ids from imdb_show {imdb_show} error: {e}", "DEBUG")
-        _cache_put(key, None)
+        _cache_put(_TRAKT_ID_CACHE, key, None)
         return {}
 
 
@@ -650,7 +541,7 @@ def _resolve_trakt_episode_id(
 ) -> int | None:
     s, e = _episode_numbers(md, root or md)
     key = ("episode", ids_all.get("imdb"), ids_all.get("tmdb"), ids_all.get("tvdb"), s, e)
-    c = _cache_get(key)
+    c = _cache_get(_TRAKT_ID_CACHE, key)
     if c is not None:
         return c
 
@@ -658,7 +549,7 @@ def _resolve_trakt_episode_id(
     found = _guid_search_episode(hint if hint else ids_all, cfg, logger=logger)
     tid = (found or {}).get("trakt")
     if isinstance(tid, int):
-        _cache_put(key, tid)
+        _cache_put(_TRAKT_ID_CACHE, key, tid)
         return tid
 
     show_tid = _resolve_trakt_show_id(ids_all, cfg, logger=logger)
@@ -673,17 +564,13 @@ def _resolve_trakt_episode_id(
                 ej = r.json() or {}
                 tid2 = ((ej.get("ids") or {}).get("trakt"))
                 if tid2:
-                    _cache_put(key, int(tid2))
+                    _cache_put(_TRAKT_ID_CACHE, key, int(tid2))
                     return int(tid2)
         except Exception as ex:
             _emit(logger, f"trakt ep id resolve error: {ex}", "DEBUG")
 
-    _cache_put(key, None)
+    _cache_put(_TRAKT_ID_CACHE, key, None)
     return None
-
-
-def _best_id_key_order(media_type: str) -> tuple[str, ...]:
-    return ("tmdb", "imdb", "tvdb") if media_type == "movie" else ("tmdb", "imdb", "tvdb")
 
 
 def _series_ids_from_payload(md: Mapping[str, Any], root: Mapping[str, Any]) -> dict[str, Any]:
@@ -725,7 +612,7 @@ def _show_ids_from_episode_hint(
         ids_hint.get("tvdb"),
     )
 
-    c = _cache_get(cache_key)
+    c = _cache_get(_TRAKT_ID_CACHE, cache_key)
     if isinstance(c, dict):
         return c
     if c is not None:
@@ -753,10 +640,10 @@ def _show_ids_from_episode_hint(
             out = {k: show_ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if show_ids.get(k)}
             if out:
                 _emit(logger, f"guid search resolved SHOW ids from episode: {out}", "DEBUG")
-                _cache_put(cache_key, out)
+                _cache_put(_TRAKT_ID_CACHE, cache_key, out)
                 return out
 
-    _cache_put(cache_key, None)
+    _cache_put(_TRAKT_ID_CACHE, cache_key, None)
     return {}
 
 
