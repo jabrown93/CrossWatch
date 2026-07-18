@@ -616,7 +616,6 @@ function renderInstanceSelects(state){
 
 // Fold toggles (works with draggable modals)
 function bindFoldToggles(root){
-  const isSummary=(el)=>el && el.tagName==="SUMMARY";
   root.addEventListener("click",(e)=>{
     const sum=e.target.closest?.("summary.fold-head, .fold > summary");
     

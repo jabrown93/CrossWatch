@@ -43,9 +43,6 @@ MDBLIST_API = "https://api.mdblist.com"
 APP_AGENT = "CrossWatch/Watcher/1.0"
 _AR_TTL = 60
 
-_RESOLVE_TTL_S = 30 * 86400
-_RESOLVE_NEG_TTL_S = 6 * 3600
-
 _TVDB_SHOW_ID_MAX = 9_999_999
 
 
@@ -176,16 +173,6 @@ def _progress_step(cfg: dict[str, Any]) -> int:
     except Exception:
         step_i = 5
     return max(1, min(25, step_i))
-
-
-def _quantize_progress(prog: int, step: int, action: str) -> int:
-    p = _clamp(prog)
-    if step <= 1 or action == "stop":
-        return p
-    if p < step:
-        return max(1, p)
-    q = (p // step) * step
-    return max(1, min(100, q))
 
 
 def _clamp(p: Any) -> int:

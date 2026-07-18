@@ -7,18 +7,14 @@ import json
 import re
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, TypeGuard
+from typing import Any, Iterable, Mapping
 
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
 
-from .._mod_common import request_with_retries
-
 from ._common import (
-    STATE_DIR,
     state_file,
     as_epoch,
     as_iso,

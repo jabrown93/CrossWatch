@@ -346,59 +346,6 @@ def remove_across_providers_by_ids(
     }
 
 
-def remove_from_provider_by_ids(
-    provider: str,
-    ids: dict[str, Any],
-    media_type: str | None = None,
-) -> dict[str, Any]:
-    from cw_platform.config_base import load_config
-    from crosswatch import _append_log
-    from .syncAPI import _load_state
-
-    cfg = load_config()
-    state = _load_state() or {}
-    prov = (provider or "").strip().upper()
-    if not prov:
-        return {"ok": False, "error": "missing provider"}
-    if prov not in _active_providers(cfg):
-        return {"ok": False, "error": f"provider '{prov}' not connected"}
-
-    keys = _candidate_keys_from_ids(ids)
-    if not keys:
-        return {"ok": False, "error": "no candidate keys from ids"}
-
-    found_key = None
-    for k in keys:
-        if _find_item_in_state_for_provider(state, k, prov):
-            found_key = k
-            break
-
-    if not found_key:
-        return {"ok": False, "reason": "not_in_state"}
-
-    try:
-        r = delete_watchlist_batch([found_key], prov, state, cfg) or {}
-        deleted = int(r.get("deleted", 0)) if isinstance(r, dict) else 0
-        ok = deleted > 0
-        kind, label = _item_label(state, found_key, prov)
-        _append_log(
-            "SYNC",
-            f"[WL] remove_by_ids on {prov}: {kind} '{label}' → {'OK' if ok else 'NOOP'}",
-        )
-        return {"ok": ok, "deleted": deleted, "provider": prov, "key": found_key}
-    except Exception as e:
-        _append_log("SYNC", f"[WL] remove_by_ids on {prov} failed: {e}")
-        return {"ok": False, "error": _public_error("delete_failed"), "provider": prov}
-
-
-def remove_from_plex_by_ids(
-    ids: dict[str, Any],
-    media_type: str | None = None,
-) -> dict[str, Any]:
-    return remove_from_provider_by_ids("PLEX", ids, media_type)
-
-
-
 @router.get("", include_in_schema=False)
 @router.get("/")
 def api_watchlist(

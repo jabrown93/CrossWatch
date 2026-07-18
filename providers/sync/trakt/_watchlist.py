@@ -19,7 +19,6 @@ from ._common import (
     _is_capture_mode,
     _now_iso,
     _chunk,
-    _last_limit_path,
     _record_limit_error,
     headers_for_adapter,
 )

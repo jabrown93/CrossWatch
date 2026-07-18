@@ -14,7 +14,6 @@ from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
-from .._mod_common import request_with_retries
 from ._common import (
     _pair_scope,
     _is_capture_mode,

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from ._types import ConflictPolicy, InventoryOps
@@ -14,12 +14,7 @@ from ._state_store import StateStore
 from ._logging import Emitter
 from ._telemetry import Stats, maybe_emit_rate_warnings
 from ._pairs import run_pairs as _run_pairs
-from ._tombstones import (
-    prune as _tomb_prune,
-    keys_for_feature as _tomb_keys_for_feature,
-    filter_with as _tomb_filter_with,
-    cascade_removals as _tomb_cascade,
-)
+from ._tombstones import prune as _tomb_prune
 from ._snapshots import (
     build_snapshots_for_feature as _build_snaps,
     allowed_providers_for_feature as _allowed_pf,
@@ -463,13 +458,6 @@ class Orchestrator:
 
         seen: set[str] = set()
         uniq: list[dict[str, Any]] = []
-
-        try:
-            from ..id_map import canonical_key  # type: ignore[no-redef]
-        except Exception:
-            def canonical_key(item: _MappingType[str, Any]) -> str:  # type: ignore[no-redef]
-                ids = item.get("ids", {})
-                return str(ids.get("imdb") or "")
 
         for it in wall:
             k = canonical_key(it)

@@ -863,14 +863,10 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
         if not group:
             continue
         alias_keys = sorted({key for key, _, _, _ in group})
-        key = alias_keys[0] if alias_keys else ""
+        key = alias_keys[0]
         candidates = [(prov, inst, it) for _key, prov, inst, it in group]
-        if not candidates:
-            continue
 
         sources = sorted({n for n, _, _ in candidates})
-        if not sources:
-            continue
 
         sources_by_provider: dict[str, list[str]] = {}
         info_best: dict[str, Any] = {}

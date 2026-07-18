@@ -1180,7 +1180,6 @@ class WatchService:
                     best = prev
 
             if best != want:
-                normalized_progress_debug = best
                 ev = ScrobbleEvent(**{**ev.__dict__, "progress": best})
             if ev.action == "start" and ev.progress < 1:
                 ev = ScrobbleEvent(**{**ev.__dict__, "progress": 1})

@@ -637,6 +637,3 @@ def request_with_retries(
         msg = f"{msg} ({type(last).__name__}: {last})"
     _http_log(session, "error", "http_request_failed", method=method, url=url, api_feature=api_feature, max_retries=max_retries, error=msg)
     raise requests.RequestException(msg)
-
-
-request_with_retry = request_with_retries

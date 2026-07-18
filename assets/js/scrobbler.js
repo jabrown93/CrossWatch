@@ -1980,15 +1980,6 @@ function chip(text, onRemove, onClick) {
     return `<div class="field"><label for="${id}">${label}</label>${helpBtn(tipId)}<input id="${id}" class="input" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" placeholder="${placeholder}"></div>`;
   }
 
-  function buildHeaderToggle(id, text) {
-    return `<label class="cx-toggle sc-shell-toggle"><input type="checkbox" id="${id}"><span class="cx-toggle-ui" aria-hidden="true"></span><span class="cx-toggle-text">${text}</span><span class="cx-toggle-state" aria-hidden="true"></span></label>`;
-  }
-
-  function buildShellHeader({ kicker = "", title = "", copy = "", tiles = "", toggleId = "", toggleText = "Enable", tilesLabel = "Sections" } = {}) {
-    return `<div class="cw-panel-head sc-shell-head"><div class="sc-shell-head-copy">${kicker ? `<div class="sc-shell-head-kicker">${kicker}</div>` : ""}<div class="cw-panel-title sc-shell-head-title">${title}</div><div class="muted sc-shell-head-copy-text">${copy}</div></div><div class="sc-shell-head-side">${tiles ? `<div class="cw-subtiles" aria-label="${tilesLabel}">${tiles}</div>` : ""}${toggleId ? buildHeaderToggle(toggleId, toggleText) : ""}</div></div>`;
-  }
-  
-
   function buildUI() {
     injectStyles();
 
@@ -2746,7 +2737,6 @@ function chip(text, onRemove, onClick) {
   }
 
 
-  const watchChipClick = () => undefined;
   function redrawWhitelist(hostSel, path, removeFn, onClick) {
     const host = $(hostSel, STATE.mount);
     if (!host) return;

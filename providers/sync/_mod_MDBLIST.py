@@ -18,7 +18,6 @@ from ._mod_common import (
     HitSession,
     SimpleRateLimiter,
     build_session,
-    request_with_retries,
     parse_rate_limit,
     make_snapshot_progress,
 )

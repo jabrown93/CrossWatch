@@ -6,63 +6,21 @@ from collections.abc import Mapping
 from typing import Any
 
 import os
-import re
 import datetime as _dt
 
-try:
-    from ._pairs_oneway import (
-        _history_bucket_sec as _hist_bucket_sec,
-        _history_ts_from_key as _hist_ts_from_key,
-        _bucket_ts as _hist_bucket_ts,
-        _provider_ignore_dropped_enabled,
-        _load_provider_dropped_tokens,
-        _filter_index_for_dropped_shows,
-        _filter_items_for_dropped_shows,
-    )
-except Exception:  # pragma: no cover
-    _HIST_RE = re.compile(r"^(?P<base>.+?)@(?P<ts>\d+)(?P<rest>.*)$")
-
-    def _hist_bucket_sec(a: str, b: str, feature: str) -> int:
-        if str(feature) != "history":
-            return 0
-        au = str(a or "").upper()
-        bu = str(b or "").upper()
-        return 60 if (au == "TRAKT" or bu == "TRAKT") else 0
-
-    def _hist_ts_from_key(key: str) -> int | None:
-        m = _HIST_RE.match(str(key))
-        if not m:
-            return None
-        try:
-            return int(m.group("ts"))
-        except Exception:
-            return None
-
-    def _hist_bucket_ts(ts: int, bucket_sec: int) -> int:
-        b2 = int(bucket_sec or 0)
-        if b2 <= 1:
-            return int(ts)
-        return (int(ts) // b2) * b2
-
-    def _provider_ignore_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
-        return False
-
-    def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
-        return set()
-
-    def _filter_index_for_dropped_shows(idx: dict[str, Any], dropped_tokens: set[str]) -> tuple[dict[str, Any], int]:
-        return dict(idx or {}), 0
-
-    def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens: set[str]) -> tuple[list[dict[str, Any]], int]:
-        return list(items or []), 0
+from ._pairs_oneway import (
+    _history_bucket_sec as _hist_bucket_sec,
+    _history_ts_from_key as _hist_ts_from_key,
+    _bucket_ts as _hist_bucket_ts,
+    _provider_ignore_dropped_enabled,
+    _load_provider_dropped_tokens,
+    _filter_index_for_dropped_shows,
+    _filter_items_for_dropped_shows,
+)
 
 from ..provider_instances import normalize_instance_id
-from ._planner import diff_ratings, diff_progress, _pick_rating
-try:
-    from ._pairs_oneway import _ratings_filter_index as _rate_filter
-except Exception:
-    def _rate_filter(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
-        return idx
+from ._planner import diff_progress, _pick_rating
+from ._pairs_oneway import _ratings_filter_index as _rate_filter
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
 from ..anime_mapping.service import (
@@ -97,15 +55,7 @@ from ._pairs_utils import (
     filter_manual_block as _filter_manual_block,
 )
 
-try:
-    from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
-except Exception:
-    def load_blackbox_keys(dst: str, feature: str, pair: str | None = None) -> set[str]:
-        return set()
-    def record_attempts(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
-    def record_success(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
+from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
 
 _PROVIDER_KEY_MAP = {
     "PLEX": "plex",
@@ -1727,7 +1677,7 @@ def _two_way_sync(
                         [k2i_A[k] for k in success_A if k in k2i_A],
                         pair=pair_key,
                     )
-                if use_phantoms and 'guardA' in locals() and guardA and success_A:
+                if use_phantoms and guardA and success_A:
                     guardA.record_success(set(success_A))
             except Exception:
                 pass
@@ -1843,7 +1793,7 @@ def _two_way_sync(
                         [k2i_B[k] for k in success_B if k in k2i_B],
                         pair=pair_key,
                     )
-                if use_phantoms and 'guardB' in locals() and guardB and success_B:
+                if use_phantoms and guardB and success_B:
                     guardB.record_success(set(success_B))
             except Exception:
                 pass

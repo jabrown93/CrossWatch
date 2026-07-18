@@ -27,7 +27,7 @@ from ._snapshots import (
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
 from ._unresolved import load_unresolved_keys, record_unresolved
-from ._planner import diff, diff_ratings, diff_progress, _pick_rating
+from ._planner import diff, diff_ratings, diff_progress
 from ._phantoms import PhantomGuard
 from ._tombstones import clear_items_for_feature
 
@@ -47,15 +47,7 @@ from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_dele
 from ._pairs_blocklist import apply_blocklist
 
 # Blackbox imports
-try:  # pragma: no cover
-    from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
-except Exception:  # pragma: no cover
-    def load_blackbox_keys(dst: str, feature: str) -> set[str]:
-        return set()
-    def record_attempts(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
-    def record_success(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
+from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
 
 _PROVIDER_KEY_MAP = {
     "PLEX": "plex",
@@ -1198,7 +1190,6 @@ def run_one_way_feature(
 
     updated_effective = 0
     added_effective = 0
-    added_provider_reported = 0
     res_update: dict[str, Any] = {
         "attempted": 0,
         "confirmed": 0,
@@ -1345,7 +1336,6 @@ def run_one_way_feature(
                     pass
             
             prov_confirmed = int((add_res or {}).get("confirmed", (add_res or {}).get("count", 0)) or 0)
-            added_provider_reported = prov_confirmed
             if have_exact_keys:
                 prov_confirmed = min(prov_confirmed or len(confirmed_keys), len(confirmed_keys))
             

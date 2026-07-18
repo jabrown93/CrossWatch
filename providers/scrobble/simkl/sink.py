@@ -196,15 +196,6 @@ def _progress_step(cfg: dict[str, Any]) -> int:
     return max(1, min(25, step_i))
 
 
-def _quantize_progress(p: int, step: int, action: str) -> int:
-    v = _clamp(p)
-    if step <= 1 or action == "stop":
-        return v
-    if v < step:
-        return max(1, v)
-    q = (v // step) * step
-    return max(1, min(100, q))
-
 def _clamp(p: Any) -> int:
     try:
         v = int(float(p))
@@ -458,7 +449,6 @@ class SimklSink(ScrobbleSink):
         self._a_sess: dict[tuple[str, str], str] = {}
         self._p_glob: dict[str, int] = {}
         self._best: dict[str, dict[str, Any]] = {}
-        self._ids_logged: set[str] = set()
         self._last_intent_path: dict[str, str] = {}
         self._last_intent_prog: dict[str, int] = {}
         self._warn_no_token = False

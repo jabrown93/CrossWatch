@@ -283,21 +283,6 @@ def _trakt_progress_step(cfg: dict[str, Any]) -> int:
     return max(1, min(25, step))
 
 
-def _quantize_progress(prog: float | int, step: int, action: str) -> int:
-    try:
-        p = int(float(prog))
-    except Exception:
-        p = 0
-    if step <= 1 or action == "stop":
-        return max(0, min(100, p))
-    if p < step:
-        return max(1, min(100, p))
-    q = (p // step) * step
-    if q <= 0:
-        q = 1
-    return max(1, min(100, q))
-
-
 def _guid_search(ev: ScrobbleEvent, cfg: dict[str, Any], instance_id: Any = None) -> dict[str, Any] | None:
     ids = ev.ids or {}
     for key in ("tmdb", "tvdb", "imdb"):
@@ -689,7 +674,6 @@ class TraktSink(ScrobbleSink):
         p_glob = self._p_glob.get(mk, -1)
 
         last_act = self._a_sess.get((sk, mk))
-        last_bucket = self._p_step.get((sk, mk), -1)
 
         name = _media_name(ev)
         key = self._ckey(ev)

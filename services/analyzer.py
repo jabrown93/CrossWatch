@@ -1947,7 +1947,6 @@ def _pair_stats(s: dict[str, Any]) -> list[dict[str, Any]]:
         for dst in targets:
             total = 0
             synced = 0
-            idx = idx_cache.get((dst, feat)) or {}
 
             for k, v in src_items.items():
                 if v.get("_ignore_missing_peer"):
@@ -2584,7 +2583,6 @@ def _problems(s: dict[str, Any], allowed_scopes: set[str] | None = None) -> list
             if not union_targets:
                 continue
 
-            merged_keys = set().union(*[set(d.keys()) for d in union_targets]) if union_targets else set()
             vv = dict(v)
             vv["_key"] = k
             alias_keys = _alias_keys(vv)
