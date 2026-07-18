@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .._log import log as cw_log
+from .._mod_common import _is_capture_mode, _safe_scope
 
 STATE_DIR = Path("/config/.cw_state")
 
@@ -25,21 +26,6 @@ def _pair_scope() -> str | None:
             continue
         return s
     return None
-
-
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:

@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, cast
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
+from .._mod_common import _chunk_items
 from ._common import (
     adapter_headers,
     extract_latest_ts,
@@ -878,11 +879,6 @@ def _write_group(item: Mapping[str, Any]) -> str:
     typ = str(item.get("type") or "").strip().lower()
     return "movies" if typ == "movie" else "shows"
 
-
-def _chunk_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
-    size = max(1, int(n or 1))
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
 
 
 def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:

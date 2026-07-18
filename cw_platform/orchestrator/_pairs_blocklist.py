@@ -7,26 +7,8 @@ from typing import Any
 from ..id_map import canonical_key, ID_KEYS
 from ._tombstones import keys_for_feature, filter_with
 
-try:
-    from ._unresolved import load_unresolved_keys  # type: ignore
-except Exception:  # pragma: no cover
-    def load_unresolved_keys(
-        dst: str,
-        feature: str | None = None,
-        *,
-        cross_features: bool = True,
-    ) -> set[str]:
-        return set()
-
-try:
-    from ._blackbox import load_blackbox_keys  # type: ignore
-except Exception:  # pragma: no cover
-    def load_blackbox_keys(
-        dst: str,
-        feature: str,
-        pair: str | None = None,
-    ) -> set[str]:
-        return set()
+from ._unresolved import load_unresolved_keys  # type: ignore
+from ._blackbox import load_blackbox_keys  # type: ignore
 
 def _breakdown(
     state_store,

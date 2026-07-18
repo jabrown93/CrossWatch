@@ -1040,6 +1040,30 @@ def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
         t["_pending_created_at"] = 0
 
 
+def _tmdb_api_key(cfg: dict[str, Any]) -> str:
+    """Resolve the effective TMDb API key from the ``tmdb`` or ``tmdb_sync`` config block, including per-instance overrides."""
+
+    def _pick_from_block(blk: Any) -> str:
+        if not isinstance(blk, dict):
+            return ""
+        k = str(blk.get("api_key") or "").strip()
+        if k:
+            return k
+        insts = blk.get("instances")
+        if isinstance(insts, dict):
+            for v in insts.values():
+                kk = str((v or {}).get("api_key") or "").strip() if isinstance(v, dict) else ""
+                if kk:
+                    return kk
+        return ""
+
+    for key in ("tmdb", "tmdb_sync"):
+        found = _pick_from_block(cfg.get(key))
+        if found:
+            return found
+    return ""
+
+
 def _normalize_trakt(cfg: dict[str, Any]) -> None:
     t0 = cfg.get("trakt")
     if isinstance(t0, dict):

@@ -110,11 +110,6 @@ class PhantomGuard:
         blocked: list[T] = [it for it in adds if keyfn(it) in phantoms]
         keep: list[T] = [it for it in adds if keyfn(it) not in phantoms]
         self._save_minimals(blocked, minimal)
-        try:
-            for k in {keyfn(it) for it in blocked}:
-                state_store.blackbox_put(pair_key, k, reason="phantom-replan")
-        except Exception:
-            pass
         emit(
             "blocked.counts",
             feature="*",

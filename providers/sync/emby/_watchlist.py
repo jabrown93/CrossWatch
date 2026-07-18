@@ -33,7 +33,6 @@ from ._common import (
     _is_future_episode,
     playlist_as_watchlist_index,
     _series_minimal_from_episode,
-    find_seed_item_id,
 )
 
 from cw_platform.id_map import minimal as id_minimal, canonical_key

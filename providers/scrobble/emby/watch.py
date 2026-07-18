@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import re, time, threading
+import time, threading
 from typing import Any, Iterable, Mapping, cast
 
 import requests

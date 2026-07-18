@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from typing import Any, Callable
 
 import json
-import os
 from pathlib import Path
 
 from ._scope import pair_scope, scoped_file

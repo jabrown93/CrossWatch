@@ -32,22 +32,16 @@ def _deep_merge_provider_overrides(dst: dict[str, Any], src: Mapping[str, Any]) 
 
 
 
-try:
-    from ._blackbox import prune_once as _bb_prune_once  # type: ignore[attr-defined]
-except Exception:
-    try:
-        from ._blackbox import prune_blackbox as _bb_prune  # type: ignore[attr-defined]
+from ._blackbox import prune_blackbox as _bb_prune
 
-        def _bb_prune_once(cfg: Mapping[str, Any]) -> None:
-            try:
-                bb_cfg = ((cfg.get("sync") or {}).get("blackbox") or {})
-                cooldown = int(bb_cfg.get("cooldown_days", 30))
-                _bb_prune(cooldown_days=cooldown)
-            except Exception:
-                pass
-    except Exception:  # last resort: no-op
-        def _bb_prune_once(cfg: Mapping[str, Any]) -> None:  # type: ignore[unused-arg]
-            return
+
+def _bb_prune_once(cfg: Mapping[str, Any]) -> None:
+    try:
+        bb_cfg = ((cfg.get("sync") or {}).get("blackbox") or {})
+        cooldown = int(bb_cfg.get("cooldown_days", 30))
+        _bb_prune(cooldown_days=cooldown)
+    except Exception:
+        pass
 
 
 def _collect_health_for_run(ctx) -> dict[str, Any]:

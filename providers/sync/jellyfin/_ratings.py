@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from typing import Any, Iterable, Mapping
 
 from cw_platform.id_map import canonical_key, minimal as id_minimal

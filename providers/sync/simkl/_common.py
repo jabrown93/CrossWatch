@@ -6,11 +6,11 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from cw_platform.id_map import canonical_key, minimal as id_minimal
+from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope, _iso_ok, _iso_z, _max_iso
 
 START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 DEFAULT_DATE_FROM = START_OF_TIME_ISO
@@ -52,29 +52,6 @@ def simkl_api_params_from_headers(headers: Mapping[str, Any], **extra: Any) -> d
     return simkl_api_params((headers or {}).get("simkl-api-key"), **extra)
 
 STATE_DIR = Path("/config/.cw_state")
-
-
-def _pair_scope() -> str | None:
-    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return None
-
-
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -218,37 +195,6 @@ def coalesce_date_from(
         if _iso_ok(candidate):
             return _iso_z(candidate)
     return hard_default
-
-
-def _iso_ok(value: Any) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return True
-    except Exception:
-        return False
-
-
-def _iso_z(value: str | None) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("invalid ISO timestamp")
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _max_iso(a: str | None, b: str | None) -> str | None:
-    if not _iso_ok(a):
-        return _iso_z(b) if _iso_ok(b) else None
-    if not _iso_ok(b):
-        return _iso_z(a)
-    a_z = _iso_z(a)
-    b_z = _iso_z(b)
-    dt_a = datetime.fromisoformat(a_z.replace("Z", "+00:00"))
-    dt_b = datetime.fromisoformat(b_z.replace("Z", "+00:00"))
-    return _iso_z(a if dt_a >= dt_b else b)
 
 
 def build_headers(cfg: Mapping[str, Any], *, force_refresh: bool = False) -> dict[str, str]:

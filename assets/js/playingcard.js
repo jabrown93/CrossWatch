@@ -67,13 +67,6 @@
     return `/art/tmdb/${type}/${encodeURIComponent(String(id))}?size=w342`;
   };
 
-  const buildBackdropUrl = (p) => {
-    const id = tmdbIdOf(p);
-    if (!id) return "";
-    const type = String(p?.media_type || p?.type || "").toLowerCase() === "movie" ? "movie" : "tv";
-    return `/art/tmdb/${type}/${encodeURIComponent(String(id))}?kind=backdrop&size=w1280`;
-  };
-
   const runtimeLabel = (mins) => {
     const m = Number(mins) || 0;
     if (!m) return "";

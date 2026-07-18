@@ -27,7 +27,7 @@ from ._snapshots import (
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
 from ._unresolved import load_unresolved_keys, record_unresolved
-from ._planner import diff, diff_ratings, diff_progress, _pick_rating
+from ._planner import diff, diff_ratings, diff_progress
 from ._phantoms import PhantomGuard
 from ._tombstones import clear_items_for_feature
 
@@ -47,15 +47,7 @@ from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_dele
 from ._pairs_blocklist import apply_blocklist
 
 # Blackbox imports
-try:  # pragma: no cover
-    from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
-except Exception:  # pragma: no cover
-    def load_blackbox_keys(dst: str, feature: str) -> set[str]:
-        return set()
-    def record_attempts(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
-    def record_success(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
+from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
 
 _PROVIDER_KEY_MAP = {
     "PLEX": "plex",
@@ -214,31 +206,31 @@ def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens:
 def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None, provider: str = "") -> str:
     return provider_index_semantics(ops, cfg or {}, feature)
 
+def _iso_to_epoch(v: Any) -> int | None:
+    if not v:
+        return None
+    try:
+        s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+        dt = _dt.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+def _pick_newest(a: Any, b: Any) -> Any:
+    ae = _iso_to_epoch(a)
+    be = _iso_to_epoch(b)
+    if be is None:
+        return a
+    if ae is None or be > ae:
+        return b
+    return a
+
 # Enrichment and hydration of index payloads
 def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
     if not cur or not prev:
         return dict(cur or {})
-
-    def _iso_to_epoch(v: Any) -> int | None:
-        if not v:
-            return None
-        try:
-            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
-            dt = _dt.datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            return int(dt.timestamp())
-        except Exception:
-            return None
-
-    def _pick_newest(a: Any, b: Any) -> Any:
-        ae = _iso_to_epoch(a)
-        be = _iso_to_epoch(b)
-        if be is None:
-            return a
-        if ae is None or be > ae:
-            return b
-        return a
 
     out: dict[str, Any] = {}
     for k, cv in (cur or {}).items():
@@ -287,27 +279,6 @@ def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: st
 def _hydrate_missing_fields(cur: dict[str, Any], donor: dict[str, Any], feature: str) -> dict[str, Any]:
     if not cur or not donor:
         return dict(cur or {})
-
-    def _iso_to_epoch(v: Any) -> int | None:
-        if not v:
-            return None
-        try:
-            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
-            dt = _dt.datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            return int(dt.timestamp())
-        except Exception:
-            return None
-
-    def _pick_newest(a: Any, b: Any) -> Any:
-        ae = _iso_to_epoch(a)
-        be = _iso_to_epoch(b)
-        if be is None:
-            return a
-        if ae is None or be > ae:
-            return b
-        return a
 
     out: dict[str, Any] = {}
     for k, cv in (cur or {}).items():
@@ -1198,7 +1169,6 @@ def run_one_way_feature(
 
     updated_effective = 0
     added_effective = 0
-    added_provider_reported = 0
     res_update: dict[str, Any] = {
         "attempted": 0,
         "confirmed": 0,
@@ -1345,7 +1315,6 @@ def run_one_way_feature(
                     pass
             
             prov_confirmed = int((add_res or {}).get("confirmed", (add_res or {}).get("count", 0)) or 0)
-            added_provider_reported = prov_confirmed
             if have_exact_keys:
                 prov_confirmed = min(prov_confirmed or len(confirmed_keys), len(confirmed_keys))
             

@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 from fastapi import APIRouter, Body, Path as FPath, Query
 from fastapi.responses import JSONResponse
 
+from cw_platform.config_base import _tmdb_api_key
 from services.watchlist import (
     _feat_enabled,
     _find_item_in_state,
@@ -115,27 +116,6 @@ def _active_pair_watchlist_providers(cfg: dict[str, Any]) -> list[str]:
                 out.append(prov)
     return out
 
-
-def _tmdb_api_key(cfg: dict[str, Any]) -> str:
-    def _pick_from_block(blk: Any) -> str:
-        if not isinstance(blk, dict):
-            return ""
-        k = str(blk.get("api_key") or "").strip()
-        if k:
-            return k
-        insts = blk.get("instances")
-        if isinstance(insts, dict):
-            for v in insts.values():
-                kk = str((v or {}).get("api_key") or "").strip() if isinstance(v, dict) else ""
-                if kk:
-                    return kk
-        return ""
-
-    for key in ("tmdb", "tmdb_sync"):
-        found = _pick_from_block(cfg.get(key))
-        if found:
-            return found
-    return ""
 
 def _type_from_item_or_guess(item: dict[str, Any], key: str = "") -> str:
     t = str(item.get("type") or item.get("media_type") or item.get("entity") or "").lower().strip()
@@ -344,59 +324,6 @@ def remove_across_providers_by_ids(
         "deleted_ok": sum(int(r.get("deleted", 0)) for r in results if r.get("ok")),
         "results": results,
     }
-
-
-def remove_from_provider_by_ids(
-    provider: str,
-    ids: dict[str, Any],
-    media_type: str | None = None,
-) -> dict[str, Any]:
-    from cw_platform.config_base import load_config
-    from crosswatch import _append_log
-    from .syncAPI import _load_state
-
-    cfg = load_config()
-    state = _load_state() or {}
-    prov = (provider or "").strip().upper()
-    if not prov:
-        return {"ok": False, "error": "missing provider"}
-    if prov not in _active_providers(cfg):
-        return {"ok": False, "error": f"provider '{prov}' not connected"}
-
-    keys = _candidate_keys_from_ids(ids)
-    if not keys:
-        return {"ok": False, "error": "no candidate keys from ids"}
-
-    found_key = None
-    for k in keys:
-        if _find_item_in_state_for_provider(state, k, prov):
-            found_key = k
-            break
-
-    if not found_key:
-        return {"ok": False, "reason": "not_in_state"}
-
-    try:
-        r = delete_watchlist_batch([found_key], prov, state, cfg) or {}
-        deleted = int(r.get("deleted", 0)) if isinstance(r, dict) else 0
-        ok = deleted > 0
-        kind, label = _item_label(state, found_key, prov)
-        _append_log(
-            "SYNC",
-            f"[WL] remove_by_ids on {prov}: {kind} '{label}' → {'OK' if ok else 'NOOP'}",
-        )
-        return {"ok": ok, "deleted": deleted, "provider": prov, "key": found_key}
-    except Exception as e:
-        _append_log("SYNC", f"[WL] remove_by_ids on {prov} failed: {e}")
-        return {"ok": False, "error": _public_error("delete_failed"), "provider": prov}
-
-
-def remove_from_plex_by_ids(
-    ids: dict[str, Any],
-    media_type: str | None = None,
-) -> dict[str, Any]:
-    return remove_from_provider_by_ids("PLEX", ids, media_type)
-
 
 
 @router.get("", include_in_schema=False)

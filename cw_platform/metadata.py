@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 import pkgutil
 from typing import Any, Callable, Mapping, Optional, cast
 
@@ -158,7 +157,6 @@ class MetadataManager:
     ) -> dict[str, Any]:
         cfg = self.load_cfg() or {}
         md_cfg = cfg.get("metadata") or {}
-        debug = bool((cfg.get("runtime") or {}).get("debug"))
         entity_norm = _norm_entity(entity)
         req_need = _norm_need(need)
         eff_locale = locale or md_cfg.get("locale") or (cfg.get("ui") or {}).get("locale")
@@ -212,8 +210,6 @@ class MetadataManager:
                     r["type"] = entity_norm
 
                 if strategy == "first_success":
-                    #if debug:
-                    #   log(f"Provider {name} hit", level="DEBUG", module="META")
                     return r
 
                 results.append(r)

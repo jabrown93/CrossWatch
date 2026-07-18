@@ -15,7 +15,6 @@ from fastapi import APIRouter, Body
 
 router = APIRouter(prefix="/api/maintenance", tags=["maintenance"])
 
-CW_STATE_KEEP_DIRS = {"id"}
 CW_STATE_KEEP_FILES = {
     "activity_history.json",
     "currently_watching.json",
@@ -48,10 +47,8 @@ def _clear_cw_state_files() -> list[str]:
     if not CW_STATE_DIR.exists():
         return removed
     for p in CW_STATE_DIR.iterdir():
+        # Preserve identity cache (.cw_state/id) and any other subdirectories.
         if p.is_dir():
-            # Preserve identity cache (.cw_state/id)
-            if p.name in CW_STATE_KEEP_DIRS:
-                continue
             continue
         if p.is_file():
             if p.name in CW_STATE_KEEP_FILES:

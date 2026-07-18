@@ -12,6 +12,7 @@ from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
+from .._mod_common import _chunk_items
 from ._common import (
     adapter_headers,
     coalesce_date_from,
@@ -995,12 +996,6 @@ def _split_buckets(
     if shows:
         payload["shows"] = shows
     return payload, unresolved
-
-
-def _chunk_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
-    size = max(1, int(n or 1))
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
 
 
 def add(

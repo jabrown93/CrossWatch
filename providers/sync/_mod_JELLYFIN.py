@@ -11,8 +11,6 @@ from typing import Any, Callable, Iterable, Mapping
 
 import requests
 
-from cw_platform.provider_instances import normalize_instance_id
-
 from ._log import log as cw_log
 
 from .jellyfin._common import normalize as jelly_normalize, key_of as jelly_key_of, _pair_scope as _jf_pair_scope, state_file as _jf_state_file, _is_capture_mode as _jf_capture_mode
@@ -26,48 +24,11 @@ from ._mod_common import (
     parse_rate_limit,  # parity
     label_jellyfin,
     make_snapshot_progress,
+    _confirmed_keys,
+    _pick_instance_id,
+    _merge_instance_block,
 )
 
-
-def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
-    attempted: list[str] = []
-    for it in items or []:
-        try:
-            k = str(key_of(it) or "").strip()
-        except Exception:
-            k = ""
-        if k:
-            attempted.append(k)
-
-    unresolved_keys: set[str] = set()
-    if unresolved:
-        for u in unresolved:
-            obj: Any = u
-            if isinstance(u, Mapping):
-                if isinstance(u.get("key"), str) and u.get("key"):
-                    unresolved_keys.add(str(u.get("key")))
-                    continue
-                if "item" in u:
-                    obj = u.get("item")
-            if isinstance(obj, str) and obj:
-                unresolved_keys.add(obj)
-                continue
-            if isinstance(obj, Mapping):
-                try:
-                    k = str(key_of(obj) or "").strip()
-                except Exception:
-                    k = ""
-                if k:
-                    unresolved_keys.add(k)
-
-    out: list[str] = []
-    seen: set[str] = set()
-    for k in attempted:
-        if k in unresolved_keys or k in seen:
-            continue
-        out.append(k)
-        seen.add(k)
-    return out
 
 try:  # type: ignore[name-defined]
     ctx  # type: ignore[misc]
@@ -80,38 +41,6 @@ os.environ.setdefault("CW_JELLYFIN_UA", f"CrossWatch/{__VERSION__} (Jellyfin)")
 __all__ = ["get_manifest", "JELLYFINModule", "OPS"]
 
 _DEF_UA = os.environ.get("CW_JELLYFIN_UA") or os.environ.get("CW_UA") or f"CrossWatch/{__VERSION__} (Jellyfin)"
-
-
-def _pick_instance_id(provider: str) -> str:
-    prov = str(provider or "").upper().strip()
-    for k in ("CW_SNAPSHOT_INSTANCE", "CW_INSTANCE_ID", "CW_PROFILE", "CW_PROVIDER_INSTANCE", "CW_INSTANCE"):
-        v = (os.environ.get(k) or "").strip()
-        if v:
-            return normalize_instance_id(v)
-    if (os.environ.get("CW_PAIR_SRC") or "").upper().strip() == prov:
-        v = (os.environ.get("CW_PAIR_SRC_INSTANCE") or os.environ.get("CW_SRC_INSTANCE") or "").strip()
-        if v:
-            return normalize_instance_id(v)
-    if (os.environ.get("CW_PAIR_DST") or "").upper().strip() == prov:
-        v = (os.environ.get("CW_PAIR_DST_INSTANCE") or os.environ.get("CW_DST_INSTANCE") or "").strip()
-        if v:
-            return normalize_instance_id(v)
-    v = (os.environ.get("CW_PAIR_INSTANCE") or "").strip()
-    return normalize_instance_id(v)
-
-def _merge_instance_block(raw: Any, inst: str) -> dict[str, Any]:
-    base = dict(raw or {}) if isinstance(raw, Mapping) else {}
-    if inst == "default":
-        base.pop("instances", None)
-        return base
-    insts = base.get("instances")
-    if isinstance(insts, Mapping) and isinstance(insts.get(inst), Mapping):
-        merged = dict(base)
-        merged.update(dict(insts.get(inst) or {}))
-        merged.pop("instances", None)
-        return merged
-    base.pop("instances", None)
-    return base
 
 
 _FEATURES: dict[str, Any] = {

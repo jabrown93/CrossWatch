@@ -12,34 +12,12 @@ from typing import Any, Mapping
 
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import canonical_key, ids_from, minimal as id_minimal
+from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 
 STATE_DIR = Path("/config/.cw_state")
 # STATE_DIR is created lazily on first write (see write_json / _migrate_legacy_json).
 # Don't mkdir at import time — it crashes when /config is absent or unwritable (e.g. CI),
 # and the other sync providers already defer directory creation the same way.
-
-
-def _pair_scope() -> str | None:
-    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return None
-
-
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:

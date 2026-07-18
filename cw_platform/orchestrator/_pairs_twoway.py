@@ -6,63 +6,26 @@ from collections.abc import Mapping
 from typing import Any
 
 import os
-import re
 import datetime as _dt
 
-try:
-    from ._pairs_oneway import (
-        _history_bucket_sec as _hist_bucket_sec,
-        _history_ts_from_key as _hist_ts_from_key,
-        _bucket_ts as _hist_bucket_ts,
-        _provider_ignore_dropped_enabled,
-        _load_provider_dropped_tokens,
-        _filter_index_for_dropped_shows,
-        _filter_items_for_dropped_shows,
-    )
-except Exception:  # pragma: no cover
-    _HIST_RE = re.compile(r"^(?P<base>.+?)@(?P<ts>\d+)(?P<rest>.*)$")
-
-    def _hist_bucket_sec(a: str, b: str, feature: str) -> int:
-        if str(feature) != "history":
-            return 0
-        au = str(a or "").upper()
-        bu = str(b or "").upper()
-        return 60 if (au == "TRAKT" or bu == "TRAKT") else 0
-
-    def _hist_ts_from_key(key: str) -> int | None:
-        m = _HIST_RE.match(str(key))
-        if not m:
-            return None
-        try:
-            return int(m.group("ts"))
-        except Exception:
-            return None
-
-    def _hist_bucket_ts(ts: int, bucket_sec: int) -> int:
-        b2 = int(bucket_sec or 0)
-        if b2 <= 1:
-            return int(ts)
-        return (int(ts) // b2) * b2
-
-    def _provider_ignore_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
-        return False
-
-    def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
-        return set()
-
-    def _filter_index_for_dropped_shows(idx: dict[str, Any], dropped_tokens: set[str]) -> tuple[dict[str, Any], int]:
-        return dict(idx or {}), 0
-
-    def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens: set[str]) -> tuple[list[dict[str, Any]], int]:
-        return list(items or []), 0
+from ._pairs_oneway import (
+    _history_bucket_sec as _hist_bucket_sec,
+    _history_ts_from_key as _hist_ts_from_key,
+    _bucket_ts as _hist_bucket_ts,
+    _provider_ignore_dropped_enabled,
+    _load_provider_dropped_tokens,
+    _filter_index_for_dropped_shows,
+    _filter_items_for_dropped_shows,
+    _enrich_index_payload,
+    _effective_library_whitelist,
+    _filter_index_by_libraries,
+    _PROVIDER_KEY_MAP,
+    _rekey_index_to_match_other_keys,
+)
 
 from ..provider_instances import normalize_instance_id
-from ._planner import diff_ratings, diff_progress, _pick_rating
-try:
-    from ._pairs_oneway import _ratings_filter_index as _rate_filter
-except Exception:
-    def _rate_filter(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
-        return idx
+from ._planner import diff_progress, _pick_rating
+from ._pairs_oneway import _ratings_filter_index as _rate_filter
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
 from ..anime_mapping.service import (
@@ -97,21 +60,7 @@ from ._pairs_utils import (
     filter_manual_block as _filter_manual_block,
 )
 
-try:
-    from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
-except Exception:
-    def load_blackbox_keys(dst: str, feature: str, pair: str | None = None) -> set[str]:
-        return set()
-    def record_attempts(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
-    def record_success(dst: str, feature: str, keys, **kwargs) -> dict[str, Any]:
-        return {"ok": True, "count": 0}
-
-_PROVIDER_KEY_MAP = {
-    "PLEX": "plex",
-    "JELLYFIN": "jellyfin",
-    "EMBY": "emby",
-}
+from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
 
 def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None, provider: str = "") -> str:
     return provider_index_semantics(ops, cfg or {}, feature)
@@ -119,134 +68,6 @@ def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None,
 
 def _cross_feature_unresolved(feature_name: str) -> bool:
     return str(feature_name or "").strip().lower() == "history"
-
-def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
-    if not cur or not prev:
-        return dict(cur or {})
-
-    def _iso_to_epoch(v: Any) -> int | None:
-        if not v:
-            return None
-        try:
-            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
-            dt = _dt.datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            return int(dt.timestamp())
-        except Exception:
-            return None
-
-    def _pick_newest(a: Any, b: Any) -> Any:
-        ae = _iso_to_epoch(a)
-        be = _iso_to_epoch(b)
-        if be is None:
-            return a
-        if ae is None or be > ae:
-            return b
-        return a
-
-    out: dict[str, Any] = {}
-    for k, cv in (cur or {}).items():
-        pv = (prev or {}).get(k)
-        if not isinstance(cv, Mapping) or not isinstance(pv, Mapping):
-            out[str(k)] = cv
-            continue
-
-        merged: dict[str, Any] = dict(pv)
-
-        ids_prev = pv.get("ids") if isinstance(pv.get("ids"), Mapping) else None
-        ids_cur = cv.get("ids") if isinstance(cv.get("ids"), Mapping) else None
-        ids = _merge_ids(ids_prev, ids_cur)
-        if ids:
-            merged["ids"] = ids
-
-        sids_prev = pv.get("show_ids") if isinstance(pv.get("show_ids"), Mapping) else None
-        sids_cur = cv.get("show_ids") if isinstance(cv.get("show_ids"), Mapping) else None
-        sids = _merge_ids(sids_prev, sids_cur)
-        if sids:
-            merged["show_ids"] = sids
-
-        for fk, fv in cv.items():
-            if fk in ("ids", "show_ids"):
-                continue
-            if fv is None:
-                continue
-            if isinstance(fv, str) and fv == "":
-                continue
-            merged[fk] = fv
-
-        if feature == "history":
-            if "watched_at" in pv or "watched_at" in cv:
-                merged["watched_at"] = _pick_newest(pv.get("watched_at"), cv.get("watched_at"))
-        elif feature == "ratings":
-            if "rated_at" in pv or "rated_at" in cv:
-                merged["rated_at"] = _pick_newest(pv.get("rated_at"), cv.get("rated_at"))
-        out[str(k)] = merged
-
-    return out
-
-
-def _effective_library_whitelist(
-    cfg: Mapping[str, Any],
-    provider_name: str,
-    feature: str,
-    fcfg: Mapping[str, Any],
-) -> list[str]:
-    if feature not in ("history", "ratings"):
-        return []
-
-    libs: list[str] = []
-    lib_cfg = fcfg.get("libraries")
-    if isinstance(lib_cfg, dict):
-        per = lib_cfg.get(provider_name.upper()) or lib_cfg.get(provider_name.lower())
-        if isinstance(per, (list, tuple)):
-            libs = [str(x).strip() for x in per if str(x).strip()]
-    elif isinstance(lib_cfg, (list, tuple)):
-        libs = [str(x).strip() for x in lib_cfg if str(x).strip()]
-
-    if libs:
-        return libs
-
-    key = _PROVIDER_KEY_MAP.get(str(provider_name).upper())
-    if not key:
-        return []
-
-    prov_cfg = cfg.get(key) or {}
-    feat_cfg = (prov_cfg.get(feature) or {})
-    base_libs = feat_cfg.get("libraries") or []
-    if isinstance(base_libs, (list, tuple)):
-        return [str(x).strip() for x in base_libs if str(x).strip()]
-
-    return []
-
-def _filter_index_by_libraries(idx: dict[str, Any], libs: list[str], *, allow_unknown: bool = False) -> dict[str, Any]:
-    if not libs or not idx:
-        return dict(idx)
-
-    allowed = {str(x).strip() for x in libs if str(x).strip()}
-    if not allowed:
-        return dict(idx)
-
-    out: dict[str, Any] = {}
-    for ck, item in idx.items():
-        v = item or {}
-        lid = (
-            v.get("library_id")
-            or v.get("libraryId")
-            or v.get("library")
-            or v.get("section_id")
-            or v.get("sectionId")
-        )
-
-        if lid is None:
-            if allow_unknown:
-                out[ck] = v
-            continue
-
-        if str(lid).strip() in allowed:
-            out[ck] = v
-
-    return out
 
 def _minimal_keep_rating(it: Mapping[str, Any]) -> dict[str, Any]:
     out = _minimal(it)
@@ -1727,7 +1548,7 @@ def _two_way_sync(
                         [k2i_A[k] for k in success_A if k in k2i_A],
                         pair=pair_key,
                     )
-                if use_phantoms and 'guardA' in locals() and guardA and success_A:
+                if use_phantoms and guardA and success_A:
                     guardA.record_success(set(success_A))
             except Exception:
                 pass
@@ -1843,7 +1664,7 @@ def _two_way_sync(
                         [k2i_B[k] for k in success_B if k in k2i_B],
                         pair=pair_key,
                     )
-                if use_phantoms and 'guardB' in locals() and guardB and success_B:
+                if use_phantoms and guardB and success_B:
                     guardB.record_success(set(success_B))
             except Exception:
                 pass
@@ -1936,57 +1757,9 @@ def _two_way_sync(
                         out["rated_at"] = b0
                 return out
 
-            def _rekey_to_other(idx0: dict[str, Any], other0: dict[str, Any]) -> dict[str, Any]:
-                if not idx0 or not other0:
-                    return dict(idx0 or {})
-
-                other_alias = _alias_index(other0)
-                other_tmdb = {t: k for t, k in other_alias.items() if str(t).startswith("tmdb:")}
-                other_imdb = {t: k for t, k in other_alias.items() if str(t).startswith("imdb:")}
-                other_tvdb = {t: k for t, k in other_alias.items() if str(t).startswith("tvdb:")}
-
-                out: dict[str, Any] = {}
-                for ck, it in (idx0 or {}).items():
-                    if not isinstance(it, Mapping):
-                        out[str(ck)] = it
-                        continue
-
-                    ck_s = str(ck)
-                    if ck_s in other0:
-                        out[ck_s] = it
-                        continue
-
-                    toks = _typed_tokens(it)
-                    mk: str | None = None
-
-                    for tok in toks:
-                        if tok.startswith("tmdb:") and tok in other_tmdb:
-                            mk = other_tmdb[tok]
-                            break
-                    if not mk:
-                        for tok in toks:
-                            if tok.startswith("imdb:") and tok in other_imdb:
-                                mk = other_imdb[tok]
-                                break
-                    if not mk:
-                        for tok in toks:
-                            if tok.startswith("tvdb:") and tok in other_tvdb:
-                                mk = other_tvdb[tok]
-                                break
-
-                    if not mk:
-                        out[ck_s] = it
-                        continue
-
-                    existing = out.get(mk)
-                    if isinstance(existing, Mapping):
-                        out[mk] = _merge_payload(existing, it)
-                    else:
-                        out[mk] = dict(it)
-
-                return out
-
-            B_eff = _rekey_to_other(B_eff, A_eff)
+            B_eff = _rekey_index_to_match_other_keys(
+                B_eff, A_eff, typed_tokens=_typed_tokens, merge_payload=_merge_payload
+            )
         _commit_baseline(provs_block, a, src_inst, feature, A_eff)
         _commit_baseline(provs_block, b, dst_inst, feature, B_eff)
         _commit_checkpoint(provs_block, a, src_inst, feature, now_cp_A)
