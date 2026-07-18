@@ -16,6 +16,17 @@ import pytest
 
 from cw_platform.id_map import canonical_key
 from cw_platform.orchestrator import _pairs_twoway as twoway
+from cw_platform.orchestrator import _unresolved
+
+
+@pytest.fixture(autouse=True)
+def _isolate_unresolved_state(monkeypatch, tmp_path):
+    # record_unresolved/load_unresolved_keys persist to a hardcoded STATE_DIR
+    # (see _unresolved.py), not the per-test CONFIG_BASE. Without this, tests
+    # that don't mock record_unresolved (e.g. the verify_after_write case)
+    # write real state that leaks into later tests reading the same path -
+    # same isolation pattern as tests/test_history_specials.py.
+    monkeypatch.setattr(_unresolved, "STATE_DIR", tmp_path)
 
 
 class _StateStore:
