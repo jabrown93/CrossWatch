@@ -89,7 +89,7 @@ async function loadCrossWatchSnapshots(cfg) {
 /*! Settings */
 
 
-/* Settings Hub: UI / Security / CW Tracker */
+/* Settings Hub: UI / Security / Local Tracker */
 
 const UI_SETTINGS_TAB_KEY = "cw.ui.settings.tab.v1";
 
@@ -105,6 +105,13 @@ function cwUiSettingsSelect(tab, opts = {}) {
     const k = String(p.dataset.tab || "").toLowerCase();
     p.classList.toggle("active", k === t);
   });
+  document.querySelectorAll(".cw-app-hero [data-target]").forEach((btn) => {
+    const on = String(btn.dataset.target || "").toLowerCase() === t;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-current", on ? "page" : "false");
+  });
+  document.querySelectorAll(".cw-app-hero-panel").forEach((hero) => hero.classList.toggle("active", String(hero.dataset.appHero || "").toLowerCase() === t));
+  document.querySelectorAll(".cw-app-hero-shape").forEach((shape) => shape.classList.toggle("active", String(shape.dataset.appHeroShape || "").toLowerCase() === t));
 
   if (persist) {
     try { localStorage.setItem(UI_SETTINGS_TAB_KEY, t); } catch {}
@@ -193,9 +200,10 @@ function cwUiSettingsHubInit() {
     "ui_show_recent_history_widget",
     "ui_show_latest_ratings_widget",
     "ui_show_recent_scrobble_widget",
+    "ui_show_recent_progress_widget",
+    "ui_show_recent_playlists_widget",
     "ui_recent_activity_display",
     "ui_recent_syncs_display",
-    "ui_show_AI",
     "ui_show_quick_add_desktop",
     "ui_show_quick_add_mobile",
     "ui_theme",
@@ -343,31 +351,16 @@ window.cwAppAuthPlexUnlink = async function cwAppAuthPlexUnlink() {
 
 /* Settings Hub: Scheduling */
 const SCHED_SETTINGS_TAB_KEY = "cw.ui.scheduling.tab.v1";
-const SCHED_PROVIDER_OPEN_KEY = "cw.ui.scheduling.open.v1";
 
 let __cwSchedOpen = false;
 
-function cwSchedProviderSelect(open, opts = {}) {
-  const tilesHost = document.getElementById("sched_provider_tiles");
+function cwSchedProviderSelect(open) {
   const panelHost = document.getElementById("sched-provider-panel");
   if (!panelHost) return;
 
   const wantOpen = (open == null) ? !__cwSchedOpen : !!open;
   __cwSchedOpen = wantOpen;
-
-  if (tilesHost) {
-    const tile = tilesHost.querySelector('[data-provider="scheduler"]');
-    if (tile) {
-      tile.classList.toggle("active", wantOpen);
-      tile.setAttribute("aria-selected", wantOpen ? "true" : "false");
-    }
-  }
-
   panelHost.classList.toggle("hidden", !wantOpen);
-
-  if (opts.persist !== false) {
-    try { localStorage.setItem(SCHED_PROVIDER_OPEN_KEY, wantOpen ? "1" : "0"); } catch {}
-  }
 }
 
 function cwSchedSettingsSelect(tab, opts = {}) {
@@ -496,7 +489,6 @@ function cwBuildSchedulerPanel() {
 }
 
 function cwSchedProviderEnsure() {
-  const tilesHost = document.getElementById("sched_provider_tiles");
   const panelHost = document.getElementById("sched-provider-panel");
   if (!panelHost) return;
 
@@ -505,22 +497,7 @@ function cwSchedProviderEnsure() {
     panelHost.dataset.__cwSchedBuilt = "1";
   }
 
-  if (tilesHost) {
-    tilesHost.querySelectorAll("[data-provider]").forEach((btn) => {
-      if (btn.__cwSchedWired) return;
-      btn.addEventListener("click", () => {
-        const isOpen = !document.getElementById("sched-provider-panel")?.classList.contains("hidden");
-        cwSchedProviderSelect(!isOpen);
-      });
-      btn.__cwSchedWired = true;
-    });
-
-    let open = "0";
-    try { open = localStorage.getItem(SCHED_PROVIDER_OPEN_KEY) || "0"; } catch {}
-    cwSchedProviderSelect(open === "1", { persist: false });
-  } else {
-    cwSchedProviderSelect(true, { persist: false });
-  }
+  cwSchedProviderSelect(true);
 
   try { cwSchedSettingsHubUpdate(); } catch {}
 }
@@ -751,12 +728,25 @@ function cwAnimeMappingRenderStatus(st = {}) {
   _cwSetText("anime_mapping_generated", _cwFormatUtc(st.dataset_generated_on));
   _cwSetText("anime_mapping_index", index);
   _cwSetText("anime_mapping_counts", installed ? `${Number(st.source_count || 0).toLocaleString()} sources | ${Number(st.edge_count || 0).toLocaleString()} edges` : "-");
+  _cwSetText("anime_mapping_last_update", _cwFormatUtc(st.dataset_generated_on));
+  _cwSetText("anime_mapping_meta_status", err ? "Error" : (installed && ready ? "Up to date" : (installed ? "Needs index" : "Missing")));
+  const statusPill = document.getElementById("anime_mapping_meta_status");
+  if (statusPill) {
+    statusPill.classList.toggle("is-ok", !!(installed && ready && !err));
+    statusPill.classList.toggle("is-err", !!err);
+  }
   _cwSetText("anime_mapping_error", err);
 
   const dot = document.getElementById("anime-mapping-dot");
   if (dot) {
     dot.classList.toggle("on", !!(enabled && installed && ready && !err));
     dot.classList.toggle("off", !!(!enabled || !installed || !ready || err));
+  }
+
+  const heroBadge = document.getElementById("anime_mapping_hero_status");
+  if (heroBadge) {
+    heroBadge.classList.toggle("is-on", !!enabled);
+    _cwSetText("anime_mapping_hero_status_text", enabled ? "Enabled" : "Disabled");
   }
 }
 
@@ -861,59 +851,89 @@ function cwBuildAnimeMappingPanel() {
       <span class="auth-dot" id="anime-mapping-dot" aria-hidden="true"></span>
     </div>
     <div class="body">
-    <div class="cw-panel-head anime-mapping-head">
-      <div class="cw-panel-head-main">
-        <div class="cw-panel-title">Anime ID Mapping</div>
-        <div class="muted">Local anime ID index for AniList watchlist and ratings pairs.</div>
+    <div class="auth-card anime-mapping-card am-body">
+      <section class="am-hero">
+        <span class="material-symbols-rounded am-hero-icon" aria-hidden="true">shield</span>
+        <div class="am-hero-copy">
+          <h4>Anime ID Mapping</h4>
+          <p>Enable and manage the local Anime ID Mapping index used for AniList watchlist and ratings pairs.</p>
+        </div>
+        <span class="am-hero-badge" id="anime_mapping_hero_status">
+          <span class="material-symbols-rounded" aria-hidden="true">check_circle</span>
+          <span id="anime_mapping_hero_status_text">Disabled</span>
+        </span>
+      </section>
+
+      <section class="am-stats">
+        <div class="am-stat">
+          <span class="material-symbols-rounded am-stat-icon" aria-hidden="true">database</span>
+          <div><span>Dataset</span><strong id="anime_mapping_dataset">-</strong></div>
+        </div>
+        <div class="am-stat">
+          <span class="material-symbols-rounded am-stat-icon is-ok" aria-hidden="true">check_circle</span>
+          <div><span>Index</span><strong id="anime_mapping_index">-</strong></div>
+        </div>
+        <div class="am-stat">
+          <span class="material-symbols-rounded am-stat-icon" aria-hidden="true">schedule</span>
+          <div><span>Generated</span><strong class="mono" id="anime_mapping_generated">-</strong></div>
+        </div>
+        <div class="am-stat">
+          <span class="material-symbols-rounded am-stat-icon" aria-hidden="true">inventory_2</span>
+          <div><span>Size</span><strong id="anime_mapping_counts">-</strong></div>
+        </div>
+        <div class="am-stat">
+          <span class="material-symbols-rounded am-stat-icon" aria-hidden="true">group</span>
+          <div><span>Used for</span><strong id="anime_mapping_used_for">AniList pairs</strong></div>
+        </div>
+      </section>
+
+      <div class="am-card">
+        <h4 class="anime-mapping-section-title"><span class="material-symbols-rounded" aria-hidden="true">settings</span>Settings</h4>
+        <div class="am-settings">
+          <div class="am-setting">
+            <div>
+              <strong>Auto update</strong>
+              <span>Keep the dataset up to date automatically</span>
+            </div>
+            <label class="cx-toggle am-toggle">
+              <input type="checkbox" id="anime_mapping_auto_update">
+              <span class="cx-toggle-ui" aria-hidden="true"></span>
+            </label>
+            <span class="anime-mapping-mode" hidden>Mode <strong id="anime_mapping_auto_update_state">Daily</strong></span>
+          </div>
+          <div class="am-setting">
+            <div>
+              <strong>Mapping index</strong>
+              <span>Enable the Anime ID Mapping index</span>
+            </div>
+            <label class="cx-toggle am-toggle">
+              <input type="checkbox" id="anime_mapping_enabled">
+              <span class="cx-toggle-ui" aria-hidden="true"></span>
+            </label>
+          </div>
+        </div>
       </div>
-      <label class="cx-toggle anime-mapping-toggle">
-        <input type="checkbox" id="anime_mapping_enabled">
-        <span class="cx-toggle-ui" aria-hidden="true"></span>
-        <span class="cx-toggle-text">Enable</span>
-        <span class="cx-toggle-state" aria-hidden="true"></span>
-      </label>
-    </div>
-    <div class="auth-card anime-mapping-card">
-      <div class="anime-mapping-summary">
-        <div>
-          <div class="muted">Used for</div>
-          <strong id="anime_mapping_used_for">AniList pairs</strong>
+
+      <div class="am-card">
+        <h4 class="anime-mapping-section-title"><span class="material-symbols-rounded" aria-hidden="true">description</span>Dataset details</h4>
+        <div class="am-details">
+          <dl class="am-detail-list">
+            <div><dt>Source</dt><dd><a href="https://github.com/anibridge/anibridge-mappings" target="_blank" rel="noopener noreferrer">aniBridge/anibridge-mappings<span class="material-symbols-rounded" aria-hidden="true">open_in_new</span></a></dd></div>
+            <div><dt>Status</dt><dd><span class="am-status-pill" id="anime_mapping_meta_status">-</span></dd></div>
+            <div><dt>Last update</dt><dd><strong id="anime_mapping_last_update">-</strong></dd></div>
+          </dl>
+          <p class="am-details-copy">CrossWatch downloads the AniBridge mappings dataset to translate media identifiers between AniList and TMDB, TVDB, IMDb, MyAnimeList, and AniDB.</p>
         </div>
-        <div>
-          <div class="muted">Auto-update</div>
-          <label class="cx-toggle anime-mapping-inline-toggle">
-            <input type="checkbox" id="anime_mapping_auto_update">
-            <span class="cx-toggle-ui" aria-hidden="true"></span>
-            <span class="cx-toggle-text" id="anime_mapping_auto_update_state">Daily</span>
-            <span class="cx-toggle-state" aria-hidden="true"></span>
-          </label>
-        </div>
+        <div class="auth-card-notes" id="anime_mapping_error"></div>
       </div>
-      <div class="anime-mapping-status-grid">
-        <div class="anime-mapping-status">
-          <span>Dataset</span>
-          <strong id="anime_mapping_dataset">-</strong>
+
+      <div class="am-card">
+        <h4 class="anime-mapping-section-title"><span class="material-symbols-rounded" aria-hidden="true">bolt</span>Actions</h4>
+        <div class="am-actions">
+          <button class="btn primary" type="button" id="btn-anime-mapping-update">Update now</button>
+          <button class="btn" type="button" id="btn-anime-mapping-rebuild">Rebuild index</button>
+          <span>Update downloads the latest dataset.<br>Rebuild recreates the local index from the dataset.</span>
         </div>
-        <div class="anime-mapping-status">
-          <span>Index</span>
-          <strong id="anime_mapping_index">-</strong>
-        </div>
-        <div class="anime-mapping-status">
-          <span>Generated</span>
-          <strong class="mono" id="anime_mapping_generated">-</strong>
-        </div>
-        <div class="anime-mapping-status">
-          <span>Size</span>
-          <strong id="anime_mapping_counts">-</strong>
-        </div>
-      </div>
-      <div class="anime-mapping-source">
-        Dataset source: <a href="https://github.com/anibridge/anibridge-mappings" target="_blank" rel="noopener noreferrer">anibridge/anibridge-mappings</a>. CrossWatch downloads the AniBridge mappings dataset to translate media identifiers between AniList and TMDB, TVDB, IMDb, MyAnimeList, and AniDB.
-      </div>
-      <div class="auth-card-notes" id="anime_mapping_error"></div>
-      <div class="cw-settings-inline-action anime-mapping-actions">
-        <button class="btn primary" type="button" id="btn-anime-mapping-update">Update now</button>
-        <button class="btn" type="button" id="btn-anime-mapping-rebuild">Rebuild index</button>
       </div>
     </div>
     </div>
@@ -1044,7 +1064,7 @@ function cwBuildTmdbPanel() {
   checkRow.style.alignItems = "center";
   checkRow.style.justifyContent = "flex-start";
   checkRow.innerHTML = `
-    <button type="button" class="btn secondary" id="tmdb_check">Check</button>
+    <button type="button" class="btn good" id="tmdb_check">Check</button>
     <button type="button" class="btn danger" id="tmdb_delete">Delete</button>
     <div id="tmdb_check_msg" class="msg ok hidden" aria-live="polite" style="margin-left:auto;width:auto;max-width:min(520px,60%);flex:0 1 auto;white-space:normal"></div>
   `;
@@ -1196,6 +1216,13 @@ function cwMetaSettingsHubUpdate() {
     dot.title = verified ? "Verified" : failed ? "TMDb key check failed" : hasKeyNow ? "Configured; click Check to validate" : "Not configured";
     dot.setAttribute("aria-label", dot.title);
     dot.closest?.('.cw-meta-provider-panel[data-provider="tmdb"]')?.classList?.toggle("is-configured", hasKeyNow && !failed);
+  }
+
+  const tmdbCheckBtn = document.getElementById("tmdb_check");
+  if (tmdbCheckBtn) {
+    const connected = verified || (cfgHasKey && !uiTouched);
+    try { window.CW?.AuthShared?.setConnectLocked?.(["tmdb_check"], connected, "Connected — delete the key to reconnect."); }
+    catch { tmdbCheckBtn.disabled = connected; }
   }
 
   try { window.syncMetadataProviderDot?.(); } catch {}
@@ -1379,6 +1406,20 @@ async function loadConfig() {
       _setSelectValue("ui_show_recent_scrobble_widget", on ? "true" : "false");
     }
 
+    {
+      const on = (typeof ui.show_recent_progress_widget === "boolean")
+        ? !!ui.show_recent_progress_widget
+        : false;
+      _setSelectValue("ui_show_recent_progress_widget", on ? "true" : "false");
+    }
+
+    {
+      const on = (typeof ui.show_recent_playlists_widget === "boolean")
+        ? !!ui.show_recent_playlists_widget
+        : false;
+      _setSelectValue("ui_show_recent_playlists_widget", on ? "true" : "false");
+    }
+
     const normalizeDisplay = (value, fallbackLimit) => {
       const raw = String(value || "").trim().toLowerCase();
       const allowed = new Set(["count:3", "count:4", "count:5", "hours:24", "hours:48", "hours:72"]);
@@ -1400,13 +1441,6 @@ async function loadConfig() {
       const normalizedTheme = storedTheme || ((theme === "flat-light" || theme === "original") ? theme : "flat-dark");
       _setSelectValue("ui_theme", normalizedTheme);
       try { window.CWTheme?.apply?.(normalizedTheme, { persist: true }); } catch {}
-    }
-
-    {
-      const on = (typeof ui.show_AI === "boolean")
-        ? !!ui.show_AI
-        : true;
-      _setSelectValue("ui_show_AI", on ? "true" : "false");
     }
 
     {
@@ -1568,7 +1602,6 @@ async function loadConfig() {
     cwRenderOtherSessions(st);
   } catch {}
 
-  try { await cwMobileDevicesRefresh(); } catch {}
   try { await cwAppAuthPlexRefreshStatus(); } catch {}
   try { cwUiSettingsHubUpdate?.(); } catch {}
 
@@ -1639,190 +1672,6 @@ function cwRenderOtherSessions(st) {
   if (btn) btn.disabled = !(st && st.authenticated && count > 0);
 }
 
-function cwMobileDateLabel(seconds) {
-  const n = Number(seconds || 0);
-  if (!Number.isFinite(n) || n <= 0) return "";
-  try {
-    return new Date(n * 1000).toLocaleString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return "";
-  }
-}
-
-async function cwMobileJson(url, options = {}) {
-  const res = await fetch(url, {
-    cache: "no-store",
-    credentials: "same-origin",
-    ...options,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data?.ok === false) {
-    throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
-  }
-  return data;
-}
-
-function cwMobileSetStatus(text, warn = false) {
-  const el = document.getElementById("mobile_auth_state");
-  if (!el) return;
-  el.textContent = String(text || "");
-  el.classList.toggle("warn", !!warn);
-}
-
-function cwMobileRenderDevices(devices) {
-  const list = document.getElementById("mobile_devices_list");
-  const count = Array.isArray(devices) ? devices.length : 0;
-  cwMobileSetStatus(`${count} paired ${count === 1 ? "device" : "devices"}`);
-  if (!list) return;
-  list.textContent = "";
-
-  if (!count) {
-    const empty = document.createElement("div");
-    empty.className = "sub";
-    empty.textContent = "No paired companion devices.";
-    list.appendChild(empty);
-    return;
-  }
-
-  for (const device of devices) {
-    const id = String(device?.id || "");
-    const name = String(device?.name || "Android device");
-    const scopes = Array.isArray(device?.scopes) ? device.scopes.join(", ") : "read";
-    const seen = cwMobileDateLabel(device?.last_seen_at);
-    const row = document.createElement("div");
-    row.className = "cw-mobile-device-row";
-    row.dataset.mobileDeviceId = id;
-
-    const meta = document.createElement("div");
-    meta.className = "cw-mobile-device-meta";
-    const title = document.createElement("strong");
-    title.textContent = name;
-    const detail = document.createElement("div");
-    detail.className = "sub";
-    detail.textContent = `${scopes || "read"}${seen ? ` | seen ${seen}` : ""}`;
-    meta.append(title, detail);
-
-    const revoke = document.createElement("button");
-    revoke.className = "btn";
-    revoke.type = "button";
-    revoke.textContent = "Revoke";
-    revoke.disabled = !id;
-    revoke.addEventListener("click", () => cwMobileRevokeDevice(id, name));
-
-    row.append(meta, revoke);
-    list.appendChild(row);
-  }
-}
-
-async function cwMobileDevicesRefresh() {
-  try {
-    const data = await cwMobileJson("/api/mobile/devices");
-    const devices = Array.isArray(data?.devices) ? data.devices : [];
-    cwMobileRenderDevices(devices);
-    return devices;
-  } catch (err) {
-    cwMobileSetStatus(String(err?.message || err || "Could not load companion devices."), true);
-    return [];
-  }
-}
-
-function cwMobilePairingPollUntil(expiresAt) {
-  try { clearInterval(window.__cwMobilePairingPoll); } catch {}
-  const stopAt = Number(expiresAt || 0);
-  if (!Number.isFinite(stopAt) || stopAt <= 0) return;
-  window.__cwMobilePairingPoll = setInterval(async () => {
-    if (Date.now() / 1000 > stopAt) {
-      clearInterval(window.__cwMobilePairingPoll);
-      return;
-    }
-    try { await cwMobileDevicesRefresh(); } catch {}
-  }, 5000);
-}
-
-async function cwMobilePairingStart() {
-  const btn = document.getElementById("btn-mobile-pairing-start");
-  const box = document.getElementById("mobile_pairing_box");
-  const qr = document.getElementById("mobile_pairing_qr");
-  const code = document.getElementById("mobile_pairing_code");
-  const uri = document.getElementById("mobile_pairing_uri");
-  const expiry = document.getElementById("mobile_pairing_expiry");
-  const previous = btn?.textContent || "Add device";
-  try {
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Creating...";
-    }
-    const data = await cwMobileJson("/api/mobile/pairing/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        device_name: "CrossWatch companion",
-        server_url: window.location?.origin || "",
-        scopes: ["read", "actions", "diagnostics", "safe-config"],
-      }),
-    });
-    if (box) box.classList.remove("hidden");
-    if (code) code.textContent = String(data?.code || "");
-    if (uri) uri.value = String(data?.pairing_uri || "");
-    if (expiry) {
-      const until = cwMobileDateLabel(data?.expires_at);
-      expiry.textContent = until ? `Expires ${until}` : "";
-    }
-    if (qr) {
-      qr.textContent = "";
-      const img = document.createElement("img");
-      img.alt = "Companion pairing QR code";
-      img.addEventListener("error", () => {
-        qr.textContent = "";
-        const msg = document.createElement("div");
-        msg.className = "sub";
-        msg.style.color = "#1f2937";
-        msg.style.textAlign = "center";
-        msg.textContent = "QR generator missing. Install requirements and restart CrossWatch.";
-        qr.appendChild(msg);
-        cwMobileSetStatus("QR image could not be loaded. Use the code or URI for now.", true);
-      });
-      img.src = `/api/mobile/pairing/${encodeURIComponent(String(data?.id || ""))}/qr.svg?t=${Date.now()}`;
-      qr.appendChild(img);
-    }
-    cwMobileSetStatus("Pairing code ready");
-    cwMobilePairingPollUntil(data?.expires_at);
-    try { await cwMobileDevicesRefresh(); } catch {}
-  } catch (err) {
-    cwMobileSetStatus(String(err?.message || err || "Could not create pairing code."), true);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = previous;
-    }
-  }
-}
-
-async function cwMobileRevokeDevice(id, name = "") {
-  const deviceId = String(id || "");
-  if (!deviceId) return false;
-  if (!confirm(`Revoke ${name || "this companion device"}?`)) return false;
-  const row = Array.from(document.querySelectorAll(".cw-mobile-device-row"))
-    .find((el) => String(el?.dataset?.mobileDeviceId || "") === deviceId);
-  const btn = row?.querySelector("button");
-  try {
-    if (btn) btn.disabled = true;
-    await cwMobileJson(`/api/mobile/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
-    await cwMobileDevicesRefresh();
-    return true;
-  } catch (err) {
-    cwMobileSetStatus(String(err?.message || err || "Could not revoke companion device."), true);
-    if (btn) btn.disabled = false;
-    return false;
-  }
-}
-
 async function cwRefreshAppAuthStatus() {
   const r = await fetch("/api/app-auth/status", { cache: "no-store", credentials: "same-origin" });
   const st = r.ok ? await r.json() : null;
@@ -1851,7 +1700,6 @@ async function cwRefreshAppAuthStatus() {
   const btn = document.getElementById("btn-auth-logout");
   if (btn) btn.disabled = !(st && st.authenticated);
   cwRenderOtherSessions(st);
-  try { await cwMobileDevicesRefresh(); } catch {}
 }
 
 window.cwAppLogout = async function cwAppLogout() {
@@ -1948,6 +1796,9 @@ async function cwVerifyTmdbKey() {
     if (input) input.dataset.verified = ok ? "1" : "0";
     cwSetTmdbCheckMessage(ok, ok ? "Connected" : (data?.error || "TMDb key check failed."));
     try { cwMetaSettingsHubUpdate(); } catch {}
+    if (ok) {
+      try { document.dispatchEvent(new CustomEvent("cw-provider-connected", { bubbles: true, detail: { provider: "tmdb", key: "TMDB_METADATA" } })); } catch {}
+    }
     return ok;
   } catch {
     if (input) input.dataset.verified = "0";
@@ -1955,7 +1806,7 @@ async function cwVerifyTmdbKey() {
     try { cwMetaSettingsHubUpdate(); } catch {}
     return false;
   } finally {
-    if (btn) btn.disabled = false;
+    try { cwMetaSettingsHubUpdate(); } catch { if (btn) btn.disabled = false; }
   }
 }
 
@@ -1991,7 +1842,7 @@ async function cwDeleteTmdbKey() {
     try { window.manualRefreshStatus?.(); } catch {}
     try { updateTmdbHint(); } catch {}
     try { cwMetaSettingsHubUpdate(); } catch {}
-    cwSetTmdbCheckMessage(true, "Deleted");
+    cwSetTmdbCheckMessage(false, "Deleted");
     return true;
   } catch {
     cwSetTmdbCheckMessage(false, "TMDb key delete failed.");
@@ -2035,9 +1886,6 @@ function setTraktSuccess(show) {
     cwMetaSettingsHubUpdate,
     cwMetaSettingsHubInit,
     cwMetaSettingsHubEnsure,
-    cwMobileDevicesRefresh,
-    cwMobilePairingStart,
-    cwMobileRevokeDevice,
     loadConfig,
     updateTmdbHint,
     setTraktSuccess,

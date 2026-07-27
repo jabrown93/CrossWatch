@@ -11,6 +11,8 @@ export const HELP_TEXT = {
   "gl-observed": "Include observed deletes\nIf off, observed deletes are ignored and delta-delete providers are disabled (safer).",
   "gl-bb-enable": "Blackbox: Enabled\nAutomatic flapper protection and failure quarantine.",
   "gl-bb-pair": "Blackbox: Pair scoped\nKeep blackbox decisions per pair instead of global.",
+  "gl-bb-section": "Blackbox\nUnresolved is only a reporting state: items that fail to write are recorded, shown in diagnostics, and retried on every sync. Blackbox is the quarantine state and the only thing that stops an item from being planned again.",
+  "gl-bb-promote": "Promote after (failed writes)\nNumber of consecutive failed write attempts before an item is moved to the blackbox. Until then the item keeps being retried; unresolved alone never blocks it.",
   "gl-section-main": "Globals\nThese are the overall safety and behavior settings for this connection. The defaults are good enough for most users, so only change them when you have a specific reason.",
   "gl-section-advanced": "Advanced\nThese are extra retention and blackbox safety controls. The defaults are good enough for most users, so you usually do not need to change anything here.",
 
@@ -28,7 +30,7 @@ export const HELP_TEXT = {
   "cx-hs-enable": "History: Enable\nCompare and write watch history to the target.",
   "cx-hs-add": "History: Add\nAdds plays/watched items to the target history.",
   "cx-hs-remove": "History: Remove\nRemoving history is discouraged (destructive and only for very specific needs).",
-  "cx-tr-hs-col": "Trakt: Add collections\nAlso add items to Trakt collections when writing history (if enabled).",
+  "cx-tr-hs-col": "Trakt: Add to library\nAlso add items to your Trakt library when writing history (if enabled).",
   "cx-tr-hs-ignore-dropped": "Trakt: Ignore dropped shows\nWhen enabled, shows marked as dropped on Trakt are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
   "cx-md-hs-ignore-dropped": "MDBList: Ignore dropped shows\nWhen enabled, shows marked as dropped on MDBList are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
   "cx-sm-hs-ignore-dropped": "Simkl: Ignore dropped shows\nWhen enabled, shows marked as dropped on Simkl are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
@@ -39,6 +41,8 @@ export const HELP_TEXT = {
   "cx-pr-min": "Progress: Minimum seconds\nIgnore tiny offsets (scrubbing).",
   "cx-pr-delta": "Progress: Change threshold\nOnly write when the difference is large enough.",
   "cx-pr-maxp": "Progress: Ignore near complete (%)\nWhen near completion, history sync should handle watched state.",
+  "cx-pr-replay": "Replay watched items\nUnwatch the target, then apply resume progress.",
+  "cx-pr-tolerance": "Timestamp tolerance\nProtect targets newer by more than this many seconds.",
 
   "cx-jf-wl-mode": "Jellyfin: Watchlist mode\nJellyfin has no native Watchlist. CrossWatch maps it to:\n• Favorites: sets the Favorite flag\n• Playlist: writes to a named playlist (episodes only; no shows)\n• Collections: writes to a named collection\nChanging mode does not move existing items.\nTip: Favorites or Collections are the most compatible.",
   "cx-em-wl-mode": "Emby: Watchlist mode\nEmby has no native Watchlist. CrossWatch maps it to:\n• Favorites: sets the Favorite flag\n• Playlist: writes to a named playlist (episodes only; no shows)\n• Collections: writes to a named collection\nChanging mode does not move existing items.\nTip: Favorites or Collections are the most compatible.",

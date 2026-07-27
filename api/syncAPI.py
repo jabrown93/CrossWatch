@@ -4,17 +4,20 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from datetime import datetime, timezone, date
 from contextlib import contextmanager
 
-import dataclasses as _dc, importlib, inspect, json, os, pkgutil, re, shlex, shutil, threading, time, uuid
+import dataclasses as _dc, importlib, inspect, json, os, re, shlex, shutil, threading, time, uuid
 import asyncio
 
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
+from cw_platform.modules_registry import get_sync_module_path_by_name, sync_provider_names, sync_provider_supports_feature
+from cw_platform.reason_labels import friendly_reason
+from cw_platform.value_coercion import coerce_bool
 
 __all__ = ["router", "_is_sync_running", "_load_state", "_find_state_path"]
 
@@ -55,8 +58,8 @@ _ALLOWED_RATING_MODES: tuple[str, ...] = ("only_new", "from_date", "all")
 def _normalize_progress_block(v: dict | bool | None) -> dict:
     if isinstance(v, bool):
         return {
-            "enable": bool(v),
-            "add": bool(v),
+            "enable": coerce_bool(v),
+            "add": coerce_bool(v),
             "remove": False,
             "min_seconds": 60,
             "delta_seconds": 30,
@@ -65,9 +68,9 @@ def _normalize_progress_block(v: dict | bool | None) -> dict:
         }
 
     d = dict(v or {})
-    d["enable"] = bool(d.get("enable", d.get("enabled", False)))
-    d["add"] = bool(d.get("add", True))
-    d["remove"] = bool(d.get("remove", False))
+    d["enable"] = coerce_bool(d.get("enable", d.get("enabled", False)))
+    d["add"] = coerce_bool(d.get("add", True), True)
+    d["remove"] = coerce_bool(d.get("remove", False))
 
     def _i(x: Any, default: int) -> int:
         try:
@@ -92,7 +95,10 @@ def _normalize_progress_block(v: dict | bool | None) -> dict:
     d["min_seconds"] = max(0, min_s)
     d["delta_seconds"] = max(0, delta_s)
     d["max_percent"] = float(min(100.0, max(0.0, max_p)))
-    d["propagate_timestamp_updates"] = bool(
+    d["replay_enabled"] = coerce_bool(d.get("replay_enabled", False))
+    tolerance = _i(d.get("timestamp_tolerance_seconds"), 30)
+    d["timestamp_tolerance_seconds"] = max(0, min(300, tolerance))
+    d["propagate_timestamp_updates"] = coerce_bool(
         d.get("propagate_timestamp_updates", d.get("propagateTimestampUpdates", False))
     )
 
@@ -105,14 +111,14 @@ def _normalize_progress_block(v: dict | bool | None) -> dict:
 def _normalize_ratings_block(v: dict | bool | None) -> dict:
     if isinstance(v, bool):
         return {
-            "enable": bool(v), "add": bool(v), "remove": False,
+            "enable": coerce_bool(v), "add": coerce_bool(v), "remove": False,
             "types": ["movies", "shows"], "mode": "only_new", "from_date": "",
         }
 
     d = dict(v or {})
-    d["enable"] = bool(d.get("enable", d.get("enabled", False)))
-    d["add"] = bool(d.get("add", True))
-    d["remove"] = bool(d.get("remove", False))
+    d["enable"] = coerce_bool(d.get("enable", d.get("enabled", False)))
+    d["add"] = coerce_bool(d.get("add", True), True)
+    d["remove"] = coerce_bool(d.get("remove", False))
 
     t = d.get("types", [])
     if isinstance(t, str):
@@ -152,35 +158,29 @@ def _normalize_features(f: dict | None) -> dict:
             if isinstance(v, (bool, dict)):
                 f[k] = _normalize_progress_block(v)
         elif isinstance(v, bool):
-            f[k] = {"enable": bool(v), "add": bool(v), "remove": False}
+            f[k] = {"enable": coerce_bool(v), "add": coerce_bool(v), "remove": False}
         elif isinstance(v, dict):
-            v.setdefault("enable", True)
-            v.setdefault("add", True)
-            v.setdefault("remove", False)
+            v["enable"] = coerce_bool(v.get("enable", True), True)
+            v["add"] = coerce_bool(v.get("add", True), True)
+            v["remove"] = coerce_bool(v.get("remove", False))
         if isinstance(f.get(k), dict) and ("use_anime_mapping" in f[k] or "anime_only_sync" in f[k]):
-            use_map = bool(f[k].get("use_anime_mapping", False))
+            use_map = coerce_bool(f[k].get("use_anime_mapping", False))
             f[k]["use_anime_mapping"] = use_map
-            f[k]["anime_only_sync"] = bool(f[k].get("anime_only_sync", False)) if use_map else False
+            f[k]["anime_only_sync"] = coerce_bool(f[k].get("anime_only_sync", False)) if use_map else False
     return f
 
-_PROGRESS_ALLOWED = {"PLEX", "EMBY", "JELLYFIN", "PUBLICMETADB", "CROSSWATCH"}
-_RATINGS_ALLOWED = {"PLEX", "SIMKL", "TRAKT", "TMDB", "MDBLIST", "PUBLICMETADB", "CROSSWATCH", "ANILIST"}
-
 def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
-    try:
-        src = str(pair.get("source") or "").strip().upper()
-        dst = str(pair.get("target") or "").strip().upper()
-        feats = pair.get("features")
-        if not isinstance(feats, dict) or not feats:
-            return
-
-        # Progress is only supported between providers that currently expose progress sync.
-        if src not in _PROGRESS_ALLOWED or dst not in _PROGRESS_ALLOWED:
-            feats.pop("progress", None)
-        if src not in _RATINGS_ALLOWED or dst not in _RATINGS_ALLOWED:
-            feats.pop("ratings", None)
-    except Exception:
+    src = str(pair.get("source") or "").strip().upper()
+    dst = str(pair.get("target") or "").strip().upper()
+    feats = pair.get("features")
+    if not isinstance(feats, dict) or not feats:
         return
+
+    # Progress/ratings are only supported between providers that expose the feature via sync OPS.
+    if not sync_provider_supports_feature(src, "progress") or not sync_provider_supports_feature(dst, "progress"):
+        feats.pop("progress", None)
+    if not sync_provider_supports_feature(src, "ratings") or not sync_provider_supports_feature(dst, "ratings"):
+        feats.pop("ratings", None)
 
 def _normalize_pair_providers(p: Any) -> dict[str, Any]:
     if not isinstance(p, dict):
@@ -191,22 +191,22 @@ def _normalize_pair_providers(p: Any) -> dict[str, Any]:
         if not key:
             continue
         if isinstance(v, bool):
-            out[key] = {"strict_id_matching": bool(v)}
+            out[key] = {"strict_id_matching": coerce_bool(v)}
             continue
         if not isinstance(v, dict):
             continue
         blk: dict[str, Any] = {}
         if "strict_id_matching" in v:
-            blk["strict_id_matching"] = bool(v.get("strict_id_matching"))
+            blk["strict_id_matching"] = coerce_bool(v.get("strict_id_matching"))
         if key == "trakt":
             if "history_ignore_dropped_shows" in v:
-                blk["history_ignore_dropped_shows"] = bool(v.get("history_ignore_dropped_shows"))
+                blk["history_ignore_dropped_shows"] = coerce_bool(v.get("history_ignore_dropped_shows"))
         if key == "mdblist":
             if "history_ignore_dropped_shows" in v:
-                blk["history_ignore_dropped_shows"] = bool(v.get("history_ignore_dropped_shows"))
+                blk["history_ignore_dropped_shows"] = coerce_bool(v.get("history_ignore_dropped_shows"))
         if key == "simkl":
             if "history_ignore_dropped_shows" in v:
-                blk["history_ignore_dropped_shows"] = bool(v.get("history_ignore_dropped_shows"))
+                blk["history_ignore_dropped_shows"] = coerce_bool(v.get("history_ignore_dropped_shows"))
         for kk, vv in v.items():
             if kk in {"strict_id_matching", "history_ignore_dropped_shows"}:
                 continue
@@ -294,9 +294,9 @@ def _seed_summary_provider_counts(phase: str) -> None:
     if ph not in ("pre", "post"):
         return
     try:
-        counts = _counts_from_state(_load_state()) or {k: 0 for k in _PROVIDER_ORDER}
+        counts = _counts_from_state(_load_state()) or _provider_count_defaults()
     except Exception:
-        counts = {k: 0 for k in _PROVIDER_ORDER}
+        counts = _provider_count_defaults()
     if not isinstance(counts, dict):
         return
     _summary_set(f"provider_counts_{ph}", counts)
@@ -340,6 +340,18 @@ def _slim_sync_log_obj(obj: Any) -> dict[str, Any] | None:
     ev = str(obj.get("event") or "")
     if ev == "ui:spotlight":
         return {}
+    if ev == "apply:unresolved":
+        return {}
+    if ev == "archive:item_failures":
+        return {}
+    if ev == "debug" and str(obj.get("msg") or "") == "blocked.counts" and isinstance(obj.get("blackbox_items"), list):
+        out = dict(cast(dict[str, Any], obj))
+        out["blackbox_items"] = len(out["blackbox_items"])
+        return out
+    if ev == "feature:error" and obj.get("traceback"):
+        out = dict(cast(dict[str, Any], obj))
+        out.pop("traceback", None)
+        return out
     if "confirmed_keys" in obj and not ev:
         return _slim_counts(cast(dict[str, Any], obj))
 
@@ -427,12 +439,81 @@ def _spot_sig(it: dict) -> str:
         typ = (it.get("type") or "").lower()
         return f"{typ}|title:{t}|year:{y}"
 
+def _friendly_unresolved_reason(raw: Any) -> str:
+    return friendly_reason(raw)
+
+def _format_unresolved_line(it: Mapping[str, Any]) -> str:
+    nested = it.get("item")
+    if isinstance(nested, Mapping):
+        merged = dict(nested)
+        for field in ("reason", "feature", "provider"):
+            if it.get(field) not in (None, ""):
+                merged[field] = it.get(field)
+        it = merged
+    series = str(it.get("series_title") or it.get("show_title") or "").strip()
+    title = str(it.get("title") or it.get("name") or "").strip()
+    reason = _friendly_unresolved_reason(it.get("reason"))
+    code = ""
+    season = it.get("season")
+    episode = it.get("episode")
+    try:
+        if season not in (None, "") and episode not in (None, ""):
+            code = f"S{int(season):02d}E{int(episode):02d}"
+    except Exception:
+        code = ""
+    head = series or title or "Unknown"
+    if code:
+        head = f"{head} - {code}"
+    return f"{head} | {reason}"
+
+def _emit_unresolved_details(total_unresolved: int | None = None) -> None:
+    with SUMMARY_LOCK:
+        items = list(SUMMARY.get("unresolved_items") or [])
+    if not items:
+        try:
+            from cw_platform.orchestrator._unresolved import load_unresolved_items
+            items = load_unresolved_items()
+        except Exception:
+            items = []
+    if not items:
+        return
+    seen: set[str] = set()
+    lines: list[str] = []
+    for it in items:
+        if not isinstance(it, Mapping):
+            continue
+        line = _format_unresolved_line(it)
+        sig = line.strip().lower()
+        if not sig or sig in seen:
+            continue
+        seen.add(sig)
+        lines.append(line)
+    if not lines:
+        return
+    try:
+        total = int(total_unresolved or 0)
+    except Exception:
+        total = 0
+    cap = 25
+    shown = lines[:cap]
+    full_total = max(total, len(lines))
+    if full_total > len(shown):
+        _sync_progress_ui(f"[i] Unresolved item examples ({len(shown)} shown, {full_total} total):")
+        for line in shown:
+            _sync_progress_ui(f"[i] {line}")
+        _sync_progress_ui("[i] ::CW_UNRESOLVED_MORE::")
+    else:
+        _sync_progress_ui(f"[i] Unresolved items ({len(shown)}):")
+        for line in shown:
+            _sync_progress_ui(f"[i] {line}")
+
 def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
     rt = _rt()
     LOG_BUFFERS, RUNNING_PROCS, STATE_PATH, _append_log, strip_ansi = rt[0], rt[1], rt[3], rt[8], rt[7]
     overrides = overrides or {}
     _summary_reset()
     LOG_BUFFERS["SYNC"] = []
+    os.environ["CW_RUN_ID"] = str(run_id)
     _sync_progress_ui("::CLEAR::")
     _sync_progress_ui(f"SYNC start: orchestrator pairs run_id={run_id}")
 
@@ -514,8 +595,11 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                     t["blocked"] += int(o.get("adds_blocked", 0) or 0) + int(o.get("removes_blocked", 0) or 0)
                 elif msg == "blocked.manual":
                     t["blocked"] += int(o.get("blocked_items", o.get("blocked_keys", 0)) or 0)
-                elif msg == "blocked.unresolved":
-                    t["blocked"] += int(o.get("blocked", 0) or 0)
+                elif msg == "blocked.counts":
+                    t["blocked"] += int(o.get("blocked_blackbox", 0) or 0) + int(o.get("blocked_manual", 0) or 0)
+
+            elif ev == "blocked.counts":
+                t["blocked"] += int(o.get("blocked_blackbox", 0) or 0) + int(o.get("blocked_manual", 0) or 0)
 
             elif ev == "run:done":
                 t["blocked"] = max(t["blocked"], int(o.get("blocked", 0) or 0))
@@ -534,7 +618,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
 
         if req_pair_id:
             pair = next((p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") == req_pair_id), None)
-            if not pair or pair.get("enabled", True) is False:
+            if not pair or not coerce_bool(pair.get("enabled", True), True):
                 _sync_progress_ui(f"[!] Pair not found or disabled: {req_pair_id}")
                 _sync_progress_ui("[SYNC] exit code: 1")
                 return
@@ -560,12 +644,12 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                 for _, fcfg in (fmap.items() or []):
                     if isinstance(fcfg, bool) and fcfg:
                         return True
-                    if isinstance(fcfg, dict) and fcfg.get("enable"):
+                    if isinstance(fcfg, dict) and coerce_bool(fcfg.get("enable", True), True):
                         return True
                 return False
 
             for pair in (cfg.get("pairs") or []):
-                if not pair.get("enabled", True):
+                if not coerce_bool(pair.get("enabled", True), True):
                     continue
                 if "features" in pair and not _pair_has_enabled_features(pair):
                     src = pair.get("source") or "?"
@@ -576,7 +660,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                     )
 
             mgr = OrchestratorClass(config=cfg)
-            dry = bool(((cfg.get("sync") or {}).get("dry_run") or False)) or bool((overrides or {}).get("dry_run"))
+            dry = coerce_bool((cfg.get("sync") or {}).get("dry_run", False)) or coerce_bool((overrides or {}).get("dry_run"))
             result = mgr.run_pairs(
                 dry_run=dry,
                 progress=_sync_progress_ui,
@@ -597,7 +681,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                     counts = _counts_from_state(state)
                     if counts is None:
                         _append_log("SYNC", "[!] Provider-counts: state malformed; keeping last known counts")
-                        counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or {k: 0 for k in _PROVIDER_ORDER})
+                        counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
                     if counts:
                         _PROVIDER_COUNTS_CACHE["ts"] = time.time()
                         _PROVIDER_COUNTS_CACHE["data"] = counts
@@ -628,6 +712,11 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
             f"[i] Done. Total added: {added}, Total removed: {removed}, Total updated: {updated}, "
             f"Total skipped: {skipped}, Total unresolved: {unresolved}, Total errors: {errors}{extra}"
         )
+        if unresolved > 0:
+            try:
+                _emit_unresolved_details(unresolved)
+            except Exception:
+                pass
         _sync_progress_ui("[SYNC] exit code: 0")
     except Exception as e:
         _sync_progress_ui(f"[!] Sync error: {e}")
@@ -639,7 +728,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
             state2 = _load_state()
             counts2 = _counts_from_state(state2) if state2 else None
             if counts2 is None:
-                counts2 = dict(_PROVIDER_COUNTS_CACHE.get("data") or {k: 0 for k in _PROVIDER_ORDER})
+                counts2 = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
             if counts2:
                 _PROVIDER_COUNTS_CACHE["ts"] = time.time()
                 _PROVIDER_COUNTS_CACHE["data"] = counts2
@@ -679,7 +768,22 @@ def _parse_sync_line(line: str) -> None:
                 apply_phase["total"] = int(apply_phase.get("total") or 0) + delta
                 _summary_set("_phase", phase)
                 return
-            
+
+            if ev == "apply:unresolved":
+                raw_items = o.get("items")
+                if isinstance(raw_items, list) and raw_items:
+                    feat_u = str(o.get("feature") or "")
+                    prov_u = str(o.get("provider") or "")
+                    with SUMMARY_LOCK:
+                        bucket = SUMMARY.setdefault("unresolved_items", [])
+                        for it in raw_items:
+                            if isinstance(it, dict):
+                                rec = dict(it)
+                                rec.setdefault("feature", feat_u)
+                                rec.setdefault("provider", prov_u)
+                                bucket.append(rec)
+                return
+
             feat = str(o.get("feature") or "").lower()
             if feat in ("watchlist", "history", "ratings", "progress", "playlists"):
                 F = SUMMARY.setdefault("features", {})
@@ -1494,7 +1598,6 @@ def _is_sync_running() -> bool:
 @router.get("/sync/providers")
 def api_sync_providers() -> JSONResponse:
     HIDDEN = {"BASE"}
-    PKG_CANDIDATES = ("providers.sync",)
     FEATURE_KEYS = ("watchlist", "ratings", "history", "playlists", "progress")
     try:
         from cw_platform.config_base import load_config
@@ -1581,8 +1684,10 @@ def api_sync_providers() -> JSONResponse:
                     getattr(info, "hidden", False) or getattr(info, "is_template", False)
                 ):
                     return None
+                supported_features = getattr(cls, "supported_features", None)
                 try:
-                    feats = dict(cls.supported_features()) if hasattr(cls, "supported_features") else {}
+                    raw_feats = supported_features() if callable(supported_features) else {}
+                    feats = dict(raw_feats) if isinstance(raw_feats, Mapping) else {}
                 except Exception:
                     feats = {}
                 return {
@@ -1618,33 +1723,27 @@ def api_sync_providers() -> JSONResponse:
 
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for pkg_name in PKG_CANDIDATES:
+    for prov_key in sync_provider_names(upper=True):
+        if prov_key in HIDDEN:
+            continue
+        module_path = get_sync_module_path_by_name(prov_key)
+        if not module_path:
+            continue
         try:
-            pkg = importlib.import_module(pkg_name)
+            mod = importlib.import_module(module_path)
         except Exception:
             continue
-        for pkg_path in getattr(pkg, "__path__", []):
-            for m in pkgutil.iter_modules([str(pkg_path)]):
-                if not m.name.startswith("_mod_"):
-                    continue
-                prov_key = m.name.replace("_mod_", "").upper()
-                if prov_key in HIDDEN:
-                    continue
-                try:
-                    mod = importlib.import_module(f"{pkg_name}.{m.name}")
-                except Exception:
-                    continue
-                mf = _manifest_from_module(mod)
-                if not mf:
-                    continue
-                mf["name"] = (mf["name"] or prov_key).upper()
-                mf["label"] = mf.get("label") or mf["name"].title()
-                mf["features"] = _norm_features(mf.get("features"))
-                mf["capabilities"] = _norm_caps(mf.get("capabilities"))
-                if mf["name"] in seen:
-                    continue
-                seen.add(mf["name"])
-                items.append(mf)
+        mf = _manifest_from_module(mod)
+        if not mf:
+            continue
+        mf["name"] = (mf["name"] or prov_key).upper()
+        mf["label"] = mf.get("label") or mf["name"].title()
+        mf["features"] = _norm_features(mf.get("features"))
+        mf["capabilities"] = _norm_caps(mf.get("capabilities"))
+        if mf["name"] in seen:
+            continue
+        seen.add(mf["name"])
+        items.append(mf)
     items.sort(key=lambda x: (x.get("label") or x.get("name") or "").lower())
     return JSONResponse(items)
 
@@ -1721,7 +1820,7 @@ def api_pairs_add(payload: PairIn = Body(...)) -> dict[str, Any]:
         item.setdefault("mode", "one-way")
         item["source_instance"] = _norm_instance_id(item.get("source_instance"))
         item["target_instance"] = _norm_instance_id(item.get("target_instance"))
-        item["enabled"] = bool(item.get("enabled", False))
+        item["enabled"] = coerce_bool(item.get("enabled", False))
         item["features"] = _normalize_features(item.get("features") or {"watchlist": True})
         _enforce_pair_feature_constraints(item)
         prov = _normalize_pair_providers(item.get("providers"))
@@ -1894,7 +1993,15 @@ def api_pairs_delete(pair_id: str, purge_state: bool = True) -> dict[str, Any]:
 
 # Provider counts endpoint
 _PROVIDER_COUNTS_CACHE = {"ts": 0.0, "data": None}
-_PROVIDER_ORDER = ("PLEX", "SIMKL", "TRAKT", "JELLYFIN", "EMBY", "MDBLIST", "PUBLICMETADB", "TMDB", "CROSSWATCH", "ANILIST")
+
+def _provider_count_defaults(extra: Any = None) -> dict[str, int]:
+    names = sync_provider_names(upper=True)
+    if isinstance(extra, Mapping):
+        for name in extra.keys():
+            key = str(name or "").strip().upper()
+            if key and key not in names:
+                names.append(key)
+    return {name: 0 for name in names}
 
 def _counts_from_state(state: dict | None) -> dict | None:
     if not isinstance(state, dict):
@@ -1903,12 +2010,12 @@ def _counts_from_state(state: dict | None) -> dict | None:
     if not isinstance(provs, dict) or not provs:
         return None
 
-    out = {k: 0 for k in _PROVIDER_ORDER}
+    out = _provider_count_defaults(provs)
     _append_log = _rt()[8]
 
     for name, pdata in provs.items():
         key = str(name or "").upper()
-        if key not in out:
+        if not key:
             continue
 
         if not isinstance(pdata, dict):
@@ -2007,7 +2114,7 @@ def _provider_counts_fast(*, max_age: int = 30, force: bool = False) -> dict:
         return dict(_PROVIDER_COUNTS_CACHE["data"])
     counts = _counts_from_state(_load_state())
     if counts is None:
-        counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or {k: 0 for k in _PROVIDER_ORDER})
+        counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
     _PROVIDER_COUNTS_CACHE["ts"] = now
     _PROVIDER_COUNTS_CACHE["data"] = counts
     return counts
@@ -2020,7 +2127,7 @@ def api_provider_counts(
 ) -> dict:
     src = (source or "state").lower().strip()
     if src in ("state", "auto"):
-        return _counts_from_state(_load_state()) or {k: 0 for k in _PROVIDER_ORDER}
+        return _counts_from_state(_load_state()) or _provider_count_defaults()
     return _provider_counts_fast(max_age=max_age, force=bool(force))
 
 # Trigger sync run endpoint
@@ -2045,7 +2152,7 @@ def api_run_sync(payload: dict | None = Body(None)) -> dict[str, Any]:
             pair = next((p for p in pairs if str(p.get("id") or "") == pair_id), None)
             if not pair:
                 return {"ok": False, "error": f"Pair not found: {pair_id}"}
-            if pair.get("enabled", True) is False:
+            if not coerce_bool(pair.get("enabled", True), True):
                 return {"ok": False, "error": f"Pair disabled: {pair_id}"}
             pairs = [pair]
         if not any(p.get("enabled", True) for p in pairs):
@@ -2083,9 +2190,9 @@ def api_run_summary() -> JSONResponse:
         snap["timeline"] = tl
 
     try:
-        snap["provider_counts"] = _counts_from_state(_load_state()) or {k: 0 for k in _PROVIDER_ORDER}
+        snap["provider_counts"] = _counts_from_state(_load_state()) or _provider_count_defaults()
     except Exception:
-        snap["provider_counts"] = {k: 0 for k in _PROVIDER_ORDER}
+        snap["provider_counts"] = _provider_count_defaults()
 
     try:
         _hydrate_summary_spotlights_from_log(snap)
@@ -2093,6 +2200,45 @@ def api_run_summary() -> JSONResponse:
         pass
 
     return JSONResponse(snap)
+
+@router.get("/run/unresolved")
+def api_run_unresolved() -> JSONResponse:
+    try:
+        from cw_platform.orchestrator._unresolved import load_unresolved_items
+        records = load_unresolved_items()
+    except Exception:
+        records = []
+
+    items: list[dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, Mapping):
+            continue
+        raw_item = rec.get("item")
+        item: Mapping[str, Any] = raw_item if isinstance(raw_item, Mapping) else {}
+        merged: dict[str, Any] = dict(item)
+        merged["reason"] = rec.get("reason")
+        line = _format_unresolved_line(merged)
+        series = str(item.get("series_title") or item.get("show_title") or "").strip()
+        title = str(item.get("title") or item.get("name") or "").strip()
+        code = ""
+        s, e = item.get("season"), item.get("episode")
+        try:
+            if s not in (None, "") and e not in (None, ""):
+                code = f"S{int(s):02d}E{int(e):02d}"
+        except Exception:
+            code = ""
+        items.append({
+            "line": line,
+            "title": series or title or "Unknown",
+            "code": code,
+            "type": str(item.get("type") or ""),
+            "reason": _friendly_unresolved_reason(rec.get("reason")),
+            "reason_code": str(rec.get("reason") or ""),
+            "feature": str(rec.get("feature") or ""),
+        })
+
+    items.sort(key=lambda x: (x["reason"], x["title"].lower(), x["code"]))
+    return JSONResponse({"total": len(items), "items": items})
 
 @router.get("/run/summary/file")
 def api_run_summary_file() -> Response:
@@ -2107,6 +2253,10 @@ def api_run_summary_file() -> Response:
         media_type="application/json",
         headers={"Content-Disposition": 'attachment; filename="last_sync.json"'},
     )
+
+_SSE_HEARTBEAT_SEC = 15.0
+_SSE_HEARTBEAT_COMMENT = ": keep-alive\n\n"
+
 
 @router.get("/run/summary/stream")
 async def api_run_summary_stream(request: Request) -> StreamingResponse:
@@ -2152,19 +2302,32 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
         if not isinstance(enabled, dict):
             return ()
         try:
-            return tuple(sorted((str(k), bool(v)) for k, v in enabled.items()))
+            return tuple(sorted((str(k), coerce_bool(v)) for k, v in enabled.items()))
+        except Exception:
+            return ()
+
+    def _provider_counts_key(counts: Any) -> tuple[Any, ...]:
+        if not isinstance(counts, Mapping):
+            return ()
+        try:
+            return tuple(sorted((str(k).upper(), int(v or 0)) for k, v in counts.items()))
         except Exception:
             return ()
     async def agen():
         last_key = None
         last_idx = 0
+        last_hydrate_sig = None
+        last_emit = time.monotonic()
         LOG_BUFFERS = _rt()[0]
 
         while True:
             if await request.is_disconnected():
                 break
+            emitted = False
+            buf_len = 0
             try:
                 buf = LOG_BUFFERS.get("SYNC") or []
+                buf_len = len(buf)
                 if last_idx > len(buf):
                     last_idx = 0
                 if last_idx < len(buf):
@@ -2179,6 +2342,7 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
                             evt = (str(obj.get("event") or "log").strip() or "log")
                             yield f"event: {evt}\n"
                             yield f"data: {json.dumps(obj, separators=(',',':'))}\n\n"
+                            emitted = True
                     last_idx = len(buf)
             except Exception:
                 pass
@@ -2186,23 +2350,18 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             snap = dict(_summary_snapshot() or {})
             snap.setdefault("features", {})
             snap.setdefault("enabled", _lanes_enabled_defaults())
-            try:
-                _hydrate_summary_spotlights_from_log(snap)
-            except Exception:
-                pass
+            hydrate_sig = (buf_len, (snap.get("timeline", {}) or {}).get("done"))
+            if hydrate_sig != last_hydrate_sig:
+                last_hydrate_sig = hydrate_sig
+                try:
+                    _hydrate_summary_spotlights_from_log(snap)
+                except Exception:
+                    pass
 
             key = (
                 snap.get("running"),
                 snap.get("exit_code"),
-                snap.get("plex_post"),
-                snap.get("simkl_post"),
-                snap.get("trakt_post"),
-                snap.get("jellyfin_post"),
-                snap.get("emby_post"),
-                snap.get("mdblist_post"),
-                snap.get("publicmetadb_post"),
-                snap.get("tmdb_post"),
-                snap.get("crosswatch_post"),
+                _provider_counts_key(snap.get("provider_counts") or snap.get("provider_counts_post")),
                 snap.get("result"),
                 snap.get("duration_sec"),
                 (snap.get("timeline", {}) or {}).get("done"),
@@ -2213,6 +2372,14 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             if key != last_key:
                 last_key = key
                 yield f"data: {json.dumps(snap, separators=(',',':'))}\n\n"
+                emitted = True
+
+            now = time.monotonic()
+            if emitted:
+                last_emit = now
+            elif (now - last_emit) >= _SSE_HEARTBEAT_SEC:
+                yield _SSE_HEARTBEAT_COMMENT
+                last_emit = now
 
             await asyncio.sleep(0.25)
 
@@ -2224,6 +2391,5 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             "Pragma": "no-cache",
             "Expires": "0",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
         },
     )

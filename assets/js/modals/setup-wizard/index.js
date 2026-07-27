@@ -23,7 +23,7 @@ const {
 } = await import(_cwVer("../core/app-auth-setup.js"));
 
 function _collapseByDefault() {
-  const ids = ["sec-auth", "sec-meta", "sec-sync", "sec-scrobbler", "sc-sec-webhook", "sc-sec-watch"];
+  const ids = ["sec-auth", "sec-meta", "sec-scrobbler", "sc-sec-webhook", "sc-sec-watch"];
   for (const id of ids) {
     try { document.getElementById(id)?.classList.remove("open"); } catch {}
   }
@@ -179,7 +179,7 @@ export default {
           <div class="card" role="listitem">
             <div class="ico" aria-hidden="true"><span class="material-symbols-rounded">key</span></div>
             <div>
-              <div><b>Authentication providers</b></div>
+              <div><b>Connections</b></div>
               <div class="muted">Next: link one or more providers in Settings.</div>
             </div>
           </div>

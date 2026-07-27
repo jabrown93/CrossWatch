@@ -6,26 +6,65 @@ from collections.abc import Mapping
 from typing import Any
 
 import os
+import re
 import datetime as _dt
 
-from ._pairs_oneway import (
-    _history_bucket_sec as _hist_bucket_sec,
-    _history_ts_from_key as _hist_ts_from_key,
-    _bucket_ts as _hist_bucket_ts,
-    _provider_ignore_dropped_enabled,
-    _load_provider_dropped_tokens,
-    _filter_index_for_dropped_shows,
-    _filter_items_for_dropped_shows,
-    _enrich_index_payload,
-    _effective_library_whitelist,
-    _filter_index_by_libraries,
-    _PROVIDER_KEY_MAP,
-    _rekey_index_to_match_other_keys,
-)
+from ._pairs_oneway import _emit_item_failures, _emit_item_resolutions, compute_effective_add, compute_effective_remove, is_remove_retry_reason, resolve_baseline_writes, select_baseline_keys
+
+try:
+    from ._pairs_oneway import (
+        _history_bucket_sec as _hist_bucket_sec,
+        _history_ts_from_key as _hist_ts_from_key,
+        _bucket_ts as _hist_bucket_ts,
+        _provider_ignore_dropped_enabled,
+        _load_provider_dropped_tokens,
+        _filter_index_for_dropped_shows,
+        _filter_items_for_dropped_shows,
+    )
+except Exception:  # pragma: no cover
+    _HIST_RE = re.compile(r"^(?P<base>.+?)@(?P<ts>\d+)(?P<rest>.*)$")
+
+    def _hist_bucket_sec(a: str, b: str, feature: str) -> int:
+        if str(feature) != "history":
+            return 0
+        au = str(a or "").upper()
+        bu = str(b or "").upper()
+        return 60 if (au == "TRAKT" or bu == "TRAKT") else 0
+
+    def _hist_ts_from_key(key: str) -> int | None:
+        m = _HIST_RE.match(str(key))
+        if not m:
+            return None
+        try:
+            return int(m.group("ts"))
+        except Exception:
+            return None
+
+    def _hist_bucket_ts(ts: int, bucket_sec: int) -> int:
+        b2 = int(bucket_sec or 0)
+        if b2 <= 1:
+            return int(ts)
+        return (int(ts) // b2) * b2
+
+    def _provider_ignore_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
+        return False
+
+    def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
+        return set()
+
+    def _filter_index_for_dropped_shows(idx: dict[str, Any], dropped_tokens: set[str]) -> tuple[dict[str, Any], int]:
+        return dict(idx or {}), 0
+
+    def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens: set[str]) -> tuple[list[dict[str, Any]], int]:
+        return list(items or []), 0
 
 from ..provider_instances import normalize_instance_id
-from ._planner import diff_progress, _pick_rating
-from ._pairs_oneway import _ratings_filter_index as _rate_filter
+from ._planner import diff_ratings, diff_progress, _pick_rating
+try:
+    from ._pairs_oneway import _ratings_filter_index as _rate_filter
+except Exception:
+    def _rate_filter(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
+        return idx
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
 from ..anime_mapping.service import (
@@ -35,15 +74,19 @@ from ..anime_mapping.service import (
 )
 from ._snapshots import (
     build_snapshots_for_feature,
+    bust_snapshot_cache,
     coerce_suspect_snapshot,
     module_checkpoint,
+    needs_post_apply_refresh,
+    prepare_source_snapshot,
     provider_index_semantics,
     prev_checkpoint,
+    refresh_destination_after_apply,
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
 from ._tombstones import clear_items_for_feature, keys_for_feature
-from ._unresolved import load_unresolved_keys, record_unresolved
+from ._unresolved import load_unresolved_keys, load_unresolved_pending, record_unresolved, clear_unresolved
 from ._phantoms import PhantomGuard  # type: ignore[attr-defined]
 
 from ._pairs_blocklist import apply_blocklist
@@ -60,7 +103,14 @@ from ._pairs_utils import (
     filter_manual_block as _filter_manual_block,
 )
 
-from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
+from ._blackbox import load_blackbox_keys, record_attempts, record_success
+
+_PROVIDER_KEY_MAP = {
+    "PLEX": "plex",
+    "JELLYFIN": "jellyfin",
+    "EMBY": "emby",
+    "KODI": "kodi",
+}
 
 def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None, provider: str = "") -> str:
     return provider_index_semantics(ops, cfg or {}, feature)
@@ -68,6 +118,134 @@ def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None,
 
 def _cross_feature_unresolved(feature_name: str) -> bool:
     return str(feature_name or "").strip().lower() == "history"
+
+def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
+    if not cur or not prev:
+        return dict(cur or {})
+
+    def _iso_to_epoch(v: Any) -> int | None:
+        if not v:
+            return None
+        try:
+            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    def _pick_newest(a: Any, b: Any) -> Any:
+        ae = _iso_to_epoch(a)
+        be = _iso_to_epoch(b)
+        if be is None:
+            return a
+        if ae is None or be > ae:
+            return b
+        return a
+
+    out: dict[str, Any] = {}
+    for k, cv in (cur or {}).items():
+        pv = (prev or {}).get(k)
+        if not isinstance(cv, Mapping) or not isinstance(pv, Mapping):
+            out[str(k)] = cv
+            continue
+
+        merged: dict[str, Any] = dict(pv)
+
+        ids_prev = pv.get("ids") if isinstance(pv.get("ids"), Mapping) else None
+        ids_cur = cv.get("ids") if isinstance(cv.get("ids"), Mapping) else None
+        ids = _merge_ids(ids_prev, ids_cur)
+        if ids:
+            merged["ids"] = ids
+
+        sids_prev = pv.get("show_ids") if isinstance(pv.get("show_ids"), Mapping) else None
+        sids_cur = cv.get("show_ids") if isinstance(cv.get("show_ids"), Mapping) else None
+        sids = _merge_ids(sids_prev, sids_cur)
+        if sids:
+            merged["show_ids"] = sids
+
+        for fk, fv in cv.items():
+            if fk in ("ids", "show_ids"):
+                continue
+            if fv is None:
+                continue
+            if isinstance(fv, str) and fv == "":
+                continue
+            merged[fk] = fv
+
+        if feature == "history":
+            if "watched_at" in pv or "watched_at" in cv:
+                merged["watched_at"] = _pick_newest(pv.get("watched_at"), cv.get("watched_at"))
+        elif feature == "ratings":
+            if "rated_at" in pv or "rated_at" in cv:
+                merged["rated_at"] = _pick_newest(pv.get("rated_at"), cv.get("rated_at"))
+        out[str(k)] = merged
+
+    return out
+
+
+def _effective_library_whitelist(
+    cfg: Mapping[str, Any],
+    provider_name: str,
+    feature: str,
+    fcfg: Mapping[str, Any],
+) -> list[str]:
+    if feature not in ("history", "ratings", "progress"):
+        return []
+
+    libs: list[str] = []
+    lib_cfg = fcfg.get("libraries")
+    if isinstance(lib_cfg, dict):
+        per = lib_cfg.get(provider_name.upper()) or lib_cfg.get(provider_name.lower())
+        if isinstance(per, (list, tuple)):
+            libs = [str(x).strip() for x in per if str(x).strip()]
+    elif isinstance(lib_cfg, (list, tuple)):
+        libs = [str(x).strip() for x in lib_cfg if str(x).strip()]
+
+    if libs:
+        return libs
+
+    key = _PROVIDER_KEY_MAP.get(str(provider_name).upper())
+    if not key:
+        return []
+
+    prov_cfg = cfg.get(key) or {}
+    feat_cfg = (prov_cfg.get(feature) or {})
+    base_libs = feat_cfg.get("libraries") or []
+    if isinstance(base_libs, (list, tuple)):
+        return [str(x).strip() for x in base_libs if str(x).strip()]
+
+    return []
+
+def _filter_index_by_libraries(idx: dict[str, Any], libs: list[str], *, allow_unknown: bool = False) -> dict[str, Any]:
+    if not libs or not idx:
+        return dict(idx)
+
+    allowed = {str(x).strip() for x in libs if str(x).strip()}
+    if not allowed:
+        return dict(idx)
+
+    out: dict[str, Any] = {}
+    for ck, item in idx.items():
+        v = item or {}
+        lid = (
+            v.get("library_id")
+            or v.get("libraryId")
+            or v.get("library")
+            or v.get("section_id")
+            or v.get("sectionId")
+        )
+
+        if lid is None:
+            if allow_unknown:
+                out[ck] = v
+            continue
+
+        if str(lid).strip() in allowed:
+            out[ck] = v
+
+    return out
 
 def _minimal_keep_rating(it: Mapping[str, Any]) -> dict[str, Any]:
     out = _minimal(it)
@@ -90,11 +268,22 @@ def _minimal_keep_progress(it: Mapping[str, Any]) -> dict[str, Any]:
             if k in it and it.get(k) is not None:
                 out["progress_ms"] = it.get(k)
                 break
+        for k in ("progress_percent", "progressPercent", "percent", "position_percent", "resume_percent"):
+            value = it.get(k)
+            if value is not None:
+                try:
+                    out["progress_percent"] = round(max(0.0, min(100.0, float(value))), 3)
+                except Exception:
+                    out["progress_percent"] = value
+                break
         if "duration_ms" in it and it.get("duration_ms") is not None:
             out["duration_ms"] = it.get("duration_ms")
         pa = it.get("progress_at") or it.get("progressAt") or it.get("last_played") or it.get("lastViewedAt")
         if isinstance(pa, str) and pa.strip():
             out["progress_at"] = pa.strip()
+        pas = it.get("progress_at_source") or it.get("progressAtSource")
+        if isinstance(pas, str) and pas.strip():
+            out["progress_at_source"] = pas.strip()
     except Exception:
         pass
     return out
@@ -102,7 +291,7 @@ def _minimal_keep_progress(it: Mapping[str, Any]) -> dict[str, Any]:
 def _confirmed(res: dict) -> int:
     return int((res or {}).get("confirmed", (res or {}).get("count", 0)) or 0)
 
-def _two_way_sync(
+def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     ctx,
     a: str,
     b: str,
@@ -203,10 +392,7 @@ def _two_way_sync(
 
     def _bust_snapshot(pname: str) -> None:
         try:
-            sc = getattr(ctx, "snap_cache", None)
-            if isinstance(sc, dict):
-                sc.pop((pname, feature), None)
-                sc.pop(pname, None)
+            bust_snapshot_cache(getattr(ctx, "snap_cache", None), pname, feature)
         except Exception:
             pass
 
@@ -214,13 +400,27 @@ def _two_way_sync(
 
     pair_providers = {a: aops, b: bops}
 
+    if str(a).strip().upper() == "SIMKL" and str(b).strip().upper() != "SIMKL":
+        build_order = [b, a]
+        prep_after, prep_ops = b, aops
+    else:
+        build_order = [a, b]
+        prep_after, prep_ops = a, bops
+
+    def _on_snapshot(name: str, idx: Mapping[str, Any]) -> None:
+        if name != prep_after:
+            return
+        prepare_source_snapshot(prep_ops, config=provider_cfg, feature=feature, items=idx, dbg=dbg)
+
     snaps = build_snapshots_for_feature(
         feature=feature, config=provider_cfg, providers=pair_providers,
         snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
         dbg=dbg, emit_info=info,
+        build_order=build_order, on_snapshot=_on_snapshot,
     )
     A_cur = snaps.get(a) or {}
     B_cur = snaps.get(b) or {}
+
 
     prev_state = getattr(ctx, "_stable_prev_state", None)
     if not prev_state:
@@ -301,8 +501,8 @@ def _two_way_sync(
     libs_A = _effective_library_whitelist(cfg, a, feature, fcfg)
     libs_B = _effective_library_whitelist(cfg, b, feature, fcfg)
 
-    allow_unknown_A = (str(a).upper() == "PLEX" and feature == "history")
-    allow_unknown_B = (str(b).upper() == "PLEX" and feature == "history")
+    allow_unknown_A = (str(a).upper() == "PLEX" and feature == "history") or str(a).upper() == "KODI"
+    allow_unknown_B = (str(b).upper() == "PLEX" and feature == "history") or str(b).upper() == "KODI"
 
     if libs_A:
         prevA = _filter_index_by_libraries(prevA, libs_A, allow_unknown=allow_unknown_A)
@@ -820,6 +1020,21 @@ def _two_way_sync(
                         return max(0, int(v))
                 return 0
 
+            def _progress_percent(it: Mapping[str, Any] | None) -> float | None:
+                if not it:
+                    return None
+                for kk in ("progress_percent", "progressPercent", "percent", "position_percent", "resume_percent"):
+                    try:
+                        v = it.get(kk)
+                        if v is None or isinstance(v, bool):
+                            continue
+                        p = float(v)
+                        if p == p:
+                            return max(0.0, min(100.0, p))
+                    except Exception:
+                        continue
+                return None
+
             def _dur(it: Mapping[str, Any] | None) -> int | None:
                 if not it:
                     return None
@@ -850,12 +1065,16 @@ def _two_way_sync(
                         continue
 
                     pms = _pm(pit)
-                    if pms <= 0:
+                    pp_explicit = _progress_percent(pit)
+                    if pms <= 0 and (pp_explicit is None or pp_explicit <= 0):
                         continue
                     if min_ms and pms < min_ms and not clear_below_min:
-                        # Not synced then don't propagate the clear either (unless clear_below_min)
-                        continue
-                    pp = _pct(pms, _dur(pit))
+                        if pms <= 0 and pp_explicit is not None:
+                            pass
+                        else:
+                            # Not synced then don't propagate the clear either (unless clear_below_min)
+                            continue
+                    pp = _pct(pms, _dur(pit)) if pms > 0 else pp_explicit
                     if pp is not None and pp >= max_percent:
                         # Near completion then let history sync handle played state
                         continue
@@ -902,11 +1121,15 @@ def _two_way_sync(
                         if not isinstance(pit, Mapping):
                             continue
                         pms = _pm(pit)
-                        if pms <= 0:
+                        pp_explicit = _progress_percent(pit)
+                        if pms <= 0 and (pp_explicit is None or pp_explicit <= 0):
                             continue
                         if min_ms and pms < min_ms and not clear_below_min:
-                            continue
-                        pp = _pct(pms, _dur(pit))
+                            if pms <= 0 and pp_explicit is not None:
+                                pass
+                            else:
+                                continue
+                        pp = _pct(pms, _dur(pit)) if pms > 0 else pp_explicit
                         if pp is not None and pp >= max_percent:
                             continue
                         base = _minimal(pit)
@@ -934,6 +1157,34 @@ def _two_way_sync(
                     continue
             return 0
 
+        def _prog_percent(it: Mapping[str, Any]) -> float | None:
+            for kk in ("progress_percent", "progressPercent", "percent", "position_percent", "resume_percent"):
+                try:
+                    v = it.get(kk)
+                    if v is None or isinstance(v, bool):
+                        continue
+                    p = float(v)
+                    if p == p:
+                        return max(0.0, min(100.0, p))
+                except Exception:
+                    continue
+            ms = _prog_ms(it)
+            dur = None
+            for kk in ("duration_ms", "durationMs", "duration"):
+                try:
+                    raw = it.get(kk)
+                    if raw is None or isinstance(raw, bool):
+                        continue
+                    val = int(float(raw))
+                    if val > 0:
+                        dur = val
+                        break
+                except Exception:
+                    continue
+            if ms > 0 and dur:
+                return (float(ms) / float(dur)) * 100.0
+            return None
+
         def _prog_epoch(it: Mapping[str, Any]) -> int | None:
             v = it.get("progress_at") or it.get("progressAt") or it.get("last_played") or it.get("lastPlayed") or it.get("lastViewedAt")
             if v is None:
@@ -950,6 +1201,17 @@ def _two_way_sync(
                 return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
             except Exception:
                 return None
+
+        def _kodi_first_observed(provider: str, it: Mapping[str, Any]) -> bool:
+            if str(provider or "").strip().upper() != "KODI":
+                return False
+            source = str(it.get("progress_at_source") or it.get("progressAtSource") or "").strip().lower()
+            return source == "kodi_first_observed"
+
+        def _real_prog_epoch(provider: str, it: Mapping[str, Any]) -> int | None:
+            if _kodi_first_observed(provider, it):
+                return None
+            return _prog_epoch(it)
 
         bi = sync_cfg.get("bidirectional") or {}
         sot = (bi.get("source_of_truth") or bi.get("sourceOfTruth") or "").strip().upper()
@@ -969,19 +1231,36 @@ def _two_way_sync(
             a_it = (A_eff.get(k) or upB.get(k) or clB.get(k) or {})
             b_it = (B_eff.get(k) or upA.get(k) or clA.get(k) or {})
 
+            if _kodi_first_observed(a, a_it) and _real_prog_epoch(b, b_it) is not None:
+                if _prog_ms(b_it) > 0 or _prog_percent(b_it) is not None:
+                    addA.append(_minimal_keep_progress(b_it))
+                continue
+
+            if _kodi_first_observed(b, b_it) and _real_prog_epoch(a, a_it) is not None:
+                if _prog_ms(a_it) > 0 or _prog_percent(a_it) is not None:
+                    addB.append(_minimal_keep_progress(a_it))
+                continue
+
             # Both want to set progress.
             if k in upA and k in upB:
-                ta = _prog_epoch(a_it)
-                tb = _prog_epoch(b_it)
+                ta = _real_prog_epoch(a, a_it)
+                tb = _real_prog_epoch(b, b_it)
                 if ta is not None and tb is not None and ta != tb:
                     win = a if ta > tb else b
                 else:
                     msa = _prog_ms(a_it)
                     msb = _prog_ms(b_it)
-                    if msa != msb:
+                    if msa > 0 and msb > 0 and msa != msb:
                         win = a if msa > msb else b
                     else:
-                        win = prefer
+                        pca = _prog_percent(a_it)
+                        pcb = _prog_percent(b_it)
+                        if pca is not None and pcb is not None and abs(float(pca) - float(pcb)) > 0.1:
+                            win = a if float(pca) > float(pcb) else b
+                        elif msa != msb:
+                            win = a if msa > msb else b
+                        else:
+                            win = prefer
 
                 if win == a:
                     addB.append(_minimal_keep_progress(upB[k]))
@@ -992,8 +1271,8 @@ def _two_way_sync(
             # Clear vs set conflicts.
             if (k in clB) and (k in upA):
                 # A explicitly cleared; B has progress. Decide by timestamp, then prefer.
-                ta = _prog_epoch(clB[k])
-                tb = _prog_epoch(b_it)
+                ta = _real_prog_epoch(a, clB[k])
+                tb = _real_prog_epoch(b, b_it)
                 if ta is not None and tb is not None and ta != tb:
                     win = a if ta > tb else b
                 else:
@@ -1006,8 +1285,8 @@ def _two_way_sync(
                 continue
 
             if (k in clA) and (k in upB):
-                tb = _prog_epoch(clA[k])
-                ta = _prog_epoch(a_it)
+                tb = _real_prog_epoch(b, clA[k])
+                ta = _real_prog_epoch(a, a_it)
                 if ta is not None and tb is not None and ta != tb:
                     win = a if ta > tb else b
                 else:
@@ -1163,19 +1442,12 @@ def _two_way_sync(
     try:
         unresolved_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
         unresolved_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-
-        preA, preB = len(add_to_A), len(add_to_B)
-        add_to_A = [it for it in add_to_A if _ck(it) not in unresolved_A]
-        add_to_B = [it for it in add_to_B if _ck(it) not in unresolved_B]
-
-        blkA = preA - len(add_to_A)
-        blkB = preB - len(add_to_B)
-        if blkA:
-            emit("debug", msg="blocked.counts", feature=feature, dst=a,
-                 pair=f"{a}-{b}", blocked_unresolved=blkA, blocked_total=blkA)
-        if blkB:
-            emit("debug", msg="blocked.counts", feature=feature, dst=b,
-                 pair=f"{a}-{b}", blocked_unresolved=blkB, blocked_total=blkB)
+        retryA = sum(1 for it in add_to_A if _ck(it) in unresolved_A)
+        retryB = sum(1 for it in add_to_B if _ck(it) in unresolved_B)
+        if retryA:
+            emit("debug", msg="unresolved.retry", feature=feature, dst=a, pair=f"{a}-{b}", retried=retryA)
+        if retryB:
+            emit("debug", msg="unresolved.retry", feature=feature, dst=b, pair=f"{a}-{b}", retried=retryB)
     except Exception:
         pass
 
@@ -1246,6 +1518,59 @@ def _two_way_sync(
         add_to_A = [it for it in add_to_A if not _present(A_eff, A_alias, it)]
         add_to_B = [it for it in add_to_B if not _present(B_eff, B_alias, it)]
 
+    def _retry_pending_removes(
+        dst_name: str,
+        dst_eff: dict[str, Any],
+        dst_alias: dict[str, str],
+        src_eff: dict[str, Any],
+        src_alias: dict[str, str],
+        planned_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not allow_removals:
+            return planned_items
+        planned = {k for k in (_ck(it) for it in planned_items) if k}
+        retry: list[dict[str, Any]] = []
+        stale: list[str] = []
+        try:
+            pending = load_unresolved_pending(dst_name, feature)
+        except Exception:
+            pending = []
+        for rec in pending or []:
+            if not isinstance(rec, Mapping) or not is_remove_retry_reason(rec.get("reason")):
+                continue
+            item = rec.get("item")
+            key = str(rec.get("key") or "")
+            if not isinstance(item, Mapping):
+                continue
+            if _present(src_eff, src_alias, item):
+                if key:
+                    stale.append(key)
+                continue
+            dv = _find_in_idx(dst_eff, dst_alias, item)
+            if not dv:
+                if key:
+                    stale.append(key)
+                continue
+            rk = _ck(dv) or _ck(item)
+            if not rk or rk in planned:
+                continue
+            planned.add(rk)
+            retry.append(_minimal(dv))
+        if stale and not dry_run_flag:
+            try:
+                clear_unresolved(dst_name, feature, stale)
+            except Exception:
+                pass
+        if retry:
+            emit("debug", msg="unresolved.remove_retry", feature=feature, dst=dst_name, count=len(retry))
+        return list(planned_items) + retry
+
+    rem_from_A = _retry_pending_removes(a, A_eff, A_alias, B_eff, B_alias, rem_from_A)
+    rem_from_B = _retry_pending_removes(b, B_eff, B_alias, A_eff, A_alias, rem_from_B)
+    retry_remove_keys = {k for k in (_ck(it) for it in (rem_from_A or []) + (rem_from_B or [])) if k}
+    add_to_A = [it for it in add_to_A if _ck(it) not in retry_remove_keys]
+    add_to_B = [it for it in add_to_B if _ck(it) not in retry_remove_keys]
+
     rem_from_A = _maybe_block_massdelete(
         rem_from_A, baseline_size=len(A_eff),
         allow_mass_delete=allow_mass_delete,
@@ -1266,6 +1591,10 @@ def _two_way_sync(
 
     resA_rem: dict[str, Any] = {"ok": True, "count": 0}
     resB_rem: dict[str, Any] = {"ok": True, "count": 0}
+    eff_rem_A = 0
+    eff_rem_B = 0
+    remove_unresolved_A = 0
+    remove_unresolved_B = 0
     remA_keys = [_ck(_minimal(it)) for it in (rem_from_A or []) if _ck(_minimal(it))]
     remB_keys = [_ck(_minimal(it)) for it in (rem_from_B or []) if _ck(_minimal(it))]
 
@@ -1297,217 +1626,97 @@ def _two_way_sync(
         except Exception:
             pass
 
-    # _apply_remove_side / _apply_update_side / _apply_add_side: side A and side B used
-    # to run near-identical copy-pasted blocks here (only names differed - a/b, aops/bops,
-    # A_eff/B_eff, etc; confirmed via a name-normalized diff before extracting). Each is
-    # called once per side below; being nested closures they still reach `feature`,
-    # `provider_cfg`, `dry_run_flag`, `emit`, `dbg`, `ctx`, `pair_key`, `cfg`,
-    # `verify_after_write`, `use_phantoms`, `_mark_tombs`, and `_bust_snapshot` from the
-    # enclosing scope exactly as the inline blocks did.
-
-    def _apply_remove_side(
-        side: str, ops: Any, name: str, down: bool,
-        items: list[dict[str, Any]], rem_keys: list[str], eff_index: dict[str, Any],
-    ) -> dict[str, Any]:
-        if down:
-            record_unresolved(name, feature, items, hint="provider_down:remove")
-            emit("writes:skipped", dst=name, feature=feature, reason="provider_down", op="remove", count=len(items))
-            return {"ok": True, "count": 0}
-
-        emit(f"two:apply:remove:{side}:start", dst=name, feature=feature, count=len(items))
-        res = apply_remove(
-            dst_ops=ops, cfg=provider_cfg, dst_name=name, feature=feature, items=items,
-            dry_run=dry_run_flag, emit=emit, dbg=dbg,
-            chunk_size=effective_chunk_size(ctx, name), chunk_pause_ms=_pause_for(name),
-        )
-        prov_count = _confirmed(res)
-        if prov_count and not dry_run_flag:
-            removed_now = 0
-            for k in rem_keys:
-                if k in eff_index:
-                    eff_index.pop(k, None)
-                    removed_now += 1
-                    if removed_now >= prov_count:
-                        break
-            _mark_tombs(items)
-            _bust_snapshot(name)
-
-        emit(f"two:apply:remove:{side}:done", dst=name, feature=feature,
-             count=_confirmed(res),
-             attempted=int(res.get("attempted", 0)),
-             removed=_confirmed(res),
-             skipped=int(res.get("skipped", 0)),
-             unresolved=int(res.get("unresolved", 0)),
-             errors=int(res.get("errors", 0)),
-             result=res)
-        return res
-
-    def _apply_update_side(
-        side: str, ops: Any, name: str, down: bool,
-        items: list[dict[str, Any]], eff_index: dict[str, Any],
-    ) -> tuple[dict[str, Any], int, int]:
-        if down:
-            record_unresolved(name, feature, items, hint="provider_down:update")
-            emit("writes:skipped", dst=name, feature=feature, reason="provider_down", op="update", count=len(items))
-            return {"ok": True, "count": 0}, 0, len(items)
-
-        emit(f"two:apply:update:{side}:start", dst=name, feature=feature, count=len(items))
-        unresolved_before = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-        res = apply_update(
-            dst_ops=ops, cfg=provider_cfg, dst_name=name, feature=feature, items=items,
-            dry_run=dry_run_flag, emit=emit, dbg=dbg,
-            chunk_size=effective_chunk_size(ctx, name), chunk_pause_ms=_pause_for(name),
-        )
-        unresolved_after = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-        prov_unresolved_keys_raw = (res or {}).get("unresolved_keys")
-        prov_unresolved_keys: list[str] = (
-            [str(x) for x in prov_unresolved_keys_raw if x] if isinstance(prov_unresolved_keys_raw, list) else []
-        )
-        new_unresolved = (unresolved_after - unresolved_before) | (set(prov_unresolved_keys) - unresolved_before)
-        eff = int((res or {}).get("confirmed", (res or {}).get("count", 0)) or 0)
-        if eff and not dry_run_flag:
-            upd_map = {(_ck(_minimal(it)) or ""): _minimal(it) for it in items}
-            confirmed_keys = [str(x) for x in ((res or {}).get("confirmed_keys") or []) if x]
-            keys_to_write = confirmed_keys if confirmed_keys else (list(upd_map.keys()) if eff >= len(upd_map) else [])
-            for k in keys_to_write:
-                v = upd_map.get(k)
-                if v:
-                    eff_index[k] = v
-            if keys_to_write:
-                _bust_snapshot(name)
-        emit(f"two:apply:update:{side}:done", dst=name, feature=feature,
-             count=eff,
-             attempted=int(res.get("attempted", 0)),
-             updated=eff,
-             skipped=int(res.get("skipped", 0)),
-             unresolved=int(res.get("unresolved", 0)),
-             errors=int(res.get("errors", 0)),
-             result=res)
-        return res, eff, len(new_unresolved)
-
-    def _apply_add_side(
-        side: str, ops: Any, name: str, down: bool,
-        items: list[dict[str, Any]], eff_index: dict[str, Any], guard: Any,
-    ) -> tuple[dict[str, Any], int, int]:
-        if down:
-            record_unresolved(name, feature, items, hint="provider_down:add")
-            emit("writes:skipped", dst=name, feature=feature, reason="provider_down", op="add", count=len(items))
-            return {"ok": True, "count": 0}, 0, len(items)
-
-        emit(f"two:apply:add:{side}:start", dst=name, feature=feature, count=len(items))
-        unresolved_before = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-        _ = set(load_blackbox_keys(name, feature, pair=pair_key) or [])
-        attempted: list[str] = []
-        seen: set[str] = set()
-        k2i: dict[str, Any] = {}
-        for it in items:
-            k = _ck(_minimal(it))
-            if not k or k in seen:
-                continue
-            seen.add(k)
-            attempted.append(k)
-            k2i[k] = _minimal(it)
-
-        res = apply_add(
-            dst_ops=ops, cfg=provider_cfg, dst_name=name, feature=feature, items=items,
-            dry_run=dry_run_flag, emit=emit, dbg=dbg,
-            chunk_size=effective_chunk_size(ctx, name), chunk_pause_ms=_pause_for(name),
-        )
-        unresolved_after = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-        prov_unresolved_keys_raw = (res or {}).get("unresolved_keys")
-        prov_unresolved_keys: list[str] = (
-            [str(x) for x in prov_unresolved_keys_raw if x] if isinstance(prov_unresolved_keys_raw, list) else []
-        )
-        prov_unresolved_set: set[str] = set(prov_unresolved_keys)
-
-        new_unresolved = (unresolved_after - unresolved_before) | (prov_unresolved_set - unresolved_before)
-        still_unresolved = set(attempted) & (unresolved_after | prov_unresolved_set)
-
-        prov_confirmed_keys_raw = (res or {}).get("confirmed_keys")
-        prov_skipped_keys_raw = (res or {}).get("skipped_keys")
-
-        prov_confirmed_keys: list[str] = (
-            [str(x) for x in prov_confirmed_keys_raw if x] if isinstance(prov_confirmed_keys_raw, list) else []
-        )
-        prov_skipped_keys: list[str] = (
-            [str(x) for x in prov_skipped_keys_raw if x] if isinstance(prov_skipped_keys_raw, list) else []
-        )
-
-        skipped_keys: set[str] = set(prov_skipped_keys)
-
-        have_exact_keys = bool(prov_confirmed_keys)
-        if have_exact_keys:
-            attempted_set = set(attempted)
-            confirmed = [k for k in prov_confirmed_keys if k in attempted_set]
-        else:
-            confirmed = [k for k in attempted if k not in still_unresolved]
-
-        prov_count = _confirmed(res)
-        if have_exact_keys:
-            prov_count = min(prov_count or len(confirmed), len(confirmed))
-
-        ambiguous_partial = False
-        if verify_after_write and _apply_verify_after_write_supported(ops):
-            try:
-                unresolved_again = set(load_unresolved_keys(name, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-                confirmed = [k for k in confirmed if k not in unresolved_again]
-            except Exception:
-                pass
-            eff = len(confirmed)
-        else:
-            ambiguous_partial = (not have_exact_keys) and bool((res or {}).get("skipped")) and prov_count and (prov_count < len(confirmed))
-            eff = 0 if still_unresolved or ambiguous_partial else min(prov_count, len(confirmed))
-
-        if eff != prov_count and not have_exact_keys:
-            dbg("two:apply:add:corrected", dst=name, feature=feature,
-                provider_count=prov_count, effective=eff, newly_unresolved=len(new_unresolved))
-
-        success = confirmed if (verify_after_write or have_exact_keys) else confirmed[:eff]
-        try:
-            failed = [k for k in attempted if k not in set(success) and k not in skipped_keys]
-            if failed and not ambiguous_partial:
-                record_attempts(name, feature, failed,
-                    reason="two:apply:add:failed", op="add",
-                    pair=pair_key, cfg=cfg)
-                failed_items = [k2i[k] for k in failed if k in k2i]
-                if failed_items:
-                    record_unresolved(name, feature, failed_items, hint="apply:add:failed")
-
-            if success:
-                record_success(name, feature, success, pair=pair_key, cfg=cfg)
-                clear_items_for_feature(
-                    ctx.state_store,
-                    dbg,
-                    feature,
-                    [k2i[k] for k in success if k in k2i],
-                    pair=pair_key,
-                )
-            if use_phantoms and guard and success:
-                guard.record_success(set(success))
-        except Exception:
-            pass
-
-        if success and not dry_run_flag:
-            for k in success:
-                v = k2i.get(k)
-                if v:
-                    eff_index[k] = v
-            _bust_snapshot(name)
-        emit(f"two:apply:add:{side}:done", dst=name, feature=feature,
-             count=_confirmed(res),
-             attempted=int(res.get("attempted", 0)),
-             added=_confirmed(res),
-             skipped=int(res.get("skipped", 0)),
-             unresolved=int(res.get("unresolved", 0)),
-             errors=int(res.get("errors", 0)),
-             result=res)
-        return res, eff, len(new_unresolved)
-
     if rem_from_A:
-        resA_rem = _apply_remove_side("A", aops, a, a_down, rem_from_A, remA_keys, A_eff)
+        if a_down:
+            record_unresolved(a, feature, rem_from_A, hint="provider_down:remove")
+            remove_unresolved_A = len(set(remA_keys))
+            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="remove", count=len(rem_from_A))
+        else:
+            emit("two:apply:remove:A:start", dst=a, feature=feature, count=len(rem_from_A))
+            resA_rem = apply_remove(
+                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=rem_from_A,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+            )
+            decA_rem = compute_effective_remove(
+                attempted_keys=remA_keys,
+                provider_confirmed_count=_confirmed(resA_rem),
+                provider_confirmed_keys=[str(x) for x in ((resA_rem or {}).get("confirmed_keys") or []) if x],
+                provider_unresolved_count=int((resA_rem or {}).get("unresolved", 0)),
+                provider_errors=int((resA_rem or {}).get("errors", 0)),
+            )
+            okA_keys = list(decA_rem["success_keys"])
+            eff_rem_A = len(okA_keys)
+            remove_unresolved_A = max(int((resA_rem or {}).get("unresolved", 0)), len(decA_rem["failed_keys"]))
+            if okA_keys and not dry_run_flag:
+                okA_set = set(okA_keys)
+                for k in okA_keys:
+                    A_eff.pop(k, None)
+                _mark_tombs([it for it in rem_from_A if _ck(_minimal(it)) in okA_set])
+                _bust_snapshot(a)
+                clear_unresolved(a, feature, okA_keys)
+            if decA_rem["failed_keys"] and not dry_run_flag:
+                failA = set(decA_rem["failed_keys"])
+                record_unresolved(
+                    a, feature,
+                    [it for it in rem_from_A if _ck(_minimal(it)) in failA],
+                    hint="two:apply:remove:unconfirmed",
+                )
+
+            emit("two:apply:remove:A:done", dst=a, feature=feature,
+                 count=eff_rem_A,
+                 attempted=int(resA_rem.get("attempted", 0)),
+                 removed=eff_rem_A,
+                 skipped=int(resA_rem.get("skipped", 0)),
+                 unresolved=remove_unresolved_A,
+                 errors=int(resA_rem.get("errors", 0)),
+                 result=resA_rem)
 
     if rem_from_B:
-        resB_rem = _apply_remove_side("B", bops, b, b_down, rem_from_B, remB_keys, B_eff)
+        if b_down:
+            record_unresolved(b, feature, rem_from_B, hint="provider_down:remove")
+            remove_unresolved_B = len(set(remB_keys))
+            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="remove", count=len(rem_from_B))
+        else:
+            emit("two:apply:remove:B:start", dst=b, feature=feature, count=len(rem_from_B))
+            resB_rem = apply_remove(
+                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=rem_from_B,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+            )
+            decB_rem = compute_effective_remove(
+                attempted_keys=remB_keys,
+                provider_confirmed_count=_confirmed(resB_rem),
+                provider_confirmed_keys=[str(x) for x in ((resB_rem or {}).get("confirmed_keys") or []) if x],
+                provider_unresolved_count=int((resB_rem or {}).get("unresolved", 0)),
+                provider_errors=int((resB_rem or {}).get("errors", 0)),
+            )
+            okB_keys = list(decB_rem["success_keys"])
+            eff_rem_B = len(okB_keys)
+            remove_unresolved_B = max(int((resB_rem or {}).get("unresolved", 0)), len(decB_rem["failed_keys"]))
+            if okB_keys and not dry_run_flag:
+                okB_set = set(okB_keys)
+                for k in okB_keys:
+                    B_eff.pop(k, None)
+                _mark_tombs([it for it in rem_from_B if _ck(_minimal(it)) in okB_set])
+                _bust_snapshot(b)
+                clear_unresolved(b, feature, okB_keys)
+            if decB_rem["failed_keys"] and not dry_run_flag:
+                failB = set(decB_rem["failed_keys"])
+                record_unresolved(
+                    b, feature,
+                    [it for it in rem_from_B if _ck(_minimal(it)) in failB],
+                    hint="two:apply:remove:unconfirmed",
+                )
+
+            emit("two:apply:remove:B:done", dst=b, feature=feature,
+                 count=eff_rem_B,
+                 attempted=int(resB_rem.get("attempted", 0)),
+                 removed=eff_rem_B,
+                 skipped=int(resB_rem.get("skipped", 0)),
+                 unresolved=remove_unresolved_B,
+                 errors=int(resB_rem.get("errors", 0)),
+                 result=resB_rem)
 
     resA_add: dict[str, Any] = {"ok": True, "count": 0}
     resB_add: dict[str, Any] = {"ok": True, "count": 0}
@@ -1517,24 +1726,384 @@ def _two_way_sync(
     eff_upd_B = 0
     eff_add_A = 0
     eff_add_B = 0
+    post_apply_A_res: dict[str, Any] | None = None
+    post_apply_B_res: dict[str, Any] | None = None
     unresolved_new_A_total = 0
     unresolved_new_B_total = 0
 
     if upd_to_A:
-        resA_upd, eff_upd_A, new_unres = _apply_update_side("A", aops, a, a_down, upd_to_A, A_eff)
-        unresolved_new_A_total += new_unres
+        if a_down:
+            record_unresolved(a, feature, upd_to_A, hint="provider_down:update")
+            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="update", count=len(upd_to_A))
+            unresolved_new_A_total += len(upd_to_A)
+        else:
+            emit("two:apply:update:A:start", dst=a, feature=feature, count=len(upd_to_A))
+            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            resA_upd = apply_update(
+                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=upd_to_A,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+            )
+            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            prov_unresolved_keys_A_raw = (resA_upd or {}).get("unresolved_keys")
+            prov_unresolved_keys_A: list[str] = (
+                [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
+            )
+            new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (set(prov_unresolved_keys_A) - unresolved_before_A)
+            unresolved_new_A_total += len(new_unresolved_A)
+            eff_upd_A = int((resA_upd or {}).get("confirmed", (resA_upd or {}).get("count", 0)) or 0)
+            if eff_upd_A and not dry_run_flag:
+                upd_map_A = {(_ck(_minimal(it)) or ""): _minimal(it) for it in upd_to_A}
+                confirmed_keys_A = [str(x) for x in ((resA_upd or {}).get("confirmed_keys") or []) if x]
+                keys_to_write_A = confirmed_keys_A if confirmed_keys_A else (list(upd_map_A.keys()) if eff_upd_A >= len(upd_map_A) else [])
+                for k in keys_to_write_A:
+                    v = upd_map_A.get(k)
+                    if v:
+                        A_eff[k] = v
+                if keys_to_write_A:
+                    _bust_snapshot(a)
+            emit("two:apply:update:A:done", dst=a, feature=feature,
+                 count=eff_upd_A,
+                 attempted=int(resA_upd.get("attempted", 0)),
+                 updated=eff_upd_A,
+                 skipped=int(resA_upd.get("skipped", 0)),
+                 unresolved=int(resA_upd.get("unresolved", 0)),
+                 errors=int(resA_upd.get("errors", 0)),
+                 result=resA_upd)
 
     if upd_to_B:
-        resB_upd, eff_upd_B, new_unres = _apply_update_side("B", bops, b, b_down, upd_to_B, B_eff)
-        unresolved_new_B_total += new_unres
+        if b_down:
+            record_unresolved(b, feature, upd_to_B, hint="provider_down:update")
+            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="update", count=len(upd_to_B))
+            unresolved_new_B_total += len(upd_to_B)
+        else:
+            emit("two:apply:update:B:start", dst=b, feature=feature, count=len(upd_to_B))
+            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            resB_upd = apply_update(
+                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=upd_to_B,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+            )
+            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            prov_unresolved_keys_B_raw = (resB_upd or {}).get("unresolved_keys")
+            prov_unresolved_keys_B: list[str] = (
+                [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
+            )
+            new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (set(prov_unresolved_keys_B) - unresolved_before_B)
+            unresolved_new_B_total += len(new_unresolved_B)
+            eff_upd_B = int((resB_upd or {}).get("confirmed", (resB_upd or {}).get("count", 0)) or 0)
+            if eff_upd_B and not dry_run_flag:
+                upd_map_B = {(_ck(_minimal(it)) or ""): _minimal(it) for it in upd_to_B}
+                confirmed_keys_B = [str(x) for x in ((resB_upd or {}).get("confirmed_keys") or []) if x]
+                keys_to_write_B = confirmed_keys_B if confirmed_keys_B else (list(upd_map_B.keys()) if eff_upd_B >= len(upd_map_B) else [])
+                for k in keys_to_write_B:
+                    v = upd_map_B.get(k)
+                    if v:
+                        B_eff[k] = v
+                if keys_to_write_B:
+                    _bust_snapshot(b)
+            emit("two:apply:update:B:done", dst=b, feature=feature,
+                 count=eff_upd_B,
+                 attempted=int(resB_upd.get("attempted", 0)),
+                 updated=eff_upd_B,
+                 skipped=int(resB_upd.get("skipped", 0)),
+                 unresolved=int(resB_upd.get("unresolved", 0)),
+                 errors=int(resB_upd.get("errors", 0)),
+                 result=resB_upd)
 
     if add_to_A:
-        resA_add, eff_add_A, new_unres = _apply_add_side("A", aops, a, a_down, add_to_A, A_eff, guardA)
-        unresolved_new_A_total += new_unres
+        if a_down:
+            record_unresolved(a, feature, add_to_A, hint="provider_down:add")
+            emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="add", count=len(add_to_A))
+            unresolved_new_A_total += len(add_to_A)
+        else:
+            emit("two:apply:add:A:start", dst=a, feature=feature, count=len(add_to_A))
+            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            _ = set(load_blackbox_keys(a, feature, pair=pair_key) or [])
+            attempted_A: list[str] = []
+            seen_A: set[str] = set()
+            k2i_A: dict[str, Any] = {}
+            for it in add_to_A:
+                k = _ck(_minimal(it))
+                if not k or k in seen_A:
+                    continue
+                seen_A.add(k)
+                attempted_A.append(k)
+                k2i_A[k] = _minimal(it)
+            
+            resA_add = apply_add(
+                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=add_to_A,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+            )
+            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            prov_unresolved_keys_A_raw = (resA_add or {}).get("unresolved_keys")
+            prov_unresolved_keys_A: list[str] = (
+                [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
+            )
+            prov_unresolved_set_A: set[str] = set(prov_unresolved_keys_A)
+
+            new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (prov_unresolved_set_A - unresolved_before_A)
+            still_unresolved_A = set(attempted_A) & (unresolved_after_A | prov_unresolved_set_A)
+            unresolved_new_A_total += len(still_unresolved_A)
+   
+            prov_confirmed_keys_A_raw = (resA_add or {}).get("confirmed_keys")
+            prov_skipped_keys_A_raw = (resA_add or {}).get("skipped_keys")
+
+            prov_confirmed_keys_A: list[str] = (
+                [str(x) for x in prov_confirmed_keys_A_raw if x] if isinstance(prov_confirmed_keys_A_raw, list) else []
+            )
+            prov_skipped_keys_A: list[str] = (
+                [str(x) for x in prov_skipped_keys_A_raw if x] if isinstance(prov_skipped_keys_A_raw, list) else []
+            )
+
+            skipped_keys_A: set[str] = set(prov_skipped_keys_A)
+
+            have_exact_keys_A = bool(prov_confirmed_keys_A)
+            if have_exact_keys_A:
+                attempted_set_A = set(attempted_A)
+                confirmed_A = [k for k in prov_confirmed_keys_A if k in attempted_set_A]
+            else:
+                confirmed_A = [k for k in attempted_A if k not in still_unresolved_A]
+
+        
+            if verify_after_write and _apply_verify_after_write_supported(aops):
+                try:
+                    unresolved_again = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+                    confirmed_A = [k for k in confirmed_A if k not in unresolved_again]
+                except Exception:
+                    pass
+
+            _decision_A = compute_effective_add(
+                attempted_keys=attempted_A,
+                prov_confirmed=_confirmed(resA_add),
+                confirmed_keys=confirmed_A,
+                still_unresolved=still_unresolved_A,
+                skipped_keys=skipped_keys_A,
+                have_exact_keys=have_exact_keys_A,
+                verify_after_write=verify_after_write,
+                provider_skipped=bool((resA_add or {}).get("skipped")),
+            )
+            prov_count_A = _decision_A["prov_confirmed"]
+            eff_add_A = _decision_A["effective"]
+            ambiguous_partial_A = _decision_A["ambiguous_partial"]
+            success_A = _decision_A["success_keys"]
+            failed_A = _decision_A["failed_keys"]
+
+            if eff_add_A != prov_count_A and not have_exact_keys_A:
+                dbg("two:apply:add:corrected", dst=a, feature=feature,
+                    provider_count=prov_count_A, effective=eff_add_A, newly_unresolved=len(new_unresolved_A))
+
+            try:
+                if failed_A and not ambiguous_partial_A:
+                    _bb_A = record_attempts(a, feature, failed_A,
+                        reason="two:apply:add:failed", op="add",
+                        pair=pair_key, cfg=cfg)
+                    promoted_A = {str(x) for x in ((_bb_A or {}).get("promoted_keys") or []) if x}
+                    failed_items_A = [k2i_A[k] for k in failed_A if k in k2i_A and k not in promoted_A]
+                    if failed_items_A:
+                        record_unresolved(a, feature, failed_items_A, hint="apply:add:failed")
+                    if promoted_A:
+                        clear_unresolved(a, feature, promoted_A)
+                        unresolved_new_A_total = max(0, unresolved_new_A_total - len(promoted_A & set(still_unresolved_A)))
+                        
+                    _emit_item_failures(emit, a, feature, pair_key, failed_A, k2i_A, _bb_A)
+               
+                if success_A:
+                    record_success(a, feature, success_A, pair=pair_key, cfg=cfg)
+                    clear_unresolved(a, feature, success_A)
+                    resolved_A = [k for k in success_A if k in unresolved_before_A]
+                    if resolved_A:
+                        _emit_item_resolutions(emit, a, feature, pair_key, resolved_A, k2i_A)
+                    clear_items_for_feature(
+                        ctx.state_store,
+                        dbg,
+                        feature,
+                        [k2i_A[k] for k in success_A if k in k2i_A],
+                        pair=pair_key,
+                    )
+                if use_phantoms and 'guardA' in locals() and guardA and success_A:
+                    guardA.record_success(set(success_A))
+            except Exception:
+                pass
+            
+            baseline_keys_A = select_baseline_keys(success_A, resA_add)
+            baseline_writes_A = resolve_baseline_writes(baseline_keys_A, k2i_A, resA_add)
+            if baseline_writes_A and not dry_run_flag:
+                for dk, item in baseline_writes_A:
+                    A_eff[dk] = item
+                _bust_snapshot(a)
+            post_apply_A_res = resA_add
+            emit("two:apply:add:A:done", dst=a, feature=feature,
+                 count=_confirmed(resA_add),
+                 attempted=int(resA_add.get("attempted", 0)),
+                 added=_confirmed(resA_add),
+                 skipped=int(resA_add.get("skipped", 0)),
+                 unresolved=int(resA_add.get("unresolved", 0)),
+                 errors=int(resA_add.get("errors", 0)),
+                 result=resA_add)
 
     if add_to_B:
-        resB_add, eff_add_B, new_unres = _apply_add_side("B", bops, b, b_down, add_to_B, B_eff, guardB)
-        unresolved_new_B_total += new_unres
+        if b_down:
+            record_unresolved(b, feature, add_to_B, hint="provider_down:add")
+            emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="add", count=len(add_to_B))
+            unresolved_new_B_total += len(add_to_B)
+        else:
+            emit("two:apply:add:B:start", dst=b, feature=feature, count=len(add_to_B))
+            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            _ = set(load_blackbox_keys(b, feature, pair=pair_key) or [])
+            attempted_B: list[str] = []
+            seen_B: set[str] = set()
+            k2i_B: dict[str, Any] = {}
+            for it in add_to_B:
+                k = _ck(_minimal(it))
+                if not k or k in seen_B:
+                    continue
+                seen_B.add(k)
+                attempted_B.append(k)
+                k2i_B[k] = _minimal(it)
+            
+            resB_add = apply_add(
+                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=add_to_B,
+                dry_run=dry_run_flag, emit=emit, dbg=dbg,
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+            )
+            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            prov_unresolved_keys_B_raw = (resB_add or {}).get("unresolved_keys")
+            prov_unresolved_keys_B: list[str] = (
+                [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
+            )
+            prov_unresolved_set_B: set[str] = set(prov_unresolved_keys_B)
+
+            new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (prov_unresolved_set_B - unresolved_before_B)
+            still_unresolved_B = set(attempted_B) & (unresolved_after_B | prov_unresolved_set_B)
+            unresolved_new_B_total += len(still_unresolved_B)
+           
+            prov_confirmed_keys_B_raw = (resB_add or {}).get("confirmed_keys")
+            prov_skipped_keys_B_raw = (resB_add or {}).get("skipped_keys")
+
+            prov_confirmed_keys_B: list[str] = (
+                [str(x) for x in prov_confirmed_keys_B_raw if x] if isinstance(prov_confirmed_keys_B_raw, list) else []
+            )
+            prov_skipped_keys_B: list[str] = (
+                [str(x) for x in prov_skipped_keys_B_raw if x] if isinstance(prov_skipped_keys_B_raw, list) else []
+            )
+
+            skipped_keys_B: set[str] = set(prov_skipped_keys_B)
+
+            have_exact_keys_B = bool(prov_confirmed_keys_B)
+            if have_exact_keys_B:
+                attempted_set_B = set(attempted_B)
+                confirmed_B = [k for k in prov_confirmed_keys_B if k in attempted_set_B]
+            else:
+                confirmed_B = [k for k in attempted_B if k not in still_unresolved_B]
+
+        
+            if verify_after_write and _apply_verify_after_write_supported(bops):
+                try:
+                    unresolved_again = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+                    confirmed_B = [k for k in confirmed_B if k not in unresolved_again]
+                except Exception:
+                    pass
+
+            _decision_B = compute_effective_add(
+                attempted_keys=attempted_B,
+                prov_confirmed=_confirmed(resB_add),
+                confirmed_keys=confirmed_B,
+                still_unresolved=still_unresolved_B,
+                skipped_keys=skipped_keys_B,
+                have_exact_keys=have_exact_keys_B,
+                verify_after_write=verify_after_write,
+                provider_skipped=bool((resB_add or {}).get("skipped")),
+            )
+            prov_count_B = _decision_B["prov_confirmed"]
+            eff_add_B = _decision_B["effective"]
+            ambiguous_partial_B = _decision_B["ambiguous_partial"]
+            success_B = _decision_B["success_keys"]
+            failed_B = _decision_B["failed_keys"]
+
+            if eff_add_B != prov_count_B and not have_exact_keys_B:
+                dbg("two:apply:add:corrected", dst=b, feature=feature,
+                    provider_count=prov_count_B, effective=eff_add_B, newly_unresolved=len(new_unresolved_B))
+
+            try:
+                if failed_B and not ambiguous_partial_B:
+                    _bb_B = record_attempts(b, feature, failed_B,
+                        reason="two:apply:add:failed", op="add",
+                        pair=pair_key, cfg=cfg)
+                    promoted_B = {str(x) for x in ((_bb_B or {}).get("promoted_keys") or []) if x}
+                    failed_items_B = [k2i_B[k] for k in failed_B if k in k2i_B and k not in promoted_B]
+                    if failed_items_B:
+                        record_unresolved(b, feature, failed_items_B, hint="apply:add:failed")
+                    if promoted_B:
+                        clear_unresolved(b, feature, promoted_B)
+                        unresolved_new_B_total = max(0, unresolved_new_B_total - len(promoted_B & set(still_unresolved_B)))
+                        
+                    _emit_item_failures(emit, b, feature, pair_key, failed_B, k2i_B, _bb_B)
+                
+                if success_B:
+                    record_success(b, feature, success_B, pair=pair_key, cfg=cfg)
+                    clear_unresolved(b, feature, success_B)
+                    resolved_B = [k for k in success_B if k in unresolved_before_B]
+                    if resolved_B:
+                        _emit_item_resolutions(emit, b, feature, pair_key, resolved_B, k2i_B)
+                    clear_items_for_feature(
+                        ctx.state_store,
+                        dbg,
+                        feature,
+                        [k2i_B[k] for k in success_B if k in k2i_B],
+                        pair=pair_key,
+                    )
+                if use_phantoms and 'guardB' in locals() and guardB and success_B:
+                    guardB.record_success(set(success_B))
+            except Exception:
+                pass
+            
+            baseline_keys_B = select_baseline_keys(success_B, resB_add)
+            baseline_writes_B = resolve_baseline_writes(baseline_keys_B, k2i_B, resB_add)
+            if baseline_writes_B and not dry_run_flag:
+                for dk, item in baseline_writes_B:
+                    B_eff[dk] = item
+                _bust_snapshot(b)
+            post_apply_B_res = resB_add
+            emit("two:apply:add:B:done", dst=b, feature=feature,
+                 count=_confirmed(resB_add),
+                 attempted=int(resB_add.get("attempted", 0)),
+                 added=_confirmed(resB_add),
+                 skipped=int(resB_add.get("skipped", 0)),
+                 unresolved=int(resB_add.get("unresolved", 0)),
+                 errors=int(resB_add.get("errors", 0)),
+                 result=resB_add)
+
+    def _post_apply_refresh(prov: str, inst: str, res: dict[str, Any] | None, ops: Any, eff: dict[str, Any], down: bool) -> None:
+        if dry_run_flag or down or not needs_post_apply_refresh(res):
+            return
+        r = res or {}
+        emit("post_apply_refresh:start", provider=prov, instance=inst, feature=feature,
+             reason="accepted_not_live_confirmed",
+             accepted_keys=len(r.get("accepted_keys") or []),
+             accepted_not_seen_live_keys=len(r.get("accepted_not_seen_live_keys") or []),
+             presence_confirmed_keys=len(r.get("presence_confirmed_keys") or []))
+        try:
+            refreshed = refresh_destination_after_apply(
+                ops=ops, config=provider_cfg, feature=feature, provider=prov, snap_cache=ctx.snap_cache,
+            )
+        except Exception:
+            refreshed = None
+        base_update = 0
+        if refreshed:
+            for rk, rv in refreshed.items():
+                if rk not in eff:
+                    base_update += 1
+                eff[rk] = rv
+        tk = str(os.environ.get("CW_PLEX_TRACE_KEY", "") or "").strip().lower()
+        contains_trace = bool(tk) and any(str(k).split("@", 1)[0].lower() == tk for k in (refreshed or {}))
+        emit("post_apply_refresh:done", provider=prov, instance=inst, feature=feature,
+             refreshed_count=len(refreshed or {}), first_keys=list(refreshed or {})[:10],
+             contains_trace_key=contains_trace, baseline_update_count=base_update)
+
+    _post_apply_refresh(a, src_inst, post_apply_A_res, aops, A_eff, a_down)
+    _post_apply_refresh(b, dst_inst, post_apply_B_res, bops, B_eff, b_down)
 
     try:
         st = ctx.state_store.load_state() or {}
@@ -1576,8 +2145,8 @@ def _two_way_sync(
             pf = _ensure_pf(pmap, prov, inst, feat)
             pf["checkpoint"] = chk
 
-        # Normalize key drift so state doesn't inflate.
-        if feature in ("history", "ratings", "progress"):
+        # Normalize key drift so state doesn't inflate. History baselines stay provider-native.
+        if feature in ("ratings", "progress"):
             def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
                 out = dict(base or {})
                 for k, v in (extra or {}).items():
@@ -1609,9 +2178,57 @@ def _two_way_sync(
                         out["rated_at"] = b0
                 return out
 
-            B_eff = _rekey_index_to_match_other_keys(
-                B_eff, A_eff, typed_tokens=_typed_tokens, merge_payload=_merge_payload
-            )
+            def _rekey_to_other(idx0: dict[str, Any], other0: dict[str, Any]) -> dict[str, Any]:
+                if not idx0 or not other0:
+                    return dict(idx0 or {})
+
+                other_alias = _alias_index(other0)
+                other_tmdb = {t: k for t, k in other_alias.items() if str(t).startswith("tmdb:")}
+                other_imdb = {t: k for t, k in other_alias.items() if str(t).startswith("imdb:")}
+                other_tvdb = {t: k for t, k in other_alias.items() if str(t).startswith("tvdb:")}
+
+                out: dict[str, Any] = {}
+                for ck, it in (idx0 or {}).items():
+                    if not isinstance(it, Mapping):
+                        out[str(ck)] = it
+                        continue
+
+                    ck_s = str(ck)
+                    if ck_s in other0:
+                        out[ck_s] = it
+                        continue
+
+                    toks = _typed_tokens(it)
+                    mk: str | None = None
+
+                    for tok in toks:
+                        if tok.startswith("tmdb:") and tok in other_tmdb:
+                            mk = other_tmdb[tok]
+                            break
+                    if not mk:
+                        for tok in toks:
+                            if tok.startswith("imdb:") and tok in other_imdb:
+                                mk = other_imdb[tok]
+                                break
+                    if not mk:
+                        for tok in toks:
+                            if tok.startswith("tvdb:") and tok in other_tvdb:
+                                mk = other_tvdb[tok]
+                                break
+
+                    if not mk:
+                        out[ck_s] = it
+                        continue
+
+                    existing = out.get(mk)
+                    if isinstance(existing, Mapping):
+                        out[mk] = _merge_payload(existing, it)
+                    else:
+                        out[mk] = dict(it)
+
+                return out
+
+            B_eff = _rekey_to_other(B_eff, A_eff)
         _commit_baseline(provs_block, a, src_inst, feature, A_eff)
         _commit_baseline(provs_block, b, dst_inst, feature, B_eff)
         _commit_checkpoint(provs_block, a, src_inst, feature, now_cp_A)
@@ -1625,8 +2242,8 @@ def _two_way_sync(
     emit("two:done", a=a, b=b, feature=feature,
          upd_to_A=eff_upd_A, upd_to_B=eff_upd_B,
          adds_to_A=eff_add_A, adds_to_B=eff_add_B,
-         rem_from_A=_confirmed(resA_rem),
-         rem_from_B=_confirmed(resB_rem))
+         rem_from_A=eff_rem_A,
+         rem_from_B=eff_rem_B)
 
     skipped_total = int(resA_upd.get("skipped", 0)) + int(resB_upd.get("skipped", 0)) + \
                     int(resA_add.get("skipped", 0)) + int(resB_add.get("skipped", 0)) + \
@@ -1634,19 +2251,21 @@ def _two_way_sync(
     errors_total = int(resA_upd.get("errors", 0)) + int(resB_upd.get("errors", 0)) + \
                    int(resA_add.get("errors", 0)) + int(resB_add.get("errors", 0)) + \
                    int(resA_rem.get("errors", 0)) + int(resB_rem.get("errors", 0))
-    unresolved_total = int(unresolved_new_A_total) + int(unresolved_new_B_total)
+    unresolved_A_total = int(unresolved_new_A_total) + int(remove_unresolved_A)
+    unresolved_B_total = int(unresolved_new_B_total) + int(remove_unresolved_B)
+    unresolved_total = unresolved_A_total + unresolved_B_total
 
     return {
         "ok": True, "feature": feature, "a": a, "b": b,
         "upd_to_A": eff_upd_A, "upd_to_B": eff_upd_B,
         "adds_to_A": eff_add_A, "adds_to_B": eff_add_B,
-        "rem_from_A": _confirmed(resA_rem),
-        "rem_from_B": _confirmed(resB_rem),
+        "rem_from_A": eff_rem_A,
+        "rem_from_B": eff_rem_B,
         "resA_update": resA_upd, "resB_update": resB_upd,
         "resA_add": resA_add, "resB_add": resB_add,
         "resA_remove": resA_rem, "resB_remove": resB_rem,
-        "unresolved_to_A": int(unresolved_new_A_total),
-        "unresolved_to_B": int(unresolved_new_B_total),
+        "unresolved_to_A": unresolved_A_total,
+        "unresolved_to_B": unresolved_B_total,
         "unresolved": unresolved_total,
         "skipped": skipped_total,
         "errors": errors_total,

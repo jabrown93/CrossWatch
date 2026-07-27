@@ -2,7 +2,7 @@
 # Utility functions for data pair synchronization.
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
-from collections.abc import Mapping
+from collections.abc import Mapping, Callable
 from typing import Any
 import importlib
 from collections.abc import Mapping as _Mapping
@@ -163,8 +163,7 @@ def merge_manual_adds(idx: dict[str, Any], adds: _Mapping[str, Any] | None) -> d
         kk = str(k).strip()
         if not kk:
             continue
-        if kk not in out:
-            out[kk] = v
+        out[kk] = v
     return out
 
 
@@ -209,3 +208,4 @@ _apply_verify_after_write_supported = apply_verify_after_write_supported
 _health_status = health_status
 _health_feature_ok = health_feature_ok
 _rate_remaining = rate_remaining
+_inject_ctx_into_provider = inject_ctx_into_provider

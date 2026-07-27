@@ -228,6 +228,7 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
 
     out: dict[str, dict[str, Any]] = {}
     done = 0
+    seen_pages: set[tuple[str, ...]] = set()
 
     while True:
         r = http.get(
@@ -260,6 +261,10 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
             rows = []
             if total is None:
                 total = 0
+        signature = tuple(str(row.get("Id") or "") for row in rows if isinstance(row, Mapping))
+        if rows and signature in seen_pages:
+            break
+        seen_pages.add(signature)
 
         for row in rows:
             try:
@@ -692,9 +697,11 @@ def _add_collections(
         mids = mids[1:]
 
     ok = 0
+    added_ids: list[str] = []
     for chunk in chunked(mids, qlim):
         if collection_add_items(http, cid, chunk):
             ok += len(chunk)
+            added_ids.extend(chunk)
         else:
             for _ in chunk:
                 unresolved.append(
@@ -702,9 +709,9 @@ def _add_collections(
                 )
         sleep_ms(delay)
 
-    if ok:
+    if added_ids:
         _thaw_if_present(
-            [canonical_key({"ids": {"emby": x}}) for x in (mids or [])],
+            [canonical_key({"ids": {"emby": x}}) for x in added_ids],
         )
     return ok, unresolved
 

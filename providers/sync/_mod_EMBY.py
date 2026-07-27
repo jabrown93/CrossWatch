@@ -11,6 +11,9 @@ from typing import Any, Callable, Iterable, Mapping
 
 import requests
 
+from cw_platform.provider_instances import normalize_instance_id
+from cw_platform.value_coercion import coerce_bool
+
 from ._log import log as cw_log
 
 from .emby._common import normalize as emby_normalize, key_of as emby_key_of
@@ -19,6 +22,12 @@ from .emby import _watchlist as feat_watchlist
 from .emby import _history as feat_history
 from .emby import _ratings as feat_ratings
 from .emby import _progress as feat_progress
+try:
+    from .emby import _playlists as feat_playlists
+except Exception as e:
+    feat_playlists = None
+    if os.environ.get("CW_DEBUG") or os.environ.get("CW_EMBY_DEBUG"):
+        cw_log("EMBY", "playlists", "warn", "feature_import_failed", error=str(e))
 
 from ._mod_common import (
     build_session,
@@ -26,18 +35,83 @@ from ._mod_common import (
     parse_rate_limit,  # parity
     label_emby,
     make_snapshot_progress,
-    _confirmed_keys,
-    _pick_instance_id,
-    _merge_instance_block,
+    unresolved_keys as _unresolved_keys,
+    build_op_result,
 )
 
+_HISTORY_META_FIELDS = ("confirmed_keys", "unresolved_keys", "results", "reason_counts")
+
+
+def _finalize_result(adapter: Any, key_of, feature: str, items, cnt: int, unresolved: Any) -> dict[str, Any]:
+    meta = getattr(adapter, "_history_write_meta", None) if feature == "history" else None
+    if isinstance(meta, Mapping):
+        rc = meta.get("reason_counts")
+        return build_op_result(
+            ok=True,
+            count=int(cnt),
+            confirmed_keys=meta.get("confirmed_keys") or [],
+            unresolved_keys=meta.get("unresolved_keys") or _unresolved_keys(unresolved, key_of),
+            unresolved=unresolved,
+            results=meta.get("results") or [],
+            reason_counts=(dict(rc) if isinstance(rc, Mapping) else None),
+        )
+    results = list(getattr(adapter, "_progress_write_results", [])) if feature == "progress" else []
+    return build_op_result(
+        ok=True,
+        count=int(cnt),
+        confirmed_keys=_confirmed_keys(key_of, items, unresolved),
+        unresolved_keys=_unresolved_keys(unresolved, key_of),
+        unresolved=unresolved,
+        results=results,
+    )
+
+
+def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
+    attempted: list[str] = []
+    for it in items or []:
+        try:
+            k = str(key_of(it) or "").strip()
+        except Exception:
+            k = ""
+        if k:
+            attempted.append(k)
+
+    unresolved_keys: set[str] = set()
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                if isinstance(u.get("key"), str) and u.get("key"):
+                    unresolved_keys.add(str(u.get("key")))
+                    continue
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                unresolved_keys.add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                try:
+                    k = str(key_of(obj) or "").strip()
+                except Exception:
+                    k = ""
+                if k:
+                    unresolved_keys.add(k)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in attempted:
+        if k in unresolved_keys or k in seen:
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
 
 try:  # type: ignore[name-defined]
     ctx  # type: ignore[misc]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.0"
+__VERSION__ = "2.0"
 os.environ.setdefault("CW_EMBY_VERSION", __VERSION__)
 os.environ.setdefault("CW_EMBY_UA", f"CrossWatch/{__VERSION__} (Emby)")
 __all__ = ["get_manifest", "EMBYModule", "OPS"]
@@ -45,6 +119,36 @@ __all__ = ["get_manifest", "EMBYModule", "OPS"]
 _DEF_UA = os.environ.get("CW_EMBY_UA") or os.environ.get("CW_UA") or f"CrossWatch/{__VERSION__} (Emby)"
 
 
+def _pick_instance_id(provider: str) -> str:
+    prov = str(provider or "").upper().strip()
+    for k in ("CW_SNAPSHOT_INSTANCE", "CW_INSTANCE_ID", "CW_PROFILE", "CW_PROVIDER_INSTANCE", "CW_INSTANCE"):
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return normalize_instance_id(v)
+    if (os.environ.get("CW_PAIR_SRC") or "").upper().strip() == prov:
+        v = (os.environ.get("CW_PAIR_SRC_INSTANCE") or os.environ.get("CW_SRC_INSTANCE") or "").strip()
+        if v:
+            return normalize_instance_id(v)
+    if (os.environ.get("CW_PAIR_DST") or "").upper().strip() == prov:
+        v = (os.environ.get("CW_PAIR_DST_INSTANCE") or os.environ.get("CW_DST_INSTANCE") or "").strip()
+        if v:
+            return normalize_instance_id(v)
+    v = (os.environ.get("CW_PAIR_INSTANCE") or "").strip()
+    return normalize_instance_id(v)
+
+def _merge_instance_block(raw: Any, inst: str) -> dict[str, Any]:
+    base = dict(raw or {}) if isinstance(raw, Mapping) else {}
+    if inst == "default":
+        base.pop("instances", None)
+        return base
+    insts = base.get("instances")
+    if isinstance(insts, Mapping) and isinstance(insts.get(inst), Mapping):
+        merged = dict(base)
+        merged.update(dict(insts.get(inst) or {}))
+        merged.pop("instances", None)
+        return merged
+    base.pop("instances", None)
+    return base
 
 
 
@@ -72,6 +176,20 @@ _FEATURES: dict[str, Any] = {
     "history": feat_history,
     "ratings": feat_ratings,
     "progress": feat_progress,
+}
+
+_PLAYLIST_CAPABILITIES: dict[str, Any] = {
+    "read": True,
+    "create": True,
+    "add": True,
+    "remove": True,
+    "reorder": True,
+    "smart": False,
+    "smart_writable": False,
+    "media_types": ["movie", "show", "episode"],
+    "endpoint_types": ["playlist", "collection"],
+    "ordered_endpoint_types": ["playlist"],
+    "unordered_endpoint_types": ["collection"],
 }
 
 _HEALTH_SHADOW_NAME = "emby.health.shadow.json"
@@ -106,7 +224,7 @@ def get_manifest() -> Mapping[str, Any]:
             "watchlist": True,
             "history": True,
             "ratings": False,
-            "playlists": False,
+            "playlists": feat_playlists is not None,
             "progress": True,
         },
         "requires": ["requests"],
@@ -120,6 +238,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "unrate": True,
                 "from_date": False,
             },
+            "playlists": _PLAYLIST_CAPABILITIES,
         },
     }
 
@@ -146,7 +265,10 @@ class EMBYConfig:
     history_backdate: bool = False
     history_backdate_tolerance_s: int = 300
     history_libraries: list[str] | None = None
+    progress_libraries: list[str] | None = None
     ratings_libraries: list[str] | None = None
+    progress_replay_enabled: bool = False
+    progress_timestamp_tolerance_seconds: int = 30
 
 
 class EMBYClient:
@@ -224,6 +346,7 @@ class EMBYClient:
 
 class EMBYModule:
     def __init__(self, cfg: Mapping[str, Any]):
+        self.instance_id = "default"
         inst = _pick_instance_id("EMBY")
         em = _merge_instance_block((cfg or {}).get("emby") or {}, inst)
         auth = _merge_instance_block(dict((cfg or {}).get("auth") or {}).get("emby") or {}, inst)
@@ -249,6 +372,7 @@ class EMBYModule:
         hi_qlim = int(hi.get("history_query_limit", 25) or 25)
         hi_wdel = int(hi.get("history_write_delay_ms", 0) or 0)
         hi_gprio = hi.get("history_guid_priority") or wl_gprio
+        pr = dict(em.get("progress") or {})
         ra = dict(em.get("ratings") or {})
 
         def _list_str(v: Any) -> list[str] | None:
@@ -284,10 +408,10 @@ class EMBYModule:
             access_token=str(em.get("access_token") or "").strip(),
             user_id=str(em.get("user_id") or "").strip(),
             device_id=str(em.get("device_id") or "crosswatch"),
-            verify_ssl=bool(em.get("verify_ssl", True)),
+            verify_ssl=coerce_bool(em.get("verify_ssl", True), True),
             timeout=float((cfg or {}).get("timeout", em.get("timeout", 15.0))),
             max_retries=int((cfg or {}).get("max_retries", em.get("max_retries", 3))),
-            strict_id_matching=bool(em.get("strict_id_matching", False)),
+            strict_id_matching=coerce_bool(em.get("strict_id_matching", False)),
             watchlist_mode=wl_mode,
             watchlist_playlist_name=wl_pname,
             watchlist_query_limit=wl_qlim,
@@ -297,7 +421,10 @@ class EMBYModule:
             history_write_delay_ms=hi_wdel,
             history_guid_priority=list(hi_gprio),
             history_libraries=_list_str(hi.get("libraries")),
+            progress_libraries=_list_str(pr.get("libraries")),
             ratings_libraries=_list_str(ra.get("libraries")),
+            progress_replay_enabled=coerce_bool(pr.get("replay_enabled", em.get("progress_replay_enabled", False))),
+            progress_timestamp_tolerance_seconds=_i(pr.get("timestamp_tolerance_seconds", em.get("progress_clock_drift_seconds", 30)), 30),
             history_force_overwrite=force_overwrite,
             history_backdate=backdate,
             history_backdate_tolerance_s=bd_tolerance,
@@ -332,9 +459,11 @@ class EMBYModule:
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
-        toggles = {"watchlist": True, "history": True, "ratings": False, "playlists": False, "progress": True}
+        toggles = {"watchlist": True, "history": True, "ratings": False, "playlists": feat_playlists is not None, "progress": True}
         present = _present_flags()
-        return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
+        out = {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
+        out["playlists"] = bool(feat_playlists is not None)
+        return out
 
     def _is_enabled(self, feature: str) -> bool:
         return bool(self.supported_features().get(feature, False))
@@ -513,9 +642,12 @@ class EMBYModule:
                 "unresolved": [],
                 "error": f"unknown_feature:{feature}",
             }
+        try:
+            setattr(self, "_history_write_meta", None)
+        except Exception:
+            pass
         cnt, unresolved = mod.add(self, lst)
-        confirmed_keys = _confirmed_keys(self.key_of, lst, unresolved)
-        return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+        return _finalize_result(self, self.key_of, f, lst, cnt, unresolved)
     def remove(
         self,
         feature: str,
@@ -540,9 +672,12 @@ class EMBYModule:
                 "unresolved": [],
                 "error": f"unknown_feature:{feature}",
             }
+        try:
+            setattr(self, "_history_write_meta", None)
+        except Exception:
+            pass
         cnt, unresolved = mod.remove(self, lst)
-        confirmed_keys = _confirmed_keys(self.key_of, lst, unresolved)
-        return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+        return _finalize_result(self, self.key_of, f, lst, cnt, unresolved)
 class _EmbyOPS:
     def name(self) -> str:
         return "EMBY"
@@ -564,6 +699,7 @@ class _EmbyOPS:
                 "unrate": True,
                 "from_date": False,
             },
+            "playlists": _PLAYLIST_CAPABILITIES,
         }
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
@@ -608,5 +744,86 @@ class _EmbyOPS:
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
+
+    def _pl(self) -> Any:
+        if feat_playlists is None:
+            raise RuntimeError("Emby playlists feature is unavailable")
+        return feat_playlists
+
+    def _playlist_adapter(self, cfg: Mapping[str, Any], instance: str | None):
+        ad = self._adapter(cfg)
+        try:
+            ad.instance_id = normalize_instance_id(instance)
+        except Exception:
+            ad.instance_id = "default"
+        return ad
+
+    def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None):
+        if feat_playlists is None:
+            return []
+        return list(self._pl().list_resources(self._playlist_adapter(cfg, instance)))
+
+    def get_playlist_snapshot(self, cfg: Mapping[str, Any], playlist_id: str, *, instance: str | None = None):
+        return self._pl().get_snapshot(self._playlist_adapter(cfg, instance), playlist_id)
+
+    def create_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        name: str,
+        *,
+        media_type: str | None = None,
+        items: Iterable[Mapping[str, Any]] | None = None,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().create(
+            self._playlist_adapter(cfg, instance),
+            name,
+            media_type=media_type,
+            items=list(items or []),
+            dry_run=dry_run,
+        )
+
+    def add_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().add(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def remove_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().remove(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def reorder_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        ordered_keys: Iterable[str],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        keys = list(ordered_keys or [])
+        if dry_run:
+            return {"ok": True, "count": 0, "dry_run": True}
+        return self._pl().reorder(self._playlist_adapter(cfg, instance), playlist_id, keys)
 
 OPS = _EmbyOPS()

@@ -20,6 +20,8 @@
     if (typeof v === "string") v = v.toLowerCase().trim();
     return v === true || v === 1 || v === "1" || v === "true" || v === "on" || v === "yes";
   };
+  const playlistMappingIds = (v) => Array.isArray(v?.mappings) ? v.mappings.map((x) => String(x || "").trim()).filter(Boolean) : [];
+  const hasPlaylistMappings = (v) => truthy(v) && playlistMappingIds(v).length > 0;
 
   function ensureStyles() {
     const css = `
@@ -483,6 +485,21 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
   }
   window.deletePairCard = deletePairCard;
 
+  async function openPlaylistMappingsForPair(pairId, trigger) {
+    const id = String(pairId || "").trim();
+    if (!id) return;
+    try {
+      if (typeof window.showTab === "function") await window.showTab("playlists");
+      const api = window.Playlists;
+      if (api?.openMappingForPair) {
+        await api.openMappingForPair(id, trigger || null, { returnToSyncPairs: true });
+      }
+    } catch (e) {
+      console.warn("[pairs.overlay] playlist mappings open failed", e);
+    }
+  }
+  window.cxOpenPlaylistMappingsForPair = openPlaylistMappingsForPair;
+
   function renderPairsOverlay() {
     ensureStyles();
     const containers = ensureHost(); if (!containers) return;
@@ -497,6 +514,8 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
 
     const bead = (cls, tip, val) => `<span class="bead ${cls} ${truthy(val) ? "on" : ""}" data-tip="${tip}"></span>`;
     const inst = (v) => (String(v || "default").trim() || "default");
+    // TEMP Disabled due to playlists validation
+    const showPlaylistMappingButton = false;
     const pill = (provider, instance, role) => {
       const name = providerLabel(provider), full = String(instance || "default").toLowerCase() !== "default" ? `${name}:${instance}` : name, logo = providerLogo(provider), tip = `${role === "src" ? "Source" : "Target"}: ${full}`;
       return `<span class="pair-pill ${role}" data-tip="${esc(tip)}"><span class="pair-pill-text">${esc(full)}</span><span class="prov-watermark" aria-hidden="true" style="--wm:url('${esc(logo)}')"></span></span>`;
@@ -533,6 +552,10 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
                 ${bead("pr", "Progress", f.progress)}
                 ${bead("pl", "Playlists", f.playlists)}
               </div>
+
+              ${showPlaylistMappingButton && hasPlaylistMappings(f.playlists) ? `<button class="icon-btn" data-tip="Manage playlist mappings" onclick="window.cxOpenPlaylistMappingsForPair && window.cxOpenPlaylistMappingsForPair(this.closest('.pair-card')?.dataset?.id, this)" aria-label="Manage playlist mappings">
+                <svg viewBox="0 0 24 24" class="ico" aria-hidden="true"><path d="M4 6h11"></path><path d="M4 12h11"></path><path d="M4 18h7"></path><path d="M17 15l4 3-4 3"></path></svg>
+              </button>` : ""}
 
               <label class="icon-btn power ${enabled ? "" : "off"}" data-tip="Enable / disable" role="switch" aria-checked="${enabled}">
                 <input class="sr-only" type="checkbox" name="pair-enabled" ${enabled ? "checked" : ""}
@@ -619,6 +642,12 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
   document.addEventListener("DOMContentLoaded", () => {
     watchSyncSection();
     renderOrEnhance();
+  });
+  document.addEventListener("cw-settings-pane-changed", (ev) => {
+    if (String(ev?.detail?.pane || "").toLowerCase() === "sync") {
+      renderOrEnhance(true);
+      scheduleViewportLimit(120);
+    }
   });
   document.addEventListener("cx-state-change", renderOrEnhance);
   window.addEventListener("cx:pairs:changed", () => { renderOrEnhance(true); });

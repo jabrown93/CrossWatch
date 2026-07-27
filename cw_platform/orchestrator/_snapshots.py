@@ -22,6 +22,82 @@ SnapIndex = dict[str, dict[str, Any]]
 SnapCache = dict[tuple[str, str, str], tuple[float, SnapIndex]]
 
 
+def bust_snapshot_cache(snap_cache: Any, provider: str, feature: str) -> None:
+    if not isinstance(snap_cache, dict):
+        return
+    prov = str(provider or "")
+    feat = str(feature or "")
+    for key in [
+        k for k in list(snap_cache.keys())
+        if isinstance(k, tuple) and len(k) == 3 and str(k[1]) == prov and str(k[2]) == feat
+    ]:
+        snap_cache.pop(key, None)
+
+
+def canonicalize_index(idx_raw: Any, *, feature: str) -> "SnapIndex":
+    canon: SnapIndex = {}
+    if isinstance(idx_raw, list):
+        for raw in idx_raw:
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            key = canonical_key(item)
+            if key:
+                canon[key] = item
+    elif isinstance(idx_raw, Mapping):
+        for k, raw in idx_raw.items():
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            computed = canonical_key(item) or ""
+            provider_key = k.split("@", 1)[0] if isinstance(k, str) and k else ""
+            key = _pick_key(provider_key, computed)
+            if key:
+                canon[key] = item
+    return _coalesce_by_shared_ids(canon, feature=feature)
+
+
+def needs_post_apply_refresh(result: Mapping[str, Any] | None) -> bool:
+    r = result or {}
+    not_seen = r.get("accepted_not_seen_live_keys") or []
+    if not_seen:
+        return True
+    accepted = r.get("accepted_keys") or []
+    presence = r.get("presence_confirmed_keys")
+    return bool(accepted) and not presence
+
+
+def refresh_destination_after_apply(
+    *,
+    ops: InventoryOps,
+    config: Mapping[str, Any],
+    feature: str,
+    provider: str,
+    snap_cache: Any,
+) -> "SnapIndex | None":
+    bust_snapshot_cache(snap_cache, provider, feature)
+    idx_raw: Any = None
+    refresher = getattr(ops, "snapshot_refresh", None)
+    if callable(refresher):
+        try:
+            idx_raw = refresher(config, feature=feature)
+        except Exception:
+            idx_raw = None
+    if idx_raw is None:
+        try:
+            idx_raw = ops.build_index(config, feature=feature)  # type: ignore[call-arg]
+        except Exception:
+            return None
+    canon = canonicalize_index(idx_raw, feature=feature)
+    try:
+        scope = pair_scope() or "unscoped"
+        if canon:
+            snap_cache[(scope, provider, feature)] = (time.time(), canon)
+    except Exception:
+        pass
+    return canon
+
+
 def provider_index_semantics(
     ops: InventoryOps,
     config: Mapping[str, Any],
@@ -570,6 +646,29 @@ def _maybe_backfill_anilist_shadow(
             collisions=int(collisions),
         )
 
+def prepare_source_snapshot(
+    ops: Any,
+    *,
+    config: Mapping[str, Any],
+    feature: str,
+    items: Mapping[str, Mapping[str, Any]],
+    dbg: Callable[..., Any] | None = None,
+) -> bool:
+    """Offer the normalized source items to a provider before its own index is built."""
+    hook = getattr(ops, "prepare_source_snapshot", None)
+    if not callable(hook) or not items:
+        return False
+    try:
+        hook(config, feature=feature, items=items)
+    except Exception as e:
+        if dbg is not None:
+            dbg("snapshot.prepare_failed", feature=feature, error=str(e))
+        return False
+    if dbg is not None:
+        dbg("snapshot.prepared", feature=feature, count=len(items))
+    return True
+
+
 def build_snapshots_for_feature(
     *,
     feature: str,
@@ -579,12 +678,25 @@ def build_snapshots_for_feature(
     snap_ttl_sec: int,
     dbg: Callable[..., Any],
     emit_info: Callable[[str], Any],
+    build_order: "list[str] | tuple[str, ...] | None" = None,
+    on_snapshot: Callable[[str, SnapIndex], Any] | None = None,
 ) -> dict[str, SnapIndex]:
     snaps: dict[str, SnapIndex] = {}
     now = time.time()
     allowed = allowed_providers_for_feature(config, feature)
 
-    for name, ops in providers.items():
+    ordered: list[tuple[str, InventoryOps]] = []
+    if build_order:
+        seen: set[str] = set()
+        for want in build_order:
+            if want in providers and want not in seen:
+                seen.add(want)
+                ordered.append((want, providers[want]))
+        ordered.extend((n, o) for n, o in providers.items() if n not in seen)
+    else:
+        ordered = list(providers.items())
+
+    for name, ops in ordered:
         try:
             feats_raw = ops.features()  # type: ignore[call-arg]
         except Exception:
@@ -614,59 +726,36 @@ def build_snapshots_for_feature(
                 if (now - ts) < snap_ttl_sec:
                     snaps[name] = cached_idx
                     dbg("snapshot.memo", provider=name, feature=feature, count=_eventish_count(feature, cached_idx), raw_count=len(cached_idx))
+                    if on_snapshot is not None:
+                        on_snapshot(name, cached_idx)
                     continue
 
-        degraded = False
         try:
             idx_raw = ops.build_index(config, feature=feature)  # type: ignore[call-arg]
         except Exception as e:
             emit_info(
                 f"[!] snapshot.failed provider={name} feature={feature} error={e}"
             )
-            dbg("provider.degraded", provider=name, feature=feature)
-            degraded = True
-            idx_raw = None
+            dbg("snapshot.failed", provider=name, feature=feature)
+            raise
 
-        canon: SnapIndex = {}
-
-        if isinstance(idx_raw, list):
-            for raw in idx_raw:
-                if not isinstance(raw, Mapping):
-                    continue
-                item = dict(raw)
-                key = canonical_key(item)
-                if key:
-                    canon[key] = item
-
-        elif isinstance(idx_raw, Mapping):
-            for k, raw in idx_raw.items():
-                if not isinstance(raw, Mapping):
-                    continue
-                item = dict(raw)
-                computed = canonical_key(item) or ""
-                provider_key = k.split("@", 1)[0] if isinstance(k, str) and k else ""
-                key = _pick_key(provider_key, computed)
-                if key:
-                    canon[key] = item
-
-        else:
-            canon = {}
-
-        canon = _coalesce_by_shared_ids(canon, feature=feature)
+        canon = canonicalize_index(idx_raw, feature=feature)
         snaps[name] = canon
 
         if snap_ttl_sec > 0:
-            if degraded or not canon:
+            if not canon:
                 dbg(
                     "snapshot.no_cache_empty",
                     provider=name,
                     feature=feature,
-                    degraded=bool(degraded),
+                    degraded=False,
                 )
             else:
                 snap_cache[memo_key] = (now, canon)
 
         dbg("snapshot", provider=name, feature=feature, count=_eventish_count(feature, canon), raw_count=len(canon))
+        if on_snapshot is not None:
+            on_snapshot(name, canon)
 
     _maybe_backfill_anilist_shadow(snaps, feature=feature, dbg=dbg)
     return snaps

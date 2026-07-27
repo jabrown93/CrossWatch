@@ -9,12 +9,12 @@ from .tlsAPI import router as tls_router
 from .maintenanceAPI import router as maintenance_router
 from .activityAPI import router as activity_router
 from .dashboardAPI import router as dashboard_router
-from .mobileAPI import router as mobile_router
 from .metaAPI import router as meta_router
 from .animeMappingAPI import router as anime_mapping_router
 from .manualAPI import router as manual_router
 from .insightAPI import register_insights
 from .watchlistAPI import router as watchlist_router
+from .playlistsAPI import router as playlists_router
 from .snapshotsAPI import router as snapshots_router
 from .backupsAPI import router as backups_router
 from .schedulingAPI import router as scheduling_router
@@ -24,10 +24,12 @@ from .probesAPI import (
     STATUS_CACHE as PROBES_STATUS_CACHE,
 )
 from .scrobbleAPI import router as scrobble_router
+from .scrobblerManagementAPI import router as scrobbler_management_router
 from .authenticationAPI import register_auth
 from .wallAPI import register_wall
 from .versionAPI import router as version_router
 from .editorAPI import router as editor_router
+from .eventsAPI import router as events_router
 from .providerInstancesAPI import router as provider_instances_router
 from .playbackProgressAPI import router as playback_progress_router
 from .syncAPI import (
@@ -47,20 +49,22 @@ __all__ = [
     "maintenance_router",
     "activity_router",
     "dashboard_router",
-    "mobile_router",
     "meta_router",
     "anime_mapping_router",
     "manual_router",
     "watchlist_router",
+    "playlists_router",
     "snapshots_router",
     "backups_router",
     "scheduling_router",
     "scrobble_router",
+    "scrobbler_management_router",
     "sync_router",
     "version_router",
     "analyzer_router",
     "export_router",
     "editor_router",
+    "events_router",
     "provider_instances_router",
     "playback_progress_router",
     "register_probes",
@@ -88,19 +92,21 @@ def register(
     app.include_router(anime_mapping_router)
     app.include_router(manual_router)
     app.include_router(watchlist_router)
+    app.include_router(playlists_router)
     app.include_router(snapshots_router)
     app.include_router(backups_router)
     app.include_router(maintenance_router)
     app.include_router(activity_router)
     app.include_router(dashboard_router)
-    app.include_router(mobile_router)
     app.include_router(scheduling_router)
     app.include_router(scrobble_router)
+    app.include_router(scrobbler_management_router)
     app.include_router(sync_router)
     app.include_router(version_router)
     app.include_router(analyzer_router)
     app.include_router(export_router)
     app.include_router(editor_router)
+    app.include_router(events_router)
     app.include_router(provider_instances_router)
     app.include_router(playback_progress_router)
 

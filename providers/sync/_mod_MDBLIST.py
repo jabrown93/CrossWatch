@@ -61,7 +61,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.1"
+__VERSION__ = "1.3"
 __all__ = ["get_manifest", "MDBLISTModule", "OPS"]
 
 def _health(status: str, ok: bool, latency_ms: int) -> None:
@@ -109,6 +109,30 @@ except Exception as e:
     _warn("feature_import_failed", import_feature="history", error=f"{type(e).__name__}: {e}")
     feat_history = None
 
+try:
+    from .mdblist import _progress as feat_progress
+except Exception as e:
+    _warn("feature_import_failed", import_feature="progress", error=f"{type(e).__name__}: {e}")
+    feat_progress = None
+
+try:
+    from .mdblist import _playlists as feat_playlists
+except Exception as e:
+    _warn("feature_import_failed", import_feature="playlists", error=f"{type(e).__name__}: {e}")
+    feat_playlists = None
+
+
+_PLAYLIST_CAPABILITIES: dict[str, Any] = {
+    "read": True,
+    "create": True,
+    "add": True,
+    "remove": True,
+    "reorder": False,
+    "smart": True,
+    "smart_writable": False,
+    "media_types": ["movies", "shows"],
+}
+
 
 _FEATURES: dict[str, Any] = {}
 if feat_watchlist:
@@ -117,6 +141,8 @@ if feat_ratings:
     _FEATURES["ratings"] = feat_ratings
 if feat_history:
     _FEATURES["history"] = feat_history
+if feat_progress:
+    _FEATURES["progress"] = feat_progress
 
 
 def _features_flags() -> dict[str, bool]:
@@ -124,7 +150,8 @@ def _features_flags() -> dict[str, bool]:
         "watchlist": "watchlist" in _FEATURES,
         "ratings": "ratings" in _FEATURES,
         "history": "history" in _FEATURES,
-        "playlists": False,
+        "progress": "progress" in _FEATURES,
+        "playlists": feat_playlists is not None,
     }
 
 
@@ -155,6 +182,14 @@ def get_manifest() -> Mapping[str, Any]:
                 "unrate": True,
                 "from_date": True,
             },
+            "progress": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+                "upsert": True,
+                "remove": True,
+            },
+            "playlists": _PLAYLIST_CAPABILITIES,
         },
     }
 
@@ -335,7 +370,7 @@ class MDBLISTModule:
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
-        toggles = {"watchlist": True, "ratings": True, "history": True, "playlists": False}
+        toggles = {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": True}
         present = _features_flags()
         return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
 
@@ -354,7 +389,7 @@ class MDBLISTModule:
                 "status": "ok",
                 "latency_ms": 0,
                 "features": {},
-                "details": {"disabled": ["watchlist", "ratings", "history"]},
+                "details": {"disabled": ["watchlist", "ratings", "history", "progress"]},
                 "api": {},
             }
 
@@ -405,7 +440,8 @@ class MDBLISTModule:
             "watchlist": bool(enabled.get("watchlist") and user_ok),
             "ratings": bool(enabled.get("ratings") and user_ok),
             "history": bool(enabled.get("history") and user_ok),
-            "playlists": False,
+            "progress": bool(enabled.get("progress") and user_ok),
+            "playlists": bool(enabled.get("playlists") and user_ok),
         }
 
         if not need_any:
@@ -630,7 +666,18 @@ class MDBLISTModule:
             _log("write_skipped", feature=feature, level="warn", op="add", reason="module_missing")
             return {"ok": True, "count": 0, "unresolved": []}
         try:
-            cnt, unresolved = mod.add(self, lst)
+            raw = mod.add(self, lst)
+            if isinstance(raw, Mapping):
+                out = dict(raw)
+                out.setdefault("ok", True)
+                out.setdefault("unresolved", [])
+                out.setdefault("confirmed_keys", [])
+                if isinstance(out.get("confirmed_keys"), list):
+                    out["count"] = len([x for x in out.get("confirmed_keys") or [] if x])
+                else:
+                    out.setdefault("count", int(out.get("count", 0) or 0))
+                return out
+            cnt, unresolved = raw
             confirmed_keys = _confirmed_keys(_mdblist_key_of, lst, unresolved)
             return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
         except Exception as e:
@@ -656,7 +703,18 @@ class MDBLISTModule:
             _log("write_skipped", feature=feature, level="warn", op="remove", reason="module_missing")
             return {"ok": True, "count": 0, "unresolved": []}
         try:
-            cnt, unresolved = mod.remove(self, lst)
+            raw = mod.remove(self, lst)
+            if isinstance(raw, Mapping):
+                out = dict(raw)
+                out.setdefault("ok", True)
+                out.setdefault("unresolved", [])
+                out.setdefault("confirmed_keys", [])
+                if isinstance(out.get("confirmed_keys"), list):
+                    out["count"] = len([x for x in out.get("confirmed_keys") or [] if x])
+                else:
+                    out.setdefault("count", int(out.get("count", 0) or 0))
+                return out
+            cnt, unresolved = raw
             confirmed_keys = _confirmed_keys(_mdblist_key_of, lst, unresolved)
             return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
         except Exception as e:
@@ -692,6 +750,14 @@ class _MDBLISTOPS:
                 "unrate": True,
                 "from_date": True,
             },
+            "progress": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+                "upsert": True,
+                "remove": True,
+            },
+            "playlists": _PLAYLIST_CAPABILITIES,
         }
 
 
@@ -845,5 +911,83 @@ class _MDBLISTOPS:
         category: str | None = None,
     ) -> Mapping[str, Any]:
         return self._adapter(cfg).fetch_journal(since=since, limit=limit, category=category)
+
+    def _pl(self) -> Any:
+        if feat_playlists is None:
+            raise MDBLISTError("MDBList playlists feature is unavailable")
+        return feat_playlists
+
+    def _playlist_adapter(self, cfg: Mapping[str, Any], instance: str | None):
+        ad = self._adapter(cfg)
+        try:
+            ad.instance_id = mdblist_auth.normalize_instance_id_value(instance)
+        except Exception:
+            ad.instance_id = "default"
+        return ad
+
+    def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None):
+        if feat_playlists is None:
+            return []
+        return list(self._pl().list_resources(self._playlist_adapter(cfg, instance)))
+
+    def get_playlist_snapshot(self, cfg: Mapping[str, Any], playlist_id: str, *, instance: str | None = None):
+        return self._pl().get_snapshot(self._playlist_adapter(cfg, instance), playlist_id)
+
+    def create_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        name: str,
+        *,
+        media_type: str | None = None,
+        items: Iterable[Mapping[str, Any]] | None = None,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().create(
+            self._playlist_adapter(cfg, instance),
+            name,
+            media_type=media_type,
+            items=list(items or []),
+            dry_run=dry_run,
+        )
+
+    def add_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().add(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def remove_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().remove(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def reorder_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        ordered_keys: Iterable[str],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return {"ok": True, "count": 0, "reordered": 0, "unsupported": True}
 
 OPS = _MDBLISTOPS()

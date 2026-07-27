@@ -23,6 +23,9 @@ _HTTP = requests.Session()
 
 _CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
 _CFG_TTL_SEC = 2.0
+OFFLINE_INITIAL_RETRY_SECONDS = 30.0
+OFFLINE_MAX_RETRY_SECONDS = 300.0
+OFFLINE_TIMEOUT_SECONDS = 2.0
 
 _TRAKT_ID_CACHE: dict[tuple, Any] = {}
 _VIEW_CACHE_TTL_SECS = 60.0
@@ -156,20 +159,21 @@ def _jf_bt(cfg: dict[str, Any]) -> tuple[str, str]:
 def _hdr(tok: str, cfg: dict[str, Any]) -> dict[str, str]:
     e = cfg.get("jellyfin") or {}
     did = str(e.get("device_id") or "crosswatch")
+    auth = f'MediaBrowser Client="CrossWatch", Device="CrossWatch", DeviceId="{did}", Version="1.0.0", Token="{tok}"'
     return {
         "Accept": "application/json",
         "X-Emby-Token": tok,
         "X-MediaBrowser-Token": tok,
-        "Authorization": f'Emby Client="CrossWatch", Device="CrossWatch", DeviceId="{did}", Version="1.0.0"',
+        "Authorization": auth,
     }
 
 
-def _get_json(base: str, tok: str, path: str, cfg: dict[str, Any]) -> Any:
+def _get_json(base: str, tok: str, path: str, cfg: dict[str, Any], timeout: float | None = None) -> Any:
     e = cfg.get("jellyfin") or {}
     r = _HTTP.get(
         f"{base}{path}",
         headers=_hdr(tok, cfg),
-        timeout=float(e.get("timeout", 6)),
+        timeout=float(timeout if timeout is not None else e.get("timeout", 6)),
         verify=bool(e.get("verify_ssl", True)),
     )
     r.raise_for_status()
@@ -561,8 +565,9 @@ class JellyfinWatchService:
         self._stop = threading.Event()
         self._bg: threading.Thread | None = None
         self._last: dict[str, dict[str, Any]] = {}
-        self._last_emit: dict[str, tuple[str, int]] = {}
+        self._last_emit: dict[str, tuple[str, float]] = {}
         self._allowed_sessions: set[str] = set()
+        self._scrobble_whitelist_sessions: set[str] = set()
         self._filtered_sessions: set[str] = set()
         self._route_filtered_ts: dict[str, float] = {}
         self._cw_last_heartbeat: dict[str, float] = {}
@@ -570,6 +575,9 @@ class JellyfinWatchService:
         self._last_seek_emit: dict[str, float] = {}
         self._view_roots_cache: dict[str, tuple[float, set[str]]] = {}
         self._item_root_cache: dict[str, str | None] = {}
+        self._offline = False
+        self._offline_failures = 0
+        self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
 
         lvl = "DEBUG" if self._quiet_startup else "INFO"
         self._log(f"Ensuring Watcher is running; inst={self._instance_id} | wired sinks: {self.sinks_count()}", lvl)
@@ -580,15 +588,40 @@ class JellyfinWatchService:
             return
         if BASE_LOG is not None:
             try:
-                BASE_LOG(msg, level=lvl, module="JFIN ")
+                BASE_LOG(msg, level=lvl, module="JELLYFIN-WATCH")
                 return
             except Exception:
                 pass
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{ts}] [JFIN ] {lvl} {msg}")
+        print(f"[{ts}] [JELLYFIN-WATCH] {lvl} {msg}")
 
     def _dbg(self, msg: str) -> None:
         self._log(msg, "DEBUG")
+
+    def _request_timeout(self, cfg: dict[str, Any]) -> float:
+        try:
+            timeout = float(((cfg.get("jellyfin") or {}).get("timeout") or 6))
+        except Exception:
+            timeout = 6.0
+        if self._offline or self._offline_failures:
+            return min(timeout, OFFLINE_TIMEOUT_SECONDS)
+        return timeout
+
+    def _mark_offline(self, exc: Exception) -> None:
+        self._offline_failures += 1
+        if not self._offline:
+            self._offline = True
+            self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
+            self._log(f"Jellyfin watcher offline: {exc}; retrying with backoff", "WARNING")
+            return
+        self._offline_retry = min(OFFLINE_MAX_RETRY_SECONDS, max(OFFLINE_INITIAL_RETRY_SECONDS, self._offline_retry * 2.0))
+
+    def _mark_online(self) -> None:
+        if self._offline:
+            self._log("Jellyfin watcher reconnected", "INFO")
+        self._offline = False
+        self._offline_failures = 0
+        self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
 
     def _update_best_offset(self, session_key: str, off_ms: int, dur_ms: int) -> None:
         if not session_key or dur_ms <= 0:
@@ -723,18 +756,34 @@ class JellyfinWatchService:
 
     def _passes_filters(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> bool:
         sk = str(ev.session_key or "")
-        if sk and sk in self._allowed_sessions:
-            return True
-
         libs = self._scrobble_whitelist(cfg)
+
         if libs:
+            # A whitelist must be validated per event
             view_id = self._session_view_id(ev.raw or {}, cfg)
             if not view_id or view_id not in libs:
+                raw = ev.raw or {}
+                is_synthetic_stop = (
+                    ev.action == "stop"
+                    and isinstance(raw, Mapping)
+                    and raw.get("_cw_stop_src") == "poll-disappear"
+                )
+                if sk and is_synthetic_stop and sk in self._scrobble_whitelist_sessions:
+                    return True
+                if sk:
+                    self._allowed_sessions.discard(sk)
+                    self._scrobble_whitelist_sessions.discard(sk)
                 if _is_debug():
-                    item = ((ev.raw or {}).get("NowPlayingItem") or {}) if isinstance(ev.raw, Mapping) else {}
+                    item = (raw.get("NowPlayingItem") or {}) if isinstance(raw, Mapping) else {}
                     name = (item.get("Name") or item.get("SeriesName") or "?") if isinstance(item, Mapping) else "?"
                     self._dbg(f"event filtered by scrobble whitelist: view={view_id or 'none'} allowed={sorted(libs)} item={name}")
                 return False
+            if sk:
+                self._scrobble_whitelist_sessions.add(sk)
+            return True
+
+        if sk and sk in self._allowed_sessions:
+            return True
 
         if sk:
             self._allowed_sessions.add(sk)
@@ -774,10 +823,11 @@ class JellyfinWatchService:
             raw=sess,
         )
 
-    def _current_sessions(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    def _current_sessions(self, cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
         try:
             q = "/Sessions?ActiveWithinSeconds=15"
-            all_sessions = _get_json(self._base, self._tok, q, cfg) or []
+            all_sessions = _get_json(self._base, self._tok, q, cfg, timeout=self._request_timeout(cfg)) or []
+            self._mark_online()
             playing: list[dict[str, Any]] = []
             for s in all_sessions:
                 if not (s.get("NowPlayingItem") or {}):
@@ -785,8 +835,8 @@ class JellyfinWatchService:
                 playing.append(s)
             return playing
         except Exception as ex:
-            self._log(f"session poll failed: {ex}", "ERROR")
-            return []
+            self._mark_offline(ex)
+            return None
 
     def _meta_from_event(self, ev: ScrobbleEvent) -> dict[str, Any]:
         return {
@@ -944,6 +994,8 @@ class JellyfinWatchService:
         now = time.time()
         cfg = self._active_cfg()
         cur = self._current_sessions(cfg)
+        if cur is None:
+            return False
         seen: set[str] = set()
 
         try:
@@ -1098,6 +1150,14 @@ class JellyfinWatchService:
                 except Exception:
                     pass
                 try:
+                    self._allowed_sessions.discard(sid)
+                except Exception:
+                    pass
+                try:
+                    self._scrobble_whitelist_sessions.discard(sid)
+                except Exception:
+                    pass
+                try:
                     self._cw_last_heartbeat.pop(sid, None)
                 except Exception:
                     pass
@@ -1150,6 +1210,14 @@ class JellyfinWatchService:
                 except Exception:
                     pass
                 try:
+                    self._allowed_sessions.discard(sid)
+                except Exception:
+                    pass
+                try:
+                    self._scrobble_whitelist_sessions.discard(sid)
+                except Exception:
+                    pass
+                try:
                     self._cw_last_heartbeat.pop(sid, None)
                 except Exception:
                     pass
@@ -1183,7 +1251,9 @@ class JellyfinWatchService:
             else:
                 self._idle_steps = min(self._idle_steps + 1, 10)
                 sleep_for = min(self._poll * (1.0 + (0.5 * self._idle_steps)), self._max_idle_sleep)
-            time.sleep(sleep_for)
+            if self._offline:
+                sleep_for = self._offline_retry
+            self._stop.wait(sleep_for)
 
     def stop(self) -> None:
         self._stop.set()

@@ -1,9 +1,9 @@
 # tests/test_shared_helpers_regression.py
 # Pins the byte-identical helper functions that refactor commit 62ebac4 hoisted out of
 # per-provider/per-endpoint files into providers/sync/_mod_common.py,
-# providers/scrobble/_sink_common.py, providers/webhooks/_utils.py, and
-# cw_platform/config_base.py. These previously had no direct unit coverage - only
-# exercised indirectly through whichever provider module happened to define them.
+# providers/scrobble/_sink_common.py, and cw_platform/config_base.py. These previously
+# had no direct unit coverage - only exercised indirectly through whichever provider
+# module happened to define them.
 from __future__ import annotations
 
 import json
@@ -16,7 +16,6 @@ import responses
 from cw_platform.config_base import _tmdb_api_key
 from providers.scrobble import _sink_common
 from providers.sync import _mod_common
-from providers.webhooks import _utils as webhook_utils
 
 
 # --- providers/sync/_mod_common.py -----------------------------------------------
@@ -284,117 +283,6 @@ def test_ar_seen_expires_after_ttl(tmp_path, monkeypatch):
     data["k1"] = time.time() - (_sink_common._AR_TTL + 5)
     state_file.write_text(json.dumps(data))
     assert _sink_common._ar_seen("k1") is False
-
-
-# --- providers/webhooks/_utils.py ------------------------------------------------
-
-def test_verify_webhook_secret_empty_secret_bypasses():
-    assert webhook_utils.verify_webhook_secret({}, "") is True
-
-
-def test_verify_webhook_secret_valid_and_invalid():
-    assert webhook_utils.verify_webhook_secret({"X-CW-Webhook-Secret": "s"}, "s") is True
-    assert webhook_utils.verify_webhook_secret({"X-CW-Webhook-Secret": "wrong"}, "s") is False
-
-
-def test_tokens_prefers_auth_trakt_over_top_level_trakt():
-    cfg = {
-        "trakt": {"client_id": "cid", "client_secret": "secret", "access_token": "top-level-tok"},
-        "auth": {"trakt": {"access_token": "auth-tok", "refresh_token": "rtok"}},
-    }
-    out = webhook_utils._tokens(cfg)
-    assert out == {"client_id": "cid", "client_secret": "secret",
-                    "access_token": "auth-tok", "refresh_token": "rtok"}
-
-
-def test_headers_includes_bearer_only_when_access_token_present():
-    cfg = {"trakt": {"client_id": "cid"}}
-    h = webhook_utils._headers(cfg)
-    assert h["trakt-api-key"] == "cid"
-    assert "Authorization" not in h
-
-    cfg2 = {"trakt": {"client_id": "cid", "access_token": "tok"}}
-    h2 = webhook_utils._headers(cfg2)
-    assert h2["Authorization"] == "Bearer tok"
-
-
-def test_cache_get_put_roundtrip():
-    cache: dict[Any, Any] = {}
-    webhook_utils._cache_put(cache, ("a", 1), "value")
-    assert webhook_utils._cache_get(cache, ("a", 1)) == "value"
-    assert webhook_utils._cache_get(cache, ("missing",)) is None
-
-
-def test_cache_put_clears_when_oversized():
-    cache: dict[Any, Any] = {("k", i): i for i in range(2049)}
-    webhook_utils._cache_put(cache, ("new",), "v")
-    # Cache was cleared for being over the 2048 threshold, then the new entry added.
-    assert cache == {("new",): "v"}
-
-
-def test_best_id_key_order_same_for_movie_and_show():
-    assert webhook_utils._best_id_key_order("movie") == ("tmdb", "imdb", "tvdb")
-    assert webhook_utils._best_id_key_order("show") == ("tmdb", "imdb", "tvdb")
-
-
-@responses.activate
-def test_del_trakt_success_no_refresh():
-    responses.add(responses.DELETE, "https://api.trakt.tv/checkin", status=204)
-    cfg = {"trakt": {"client_id": "cid", "access_token": "tok"}}
-    r = webhook_utils._del_trakt("/checkin", cfg)
-    assert r.status_code == 204
-    assert len(responses.calls) == 1
-
-
-@responses.activate
-def test_del_trakt_401_triggers_refresh_and_retries(monkeypatch):
-    responses.add(responses.DELETE, "https://api.trakt.tv/checkin", status=401)
-    responses.add(responses.DELETE, "https://api.trakt.tv/checkin", status=204)
-
-    refreshed = []
-
-    class FakeTraktAuth:
-        @staticmethod
-        def refresh(cfg):
-            refreshed.append(True)
-            cfg["trakt"]["access_token"] = "new-tok"
-
-    import providers.auth._auth_TRAKT as auth_mod
-    monkeypatch.setattr(auth_mod, "PROVIDER", FakeTraktAuth)
-    monkeypatch.setattr(webhook_utils, "_save_config", lambda cfg: None)
-
-    cfg = {"trakt": {"client_id": "cid", "access_token": "old-tok"}}
-    r = webhook_utils._del_trakt("/checkin", cfg)
-
-    assert refreshed == [True]
-    assert r.status_code == 204
-    assert len(responses.calls) == 2
-
-
-def test_call_remove_across_skips_when_delete_plex_disabled(monkeypatch):
-    monkeypatch.setattr(webhook_utils, "_load_config", lambda: {"scrobble": {"delete_plex": False}})
-    called = []
-    monkeypatch.setattr(webhook_utils, "_rm_across", lambda ids, mt: called.append((ids, mt)))
-    webhook_utils._call_remove_across({"imdb": "tt01"}, "movie")
-    assert called == []
-
-
-def test_call_remove_across_calls_rm_across_when_type_allowed(monkeypatch):
-    monkeypatch.setattr(
-        webhook_utils, "_load_config",
-        lambda: {"scrobble": {"delete_plex": True, "delete_plex_types": ["movies"]}},
-    )
-    called = []
-    monkeypatch.setattr(webhook_utils, "_rm_across", lambda ids, mt: called.append((ids, mt)))
-    webhook_utils._call_remove_across({"imdb": "tt01"}, "movie")
-    assert called == [({"imdb": "tt01"}, "movie")]
-
-
-def test_call_remove_across_empty_ids_is_noop(monkeypatch):
-    called = []
-    monkeypatch.setattr(webhook_utils, "_rm_across", lambda ids, mt: called.append((ids, mt)))
-    webhook_utils._call_remove_across({}, "movie")
-    assert called == []
 
 
 # --- cw_platform/config_base._tmdb_api_key ---------------------------------------

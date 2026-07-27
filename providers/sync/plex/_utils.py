@@ -16,19 +16,11 @@ from requests.exceptions import ConnectionError, SSLError
 
 from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import normalize_instance_id
+from cw_platform.value_coercion import coerce_bool
 
 from ._common import make_logger, plex_headers
 def _boolish(value: Any, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in ("0", "false", "no", "off", "n"):
-        return False
-    if s in ("1", "true", "yes", "on", "y"):
-        return True
-    return default
+    return coerce_bool(value, default)
 
 
 _dbg, _info, _warn, _error, _log = make_logger("utils")
@@ -1044,25 +1036,13 @@ def ensure_whitelist_defaults(cfg: dict[str, Any] | None = None, instance_id: An
     cfg = load_config() if cfg is None else cfg
     plex = _plex(cfg, instance_id)
     changed = False
-    if not isinstance(plex.get("history"), dict):
-        plex["history"] = {}
-        changed = True
-    if not isinstance(plex.get("ratings"), dict):
-        plex["ratings"] = {}
-        changed = True
-    if not isinstance(plex.get("scrobble"), dict):
-        plex["scrobble"] = {}
-        changed = True
-    if not isinstance(plex["history"].get("libraries"), list):
-        plex["history"]["libraries"] = []
-        changed = True
-    if not isinstance(plex["ratings"].get("libraries"), list):
-        plex["ratings"]["libraries"] = []
-        changed = True
-    if not isinstance(plex["scrobble"].get("libraries"), list):
-        plex["scrobble"]["libraries"] = []
-        changed = True
-    for sec in ("history", "ratings", "scrobble"):
+    for sec in ("history", "progress", "ratings", "scrobble"):
+        if not isinstance(plex.get(sec), dict):
+            plex[sec] = {}
+            changed = True
+        if not isinstance(plex[sec].get("libraries"), list):
+            plex[sec]["libraries"] = []
+            changed = True
         libs = plex[sec]["libraries"]
         norm = sorted({str(x).strip() for x in libs if str(x).strip()})
         if libs != norm:

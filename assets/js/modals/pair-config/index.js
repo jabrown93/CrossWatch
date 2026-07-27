@@ -30,8 +30,10 @@ const isTrakt=(v)=>same(v,"trakt");
 const isMDBList=(v)=>same(v,"mdblist");
 const isPublicMetaDB=(v)=>same(v,"publicmetadb");
 const isPlex = (v) => same(v, "plex");
+const isKodi = (v) => same(v, "kodi");
 const isCrossWatch = (v) => same(v, "crosswatch");
 function hasPlex(state){ return isPlex(state?.src) || isPlex(state?.dst) }
+function hasKodi(state){ return isKodi(state?.src) || isKodi(state?.dst) }
 const isMedia = (v) => isPlex(v) || isEmby(v) || isJelly(v);
 function providerSupportsProgress(state, name){ return !!(byName(state, name)?.features || {}).progress }
 function isProgressPair(state){ return providerSupportsProgress(state, state?.src) && providerSupportsProgress(state, state?.dst) }
@@ -204,7 +206,7 @@ function defaultState(){
       ratings:{enable:false,add:false,remove:false,types:["movies","shows","seasons","episodes"],mode:"all",from_date:""},
       history:{enable:false,add:false,remove:false},
       playlists:{enable:false,add:true,remove:false},
-      progress:{enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,propagate_timestamp_updates:false}
+      progress:{enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false}
     },
     pairProviders:{},
     jellyfin:{watchlist:{mode:"favorites",playlist_name:"Watchlist"}},
@@ -212,7 +214,7 @@ function defaultState(){
     globals:{
       dry_run:false,verify_after_write:false,drop_guard:false,allow_mass_delete:true,one_way_remove_mode:"source_deletes",
       tombstone_ttl_days:30,include_observed_deletes:true,
-      blackbox:{enabled:true,promote_after:1,unresolved_days:0,cooldown_days:30,pair_scoped:true,block_adds:true,block_removes:true}
+      blackbox:{enabled:true,promote_after:3,cooldown_days:30,pair_scoped:true,block_adds:true,block_removes:true}
     },
     cfgRaw:null,
     visited:new Set()
@@ -307,15 +309,8 @@ async function loadProviderInstances(state){
 
 async function loadProviders(state){
   const list=await getJSON("/api/sync/providers?cb="+Date.now());
-  state.providers=Array.isArray(list)?list:[
-    {name:"PLEX",label:"Plex",features:{watchlist:true,ratings:true,history:true,progress:true,playlists:true},capabilities:{bidirectional:true},version:"1.0.0"},
-    {name:"CROSSWATCH",label:"CW Tracker",features:{watchlist:true,ratings:true,history:true,progress:true,playlists:false},capabilities:{bidirectional:true},version:"1.0.0"},
-    {name:"SIMKL",label:"Simkl",features:{watchlist:true,ratings:true,history:true,progress:false,playlists:false},capabilities:{bidirectional:true},version:"1.0.0"},
-    {name:"TRAKT",label:"Trakt",features:{watchlist:true,ratings:true,history:true,progress:false,playlists:true},capabilities:{bidirectional:true},version:"1.0.0"},
-    {name:"ANILIST",label:"AniList",features:{watchlist:true,ratings:true,history:false,progress:false,playlists:false},capabilities:{bidirectional:true},version:"0.1"},
-    {name:"JELLYFIN",label:"Jellyfin",features:{watchlist:true,ratings:false,history:true,progress:true,playlists:true},capabilities:{bidirectional:true},version:"1.2.1"},
-    {name:"EMBY",label:"Emby",features:{watchlist:true,ratings:false,history:true,progress:true,playlists:true},capabilities:{bidirectional:true},version:"1.0.0"} 
-  ]
+  if(!Array.isArray(list)) throw new Error("Invalid sync providers response");
+  state.providers=list
 }
 
 async function loadConfigBits(state){
@@ -332,7 +327,7 @@ async function loadConfigBits(state){
     tombstone_ttl_days:Number.isFinite(s.tombstone_ttl_days)?s.tombstone_ttl_days:30,
     include_observed_deletes:!!s.include_observed_deletes,
     blackbox:Object.assign(
-      {enabled:true,promote_after:1,unresolved_days:0,cooldown_days:30,pair_scoped:true,block_adds:true,block_removes:true},
+      {enabled:true,promote_after:3,cooldown_days:30,pair_scoped:true,block_adds:true,block_removes:true},
       s.blackbox||{}
     ),
     runtime:Object.assign(
@@ -369,12 +364,12 @@ const commonFeatures=(state)=>{
 const defaultFor=(k)=>
   k==="watchlist"?{enable:false,add:false,remove:false}:
   k==="playlists"?{enable:false,add:true,remove:false}:
-  k==="progress"?{enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,propagate_timestamp_updates:false}:
+  k==="progress"?{enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false}:
   {enable:false,add:false,remove:false};
 function getOpts(state,key){
   if(!state.visited.has(key)){
     if(key==="ratings") state.options.ratings=Object.assign({enable:false,add:false,remove:false,types:["movies","shows","seasons","episodes"],mode:"all",from_date:""},state.options.ratings||{});
-    else if(key==="progress") state.options.progress=Object.assign({enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,propagate_timestamp_updates:false},state.options.progress||{});
+    else if(key==="progress") state.options.progress=Object.assign({enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false},state.options.progress||{});
     else state.options[key]=state.options[key]??defaultFor(key);
     state.visited.add(key);
   }
@@ -523,6 +518,7 @@ const {
   hasPlex,
   hasJelly,
   hasEmby,
+  hasKodi,
   getOpts,
   onLibrariesChanged: (state) => refreshProviderCardSummaries(state),
 });
@@ -534,6 +530,7 @@ function renderProviderSelects(state){
   if(state.src) srcSel.value=state.src;if(state.dst) dstSel.value=state.dst;
   const providerKind=(name)=>{
     if(isMedia(name)) return "Media server";
+    if(isKodi(name)) return "Media client";
     if(isCrossWatch(name)) return "Tracker";
     if(isTrakt(name)||isSimkl(name)||same(name,"mdblist")||same(name,"publicmetadb")||same(name,"tautulli")) return "Tracker";
     if(same(name,"tmdb")||same(name,"anilist")) return "Metadata";
@@ -655,7 +652,7 @@ function applySubDisable(feature){
     ],
     history: ["#cx-hs-add", "#cx-hs-remove", "#cx-tr-hs-numfb", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-tr-hs-ignore-dropped", "#cx-md-hs-ignore-dropped", "#cx-sm-hs-ignore-dropped", "#cx-tr-hs-unres"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
-    progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp"]
+    progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance"]
   };
   const on=ID(feature==="ratings"?"cx-rt-enable":feature==="watchlist"?"cx-wl-enable":feature==="history"?"cx-hs-enable":feature==="progress"?"cx-pr-enable":"cx-pl-enable")?.checked;
   (map[feature]||[]).forEach(sel=>{const n=Q(sel);if(n){n.disabled=!on;n.closest?.(".opt-row")?.classList.toggle("muted",!on)}});
@@ -664,9 +661,11 @@ function applySubDisable(feature){
 function countProviderLibraries(state, providerName){
   const historyLibs = state.options?.history?.libraries?.[providerName];
   const ratingsLibs = state.options?.ratings?.libraries?.[providerName];
+  const progressLibs = state.options?.progress?.libraries?.[providerName];
   const historyCount = Array.isArray(historyLibs) ? historyLibs.length : 0;
   const ratingsCount = Array.isArray(ratingsLibs) ? ratingsLibs.length : 0;
-  return historyCount + ratingsCount;
+  const progressCount = Array.isArray(progressLibs) ? progressLibs.length : 0;
+  return historyCount + ratingsCount + progressCount;
 }
 
 function getProviderOverrideCount(state, providerKey){
@@ -715,6 +714,9 @@ function getProviderOverrideCount(state, providerKey){
     if (checked("em-strict-ids", getPairProviderStrictValue(state, "emby")) !== strictDefault) count++;
     return count + countProviderLibraries(state, "EMBY");
   }
+  if (providerKey === "kodi") {
+    return countProviderLibraries(state, "KODI");
+  }
   return 0;
 }
 
@@ -726,7 +728,7 @@ function getProviderSummaryText(state, providerKey){
 }
 
 function refreshProviderCardSummaries(state){
-  [["plex","prov-plex-summary"],["jellyfin","prov-jelly-summary"],["emby","prov-emby-summary"]].forEach(([key, id]) => {
+  [["plex","prov-plex-summary"],["jellyfin","prov-jelly-summary"],["emby","prov-emby-summary"],["kodi","prov-kodi-summary"]].forEach(([key, id]) => {
     const el = ID(id);
     if (el) el.textContent = getProviderSummaryText(state, key);
   });
@@ -753,6 +755,7 @@ function renderFeaturePanel(state){
     const providerHintText = (providerKey) => {
       if (providerKey === "plex") return "Tune Plex matching, retries, workers, and pair library scope";
       if (providerKey === "jellyfin") return "Tune Jellyfin matching, longer timeouts and pair library scope.";
+      if (providerKey === "kodi") return "Tune Kodi pair library scope.";
       return "Tune Emby matching, longer timeouts and pair-level library scope.";
     };
 
@@ -791,6 +794,10 @@ function renderFeaturePanel(state){
               <div class="field-label">Ratings</div>
               <div class="chip-row" id="plx-rate-libs"></div>
             </div>
+            <div class="opt-row">
+              <div class="field-label">Progress</div>
+              <div class="chip-row" id="plx-prog-libs"></div>
+            </div>
             <button type="button" class="cx-btn small" id="plx-libs-load">Load libraries</button>
           </div>
         </div>
@@ -827,6 +834,10 @@ function renderFeaturePanel(state){
             <div class="opt-row">
               <div class="field-label">Ratings</div>
               <div class="chip-row" id="jf-rate-libs"></div>
+            </div>
+            <div class="opt-row">
+              <div class="field-label">Progress</div>
+              <div class="chip-row" id="jf-prog-libs"></div>
             </div>
             <button type="button" class="cx-btn small" id="jf-libs-load">Load libraries</button>
           </div>
@@ -865,12 +876,52 @@ function renderFeaturePanel(state){
               <div class="field-label">Ratings</div>
               <div class="chip-row" id="em-rate-libs"></div>
             </div>
+            <div class="opt-row">
+              <div class="field-label">Progress</div>
+              <div class="chip-row" id="em-prog-libs"></div>
+            </div>
             <button type="button" class="cx-btn small" id="em-libs-load">Load libraries</button>
           </div>
         </div>
       </details>`);
 
-    left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">dns</span>Media Servers</div>
+    if (hasKodi(state)) providerCards.push(`
+      <details class="mods fold provider-card provider-kodi" id="prov-kodi">
+        <summary class="fold-head provider-card-head">
+          <span class="provider-card-main">
+            <span class="provider-card-badge">Kodi</span>
+            <span class="provider-card-copy">
+              <span class="provider-card-title">Kodi</span>
+              <span class="provider-card-sub" id="prov-kodi-summary">${getProviderSummaryText(state, "kodi")}</span>
+            </span>
+          </span>
+          <span class="provider-card-meta">
+            <span class="provider-card-hint">${providerHintText("kodi")}</span>
+            <span class="chev">expand_more</span>
+          </span>
+        </summary>
+        <div class="fold-body provider-card-body">
+          <div class="prov-box" id="kodi-pair-libs">
+            <div class="panel-title small">Pair library whitelist</div>
+            <div class="muted">Empty = use connection-level whitelist.</div>
+            <div class="opt-row">
+              <div class="field-label">History</div>
+              <div class="chip-row" id="kodi-hist-libs"></div>
+            </div>
+            <div class="opt-row">
+              <div class="field-label">Ratings</div>
+              <div class="chip-row" id="kodi-rate-libs"></div>
+            </div>
+            <div class="opt-row">
+              <div class="field-label">Progress</div>
+              <div class="chip-row" id="kodi-prog-libs"></div>
+            </div>
+            <button type="button" class="cx-btn small" id="kodi-libs-load">Load libraries</button>
+          </div>
+        </div>
+      </details>`);
+
+    left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">dns</span>Providers</div>
       <div class="providers-intro">
         <div class="providers-intro-copy">
           <div class="providers-intro-title">Advanced provider tuning</div>
@@ -878,10 +929,10 @@ function renderFeaturePanel(state){
         </div>
         <div class="providers-intro-badge">${providerCards.length} ${providerCards.length === 1 ? "provider" : "providers"} in this pair</div>
       </div>
-      <div class="provider-card-list">${providerCards.length ? providerCards.join("") : `<div class="providers-empty">This connection does not include a media server with provider-specific controls.</div>`}</div>
+      <div class="provider-card-list">${providerCards.length ? providerCards.join("") : `<div class="providers-empty">This connection does not include a provider with provider-specific controls.</div>`}</div>
       <div class="providers-note" role="note" aria-live="polite">
         <div class="providers-note-title"><span class="material-symbols-rounded">info</span>Optional advanced controls</div>
-        <div class="providers-note-body">Library whitelists only appear for media servers that are actually part of this pair.</div>
+        <div class="providers-note-body">Library whitelists only appear for providers that support pair-specific library scope and are actually part of this pair.</div>
       </div>`;
 
     right.innerHTML = "";
@@ -925,14 +976,14 @@ function renderFeaturePanel(state){
     right.innerHTML=`<div class="panel-title">Advanced <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-section-advanced">help</button></div>
       <div class="opt-row"><label for="gl-ttl">Tombstone TTL (days)</label><input id="gl-ttl" class="input" type="number" min="0" step="1" value="${g.tombstone_ttl_days??30}"></div><div class="muted">Keep delete markers to avoid re-adding.</div>
       <div class="opt-row"><label for="gl-observed">Include observed deletes</label><label class="switch"><input id="gl-observed" type="checkbox" ${g.include_observed_deletes?"checked":""}><span class="slider"></span></label></div>
-      <div class="panel-title small" style="margin-top:10px">Blackbox</div>
+      <div class="panel-title small" style="margin-top:10px">Blackbox <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-bb-section">help</button></div>
       <div class="grid2 compact">
         <div class="opt-row"><label for="gl-bb-enable">Enabled</label><label class="switch"><input id="gl-bb-enable" type="checkbox" ${bb.enabled?"checked":""}><span class="slider"></span></label></div>
         <div class="opt-row"><label for="gl-bb-pair">Pair scoped</label><label class="switch"><input id="gl-bb-pair" type="checkbox" ${bb.pair_scoped?"checked":""}><span class="slider"></span></label></div>
-        <div class="opt-row"><label for="gl-bb-promote">Promote after (days)</label><input id="gl-bb-promote" class="input small" type="number" min="0" max="365" step="1" value="${bb.promote_after??1}"></div>
-        <div class="opt-row"><label for="gl-bb-unresolved">Unresolved days</label><input id="gl-bb-unresolved" class="input small" type="number" min="0" max="365" step="1" value="${bb.unresolved_days??0}"></div>
+        <div class="opt-row"><label for="gl-bb-promote">Promote after (failed writes) <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-bb-promote">help</button></label><input id="gl-bb-promote" class="input small" type="number" min="0" max="365" step="1" value="${bb.promote_after??3}"></div>
         <div class="opt-row"><label for="gl-bb-cooldown">Cooldown days</label><input id="gl-bb-cooldown" class="input small" type="number" min="0" max="365" step="1" value="${bb.cooldown_days??30}"></div>
-      </div>`;
+      </div>
+      <div class="muted">Unresolved is a reporting state: failed writes are logged and retried every sync. Blackbox is the quarantine state: after this many failed writes an item is blackboxed and only then stops being planned.</div>`;
     return;
   }
 
@@ -1303,7 +1354,7 @@ function renderFeaturePanel(state){
 
     const trColRow = hasTrakt(state)
       ? `<div class="opt-row" style="grid-column:1/-1">
-          <label for="cx-tr-hs-col"><span class="cx-provider-pill provider-trakt">TRAKT</span> Add to collection</label>
+          <label for="cx-tr-hs-col"><span class="cx-provider-pill provider-trakt">TRAKT</span> Add to library</label>
           <label class="switch">
             <input id="cx-tr-hs-col" type="checkbox" ${trColOn ? "checked" : ""}>
             <span class="slider"></span>
@@ -1490,12 +1541,41 @@ left.innerHTML = `
 
   if (state.feature === "playlists") {
     const pl=getOpts(state,"playlists");
+    if(!Array.isArray(pl.mappings)) pl.mappings=[];
     left.innerHTML=`<div class="panel-title">Playlists</div>
-      <div class="grid2"><div class="opt-row"><label for="cx-pl-enable">Enable</label><label class="switch"><input id="cx-pl-enable" type="checkbox" ${pl.enable?"checked":""}><span class="slider"></span></label></div>
-      <div class="opt-row"><label for="cx-pl-add">Add</label><label class="switch"><input id="cx-pl-add" type="checkbox" ${pl.add?"checked":""}><span class="slider"></span></label></div>
-      <div class="opt-row"><label for="cx-pl-remove">Remove</label><label class="switch"><input id="cx-pl-remove" type="checkbox" ${pl.remove?"checked":""}><span class="slider"></span></label></div></div>`;
-    right.innerHTML=`<div class="panel-title">Advanced</div><div class="muted">Experimental.</div>`;
+      <div class="opt-row"><label for="cx-pl-enable">Enable</label><label class="switch"><input id="cx-pl-enable" type="checkbox" ${pl.enable?"checked":""}><span class="slider"></span></label></div>
+      <div class="hint">Enables playlist sync for this pair. Attach one or more mapping profiles (MAP-xx) on the right; each carries its own source/target lists and rules.</div>
+      <input id="cx-pl-add" type="checkbox" ${pl.add?"checked":""} hidden>
+      <input id="cx-pl-remove" type="checkbox" ${pl.remove?"checked":""} hidden>`;
+    right.innerHTML=`<div class="panel-title">Mapping profiles</div>
+      <div class="muted" style="margin-bottom:10px">Attach mapping profiles whose endpoints match this pair. Only compatible, unattached MAP-ids are shown. Create and edit them on the Playlists page.</div>
+      <div id="cx-pl-maplist"><div class="muted">Loading…</div></div>
+      <button type="button" class="cx-btn" style="margin-top:10px" onclick="window.cxCloseModal&&window.cxCloseModal();window.showTab&&window.showTab('playlists')">Open Playlists page →</button>`;
     applySubDisable("playlists");
+    (async()=>{
+      const host=ID("cx-pl-maplist"); if(!host) return;
+      const e=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      let data; try{ const r=await fetch("/api/playlists/mappings",{cache:"no-store"}); data=await r.json(); }catch(err){ host.innerHTML='<div class="muted">Could not load mapping profiles.</div>'; return; }
+      const all=(data&&data.mappings)||[];
+      const twoWay=isTwoWayMode(state);
+      const norm=(p,i)=>`${String(p||"").toUpperCase()}#${String(i||"default")}`;
+      const A=norm(state.src,state.src_instance), B=norm(state.dst,state.dst_instance);
+      const sel=new Set((getOpts(state,"playlists").mappings||[]).map(String));
+      const compat=(m)=>{const s=norm((m.source||{}).provider,(m.source||{}).instance),t=norm((m.target||{}).provider,(m.target||{}).instance);return twoWay?((s===A&&t===B)||(s===B&&t===A)):(s===A&&t===B)};
+      const avail=(m)=>!m.assigned_pair||sel.has(String(m.id));
+      const choices=all.filter(m=>m.valid!==false&&compat(m)&&avail(m));
+      if(!choices.length){ host.innerHTML=`<div class="muted">No compatible mapping profiles. On the Playlists page, create endpoints for ${e(state.src)} and ${e(state.dst)}, then a MAP-xx linking them.</div>`; return; }
+      host.innerHTML=choices.map(m=>`<label class="opt-row" style="justify-content:flex-start;gap:10px;cursor:pointer">
+        <input type="checkbox" class="cx-plmap" value="${e(m.id)}" ${sel.has(String(m.id))?"checked":""}>
+        <span><b>${e(m.id)}</b> ${e(m.name||"")} <span class="muted">(${e((m.source||{}).label)} → ${e((m.target||{}).label)}, ${e(m.membership)})</span></span>
+      </label>`).join("");
+      host.querySelectorAll(".cx-plmap").forEach(cb=>cb.addEventListener("change",()=>{
+        const opts=getOpts(state,"playlists");
+        const ids=[...host.querySelectorAll(".cx-plmap:checked")].map(x=>x.value);
+        state.options.playlists=Object.assign({},opts,{mappings:ids});
+        state.visited.add("playlists");
+      }));
+    })();
     return;
   }
 
@@ -1504,6 +1584,8 @@ left.innerHTML = `
     const minS = Number.isFinite(pr.min_seconds) ? pr.min_seconds : 60;
     const deltaS = Number.isFinite(pr.delta_seconds) ? pr.delta_seconds : 30;
     const maxP = Number.isFinite(pr.max_percent) ? pr.max_percent : 80;
+    const replayEnabled = pr.replay_enabled === true || ["1", "true", "yes", "on"].includes(String(pr.replay_enabled ?? "").trim().toLowerCase());
+    const timestampTolerance = Number.isFinite(Number(pr.timestamp_tolerance_seconds)) ? Math.max(0, Math.min(300, Math.round(Number(pr.timestamp_tolerance_seconds)))) : 30;
 
     left.innerHTML = `<div class="panel-title">Progress | Basics</div>
       <div class="grid2">
@@ -1515,7 +1597,7 @@ left.innerHTML = `
           <label class="switch"><input id="cx-pr-remove" type="checkbox" ${pr.remove ? "checked" : ""}><span class="slider"></span></label></div>
       </div>`;
 
-    right.innerHTML = `<div class="panel-title">Advanced</div>
+    right.innerHTML = `<div class="panel-title">Advanced Playback Progress</div>
       <div class="grid2 compact">
         <div class="opt-row"><label for="cx-pr-min" data-tip-id="cx-pr-min">Minimum seconds</label>
           <input id="cx-pr-min" class="input small" type="number" min="0" max="36000" value="${minS}"></div>
@@ -1523,7 +1605,12 @@ left.innerHTML = `
           <input id="cx-pr-delta" class="input small" type="number" min="0" max="36000" value="${deltaS}"></div>
         <div class="opt-row"><label for="cx-pr-maxp" data-tip-id="cx-pr-maxp">Ignore near complete (%)</label>
           <input id="cx-pr-maxp" class="input small" type="number" min="0" max="100" step="1" value="${maxP}"></div>
+        <div class="opt-row"><label for="cx-pr-replay" data-tip-id="cx-pr-replay">Replay watched items</label>
+          <label class="switch"><input id="cx-pr-replay" type="checkbox" ${replayEnabled ? "checked" : ""}><span class="slider"></span></label></div>
+        <div class="opt-row"><label for="cx-pr-tolerance" data-tip-id="cx-pr-tolerance">Timestamp tolerance (s)</label>
+          <input id="cx-pr-tolerance" class="input small" type="number" min="0" max="300" step="1" value="${timestampTolerance}"></div>
       </div>
+      <div class="muted" style="margin-top:10px;color:#f0b35a">Warning: replay progress marks watched targets unwatched before writing the resume position.</div>
       <div class="muted" style="margin-top:10px">Tip: Progress does not infer clears from absence. It only syncs resume positions.</div>`;
 
     applySubDisable("progress");
@@ -1830,13 +1917,16 @@ function bindChangeHandlers(state,root){
       const minS=parseInt(ID("cx-pr-min")?.value||"60",10);
       const delS=parseInt(ID("cx-pr-delta")?.value||"30",10);
       const maxP=parseFloat(ID("cx-pr-maxp")?.value||"95");
+      const tolerance=parseInt(ID("cx-pr-tolerance")?.value||"30",10);
       state.options.progress=Object.assign({},prev,{
         enable:!!ID("cx-pr-enable")?.checked,
         add:!!ID("cx-pr-add")?.checked,
         remove:!!ID("cx-pr-remove")?.checked,
         min_seconds: Number.isFinite(minS)?Math.max(0,minS):60,
         delta_seconds: Number.isFinite(delS)?Math.max(0,delS):30,
-        max_percent: Number.isFinite(maxP)?Math.min(100,Math.max(0,maxP)):80
+        max_percent: Number.isFinite(maxP)?Math.min(100,Math.max(0,maxP)):80,
+        replay_enabled:!!ID("cx-pr-replay")?.checked,
+        timestamp_tolerance_seconds:Number.isFinite(tolerance)?Math.max(0,Math.min(300,tolerance)):30
       });
       state.visited.add("progress");
     }
@@ -1846,7 +1936,6 @@ function bindChangeHandlers(state,root){
         enabled:!!Q("#gl-bb-enable")?.checked,
         pair_scoped:!!Q("#gl-bb-pair")?.checked,
         promote_after:Math.min(365,Math.max(0,parseInt(Q("#gl-bb-promote")?.value||"0",10)||0)),
-        unresolved_days:Math.min(365,Math.max(0,parseInt(Q("#gl-bb-unresolved")?.value||"0",10)||0)),
         cooldown_days:Math.min(365,Math.max(0,parseInt(Q("#gl-bb-cooldown")?.value||"0",10)||0))
       };
       bb.block_adds = bb.enabled;
@@ -1919,7 +2008,6 @@ async function saveConfigBits(state){
         enabled:!!ID("gl-bb-enable")?.checked,
         pair_scoped:!!ID("gl-bb-pair")?.checked,
         promote_after:Math.min(365,Math.max(0,parseInt(ID("gl-bb-promote")?.value||"0",10)||0)),
-        unresolved_days:Math.min(365,Math.max(0,parseInt(ID("gl-bb-unresolved")?.value||"0",10)||0)),
         cooldown_days:Math.min(365,Math.max(0,parseInt(ID("gl-bb-cooldown")?.value||"0",10)||0))
       };
       bb.block_adds = bb.enabled; bb.block_removes = bb.enabled;

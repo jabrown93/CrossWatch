@@ -12,7 +12,9 @@ from cw_platform.id_map import minimal as id_minimal
 from .._log import log as cw_log
 from .._mod_common import _chunk_items
 from ._common import (
+    SIMKLFetchError,
     adapter_headers,
+    cache_anime_mappings,
     extract_latest_ts,
     fetch_activities,
     get_watermark,
@@ -29,12 +31,9 @@ from ._common import (
 )
 
 BASE = "https://api.simkl.com"
+URL_INDEX = f"{BASE}/sync/ratings"
 URL_ADD = f"{BASE}/sync/ratings"
 URL_REMOVE = f"{BASE}/sync/ratings/remove"
-
-
-def _unresolved_path() -> str:
-    return str(state_file("simkl_ratings.unresolved.json"))
 
 
 def _shadow_path() -> str:
@@ -145,64 +144,6 @@ def _load_json(path: str) -> dict[str, Any]:
 
 def _save_json(path: str, data: Mapping[str, Any]) -> None:
     save_json_state(path, data)
-
-
-def _load_unresolved() -> dict[str, Any]:
-    data = _load_json(_unresolved_path())
-    if not isinstance(data, dict):
-        return {}
-    cleaned = False
-    for k in list(data.keys()):
-        if _is_unknown_key(k):
-            data.pop(k, None)
-            cleaned = True
-    if cleaned:
-        _save_json(_unresolved_path(), data)
-    return data
-
-
-def _save_unresolved(data: Mapping[str, Any]) -> None:
-    _save_json(_unresolved_path(), data)
-
-
-def _is_frozen(item: Mapping[str, Any]) -> bool:
-    key = simkl_key_of(id_minimal(dict(item)))
-    return key in _load_unresolved()
-
-
-def _freeze(
-    item: Mapping[str, Any],
-    *,
-    action: str,
-    reasons: list[str],
-    ids_sent: Mapping[str, Any],
-    rating: int | None,
-) -> None:
-    key = simkl_key_of(id_minimal(dict(item)))
-    if _is_unknown_key(key):
-        return
-    data = _load_unresolved()
-    row = data.get(key) or {"feature": "ratings", "action": action, "first_seen": _now(), "attempts": 0}
-    row.update({"item": id_minimal(dict(item)), "last_attempt": _now()})
-    existing_reasons: list[str] = list(row.get("reasons", [])) if isinstance(row.get("reasons"), list) else []
-    row["reasons"] = sorted(set(existing_reasons) | set(reasons or []))
-    row["ids_sent"] = dict(ids_sent or {})
-    if rating is not None:
-        row["rating"] = int(rating)
-    row["attempts"] = int(row.get("attempts", 0)) + 1
-    data[key] = row
-    _save_unresolved(data)
-
-
-def _unfreeze_if_present(keys: Iterable[str]) -> None:
-    data = _load_unresolved()
-    changed = False
-    for k in set(keys or []):
-        if k in data:
-            del data[k]
-            changed = True
-    if changed:
-        _save_unresolved(data)
 
 
 def _rshadow_load() -> dict[str, Any]:
@@ -339,25 +280,6 @@ def _rshadow_merge_into(out: dict[str, dict[str, Any]], thaw: set[str]) -> None:
     if cleaned or changed:
         sh["items"] = store
         _rshadow_save(sh)
-
-
-def _shadow_has_anime_items() -> bool:
-    sh = _rshadow_load()
-    store = sh.get("items") or {}
-    if not isinstance(store, Mapping):
-        return False
-    for rec_any in store.values():
-        rec = rec_any if isinstance(rec_any, Mapping) else {}
-        item = rec.get("item") if isinstance(rec.get("item"), Mapping) else {}
-        if not isinstance(item, Mapping):
-            continue
-        if str(item.get("anime_type") or "").strip():
-            return True
-        ids_any = item.get("ids")
-        ids: Mapping[str, Any] = ids_any if isinstance(ids_any, Mapping) else {}
-        if any(ids.get(k) for k in ("anilist", "mal", "kitsu", "anidb")):
-            return True
-    return False
 
 
 def _dedupe_prefer_plex_id(out: dict[str, dict[str, Any]]) -> None:
@@ -530,71 +452,42 @@ def _merge_row_identity(m: dict[str, Any], row: Mapping[str, Any]) -> None:
             m["year"] = year
 
 
-def _resolve_by_simkl_id(
+def _fetch_current(
     sess: Any,
     hdrs: Mapping[str, str],
     *,
-    kind: str,
-    simkl_id: int,
     timeout: float,
-) -> Mapping[str, Any]:
-    params = simkl_api_params_from_headers(hdrs, extended="full")
-
-    k = str(kind or "").lower()
-    if k == "movies":
-        url = f"{BASE}/movies/{simkl_id}"
-    elif k == "anime":
-        url = f"{BASE}/anime/{simkl_id}"
-    else:
-        url = f"{BASE}/tv/{simkl_id}"
-
-    try:
-        resp = sess.get(url, headers=dict(hdrs), params=params, timeout=timeout)
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()
-        return data if isinstance(data, Mapping) else {}
-    except Exception:
-        return {}
-
-
-RATINGS_ALL = "1,2,3,4,5,6,7,8,9,10"
-
-
-def _fetch_rows_current(
-    sess: Any,
-    hdrs: Mapping[str, str],
-    *,
-    kind: str,
-    timeout: float,
-) -> tuple[list[Mapping[str, Any]], bool]:
-    if kind not in {"movies", "shows", "anime"}:
-        return [], False
-    url = f"{BASE}/sync/ratings/{kind}/{RATINGS_ALL}"
+) -> tuple[dict[str, list[Mapping[str, Any]]], bool]:
+    empty = {"movies": [], "shows": [], "anime": []}
     try:
         resp = sess.get(
-            url,
+            URL_INDEX,
             headers=dict(hdrs),
             params=simkl_api_params_from_headers(hdrs),
             timeout=timeout,
         )
         if resp.status_code != 200:
-            _warn("http_failed", op="index", kind=kind, status=resp.status_code, body=(resp.text or "")[:200])
-            return [], False
+            _warn("http_failed", op="index", status=resp.status_code, body=(resp.text or "")[:200])
+            return empty, False
         data = resp.json()
         if not isinstance(data, Mapping):
-            if isinstance(data, list):
-                _dbg("index_reconcile", op="index", kind=kind, reason="non_mapping_bare_list", count=len(data))
-                return [r for r in data if isinstance(r, Mapping)], True
-            _dbg("http_failed", op="index", kind=kind, reason="non_mapping_response_assumed_empty")
-            return [], True
-        rows_any = data.get(kind)
-        if not isinstance(rows_any, list):
-            return [], True
-        return [r for r in rows_any if isinstance(r, Mapping)], True
+            _warn("http_failed", op="index", reason="invalid_response_shape")
+            return empty, False
+        out: dict[str, list[Mapping[str, Any]]] = {}
+        for kind in ("movies", "shows", "anime"):
+            rows_any = data.get(kind)
+            if rows_any is None:
+                out[kind] = []
+                continue
+            if not isinstance(rows_any, list):
+                _warn("http_failed", op="index", kind=kind, reason="invalid_bucket_shape")
+                return empty, False
+            out[kind] = [row for row in rows_any if isinstance(row, Mapping)]
+        cache_anime_mappings(out["anime"])
+        return out, True
     except Exception as exc:
-        _warn("http_failed", op="index", kind=kind, error=str(exc))
-        return [], False
+        _warn("http_failed", op="index", error=str(exc))
+        return empty, False
 
 
 def _filter_rows_since(
@@ -648,7 +541,6 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
                     prog.done(ok=True, total=len(out))
                 except Exception:
                     pass
-            _unfreeze_if_present(thaw)
             try:
                 _rshadow_put_all(out.values())
             except Exception as exc:
@@ -657,19 +549,9 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
             return out
 
     hdrs = _headers(adapter, force_refresh=True)
-    rows_movies_raw, ok_movies = _fetch_rows_current(sess, hdrs, kind="movies", timeout=tmo)
-    rows_shows_raw, ok_shows = _fetch_rows_current(sess, hdrs, kind="shows", timeout=tmo)
-    rows_anime_raw, ok_anime = _fetch_rows_current(sess, hdrs, kind="anime", timeout=tmo)
-    if ok_movies and ok_shows and not ok_anime:
-        if _shadow_has_anime_items():
-            _warn("index_reconcile", reason="anime_bucket_unavailable_shadow_has_items", source="current")
-        else:
-            _dbg("index_reconcile", reason="anime_bucket_unavailable_assumed_empty", source="current")
-        rows_anime_raw = []
-        ok_anime = True
-    fetch_ok = ok_movies and ok_shows and ok_anime
-
-    if not fetch_ok and shadow_has_data:
+    def _incomplete_fetch() -> dict[str, dict[str, Any]]:
+        if not shadow_has_data:
+            raise SIMKLFetchError("ratings snapshot fetch was incomplete and no shadow is available")
         _warn("index_reconcile", reason="current_fetch_incomplete", source="shadow_fallback")
         _rshadow_merge_into(out, thaw)
         _dedupe_prefer_plex_id(out)
@@ -680,6 +562,13 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
                 pass
         _info("index_done", count=len(out), source="shadow_fallback")
         return out
+
+    rows_by_kind, fetch_ok = _fetch_current(sess, hdrs, timeout=tmo)
+    if not fetch_ok:
+        return _incomplete_fetch()
+    rows_movies_raw = rows_by_kind["movies"]
+    rows_shows_raw = rows_by_kind["shows"]
+    rows_anime_raw = rows_by_kind["anime"]
 
     rows_movies = _filter_rows_since(rows_movies_raw, since_iso=since_iso)
     rows_shows = _filter_rows_since(rows_shows_raw, since_iso=since_iso)
@@ -722,7 +611,7 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
                 m["type"] = "movie"
             elif kind == "anime":
                 raw = media0.get("anime") if isinstance(media0, Mapping) else None
-                at = (raw.get("anime_type") or raw.get("animeType")) if isinstance(raw, Mapping) else None
+                at = row.get("anime_type") or row.get("animeType") or ((raw.get("anime_type") or raw.get("animeType")) if isinstance(raw, Mapping) else None)
                 anime_type = at.strip().lower() if isinstance(at, str) and at.strip() else None
                 m["type"] = "movie" if anime_type == "movie" else "show"
                 if anime_type:
@@ -825,7 +714,6 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
     if latest_any is not None:
         update_watermark_if_new("ratings", _as_iso(latest_any))
 
-    _unfreeze_if_present(thaw)
     try:
         _rshadow_replace_all(out.values())
     except Exception as exc:
@@ -862,7 +750,10 @@ def _show_entry_add(adapter: Any, it: Mapping[str, Any]) -> dict[str, Any] | Non
     rating = _norm_rating(it.get("rating"))
     if not ids or rating is None:
         return None
-    ids = _maybe_map_tvdb(adapter, ids)
+    bucket = str(it.get("simkl_bucket") or "").strip().lower()
+    is_anime = bucket == "anime" or any(ids.get(key) for key in ("mal", "anidb", "anilist", "kitsu"))
+    if is_anime:
+        ids = _maybe_map_tvdb(adapter, ids)
     ent: dict[str, Any] = {"ids": ids, "rating": rating}
     ra = _pick_rated_at(it)
     if ra:
@@ -881,6 +772,57 @@ def _write_group(item: Mapping[str, Any]) -> str:
 
 
 
+def _id_tokens(value: Any) -> set[str]:
+    if not isinstance(value, Mapping):
+        return set()
+    request = value.get("request")
+    if isinstance(request, Mapping):
+        nested = _id_tokens(request)
+        if nested:
+            return nested
+    ids_any = value.get("ids")
+    ids = ids_any if isinstance(ids_any, Mapping) else value
+    return {
+        f"{key}:{str(ids.get(key)).strip().lower()}"
+        for key in ID_KEYS
+        if ids.get(key) not in (None, "")
+    }
+
+
+def _partition_write_result(
+    attempted: list[Mapping[str, Any]],
+    payload: Any,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    if not isinstance(payload, Mapping):
+        return [], list(attempted)
+    not_found = payload.get("not_found")
+    if not isinstance(not_found, Mapping):
+        return list(attempted), []
+
+    rejected_tokens: set[str] = set()
+    rejected_without_ids = False
+    for rows in not_found.values():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            tokens = _id_tokens(row)
+            if tokens:
+                rejected_tokens.update(tokens)
+            else:
+                rejected_without_ids = True
+    if rejected_without_ids:
+        return [], list(attempted)
+    if not rejected_tokens:
+        return list(attempted), []
+
+    confirmed: list[Mapping[str, Any]] = []
+    rejected: list[Mapping[str, Any]] = []
+    for item in attempted:
+        target = rejected if (_id_tokens(item) & rejected_tokens) else confirmed
+        target.append(item)
+    return confirmed, rejected
+
+
 def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
     sess = adapter.client.session
     hdrs = _headers(adapter)
@@ -895,7 +837,6 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     for part in _chunk_items(items_list, chunk_size):
         movies: list[dict[str, Any]] = []
         shows: list[dict[str, Any]] = []
-        thaw_keys: list[str] = []
         rshadow_events: list[dict[str, Any]] = []
         attempted: list[Mapping[str, Any]] = []
 
@@ -912,14 +853,10 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 unresolved.append({"item": mini, "hint": "missing_or_invalid_type"})
                 continue
 
-            if _is_frozen(it):
-                continue
-
             if typ == "movie" and group == "movies":
                 ent = _movie_entry_add(it)
                 if ent:
                     movies.append(ent)
-                    thaw_keys.append(key)
                     attempted.append(it)
                     ev = dict(mini)
                     ev["rating"] = ent["rating"]
@@ -933,7 +870,6 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 ent = _show_entry_add(adapter, it)
                 if ent:
                     shows.append(ent)
-                    thaw_keys.append(key)
                     attempted.append(it)
                     ev = dict(mini)
                     ev["rating"] = ent["rating"]
@@ -950,7 +886,6 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             ent = _show_entry_add(adapter, it)
             if ent:
                 shows.append(ent)
-                thaw_keys.append(key)
                 attempted.append(it)
                 ev = dict(mini)
                 ev["rating"] = ent["rating"]
@@ -977,26 +912,34 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 timeout=adapter.cfg.timeout,
             )
             if 200 <= resp.status_code < 300:
-                _unfreeze_if_present(thaw_keys)
-                ok += len(movies) + len(shows)
                 try:
-                    _rshadow_put_all(rshadow_events)
+                    payload = resp.json() if (resp.text or "").strip() else None
+                except Exception:
+                    payload = None
+                confirmed, rejected = _partition_write_result(attempted, payload)
+                confirmed_keys = {
+                    simkl_key_of(id_minimal(dict(item)))
+                    for item in confirmed
+                }
+                ok += len(confirmed)
+                try:
+                    _rshadow_put_all(
+                        event
+                        for event in rshadow_events
+                        if simkl_key_of(id_minimal(dict(event))) in confirmed_keys
+                    )
                 except Exception as exc:
                     _warn("cache_save_failed", cache="shadow", op="add", error=str(exc))
+                for item in rejected:
+                    unresolved.append({"item": id_minimal(dict(item)), "hint": "simkl_not_found"})
             else:
                 _warn("write_failed", op="add", status=resp.status_code, body=(resp.text or '')[:180])
                 for it in attempted:
-                    ids = _maybe_map_tvdb(adapter, _ids_of(it))
-                    rating = _norm_rating(it.get("rating"))
-                    if ids and rating is not None:
-                        _freeze(it, action="add", reasons=["write_failed"], ids_sent=ids, rating=rating)
+                    unresolved.append({"item": id_minimal(dict(it)), "hint": "write_failed"})
         except Exception as exc:
             _warn("write_failed", op="add", error=str(exc))
             for it in attempted:
-                ids = _maybe_map_tvdb(adapter, _ids_of(it))
-                rating = _norm_rating(it.get("rating"))
-                if ids and rating is not None:
-                    _freeze(it, action="add", reasons=["write_failed"], ids_sent=ids, rating=rating)
+                unresolved.append({"item": id_minimal(dict(it)), "hint": "write_failed"})
 
     _info("write_done", op="add", ok=bool(items_list) and len(unresolved) == 0 and ok == len(items_list), applied=ok, unresolved=len(unresolved))
     return ok, unresolved
@@ -1016,7 +959,6 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     for part in _chunk_items(items_list, chunk_size):
         movies: list[dict[str, Any]] = []
         shows: list[dict[str, Any]] = []
-        thaw_keys: list[str] = []
         attempted: list[Mapping[str, Any]] = []
 
         for it in part:
@@ -1026,11 +968,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 unresolved.append({"item": mini, "hint": "missing_identity"})
                 continue
 
-            if _is_frozen(it):
-                continue
-
             ids = _ids_of(it) or _show_ids_of_episode(it)
-            ids = _maybe_map_tvdb(adapter, ids)
             if not ids:
                 unresolved.append({"item": mini, "hint": "missing_ids"})
                 continue
@@ -1051,7 +989,6 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
             else:
                 shows.append({"ids": ids})
 
-            thaw_keys.append(key)
             attempted.append(it)
 
         if not (movies or shows):
@@ -1072,12 +1009,20 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 timeout=adapter.cfg.timeout,
             )
             if 200 <= resp.status_code < 300:
-                _unfreeze_if_present(thaw_keys)
+                try:
+                    payload = resp.json() if (resp.text or "").strip() else None
+                except Exception:
+                    payload = None
+                confirmed, rejected = _partition_write_result(attempted, payload)
+                confirmed_keys = {
+                    simkl_key_of(id_minimal(dict(item)))
+                    for item in confirmed
+                }
                 try:
                     sh = _rshadow_load()
                     store: dict[str, Any] = dict(sh.get("items") or {})
                     changed = False
-                    for k in thaw_keys:
+                    for k in confirmed_keys:
                         if k in store:
                             store.pop(k, None)
                             changed = True
@@ -1086,17 +1031,16 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                         _rshadow_save(sh)
                 except Exception:
                     pass
-                ok += len(movies) + len(shows)
+                ok += len(confirmed)
+                for item in rejected:
+                    unresolved.append({"item": id_minimal(dict(item)), "hint": "simkl_not_found"})
                 continue
             _warn("write_failed", op="remove", status=resp.status_code, body=(resp.text or '')[:180])
         except Exception as exc:
             _warn("write_failed", op="remove", error=str(exc))
 
         for it in attempted:
-            ids = _ids_of(it) or _show_ids_of_episode(it)
-            ids = _maybe_map_tvdb(adapter, ids)
-            if ids:
-                _freeze(it, action="remove", reasons=["write_failed"], ids_sent=ids, rating=None)
+            unresolved.append({"item": id_minimal(dict(it)), "hint": "write_failed"})
 
     _info("write_done", op="remove", ok=bool(items_list) and len(unresolved) == 0 and ok == len(items_list), applied=ok, unresolved=len(unresolved))
     return ok, unresolved

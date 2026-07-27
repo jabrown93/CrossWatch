@@ -17,6 +17,7 @@ from providers.scrobble.sources import source_enabled
 from _logging import log as BASE_LOG
 
 BACKUP_LOG = BASE_LOG.child("BACKUP")
+WATCH_LOG = BASE_LOG.child("WATCH")
 
 def _env() -> dict[str, Any]:
     try:
@@ -61,17 +62,20 @@ def _nostore(res: JSONResponse) -> JSONResponse:
 
 router = APIRouter(prefix="/api", tags=["config"])
 
-_LAST_SCROBBLE_SOURCE_LOG: tuple[bool, bool, bool] | None = None
+_LAST_SCROBBLE_SOURCE_LOG: tuple[bool, bool, bool, tuple[tuple[str, str], ...]] | None = None
 
 
 def _log_scrobble_source_state(env: dict[str, Any], cfg: dict[str, Any]) -> None:
     global _LAST_SCROBBLE_SOURCE_LOG
     try:
+        from providers.webhooks.config import active_webhook_endpoints, describe_active_webhooks
+
         sc = cfg.get("scrobble") if isinstance(cfg.get("scrobble"), dict) else {}
         enabled = bool((sc or {}).get("enabled"))
-        webhook = source_enabled(cfg, "webhook")
+        webhook = source_enabled(cfg, "webhook") and bool(active_webhook_endpoints(cfg))
         watcher = source_enabled(cfg, "watcher")
-        state = (enabled, webhook, watcher)
+        webhook_lines = describe_active_webhooks(cfg) if webhook else []
+        state = (enabled, webhook, watcher, tuple(webhook_lines))
         if state == _LAST_SCROBBLE_SOURCE_LOG:
             return
         _LAST_SCROBBLE_SOURCE_LOG = state
@@ -87,13 +91,13 @@ def _log_scrobble_source_state(env: dict[str, Any], cfg: dict[str, Any]) -> None
             if callable(logger):
                 logger(message, level=level)
 
-        if webhook:
-            emit("Webhook listening; endpoints ready for Plex/Jellyfin/Emby events", module="WEBHOOK")
+        for message, level in webhook_lines:
+            emit(message, level=level, module="WEBHOOK")
         if watcher:
             emit("Watcher source enabled", module="WATCH")
         if webhook and watcher:
             emit(
-                "WARNING: both Webhook and Watcher are enabled; duplicate events are possible if the same server sends both",
+                "Webhook and Watcher are both enabled, do not use both for the same tracker.",
                 level="WARN",
                 module="SCROBBLE",
             )
@@ -132,6 +136,77 @@ def _after_config_save(env: dict[str, Any], cfg: dict[str, Any]) -> None:
                 getattr(sched, "stop", lambda: None)()
     except Exception:
         pass
+
+def _stable_json(v: Any) -> str:
+    try:
+        return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(v)
+
+
+def _watch_runtime_fingerprint(cfg: dict[str, Any]) -> str:
+    sc = cfg.get("scrobble")
+    sc = sc if isinstance(sc, dict) else {}
+    watch = sc.get("watch")
+    watch = watch if isinstance(watch, dict) else {}
+    sources = sc.get("sources")
+    sources = sources if isinstance(sources, dict) else {}
+    routes = watch.get("routes")
+    relevant = {
+        "scrobble_enabled": bool(sc.get("enabled")),
+        "mode": str(sc.get("mode") or ""),
+        "source_watcher": bool(sources.get("watcher", sources.get("watch", False))),
+        "watch_autostart": bool(watch.get("autostart")),
+        "routes": routes if isinstance(routes, list) else None,
+    }
+    return _stable_json(relevant)
+
+
+def _watch_runtime_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return _watch_runtime_fingerprint(before) != _watch_runtime_fingerprint(after)
+
+
+def _watcher_running(app: Any) -> bool:
+    try:
+        from providers.scrobble import watch_manager as wm
+        st = wm.status(app) or {}
+    except Exception:
+        return False
+    try:
+        for g in (st.get("groups") or []):
+            if isinstance(g, dict) and g.get("running"):
+                return True
+        for r in (st.get("routes") or []):
+            if isinstance(r, dict) and r.get("running"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _apply_watch_runtime(app: Any, cfg: dict[str, Any], watcher_was_running: bool) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    try:
+        from providers.scrobble import watch_manager as wm
+    except Exception as e:
+        WATCH_LOG.error(f"watcher runtime refresh unavailable: {type(e).__name__}: {e}")
+        return {"watcher_reload_error": "watch_manager_unavailable"}
+    try:
+        if not source_enabled(cfg, "watcher"):
+            wm.stop_all(app, wait=False)
+            out["watcher_stopped"] = True
+            WATCH_LOG.info("Watcher source disabled; stopped watcher runtime")
+        else:
+            autostart = bool(((cfg.get("scrobble") or {}).get("watch") or {}).get("autostart"))
+            if watcher_was_running or autostart:
+                wm.start_from_config(app)
+                out["watcher_reloaded"] = True
+                WATCH_LOG.info("Watcher routing changed; refreshed watcher runtime")
+    except Exception as e:
+        out["watcher_reload_error"] = "watcher_reload_failed"
+        WATCH_LOG.error(f"watcher runtime refresh failed: {type(e).__name__}: {e}")
+    return out
+
 
 def _norm_ver(v: str | None) -> str:
     raw = (v or "").strip()
@@ -367,7 +442,7 @@ def _finalize_config(env: dict[str, Any], cfg: dict[str, Any], *, ensure: bool =
 
 
 @router.post("/config")
-def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     env = _env()
     incoming = dict(payload or {})
     current  = dict(env["load"]() or {})
@@ -387,6 +462,9 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         k = str(key or "").strip().lower()
         if not k:
             return False
+
+        if k.startswith("profile:"):
+            return True
 
         exact = {
             "api_key", "apikey",
@@ -489,6 +567,7 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         *_server_url_checks("jellyfin", "server"),
         *_server_url_checks("emby", "server"),
         *_server_url_checks("tautulli", "server_url"),
+        *_server_url_checks("kodi", "server"),
     ]
     for _url_val, _url_field in _url_checks:
         try:
@@ -505,11 +584,22 @@ def api_config_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     _finalize_config(env, cfg)
 
+    # Detect watcher-routing changes
+    watch_runtime_changed = _watch_runtime_changed(current, cfg)
+    watcher_was_running = _watcher_running(request.app) if watch_runtime_changed else False
+
     env["save"](cfg)
 
     _after_config_save(env, cfg)
 
-    return {"ok": True}
+    result: dict[str, Any] = {"ok": True}
+    if watch_runtime_changed:
+        try:
+            result.update(_apply_watch_runtime(request.app, cfg, watcher_was_running))
+        except Exception as e:
+            result["watcher_reload_error"] = "watcher_reload_failed"
+            WATCH_LOG.error(f"watcher runtime refresh failed: {type(e).__name__}: {e}")
+    return result
 
 @router.post("/config/migrate")
 def api_config_migrate() -> dict[str, Any]:

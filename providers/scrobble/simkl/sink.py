@@ -3,14 +3,17 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import json, time
+from pathlib import Path
 from typing import Any
 
 import requests
 
+from cw_platform.config_base import load_config
 from cw_platform.provider_instances import normalize_instance_id
 from services.activity import record_scrobble_event
+from cw_platform.event_archive import record_watch
 
 try:
     from _logging import log as BASE_LOG
@@ -18,19 +21,7 @@ except Exception:
     BASE_LOG = None
 
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
-from providers.scrobble._sink_common import (
-    _app_meta,
-    _ar_seen,
-    _ar_state_file,
-    _cfg,
-    _cfg_delete_enabled,
-    _cfg_num,
-    _clamp,
-    _extract_skeleton_from_body,
-    _is_debug,
-    _merged_provider_block,
-    _norm_type,
-)
+from providers.scrobble._watched_gate import resolve_stop_action
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
 except ImportError:
@@ -53,6 +44,7 @@ except ImportError:
 
 SIMKL_API = "https://api.simkl.com"
 APP_AGENT = "CrossWatch/Watcher/1.0"
+_AR_TTL = 60
 
 _SIMKL_ID_KEYS = (
     "tmdb",
@@ -68,17 +60,54 @@ _SIMKL_ID_KEYS = (
 _SIMKL_ANIME_ID_KEYS = ("simkl", "tmdb", "tvdb", "mal", "anilist", "kitsu", "anidb", "imdb")
 
 
+def _cfg() -> dict[str, Any]:
+    try:
+        return load_config()
+    except Exception:
+        return {}
+
+
+def _is_debug() -> bool:
+    try:
+        return bool((_cfg().get("runtime") or {}).get("debug"))
+    except Exception:
+        return False
+
+
 def _log(msg: str, lvl: str = "INFO") -> None:
     level = (str(lvl) or "INFO").upper()
     if level == "DEBUG" and not _is_debug():
         return
     if BASE_LOG is not None:
         try:
-            BASE_LOG(str(msg), level=level, module="SIMKL")
+            BASE_LOG(str(msg), level=level, module="SIMKL-SCROBBLE")
             return
         except Exception:
             pass
-    print(f"[SIMKL:{level}] {msg}")
+    print(f"[SIMKL-SCROBBLE:{level}] {msg}")
+
+
+def _merged_provider_block(cfg: Mapping[str, Any], key: str, instance_id: Any = None) -> dict[str, Any]:
+    base = cfg.get(key) if isinstance(cfg, Mapping) else None
+    blk = dict(base or {}) if isinstance(base, Mapping) else {}
+    inst = normalize_instance_id(instance_id)
+    if inst != "default":
+        insts = blk.get("instances")
+        if isinstance(insts, Mapping) and isinstance(insts.get(inst), Mapping):
+            overlay = dict(insts.get(inst) or {})
+            blk.pop("instances", None)
+            out = dict(blk)
+            out.update(overlay)
+            return out
+    blk.pop("instances", None)
+    return blk
+
+
+def _app_meta(cfg: dict[str, Any]) -> dict[str, str]:
+    rt = cfg.get("runtime") or {}
+    av = str(rt.get("version") or APP_AGENT)
+    ad = (rt.get("build_date") or "").strip()
+    return {"app_version": av, **({"app_date": ad} if ad else {})}
 
 
 def _hdr(cfg: dict[str, Any]) -> dict[str, str]:
@@ -101,31 +130,134 @@ def _post(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> requests.Resp
 
 
 def _stop_pause_threshold(cfg: dict[str, Any]) -> int:
-    return _cfg_num(cfg, "simkl", "stop_pause_threshold", 85, fallback_section="trakt")
+    try:
+        s = cfg.get("scrobble") or {}
+        src = (s.get("simkl") or {}).get("stop_pause_threshold")
+        if src is None:
+            src = (s.get("trakt") or {}).get("stop_pause_threshold", 85)
+        return int(src)
+    except Exception:
+        return 85
 
 
 def _force_stop_at(cfg: dict[str, Any]) -> int:
-    return _cfg_num(cfg, "simkl", "force_stop_at", 95, fallback_section="trakt")
+    try:
+        s = cfg.get("scrobble") or {}
+        src = (s.get("simkl") or {}).get("force_stop_at")
+        if src is None:
+            src = (s.get("trakt") or {}).get("force_stop_at", 95)
+        return int(src)
+    except Exception:
+        return 95
 
 
 def _complete_at(cfg: dict[str, Any]) -> int:
-    return _cfg_num(cfg, "simkl", "complete_at", 0, fallback_section="trakt")
+    try:
+        s = cfg.get("scrobble") or {}
+        src = (s.get("simkl") or {}).get("complete_at")
+        if src is None:
+            src = (s.get("trakt") or {}).get("complete_at", 0)
+        return int(src)
+    except Exception:
+        return 0
+
+
+def _watched_at(cfg: dict[str, Any]) -> float:
+    try:
+        s = cfg.get("scrobble") or {}
+        src = (s.get("simkl") or {}).get("watched_at")
+        if src is None:
+            src = (s.get("trakt") or {}).get("watched_at", 90.0)
+        return float(src)
+    except Exception:
+        return 90.0
 
 
 def _regress_tolerance_percent(cfg: dict[str, Any]) -> int:
-    return _cfg_num(cfg, "simkl", "regress_tolerance_percent", 5, fallback_section="trakt")
+    try:
+        s = cfg.get("scrobble") or {}
+        src = (s.get("simkl") or {}).get("regress_tolerance_percent")
+        if src is None:
+            src = (s.get("trakt") or {}).get("regress_tolerance_percent", 5)
+        return int(src)
+    except Exception:
+        return 5
 
 
 def _watch_pause_debounce(cfg: dict[str, Any]) -> int:
-    return _cfg_num(cfg, "watch", "pause_debounce_seconds", 5)
+    try:
+        return int(((cfg.get("scrobble") or {}).get("watch") or {}).get("pause_debounce_seconds", 5))
+    except Exception:
+        return 5
 
 
 def _watch_suppress_start_at(cfg: dict[str, Any]) -> float:
-    return _cfg_num(cfg, "watch", "suppress_start_at", 99.0)
+    try:
+        return float(((cfg.get("scrobble") or {}).get("watch") or {}).get("suppress_start_at", 99))
+    except Exception:
+        return 99.0
 
 def _progress_step(cfg: dict[str, Any]) -> int:
-    step_i = _cfg_num(cfg, "simkl", "progress_step", 5, fallback_section="trakt")
+    try:
+        s = cfg.get("scrobble") or {}
+        step = (s.get("simkl") or {}).get("progress_step")
+        if step is None:
+            step = (s.get("trakt") or {}).get("progress_step", 25)
+        step_i = int(step)
+    except Exception:
+        step_i = 25
     return max(1, min(25, step_i))
+
+
+def _quantize_progress(p: int, step: int, action: str) -> int:
+    v = int(_clamp(p))
+    if step <= 1 or action == "stop":
+        return v
+    if v < step:
+        return max(1, v)
+    q = (v // step) * step
+    return max(1, min(100, q))
+
+def _clamp(p: Any) -> float:
+    try:
+        v = float(p)
+    except Exception:
+        v = 0.0
+    return max(0, min(100, v))
+
+
+def _ar_state_file() -> Path:
+    base = Path("/config/.cw_state") if Path("/config/config.json").exists() else Path(".cw_state")
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return base / "auto_remove_seen.json"
+
+
+def _ar_seen(key: str) -> bool:
+    p = _ar_state_file()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        data = {}
+    now = time.time()
+    try:
+        data = {k: v for k, v in data.items() if (now - float(v)) < _AR_TTL}
+    except Exception:
+        data = {}
+    if key in data:
+        try:
+            p.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+        return True
+    data[key] = now
+    try:
+        p.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+    return False
 
 
 def _ar_key(ids: dict[str, Any], media_type: str, scope: str = "") -> str:
@@ -139,6 +271,37 @@ def _ar_key(ids: dict[str, Any], media_type: str, scope: str = "") -> str:
     except Exception:
         base = f"{media_type}:title/year"
         return f"{scope}|{base}" if scope else base
+
+
+def _norm_type(t: str) -> str:
+    s = (t or "").strip().lower()
+    if s.endswith("s"):
+        s = s[:-1]
+    if s == "series":
+        s = "show"
+    return s
+
+
+def _cfg_delete_enabled(cfg: dict[str, Any], media_type: str) -> bool:
+    s = cfg.get("scrobble") or {}
+    watch = s.get("watch") or {}
+    route_opts_raw = watch.get("route_options")
+    route_opts: dict[str, Any] = route_opts_raw if isinstance(route_opts_raw, dict) else {}
+    route_mode = str(route_opts.get("auto_remove_watchlist") or "inherit").strip().lower()
+    if route_mode == "off":
+        return False
+    if not s.get("delete_plex"):
+        if route_mode != "on":
+            return False
+    types = s.get("delete_plex_types") or []
+    mt = _norm_type(media_type)
+    if isinstance(types, str):
+        return _norm_type(types) == mt
+    try:
+        allowed = {_norm_type(x) for x in types if str(x).strip()}
+    except Exception:
+        return False
+    return mt in allowed
 
 
 def _ids(ev: Any) -> dict[str, Any]:
@@ -202,6 +365,14 @@ def _ids_desc_map(ids: dict[str, Any]) -> str:
         if v is not None:
             return f"{k}:{v}"
     return "title/year"
+
+
+def _extract_skeleton_from_body(b: dict[str, Any]) -> dict[str, Any]:
+    out = dict(b)
+    out.pop("progress", None)
+    out.pop("app_version", None)
+    out.pop("app_date", None)
+    return out
 
 
 def _body_ids_desc(b: dict[str, Any]) -> str:
@@ -295,11 +466,13 @@ class SimklSink(ScrobbleSink):
         self._cfg_provider = cfg_provider
         self._instance_id = normalize_instance_id(instance_id)
         self._last_sent: dict[str, float] = {}
-        self._p_sess: dict[tuple[str, str], int] = {}
+        self._p_sess: dict[tuple[str, str], float] = {}
         self._p_step: dict[tuple[str, str], int] = {}
         self._a_sess: dict[tuple[str, str], str] = {}
-        self._p_glob: dict[str, int] = {}
+        self._p_glob: dict[str, float] = {}
         self._best: dict[str, dict[str, Any]] = {}
+        self._completed: dict[str, float] = {}
+        self._ids_logged: set[str] = set()
         self._last_intent_path: dict[str, str] = {}
         self._last_intent_prog: dict[str, int] = {}
         self._warn_no_token = False
@@ -307,8 +480,8 @@ class SimklSink(ScrobbleSink):
 
     def _route_source(self, cfg: dict[str, Any]) -> tuple[str, str]:
         watch = ((cfg.get("scrobble") or {}).get("watch") or {}) if isinstance(cfg, dict) else {}
-        source = str(watch.get("route_provider") or watch.get("provider") or "watcher").strip().lower() or "watcher"
-        source_instance = str(watch.get("route_provider_instance") or watch.get("provider_instance") or "default").strip() or "default"
+        source = str(watch.get("route_provider") or "watcher").strip().lower() or "watcher"
+        source_instance = str(watch.get("route_provider_instance") or "default").strip() or "default"
         return source, source_instance
 
     def _mkey(self, ev: Any) -> str:
@@ -357,6 +530,17 @@ class SimklSink(ScrobbleSink):
             self._last_intent_prog[key] = int(prog)
         return changed
 
+    def _note_watch(self, ev: Any, action: str, cfg: dict[str, Any], prog: Any, status: str = "ok", reason: str | None = None) -> None:
+        try:
+            src, src_inst = self._route_source(cfg)
+            record_watch(
+                ev, action=action, source_provider=src, source_instance=src_inst,
+                destination_provider="simkl", destination_instance=self._instance_id,
+                status=status, progress=prog, reason=reason,
+            )
+        except Exception:
+            pass
+
     def send(self, ev: Any, cfg: dict[str, Any] | None = None) -> None:
         cfg = cfg or (self._cfg_provider() if self._cfg_provider else None) or _cfg()
         if not isinstance(cfg, dict):
@@ -395,6 +579,9 @@ class SimklSink(ScrobbleSink):
         last_act = self._a_sess.get((sk, mk))
         last_bucket = self._p_step.get((sk, mk), -1)
 
+        if action == "start":
+            self._note_watch(ev, "start", cfg, p_now)
+
         name = _media_name(ev)
         key = self._ckey(ev)
 
@@ -427,7 +614,7 @@ class SimklSink(ScrobbleSink):
 
         thr = _stop_pause_threshold(cfg)
         last_sess = p_sess
-        comp = _complete_at(cfg)
+        watched_at = _watched_at(cfg)
         suppress_at = _watch_suppress_start_at(cfg)
 
         if action == "start" and p_send >= suppress_at:
@@ -437,16 +624,15 @@ class SimklSink(ScrobbleSink):
             self._p_sess[(sk, mk)] = p_send
             return
 
-        if comp and p_send >= comp and action not in ("stop", "start"):
-            action = "stop"
-
         if action_in == "stop":
-            if p_send >= _force_stop_at(cfg) or (comp and p_send >= comp):
-                action = "stop"
-            elif (not preserve_stop) and p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
+            if (not preserve_stop) and p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
                 _log(f"Demote STOP→PAUSE (jump {last_sess}%→{p_send}%, thr={thr})", "DEBUG")
                 action = "pause"
                 p_send = last_sess
+            else:
+                action = resolve_stop_action(p_send, watched_at)
+                if action == "pause":
+                    _log(f"Hold STOP→PAUSE below watched_at ({p_send:.0f}% < {watched_at:.0f}%)", "DEBUG")
 
         step = _progress_step(cfg)
         p_payload = int(float(p_send))
@@ -463,12 +649,15 @@ class SimklSink(ScrobbleSink):
             if last_act == "start":
                 p_payload = bucket
 
-        self._p_sess[(sk, mk)] = int(p_send)
-        if int(p_send) > (p_glob if p_glob >= 0 else -1):
-            self._p_glob[mk] = int(p_send)
+        self._p_sess[(sk, mk)] = p_send
+        if p_send > (p_glob if p_glob >= 0 else -1):
+            self._p_glob[mk] = p_send
 
-        comp_thr = max(_force_stop_at(cfg), comp or 0)
-        if not (action == "stop" and p_send >= comp_thr):
+        done_key = f"{sk}:{mk}"
+        record_complete = action == "stop" and p_send >= watched_at
+        if record_complete and self._completed.get(done_key, -1.0) >= watched_at:
+            return
+        if action_in != "stop":
             if self._debounced(sk, action, _watch_pause_debounce(cfg)):
                 return
         path = {"start": "/scrobble/start", "pause": "/scrobble/pause", "stop": "/scrobble/stop"}[action]
@@ -515,7 +704,7 @@ class SimklSink(ScrobbleSink):
                     _log(f"scrobble {act} user='{_mask_account(acc)}' p={prog_val:.1f}% media='{name}'", "INFO")
                 except Exception:
                     pass
-                if action == "stop" and p_send >= comp_thr:
+                if record_complete:
                     src, src_inst = self._route_source(cfg)
                     try:
                         record_scrobble_event(
@@ -529,6 +718,7 @@ class SimklSink(ScrobbleSink):
                     except Exception:
                         pass
                     _auto_remove_across(ev, cfg, scope=f"simkl:{self._instance_id}")
+                    self._completed[done_key] = p_send
                 self._a_sess[(sk, mk)] = action
                 if action == "start" and step > 1 and bucket is not None:
                     self._p_step[(sk, mk)] = int(bucket)
@@ -541,7 +731,7 @@ class SimklSink(ScrobbleSink):
 
         if last_err and last_err.get("status") == 409 and action == "stop":
             _log("Treating 409 (duplicate stop) as watched; proceeding to auto-remove", "WARN")
-            if p_send >= comp_thr:
+            if record_complete:
                 src, src_inst = self._route_source(cfg)
                 try:
                     record_scrobble_event(
@@ -555,10 +745,13 @@ class SimklSink(ScrobbleSink):
                 except Exception:
                     pass
                 _auto_remove_across(ev, cfg, scope=f"simkl:{self._instance_id}")
+                self._completed[done_key] = p_send
             return
 
         if last_err:
             _log(f"{path} {last_err.get('status')} err={last_err.get('resp')}", "ERROR")
+            if action in ("start", "stop"):
+                self._note_watch(ev, action, cfg, p_send, status="fail", reason=str(last_err.get("status") or ""))
 
     def _send_http(self, path: str, body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         backoff = 1.0

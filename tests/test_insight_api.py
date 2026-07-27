@@ -1,7 +1,5 @@
 # tests/test_insight_api.py
-# Characterization coverage for the routes originally in api/insightAPI.py (1914 lines,
-# the single biggest file in the repo), now split into insight_stats.py/
-# insight_snapshot.py/insight_analytics.py. insightAPI.py had zero prior test coverage.
+# Characterization coverage for api/insightAPI.py, which ships with none of its own.
 # These tests pin the actual output of all 4 routes. Routes are invoked directly via the
 # FastAPI route table (matching the existing tests/test_wall_api.py convention),
 # bypassing Query() validation the way that convention already does.
@@ -13,7 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from api import insightAPI, insight_analytics, insight_snapshot, insight_stats
+from api import insightAPI
 
 
 class FakeStats:
@@ -50,8 +48,7 @@ def _endpoint(app: FastAPI, path: str):
 
 def _install_env(monkeypatch, cw, cfg: dict[str, Any] | None = None, save_config=None) -> None:
     env = (cw, lambda: (cfg if cfg is not None else {}), save_config or (lambda _c: None), lambda *a, **k: None)
-    for mod in (insight_stats, insight_snapshot, insight_analytics):
-        monkeypatch.setattr(mod, "_env", lambda env=env: env)
+    monkeypatch.setattr(insightAPI, "_env", lambda env=env: env)
 
 
 # --- /api/stats/raw ---------------------------------------------------------------
@@ -164,7 +161,7 @@ def test_select_snapshot_save_failure_returns_ok_false(monkeypatch):
 def test_insights_with_no_stats_or_state_returns_safe_defaults(monkeypatch):
     app = FastAPI()
     insightAPI.register_insights(app)
-    monkeypatch.setattr(insight_analytics, "time", FakeTime)
+    monkeypatch.setattr(insightAPI, "time", FakeTime)
 
     class CW:
         STATS = None
@@ -224,7 +221,7 @@ def test_insights_with_no_stats_or_state_returns_safe_defaults(monkeypatch):
 def test_insights_with_history_event_and_state_computes_breakdown_and_lanes(monkeypatch):
     app = FastAPI()
     insightAPI.register_insights(app)
-    monkeypatch.setattr(insight_analytics, "time", FakeTime)
+    monkeypatch.setattr(insightAPI, "time", FakeTime)
 
     state = {
         "providers": {

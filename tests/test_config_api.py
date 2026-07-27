@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import types
 
 import pytest
@@ -25,6 +27,12 @@ def _stub_env(monkeypatch, cfg_api, load_cfg, save_cfg) -> None:
     )
 
 
+def _stub_request():
+    """api_config_save takes a Request for its .app (watcher restart) only; the
+    URL validation under test runs well before that."""
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+
 def test_config_save_rejects_metadata_server_url(monkeypatch) -> None:
     from api import configAPI as cfg_api
 
@@ -34,7 +42,7 @@ def test_config_save_rejects_metadata_server_url(monkeypatch) -> None:
     payload = {"plex": {"server_url": "http://169.254.169.254/latest/meta-data/"}}
 
     with pytest.raises(HTTPException) as exc_info:
-        cfg_api.api_config_save(payload)
+        cfg_api.api_config_save(_stub_request(), payload)
 
     assert exc_info.value.status_code == 400
     assert "plex.server_url" in str(exc_info.value.detail)
@@ -55,7 +63,7 @@ def test_config_save_rejects_metadata_server_url_in_instance(monkeypatch) -> Non
     }
 
     with pytest.raises(HTTPException) as exc_info:
-        cfg_api.api_config_save(payload)
+        cfg_api.api_config_save(_stub_request(), payload)
 
     assert exc_info.value.status_code == 400
     assert "jellyfin.instances.evil.server" in str(exc_info.value.detail)
@@ -71,7 +79,7 @@ def test_config_save_allows_lan_server_url(monkeypatch) -> None:
     payload = {"plex": {"server_url": "http://192.168.1.50:32400"}}
 
     # Should not raise for a normal LAN server URL.
-    cfg_api.api_config_save(payload)
+    cfg_api.api_config_save(_stub_request(), payload)
 
 
 def test_config_migrate_clears_pending_upgrade_marker(monkeypatch) -> None:
@@ -113,3 +121,18 @@ def test_config_migrate_clears_pending_upgrade_marker(monkeypatch) -> None:
 
     assert res["ok"] is True
     assert "_pending_upgrade_from_version" not in (saved.get("ui") or {})
+
+
+def test_config_save_rejects_metadata_kodi_server(monkeypatch) -> None:
+    from api import configAPI as cfg_api
+
+    saved: dict = {}
+    _stub_env(monkeypatch, cfg_api, lambda: {}, lambda cfg: saved.update(cfg))
+
+    payload = {"kodi": {"server": "http://169.254.169.254:8080"}}
+
+    with pytest.raises(HTTPException) as exc_info:
+        cfg_api.api_config_save(_stub_request(), payload)
+
+    assert exc_info.value.status_code == 400
+    assert "kodi.server" in str(exc_info.value.detail)

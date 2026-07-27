@@ -42,7 +42,7 @@ from api.appAuthAPI import (
     register_app_auth,
 )
 
-from _logging import log as LOG, BLUE, GREEN, DIM, RESET  # type: ignore
+from _logging import log as LOG, BLUE, GREEN, DIM, RED, YELLOW, RESET  # type: ignore
 BACKUP_LOG = LOG.child("BACKUP")
 
 def _c(text: str, color: str) -> str:
@@ -55,13 +55,14 @@ from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from starlette.middleware.gzip import GZipMiddleware
 
 from api.wallAPI import _load_wall_snapshot
-from providers.webhooks.plextrakt import process_webhook as process_webhook
-from providers.webhooks.jellyfintrakt import process_webhook as process_webhook_jellyfin
+from providers.webhooks.plex import process_webhook as process_webhook
+from providers.webhooks.jellyfin import process_webhook as process_webhook_jellyfin
 
 __all__ = ["process_webhook", "process_webhook_jellyfin"]
 
@@ -393,6 +394,27 @@ app.add_middleware(
     allow_headers=[],
 )
 
+from api.scrobbleAPI import WebhookAuthError
+
+@app.exception_handler(WebhookAuthError)
+async def _handle_webhook_auth_error(request: Request, exc: WebhookAuthError) -> JSONResponse:
+    client = request.client.host if request.client else "-"
+    LOG(
+        f"Rejected webhook request, provider={exc.provider or '-'}, reason={exc.reason}, client={client}, path={request.url.path}",
+        level="WARN",
+        module="WEBHOOK",
+    )
+    return JSONResponse({"detail": exc.reason}, status_code=401)
+
+def _is_closed_log_stream(request: Request, err: Exception) -> bool:
+    return (
+        request.method == "GET"
+        and request.url.path == "/api/logs/stream"
+        and isinstance(err, RuntimeError)
+        and str(err) == "No response returned."
+    )
+
+
 @app.middleware("http")
 async def conditional_access_logger(request: Request, call_next):
     _apply_debug_env_from_config()
@@ -404,8 +426,12 @@ async def conditional_access_logger(request: Request, call_next):
         response = await call_next(request)
         status = getattr(response, "status_code", 0) or 0
     except Exception as e:
-        err = e
-        status = 500
+        if _is_closed_log_stream(request, e):
+            response = Response(status_code=204)
+            status = 204
+        else:
+            err = e
+            status = 500
     finally:
         if not _is_http_debug_enabled():
             path = request.url.path
@@ -418,8 +444,11 @@ async def conditional_access_logger(request: Request, call_next):
                 if should_log:
                     dt_ms = int((time.time() - t0) * 1000)
                     host = f"{client.host}:{client.port}" if client else "-"
-                    qs = _redact_query_string(request.url.query)
-                    path_qs = path + (f"?{qs}" if qs else "")
+                    if path.startswith("/webhook/"):
+                        path_qs = path
+                    else:
+                        qs = _redact_query_string(request.url.query)
+                        path_qs = path + (f"?{qs}" if qs else "")
                     proto = f"HTTP/{request.scope.get('http_version','1.1')}"
                     print(f'{host} - "{request.method} {path_qs} {proto}" {status} ({dt_ms} ms)')
 
@@ -469,9 +498,6 @@ async def app_auth_gate(request: Request, call_next):
     if path.startswith("/api/app-auth/") or path in {"/login", "/logout"}:
         return await call_next(request)
 
-    if path.startswith("/api/mobile/"):
-        return await call_next(request)
-
     # exclude callback paths
     if path == "/callback" or path.startswith("/callback/"):
         return await call_next(request)
@@ -509,6 +535,30 @@ DIAG_LOG_TAG = "DEBUG"
 LOG_BUFFERS: Dict[str, List[str]] = {"SYNC": [], DIAG_LOG_TAG: []}
 LOG_BASE_SEQ: Dict[str, int] = {"SYNC": 1, DIAG_LOG_TAG: 1}
 LOG_NEXT_SEQ: Dict[str, int] = {"SYNC": 1, DIAG_LOG_TAG: 1}
+WATCH_LOG_TAGS = {
+    "WATCH",
+    "WATCHM",
+    "SCROBBLE",
+    "WEBHOOK",
+    "PLEX-WATCH",
+    "JELLYFIN-WATCH",
+    "EMBY-WATCH",
+    "TRAKT-SCROBBLE",
+    "SIMKL-SCROBBLE",
+    "MDBLIST-SCROBBLE",
+}
+WATCH_LOG_DEFAULT_TAGS = [
+    "WATCH",
+    "WATCHM",
+    "SCROBBLE",
+    "WEBHOOK",
+    "PLEX-WATCH",
+    "JELLYFIN-WATCH",
+    "EMBY-WATCH",
+    "TRAKT-SCROBBLE",
+    "SIMKL-SCROBBLE",
+    "MDBLIST-SCROBBLE",
+]
 
 ANSI_RE    = re.compile(r"\x1b\[([0-9;]*)m")
 ANSI_STRIP = re.compile(r"\x1b\[[0-9;]*m")
@@ -545,6 +595,22 @@ def _log_lines(tag: str | None, tail: int | None = None) -> List[str]:
     if not tail:
         return list(buf)
     return buf[-int(tail):]
+
+def _watch_log_selection(tags: str | None = "") -> List[str]:
+    if tags and tags.strip():
+        sel = [
+            t
+            for t in (_norm_log_tag(raw) for raw in tags.split(",") if raw and raw.strip())
+            if t in WATCH_LOG_TAGS
+        ]
+    else:
+        sel = list(WATCH_LOG_DEFAULT_TAGS)
+
+    out: List[str] = []
+    for t in sel:
+        if t and t not in out:
+            out.append(t)
+    return out or list(WATCH_LOG_DEFAULT_TAGS)
 
 class _LogTextExtractor(HTMLParser):
     def __init__(self) -> None:
@@ -723,18 +789,18 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         sc = (cfg.get("scrobble") or {}) or {}
         watch = (sc.get("watch") or {}) if isinstance(sc.get("watch"), dict) else {}
         from providers.scrobble.sources import source_enabled
-        want_webhooks = source_enabled(cfg, "webhook")
+        from providers.webhooks.config import active_webhook_endpoints
+        want_webhooks = source_enabled(cfg, "webhook") and bool(active_webhook_endpoints(cfg))
         want_autostart = source_enabled(cfg, "watcher") and bool(watch.get("autostart"))
 
         if want_webhooks:
-            LOG(
-                "Webhook listening; endpoints ready for Plex/Jellyfin/Emby events",
-                level="INFO",
-                module="WEBHOOK",
-            )
+            from providers.webhooks.config import describe_active_webhooks
+
+            for message, level in describe_active_webhooks(cfg):
+                LOG(message, level=level, module="WEBHOOK")
         if want_webhooks and source_enabled(cfg, "watcher"):
             LOG(
-                "WARNING: both Webhook and Watcher are enabled; avoid sending the same server through both",
+                "Webhook and Watcher are both enabled, do not use both for the same tracker.",
                 level="WARN",
                 module="SCROBBLE",
             )
@@ -864,17 +930,26 @@ async def api_logs_stream_initial(
     request: Request,
     tag: str = Query("SYNC"),
     tail: int | None = Query(None, ge=1, le=MAX_LOG_LINES),
+    since: int | None = Query(None, ge=1),
     plain: bool = Query(False),
 ):
     tag = _norm_log_tag(tag)
 
     async def agen():
-        buf = _get_log_buf(tag)
-        initial = buf[-int(tail):] if tail else buf
-        for line in initial:
-            yield f"data: {_log_stream_text(line, plain)}\n\n"
+        buf = list(_get_log_buf(tag))
         base = int(LOG_BASE_SEQ.get(tag, int(LOG_NEXT_SEQ.get(tag, 1))))
-        last_seq = base + len(buf) - 1
+        if since is not None:
+            last_seq = max(int(since), base - 1)
+        else:
+            buf_len = len(buf)
+            start = max(0, buf_len - int(tail)) if tail else 0
+            last_seq = base - 1
+            for i in range(start, buf_len):
+                line = buf[i]
+                seq = base + i
+                yield f"id: {seq}\ndata: {_log_stream_text(line, plain)}\n\n"
+                last_seq = seq
+            last_seq = max(last_seq, base + buf_len - 1)
         last = time.time()
         while True:
             if await request.is_disconnected():
@@ -889,9 +964,10 @@ async def api_logs_stream_initial(
                 start_idx = 0
             for i in range(start_idx, len(new_buf)):
                 line = new_buf[i]
-                yield f"data: {_log_stream_text(line, plain)}\n\n"
+                seq = base + i
+                yield f"id: {seq}\ndata: {_log_stream_text(line, plain)}\n\n"
                 last = time.time()
-                last_seq = base + i
+                last_seq = seq
             if time.time() - last > 15:
                 yield "event: ping\ndata: 1\n\n"
                 last = time.time()
@@ -916,35 +992,7 @@ async def api_logs_watcher(
     tags: str = Query("", description="Optional CSV override"),
     plain: bool = Query(False),
 ):
-    cfg = load_config() or {}
-    if tags and tags.strip():
-        sel = [_norm_log_tag(t) for t in tags.split(",") if t and t.strip()]
-    else:
-        watch_cfg: dict[str, Any] = {}
-        sc = cfg.get("scrobble") or {}
-        if isinstance(sc, dict) and isinstance(sc.get("watch"), dict):
-            watch_cfg = sc.get("watch") or {}
-        routes = watch_cfg.get("routes") if isinstance(watch_cfg, dict) else None
-        if isinstance(routes, list) and routes:
-            providers = [
-                _norm_log_tag(str((r or {}).get("provider") or ""))
-                for r in routes
-                if isinstance(r, dict) and bool((r or {}).get("enabled", True))
-            ]
-            sinks = [
-                _norm_log_tag(str((r or {}).get("sink") or ""))
-                for r in routes
-                if isinstance(r, dict) and bool((r or {}).get("enabled", True))
-            ]
-            sel = [*providers, *sinks]
-        else:
-            sel = ["WATCH"]
-
-    out: List[str] = []
-    for t in sel:
-        if t and t not in out:
-            out.append(t)
-    tags_sel = out or ["SYNC"]
+    tags_sel = _watch_log_selection(tags)
 
     async def agen():
         last_seq: Dict[str, int] = {}
@@ -1220,6 +1268,15 @@ def main(host: str = "0.0.0.0", port: int = 8787) -> None:
     boot.info(f"  {_c('Tombstones:', DIM)} {TOMBSTONES_PATH} (JSON)")
     boot.info(f"  {_c('State:', DIM)}      {STATE_PATH} (JSON)")
     boot.info(f"  {_c('Config:', DIM)}     {CONFIG_DIR / 'config.json'} (JSON)")
+
+    try:
+        from cw_platform.event_archive import boot_check as _events_boot_check, events_db_path
+        ev = _events_boot_check(state_dir=CW_STATE_DIR, reports_dir=REPORT_DIR)
+        ev_color = GREEN if ev.get("status") in ("ready", "created") else (RED if not ev.get("ok") else YELLOW)
+        boot.info(f"  {_c('Events DB:', DIM)}  {ev.get('path') or events_db_path()} (SQLite)")
+        boot.info(f"              {_c(ev.get('message') or 'unknown', ev_color)}")
+    except Exception as exc:
+        boot.info(f"  {_c('Events DB:', DIM)}  {_c(f'error — {exc}', RED)}")
     boot.info("")
 
     debug = bool((cfg.get("runtime") or {}).get("debug"))

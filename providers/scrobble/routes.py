@@ -8,10 +8,20 @@ from cw_platform.provider_instances import normalize_instance_id
 
 
 DEFAULT_INSTANCE_ID = "default"
-ROUTE_PROVIDERS = {"plex", "emby", "jellyfin"}
+ROUTE_PROVIDERS = {"plex", "emby", "jellyfin", "kodi"}
 ROUTE_SINKS = {"trakt", "simkl", "mdblist"}
 ROUTE_OPTION_STATES = {"inherit", "on", "off"}
-ROUTE_RATINGS_MODES = {"inherit", "off", "custom"}
+ROUTE_RATINGS_MODES = {"off", "custom"}
+ROUTE_SCROBBLE_POLICY_RANGES = {
+    "watched_at": (0.0, 100.0),
+    "force_stop_at": (0.0, 100.0),
+    "progress_step": (1.0, 25.0),
+}
+ROUTE_SCROBBLE_POLICY_KEYS = set(ROUTE_SCROBBLE_POLICY_RANGES)
+ROUTE_WATCH_POLICY_RANGES = {
+    "pause_debounce_seconds": (0, 3600),
+    "suppress_start_at": (0, 100),
+}
 
 
 def _deep_clone(v: Any) -> Any:
@@ -47,9 +57,9 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
 
     ratings_raw = raw.get("ratings")
     ratings_src = ratings_raw if isinstance(ratings_raw, dict) else {}
-    ratings_mode = str(ratings_src.get("mode") or "inherit").strip().lower() or "inherit"
+    ratings_mode = str(ratings_src.get("mode") or "off").strip().lower() or "off"
     if ratings_mode not in ROUTE_RATINGS_MODES:
-        ratings_mode = "inherit"
+        ratings_mode = "off"
 
     targets_raw = ratings_src.get("targets")
     if isinstance(targets_raw, str):
@@ -70,6 +80,37 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
 
     webhook_id = str(ratings_src.get("webhook_id") or "").strip()
     webhook_token = str(ratings_src.get("webhook_token") or "").strip()
+    scrobble_raw = raw.get("scrobble")
+    scrobble_src: dict[str, Any] = scrobble_raw if isinstance(scrobble_raw, dict) else {}
+    scrobble: dict[str, float] = {}
+    for key, (min_val, max_val) in ROUTE_SCROBBLE_POLICY_RANGES.items():
+        if key not in scrobble_src:
+            continue
+        src_val = scrobble_src.get(key)
+        if src_val is None:
+            continue
+        try:
+            val = float(src_val)
+        except Exception:
+            continue
+        if min_val <= val <= max_val:
+            scrobble[key] = val
+
+    watch_raw = raw.get("watch")
+    watch_src: dict[str, Any] = watch_raw if isinstance(watch_raw, dict) else {}
+    watch: dict[str, int] = {}
+    for key, (min_val, max_val) in ROUTE_WATCH_POLICY_RANGES.items():
+        if key not in watch_src:
+            continue
+        src_val = watch_src.get(key)
+        if src_val is None:
+            continue
+        try:
+            val = int(src_val)
+        except Exception:
+            continue
+        if min_val <= val <= max_val:
+            watch[key] = val
 
     return {
         "auto_remove_watchlist": auto_remove,
@@ -79,6 +120,8 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
             "webhook_id": webhook_id,
             "webhook_token": webhook_token,
         },
+        "scrobble": scrobble,
+        "watch": watch,
     }
 
 
@@ -161,6 +204,12 @@ def build_route_cfg(cfg: dict[str, Any], route: dict[str, Any]) -> dict[str, Any
         out[r["provider"]] = _provider_view(out, r["provider"], r["provider_instance"])
     if r["sink"]:
         out[r["sink"]] = _provider_view(out, r["sink"], r["sink_instance"])
+    ratings = (r.get("options") or {}).get("ratings")
+    rating_targets = ratings.get("targets") if isinstance(ratings, dict) else []
+    for target in rating_targets if isinstance(rating_targets, list) else []:
+        target_key = str(target or "").strip().lower()
+        if target_key in ROUTE_SINKS:
+            out[target_key] = _provider_view(out, target_key, r["sink_instance"])
 
     w["filters"] = _deep_clone(r.get("filters") or {})
     w["route_id"] = r["id"]
@@ -169,6 +218,19 @@ def build_route_cfg(cfg: dict[str, Any], route: dict[str, Any]) -> dict[str, Any
     w["route_sink"] = r["sink"]
     w["route_sink_instance"] = r["sink_instance"]
     w["route_options"] = _deep_clone(r.get("options") or {})
+    watch_policy = (w.get("route_options") or {}).get("watch")
+    if isinstance(watch_policy, dict):
+        for key in ROUTE_WATCH_POLICY_RANGES:
+            if key in watch_policy:
+                w[key] = watch_policy[key]
+    if r["sink"] in ROUTE_SINKS:
+        policy = (w.get("route_options") or {}).get("scrobble")
+        if isinstance(policy, dict):
+            target = out.setdefault("scrobble", {}).setdefault("trakt", {})
+            if isinstance(target, dict):
+                for key in ROUTE_SCROBBLE_POLICY_KEYS:
+                    if key in policy:
+                        target[key] = policy[key]
     return out
 
 

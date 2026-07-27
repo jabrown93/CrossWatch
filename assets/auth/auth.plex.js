@@ -20,6 +20,8 @@
 
 
   const PLEX_SUBTAB_KEY = "cw.ui.plex.auth.subtab.v1";
+  let __plexAutoTabInst = "";
+  let __plexNewProfileInst = "";
 
 const plexProfile = Shared.createProfileAdapter({
   provider: "plex",
@@ -70,7 +72,11 @@ function ensurePlexInstanceUI() {
     if (!root) return;
 
     const want = String(tab || "auth").toLowerCase();
-    const sub = ["auth", "settings", "whitelist"].includes(want) ? want : "auth";
+    let sub = ["auth", "settings", "whitelist"].includes(want) ? want : "auth";
+    const state = getPlexSetupState();
+    if (sub === "settings" && !state.settingsEnabled) sub = "auth";
+    if (sub === "whitelist" && !state.whitelistEnabled) sub = state.settingsEnabled ? "settings" : "auth";
+    try { Shared.applyMediaTabState(root, state); } catch {}
 
     root.querySelectorAll(".cw-subtile[data-sub]").forEach((btn) => {
       btn.classList.toggle("active", String(btn.dataset.sub || "").toLowerCase() === sub);
@@ -84,17 +90,30 @@ function ensurePlexInstanceUI() {
     }
 
     if (sub === "whitelist") {
+      const fresh = !w.__plexWlHandle;
       try { mountPlexLibraryMatrix(); } catch {}
+      if (!fresh) { try { w.__plexWlHandle?.load(true); } catch {} }
     }
 
     if (sub === "settings") {
       setTimeout(() => { try { plexRefreshPmsSuggestions({ force: true }); } catch {} }, 0);
     }
+
+    try { Shared.setMediaAuthStep(root, sub); } catch {}
   }
 
   function mountPlexAuthTabs() {
     const root = q('#sec-plex .cw-meta-provider-panel[data-provider="plex"]');
     if (!root) return;
+    try {
+      Shared.mediaAuthGuide(root, {
+        kind: "plex",
+        label: "Plex",
+        title: "Link Plex, then tune the server",
+        copy: "Click Connect Plex to get a link code. CrossWatch shows the code, then opens plex.tv/link so you can enter it and approve access. Next, validate the server URL and optionally whitelist libraries."
+      });
+      syncPlexSetupTabs();
+    } catch {}
 
     root.querySelectorAll(".cw-subtile[data-sub]").forEach((btn) => {
       if (btn.__plexTabWired) return;
@@ -108,6 +127,46 @@ function ensurePlexInstanceUI() {
     let last = "auth";
     try { last = localStorage.getItem(PLEX_SUBTAB_KEY) || "auth"; } catch {}
     plexAuthSubSelect(last, { persist: false });
+  }
+
+  function getPlexSetupState() {
+    let connected = false;
+    try { connected = !!getPlexState().connected; } catch {}
+    const url = String($("plex_server_url")?.value || "").trim();
+    const user = String($("plex_username")?.value || "").trim();
+    const aid = String($("plex_account_id")?.value || "").trim();
+    const configured = connected || !!(url || user || aid);
+    return {
+      configured,
+      connected,
+      settingsEnabled: connected,
+      whitelistEnabled: connected,
+    };
+  }
+
+  function syncPlexSetupTabs(opts = {}) {
+    const root = q('#sec-plex .cw-meta-provider-panel[data-provider="plex"]') || q("#sec-plex .cw-panel");
+    if (!root) return;
+    const state = getPlexSetupState();
+    try { Shared.applyMediaTabState(root, state); } catch {}
+    if (opts.auto) {
+      const inst = getPlexInstance();
+      if (__plexAutoTabInst !== inst) {
+        __plexAutoTabInst = inst;
+        const cur = root.querySelector(".cw-subtile.active[data-sub]")?.dataset?.sub || "auth";
+        if (cur === "auth") plexAuthSubSelect("auth", { persist: false });
+        return;
+      }
+    }
+    if (opts.preferSettings && state.settingsEnabled) {
+      const cur = root.querySelector(".cw-subtile.active[data-sub]")?.dataset?.sub || "auth";
+      if (cur === "auth") {
+        plexAuthSubSelect("settings", { persist: opts.persist !== false });
+        return;
+      }
+    }
+    const active = root.querySelector(".cw-subtile.active[data-sub]");
+    plexAuthSubSelect(active?.dataset?.sub || "auth", { persist: false });
   }
 
   let __plexHydrateWatch = null;
@@ -245,6 +304,8 @@ function ensurePlexInstanceUI() {
     try { getPlexState().connected = !!on; } catch {}
     if (on) setPlexBanner("ok", text || "Connected");
     else { setPlexBanner(null, ""); setPlexBannerDetail(null, ""); }
+    try { Shared.setConnectLocked(["btn-connect-plex", "btn-plex-restart"], !!on); } catch {}
+    try { syncPlexSetupTabs(); } catch {}
   }
 
   function setPlexConnected() {
@@ -253,12 +314,85 @@ function ensurePlexInstanceUI() {
     schedulePlexPmsProbe(200);
   }
 
-  async function copyPlexPin(btn) {
-    return Shared.copyField("plex_pin", btn);
+  const PLEX_QC_MAX_MS = 300000;
+  const PLEX_ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+  const PLEX_ICON_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+  let plexQcDeadline = 0;
+  let plexQcTimer = null;
+  let plexQcCopyRevert = null;
+
+  function plexQcSetState(show) {
+    const box = $("plex_qc_state"); if (box) box.classList.toggle("hidden", !show);
+    const connect = $("btn-connect-plex"), cancel = $("btn-plex-cancel"), restart = $("btn-plex-restart");
+    if (connect) connect.classList.toggle("hidden", show);
+    if (cancel) cancel.classList.toggle("hidden", !show);
+    if (restart) restart.classList.add("hidden");
+  }
+
+  function plexQcShowRestart() {
+    const restart = $("btn-plex-restart"), connect = $("btn-connect-plex"), cancel = $("btn-plex-cancel");
+    if (restart) restart.classList.remove("hidden");
+    if (connect) connect.classList.add("hidden");
+    if (cancel) cancel.classList.add("hidden");
+  }
+
+  function plexQcUpdateTimer() {
+    if (plexQcDeadline && Date.now() > plexQcDeadline) { plexQcTimeout(); return; }
+    const el = $("plex_qc_timer"); if (!el) return;
+    const left = Math.max(0, Math.round((plexQcDeadline - Date.now()) / 1000));
+    const mm = Math.floor(left / 60), ss = String(left % 60).padStart(2, "0");
+    el.textContent = left > 0 ? `Expires in ${mm}:${ss}` : "";
+  }
+
+  function plexQcStop() {
+    if (plexQcTimer) { clearInterval(plexQcTimer); plexQcTimer = null; }
+    try { if (plexTokenPoller) plexTokenPoller.stop(); } catch {}
+    plexQcDeadline = 0;
+    plexQcSetState(false);
+  }
+
+  function plexQcTimeout() {
+    if (plexQcTimer) { clearInterval(plexQcTimer); plexQcTimer = null; }
+    try { if (plexTokenPoller) plexTokenPoller.stop(); } catch {}
+    plexQcDeadline = 0;
+    const st = $("plex_qc_status"); if (st) st.textContent = "Link code expired. Restart to try again.";
+    const el = $("plex_qc_timer"); if (el) el.textContent = "";
+    plexQcShowRestart();
+  }
+
+  async function plexQcCopy(btn) {
+    const code = ($("plex_qc_code")?.textContent || $("plex_pin")?.value || "").replace(/\s+/g, "").trim();
+    if (!code || code === "----") return;
+    let ok = false;
+    try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(code); ok = true; } } catch {}
+    if (!ok) {
+      try {
+        const ta = d.createElement("textarea");
+        ta.value = code; ta.style.position = "fixed"; ta.style.opacity = "0";
+        d.body.appendChild(ta); ta.focus(); ta.select();
+        ok = d.execCommand("copy");
+        d.body.removeChild(ta);
+      } catch {}
+    }
+    if (!ok) { notify("Copy failed"); return; }
+    btn.classList.add("copied");
+    btn.innerHTML = PLEX_ICON_CHECK;
+    btn.title = "Copied!";
+    if (plexQcCopyRevert) clearTimeout(plexQcCopyRevert);
+    plexQcCopyRevert = setTimeout(() => {
+      btn.classList.remove("copied");
+      btn.innerHTML = PLEX_ICON_COPY;
+      btn.title = "Copy code";
+    }, 1400);
   }
 
   function wirePlexCopyButton() {
-    Shared.wireCopyButton("btn-copy-plex-pin", "plex_pin");
+    const copy = $("plex_qc_copy");
+    if (copy && !copy.__wired) { copy.__wired = true; copy.addEventListener("click", (e) => { e.preventDefault(); plexQcCopy(copy); }); }
+    const cancel = $("btn-plex-cancel");
+    if (cancel && !cancel.__wired) { cancel.__wired = true; cancel.addEventListener("click", () => plexQcStop()); }
+    const restart = $("btn-plex-restart");
+    if (restart && !restart.__wired) { restart.__wired = true; restart.addEventListener("click", () => requestPlexPin()); }
   }
 
   function wirePlexActionButtons() {
@@ -281,12 +415,12 @@ function ensurePlexInstanceUI() {
   async function plexProbePmsReachability() {
     const cfg = await fetch("/api/config" + bust(), { cache: "no-store" }).then(r => r.json()).catch(() => ({}));
     const tok = String(getPlexCfgBlock(cfg || {}).account_token || "").trim();
-    if (!tok) { setPlexBannerDetail(null, ""); return; }
+    if (!tok) { try { window.CW.AuthShared.clearConnectionWarnings(); } catch {} return; }
     try {
-      const r = await fetch(plexApi("/api/plex/pms/probe"), { cache: "no-store" });
+      const r = await fetch(plexApi("/api/plex/pms/probe") + plexLiveQS(), { cache: "no-store" });
       const j = await r.json().catch(() => ({}));
       if (r.ok && j?.reachable) {
-        setPlexBannerDetail(null, "");
+        try { window.CW.AuthShared.clearConnectionWarnings(); } catch {}
         return;
       }
       const base = String(j?.server_url || "").trim();
@@ -294,16 +428,22 @@ function ensurePlexInstanceUI() {
       let msg = "Connected, but PMS is not reachable - validate settings.";
       if (!base) msg = "Connected, but no PMS URL is set - validate settings.";
       else if (sc === 401 || sc === 403) msg = "Connected, but PMS rejected the token - validate settings.";
-      setPlexBannerDetail("warn", msg);
+      try { window.CW.AuthShared.showConnectionWarning(msg); } catch {}
     } catch {
-      setPlexBannerDetail("warn", "Connected, but PMS is not reachable - validate settings.");
+      try { window.CW.AuthShared.showConnectionWarning("Connected, but PMS is not reachable - validate settings."); } catch {}
     }
   }
 
-  // PIN flow
   async function requestPlexPin() {
+    try { plexQcStop(); } catch {}
     try { setPlexSuccess(false); } catch {}
-    let win = null; try { win = w.open("https://plex.tv/link", "_blank"); } catch {}
+    try { setPlexBannerDetail(null, ""); } catch {}
+
+    const connectBtn = $("btn-connect-plex");
+    if (connectBtn) { connectBtn.disabled = true; connectBtn.classList.add("busy"); }
+
+    let win = null; try { win = w.open("about:blank", "_blank"); } catch {}
+
     let data = null;
     try {
       const r = await fetch(plexApi("/api/plex/pin/new"), { method: "POST", cache: "no-store" });
@@ -311,122 +451,95 @@ function ensurePlexInstanceUI() {
       if (!r.ok || data?.ok === false) throw new Error(data?.error || "PIN request failed");
     } catch (e) {
       console.warn("plex pin fetch failed", e);
-      notify("Failed to request PIN");
       try { if (win && !win.closed) win.close(); } catch {}
+      setPlexBanner("warn", "Could not request a Plex link code.");
+      if (connectBtn) { connectBtn.disabled = false; connectBtn.classList.remove("busy"); }
       return;
     }
-    const pin = data.code || data.pin || data.id || "";
-    try {
-      d.querySelectorAll('#plex_pin, input[name="plex_pin"]').forEach(el => { el.value = pin; });
-      const msg = $("plex_msg");
-      if (msg && !pin) setPlexBanner("warn", "PIN request failed");
-      try { setPlexBannerDetail(null, ""); } catch {}
-      if (pin && d.hasFocus()) { try { await Shared.copyText(pin, null, { failureMessage: false }); } catch {} }
-      if (win && !win.closed) {
-        try { win.focus(); } catch {}
-      } else {
-        notify("Popup blocked - allow popups and try again");
-      }
-    } catch (e) { console.warn("pin ui update failed", e); }
+
+    const pin = String(data.code || data.pin || data.id || "").trim();
+    const pinEl = $("plex_pin"); if (pinEl) pinEl.value = pin;
+    const codeEl = $("plex_qc_code"); if (codeEl) codeEl.textContent = pin || "----";
+    const statusEl = $("plex_qc_status"); if (statusEl) statusEl.textContent = "Waiting for authorization…";
+    const helpEl = $("plex_qc_help");
+    if (helpEl) helpEl.textContent = win
+      ? "Opening plex.tv/link — enter this code there and approve CrossWatch."
+      : "Open plex.tv/link and enter this code to approve CrossWatch.";
+
+    plexQcDeadline = Date.now() + PLEX_QC_MAX_MS;
+    plexQcSetState(true);
+    plexQcUpdateTimer();
+    plexQcTimer = setInterval(plexQcUpdateTimer, 1000);
+
+    if (win && !win.closed) {
+      try {
+        win.document.write(
+          '<!doctype html><meta charset="utf-8"><title>CrossWatch → Plex</title>' +
+          '<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0d12;color:#e9eefb;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center">' +
+          '<div><div style="font-size:14px;opacity:.7;margin-bottom:12px">Opening plex.tv/link…</div>' +
+          '<div style="font-size:36px;font-weight:700;letter-spacing:.22em;color:#8ff0c2">' + pin + '</div>' +
+          '<div style="font-size:12px;opacity:.6;margin-top:12px">Redirecting in a moment…</div></div></body>'
+        );
+      } catch {}
+      setTimeout(() => { try { if (win && !win.closed) win.location.href = "https://plex.tv/link"; } catch {} }, 3000);
+    } else {
+      notify("Popup blocked - open plex.tv/link and enter the code.");
+    }
+
+    if (connectBtn) { connectBtn.disabled = false; connectBtn.classList.remove("busy"); }
     try { startPlexTokenPoll(); } catch {}
   }
 
   // token poll
-  let plexPoll = null;
-  function startPlexTokenPoll() {
-    try { if (plexPoll) clearTimeout(plexPoll); } catch {}
-    const deadline = Date.now() + 120000;
-    const back = [1000, 2500, 5000, 7500, 10000, 15000, 20000, 20000];
-    let i = 0;
-    let detailTries = 0;
-    let autoTried = false;
-    let inspectTried = false;
-    let lastTok = "";
+  let plexTokenPoller = null;
+  let __plexLastTok = "";
 
-    const poll = async () => {
-      if (Date.now() >= deadline) { plexPoll = null; return; }
-
-      const settingsVisible = !!($("page-settings") && !$("page-settings").classList.contains("hidden"));
-      if (d.hidden || !settingsVisible) {
-        plexPoll = setTimeout(poll, 5000);
-        return;
-      }
-
-      let cfg = null;
-      try {
-        cfg = await fetch("/api/config" + bust(), { cache: "no-store" }).then(r => r.json());
-      } catch {}
-
-      const p = getPlexCfgBlock(cfg || {});
-      const tok = (p.account_token || "").trim();
-
-      if (tok) {
-        if (tok !== lastTok) {
-          lastTok = tok;
-          inspectTried = false;
-          try { __plexUsersByInst.delete(getPlexInstance()); __plexUsersMetaByInst.delete(getPlexInstance()); } catch {}
-        }
+  function ensurePlexTokenPoller() {
+    if (plexTokenPoller) return plexTokenPoller;
+    plexTokenPoller = Shared.createDevicePoll({
+      url: () => "/api/config" + bust(),
+      method: "GET",
+      minIntervalMs: 1500,
+      maxTotalMs: PLEX_QC_MAX_MS,
+      shouldPause: () => {
+        if (d.hidden) return true;
+        return !($("page-settings") && !$("page-settings").classList.contains("hidden"));
+      },
+      classify: (status, cfg) => {
+        const p = getPlexCfgBlock(cfg || {});
+        return String(p.account_token || "").trim() ? { state: "authorized" } : { state: "pending" };
+      },
+      onAuthorized: async (cfg) => {
+        try { plexQcStop(); } catch {}
+        try { setPlexSuccess(true, "Connected"); } catch {}
+        try { d.dispatchEvent(new CustomEvent("cw-provider-connected", { bubbles: true, detail: { provider: "plex", key: "PLEX" } })); } catch {}
         try {
-
-          const urlEl  = $("plex_server_url");
-          const userEl = $("plex_username");
-          const idEl   = $("plex_account_id");
-
-          // Force an inspect once a token exists
-          if (!inspectTried) {
-            inspectTried = true;
-            try { await fetch(plexApi("/api/plex/inspect"), { cache: "no-store" }); } catch {}
-            try { await hydratePlexFromConfigRaw(); } catch {}
+          const tok = String(getPlexCfgBlock(cfg || {}).account_token || "").trim();
+          if (tok !== __plexLastTok) {
+            __plexLastTok = tok;
+            try { __plexUsersByInst.delete(getPlexInstance()); } catch {}
           }
-
-          // Re-read config 
-          try {
-            cfg = await fetch("/api/config" + bust(), { cache: "no-store" }).then(r => r.json());
-          } catch {}
-
-          const p2 = getPlexCfgBlock(cfg || {});
-          const cfgUrl  = (p2.server_url || "").trim();
-          const cfgUser = (p2.username || "").trim();
-          const cfgId   = (p2.account_id != null ? String(p2.account_id) : "").trim();
-
-          // Token poll is a post-auth synchronizer
-          if (urlEl && cfgUrl && urlEl.value.trim() !== cfgUrl)  urlEl.value = cfgUrl;
-          if (userEl && cfgUser && userEl.value.trim() !== cfgUser) userEl.value = cfgUser;
-          if (idEl) {
-            if (cfgId && idEl.value.trim() !== cfgId) idEl.value = cfgId;
-          }
-
-          if (!autoTried && typeof plexAuto === "function" && (!cfgUser || !cfgId || !cfgUrl)) {
-            autoTried = true;
-            try { await plexAuto(); } catch {}
-          }
-
-          const haveDetails = !!(cfgUrl || cfgUser || cfgId);
-
-          if (haveDetails || detailTries++ >= 15) {
-            try { setPlexSuccess(true); } catch {}
-            try { await plexProbePmsReachability(); } catch {}
-            plexPoll = null;
-            return;
-          }
-        } catch (e) {
-          console.warn("plex token poll hydrate failed", e);
-          try { setPlexSuccess(true); } catch {}
+          try { await fetch(plexApi("/api/plex/inspect"), { cache: "no-store" }); } catch {}
+          try { await hydratePlexFromConfigRaw(); } catch {}
+          const missing = !($("plex_server_url")?.value?.trim()) || !($("plex_username")?.value?.trim()) || !($("plex_account_id")?.value?.trim());
+          if (missing && typeof plexAuto === "function") { try { await plexAuto(); } catch {} }
           try { await plexProbePmsReachability(); } catch {}
-          plexPoll = null;
-          return;
+        } catch (e) {
+          console.warn("plex post-auth sync failed", e);
         }
-      }
+      },
+    });
+    return plexTokenPoller;
+  }
 
-      plexPoll = setTimeout(poll, back[Math.min(i++, back.length - 1)]);
-    };
-
-    plexPoll = setTimeout(poll, 1000);
+  function startPlexTokenPoll() {
+    ensurePlexTokenPoller().start({ intervalMs: 1500, deadlineMs: plexQcDeadline || 0 });
   }
 
   // delete Plex account token
 async function plexDeleteToken() {
-  const btn = d.querySelector('#sec-plex .btn.danger, #sec-plex [data-action="plex-delete"], #sec-plex button[id*="delete"]');
+  const btn = $("btn-delete-plex") || d.querySelector('#sec-plex [data-action="plex-delete"], #sec-plex button[id*="delete"]');
+  try { plexQcStop(); } catch {}
   try { if (btn) { btn.disabled = true; btn.classList.add("busy"); } } catch {}
   try {
     const r = await fetch(plexApi("/api/plex/token/delete"), {
@@ -436,14 +549,17 @@ async function plexDeleteToken() {
       cache: "no-store"
     });
     const j = await r.json().catch(() => ({}));
+    if (Shared.reportProviderUsage({ status: r.status, data: j })) return;
     if (r.ok && (j.ok !== false)) {
       ["plex_pin", "plex_username", "plex_account_id"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+      try { const codeEl = $("plex_qc_code"); if (codeEl) codeEl.textContent = "----"; } catch {}
       try { const st = getPlexState(); st.libs = []; st.connected = false; } catch {}
-      try { __plexUsersByInst.delete(getPlexInstance()); __plexUsersMetaByInst.delete(getPlexInstance()); } catch {}
+      try { __plexUsersByInst.delete(getPlexInstance()); } catch {}
       try { setPlexBanner("warn", "Disconnected"); } catch {}
       try { setPlexBannerDetail("warn", "Token deleted and saved."); } catch {}
       try { notify("Plex disconnected (saved)."); } catch {}
       try { refreshPlexLibraries(); } catch {}
+      try { syncPlexSetupTabs(); } catch {}
     } else {
       const msg = String(j?.error || j?.message || "").trim() || "Could not remove Plex token.";
       try { setPlexBannerDetail("warn", msg); } catch {}
@@ -457,13 +573,26 @@ async function plexDeleteToken() {
 }
 
 
-  function getPlexState() { return (w.__plexState ||= { hist: new Set(), rate: new Set(), scr: new Set(), libs: [], hydrated: false, connected: false }); }
+  function getPlexState() {
+    const st = (w.__plexState ||= { hist: new Set(), rate: new Set(), prog: new Set(), scr: new Set(), libs: [], hydrated: false, connected: false });
+    st.prog ||= new Set();
+    return st;
+  }
 
   // Config
   async function hydratePlexFromConfigRaw() {
     try {
       const r = await fetch("/api/config", { cache: "no-store" }); if (!r.ok) return;
       const cfg = await r.json(); const p = getPlexCfgBlock(cfg);
+      w.__cfg = cfg;
+      const st = getPlexState();
+      st.hist = new Set((p.history?.libraries || []).map(x => String(x)));
+      st.rate = new Set((p.ratings?.libraries || []).map(x => String(x)));
+      st.prog = new Set((p.progress?.libraries || []).map(x => String(x)));
+      st.scr  = new Set((p.scrobble?.libraries || []).map(x => String(x)));
+      st.hydrated = true;
+      w.__plexHydrated = true;
+      if (st.libs.length) mountPlexLibraryMatrix();
       await waitFor("#plex_server_url"); await waitFor("#plex_username");
       const set = (id, val) => { const el = $(id); if (el != null && val != null) el.value = String(val); };
       const tok = String(p.account_token || '').trim();
@@ -479,22 +608,17 @@ async function plexDeleteToken() {
       await refreshPlexSelectedUserScopeNotice();
       try { const cb = $("plex_verify_ssl"); if (cb) cb.checked = !!p.verify_ssl; } catch {}
 
-      const st = getPlexState();
-      st.hist = new Set((p.history?.libraries || []).map(x => String(x)));
-      st.rate = new Set((p.ratings?.libraries || []).map(x => String(x)));
-      st.scr  = new Set((p.scrobble?.libraries || []).map(x => String(x)));
-      st.hydrated = true;
-      w.__plexHydrated = true;
-
-      ["plex_lib_history", "plex_lib_ratings", "plex_lib_scrobble"].forEach(id => {
+      ["plex_lib_history", "plex_lib_ratings", "plex_lib_progress", "plex_lib_scrobble"].forEach(id => {
         const el = $(id); if (!el) return;
         Array.from(el.options || []).forEach(o => {
           if (id === "plex_lib_history") o.selected = st.hist.has(o.value);
           if (id === "plex_lib_ratings") o.selected = st.rate.has(o.value);
+          if (id === "plex_lib_progress") o.selected = st.prog.has(o.value);
           if (id === "plex_lib_scrobble") o.selected = st.scr.has(o.value);
         });
       });
       try { plexRefreshPmsSuggestions(); } catch {}
+      try { syncPlexSetupTabs({ auto: true }); } catch {}
     } catch (e) { console.warn("[plex] hydrate failed", e); }
   }
 
@@ -594,45 +718,6 @@ const tags = [
       .map((it) => `<option value="${it.url}" label="${it.label}"></option>`)
       .join("");
 
-    // Also expose suggestions as a visible dropdown (datalist is easy to miss)
-    try {
-      const sel = document.getElementById("plex_server_url_select");
-      const hint = document.getElementById("plex_server_url_select_hint");
-      const urlEl = document.getElementById("plex_server_url");
-
-      if (sel) {
-        // Show the discovered URL picker only when Server URL is empty.
-        // This avoids displaying the same URL twice (input + dropdown).
-        const curr = (urlEl?.value || "").trim().replace(/\/+$/, "");
-        const show = !curr && items.length > 0;
-
-        sel.innerHTML = [
-          `<option value="">— Pick a discovered server URL —</option>`,
-          ...items.map((it) => `<option value="${it.url}">${it.label}</option>`)
-        ].join("");
-
-        sel.value = ""; // Keep placeholder selected
-
-        sel.classList.toggle("hidden", !show);
-        if (hint) hint.classList.toggle("hidden", !show);
-
-        if (!sel.__wired) {
-          sel.__wired = true;
-          sel.addEventListener("change", () => {
-            const v = (sel.value || "").trim();
-            if (!v || !urlEl) return;
-            urlEl.value = v;
-            urlEl.dispatchEvent(new Event("input", { bubbles: true }));
-            urlEl.dispatchEvent(new Event("change", { bubbles: true }));
-
-            // Hide after selection to keep UI clean
-            sel.value = "";
-            sel.classList.add("hidden");
-            if (hint) hint.classList.add("hidden");
-          });
-        }
-      }
-    } catch {}
     return items[0]?.url || "";
   }
 
@@ -643,18 +728,6 @@ const tags = [
 
   async function plexRefreshPmsSuggestions(opts = {}) {
     const force = !!opts.force;
-    const urlEl = $("plex_server_url");
-    const sel = $("plex_server_url_select");
-    const hint = $("plex_server_url_select_hint");
-    if (!sel) return;
-
-    const curr = (urlEl?.value || "").trim().replace(/\/+$/, "");
-    if (curr) {
-      sel.classList.add("hidden");
-      if (hint) hint.classList.add("hidden");
-      return;
-    }
-
     const cfg = await fetch("/api/config" + bust(), { cache: "no-store" }).then(r => r.json()).catch(() => ({}));
     const tok = String(getPlexCfgBlock(cfg || {}).account_token || "").trim();
     if (!tok) return;
@@ -780,7 +853,7 @@ const tags = [
       if (!needsResolve) return;
 
       if (opts.bustCache) {
-        try { __plexUsersByInst.delete(getPlexInstance()); __plexUsersMetaByInst.delete(getPlexInstance()); } catch {}
+        try { __plexUsersByInst.delete(getPlexInstance()); } catch {}
       }
 
       const users = await fetchPlexUsers();
@@ -809,23 +882,32 @@ const tags = [
     } catch {}
   }
 
-  // User picker
   const __plexUsersByInst = new Map();
-  const __plexUsersMetaByInst = new Map();
+
+  function plexLiveQS() {
+    let qs = "";
+    const url = $("plex_server_url")?.value?.trim() || "";
+    if (url) qs += `&server=${encodeURIComponent(url)}`;
+    const cb = $("plex_verify_ssl");
+    if (cb) qs += `&verify_ssl=${cb.checked ? 1 : 0}`;
+    return qs;
+  }
 
   async function fetchPlexUsers() {
     const inst = getPlexInstance();
+    const currUrl = $("plex_server_url")?.value?.trim() || "";
+    if (currUrl && currUrl !== (w.__lastPlexUrl || "")) {
+      try { __plexUsersByInst.delete(inst); } catch {}
+      w.__lastPlexUrl = currUrl;
+    }
     if (__plexUsersByInst.has(inst)) return __plexUsersByInst.get(inst) || [];
     let out = [];
-    let meta = {};
     try {
-      const r = await fetch(plexApi("/api/plex/pickusers"), { cache: "no-store" });
+      const r = await fetch(plexApi("/api/plex/pickusers") + plexLiveQS(), { cache: "no-store" });
       const j = await r.json();
       out = Array.isArray(j?.users) ? j.users : [];
-      meta = j && typeof j === "object" ? j : {};
-    } catch { out = []; meta = {}; }
+    } catch { out = []; }
     __plexUsersByInst.set(inst, out);
-    __plexUsersMetaByInst.set(inst, meta);
     return out;
   }
 
@@ -857,115 +939,35 @@ const tags = [
     }
   }
 
-  function renderPlexUserList() {
-    const listEl = $("plex_user_list"); if (!listEl) return;
-    const qv = ($("plex_user_filter")?.value || "").trim().toLowerCase();
-    const rankType = { owner:0, managed:1, friend:2 };
-    const rankSrc  = { cloud:0, pms:1 };
-    const by = new Map();
-
-    const inst = getPlexInstance();
-    const src = __plexUsersByInst.get(inst) || [];
-    const meta = __plexUsersMetaByInst.get(inst) || {};
-
-    for (const u of src) {
-      const uname = (u.username || u.title || `user#${u.id}`).trim();
-      if (!uname) continue;
-      const key = uname.toLowerCase();
-      const id = Number(u.id ?? u.account_id ?? 0);
-      if (!Number.isFinite(id) || id <= 0) continue;
-
-      const type = String(u.type || "friend").toLowerCase();
-      const label = String(u.label || "");
-      const source = String(u.source || "").toLowerCase();
-
-      const cur = by.get(key);
-      if (!cur) { by.set(key, { id, username: uname, type, label, source }); continue; }
-
-      const srNew = rankSrc[source] ?? 9;
-      const srCur = rankSrc[cur.source] ?? 9;
-      const trNew = rankType[type] ?? 9;
-      const trCur = rankType[cur.type] ?? 9;
-
-      const better = (srNew < srCur) ||
-        (srNew === srCur && trNew < trCur) ||
-        (srNew === srCur && trNew === trCur && id < cur.id);
-
-      if (better) by.set(key, { id, username: uname, type, label, source });
-    }
-
-    let users = Array.from(by.values());
-    users = users.filter(u => {
-      if (!qv) return true;
-      const hay = `${u.username} ${u.type || ""} ${u.label || ""} ${u.source || ""}`.toLowerCase();
-      return hay.includes(qv);
+  async function openPlexUserPicker() {
+    const btn = $("plex_user_pick_btn");
+    if (!window.cwMediaUserPicker || typeof window.cwMediaUserPicker.open !== "function") return;
+    window.cwMediaUserPicker.open({
+      provider: "plex",
+      instance: getPlexInstance(),
+      server: $("plex_server_url")?.value?.trim() || "",
+      verifySsl: !!$("plex_verify_ssl")?.checked,
+      anchorEl: btn,
+      title: "Pick Plex user",
+      onPick: (u) => {
+        const uname = String(u?.name || "").trim();
+        const uid = String(u?.id || "").trim();
+        const raw = u?.raw || {};
+        const uEl = $("plex_username"); if (uEl) uEl.value = uname;
+        const aEl = $("plex_account_id"); if (aEl) aEl.value = uid;
+        setPlexUserScopeNotice({ username: uname, type: raw.type, label: raw.label, source: raw.source });
+        try { document.dispatchEvent(new CustomEvent("settings-collect", { detail: { section: "plex-users" } })); } catch {}
+      },
     });
-    users.sort((a,b)=> ((rankType[a.type||"friend"] ?? 9) - (rankType[b.type||"friend"] ?? 9)) || a.username.localeCompare(b.username));
-
-    const esc = s => String(s||"").replace(/[&<>"']/g,c=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
-    listEl.innerHTML = users.length ? users.map(u => `
-      <button type="button" class="userrow" data-uid="${esc(u.id)}" data-username="${esc(u.username)}" data-usertype="${esc(u.type)}" data-userlabel="${esc(u.label)}" data-usersource="${esc(u.source)}">
-        <div class="row1">
-          <strong>${esc(u.username)}</strong>
-          <span class="tag ${esc(u.type)}">${esc(u.label || u.type)}</span>
-        </div>
-      </button>
-    `).join("") : `<div class="sub">${esc(meta.reason === "token_required" ? (meta.message || "Connect this Plex profile first.") : "No users found.")}</div>`;
   }
 
-  function placePlexUserPop() {
-    const pop = $("plex_user_pop");
-    const anchor = $("plex_user_pick_btn")?.closest(".userpick") || $("plex_user_pick_btn");
-    if (!pop || !anchor) return;
-    const r = anchor.getBoundingClientRect();
-    const W = Math.min(360, Math.max(280, Math.round(window.innerWidth * 0.9)));
-    pop.style.width = W + "px";
-    const left = Math.max(8, Math.min(r.right - W, window.innerWidth - W - 8));
-    const top  = Math.min(window.innerHeight - 48, r.bottom + 8);
-    pop.style.left = left + "px";
-    pop.style.top  = top  + "px";
-  }
-
-  function openPlexUserPicker() {
-    const pop = $("plex_user_pop"); if (!pop) return;
-    pop.classList.remove("hidden");
-    fetchPlexUsers().then(() => { renderPlexUserList(); placePlexUserPop(); $("plex_user_filter")?.focus(); });
-  }
-
-  function closePlexUserPicker() { $("plex_user_pop")?.classList.add("hidden"); }
+  function closePlexUserPicker() { try { window.cwMediaUserPicker?.close?.(); } catch {} }
 
   function mountPlexUserPicker() {
     const pickBtn = $("plex_user_pick_btn");
     if (pickBtn && !pickBtn.__wired){
       pickBtn.__wired = true;
-      pickBtn.addEventListener("click", (e)=>{ e.preventDefault(); openPlexUserPicker(); try{ placePlexUserPop(); }catch{} });
-    }
-    const closeBtn = $("plex_user_close");
-    if (closeBtn && !closeBtn.__wired){
-      closeBtn.__wired = true;
-      closeBtn.addEventListener("click", (e)=>{ e.preventDefault(); closePlexUserPicker(); });
-    }
-    const filter = $("plex_user_filter");
-    if (filter && !filter.__wired){
-      filter.__wired = true;
-      filter.addEventListener("input", renderPlexUserList);
-    }
-    const list = $("plex_user_list");
-    if (list && !list.__wired){
-      list.__wired = true;
-      list.addEventListener("click",(e)=>{
-        const row = e.target.closest(".userrow"); if (!row) return;
-        const uname = row.dataset.username || "";
-        const uid   = row.dataset.uid || "";
-        const type  = row.dataset.usertype || "";
-        const label = row.dataset.userlabel || "";
-        const source = row.dataset.usersource || "";
-        const uEl = $("plex_username"); if (uEl) uEl.value = uname;
-        const aEl = $("plex_account_id"); if (aEl) aEl.value = uid;
-        setPlexUserScopeNotice({ username: uname, type, label, source });
-        closePlexUserPicker();
-        try{ document.dispatchEvent(new CustomEvent("settings-collect",{detail:{section:"plex-users"}})); }catch{}
-      });
+      pickBtn.addEventListener("click", (e)=>{ e.preventDefault(); openPlexUserPicker(); });
     }
     ["plex_username", "plex_account_id"].forEach((id) => {
       const input = $(id);
@@ -973,36 +975,13 @@ const tags = [
       input.__plexUserScopeNoticeWired = true;
       input.addEventListener("input", () => setPlexUserScopeNotice(null));
     });
-    if (!document.__plexUserAway){
-      document.__plexUserAway = true;
-      document.addEventListener("click",(e)=>{
-        const pop = $("plex_user_pop");
-        if (!pop || pop.classList.contains("hidden")) return;
-        if (pop.contains(e.target) || e.target.id==="plex_user_pick_btn") return;
-        closePlexUserPicker();
-      });
-      document.addEventListener("keydown",(e)=>{ if (e.key === "Escape") closePlexUserPicker(); });
-    }
-    if (!window.__plexUserPos){
-      window.__plexUserPos = true;
-      let raf = null;
-      const safeReposition = ()=>{
-        const pop = $("plex_user_pop");
-        if (!pop || pop.classList.contains("hidden")) return;
-        if (raf) return;
-        raf = requestAnimationFrame(()=>{ raf = null; try{ placePlexUserPop(); }catch{} });
-      };
-      window.addEventListener("resize", safeReposition, { passive:true });
-      window.addEventListener("scroll", safeReposition, { passive:true, capture:true });
-      document.addEventListener("scroll", safeReposition, { passive:true, capture:true });
-    }
   }
 
   // Libraries
   async function plexLoadLibraries() {
     let libs = [];
     try {
-      const r = await fetch(plexApi("/api/plex/libraries"), { cache: "no-store" });
+      const r = await fetch(plexApi("/api/plex/libraries") + plexLiveQS(), { cache: "no-store" });
       if (r.ok) {
         const j = await r.json();
         libs = Array.isArray(j?.libraries) ? j.libraries : [];
@@ -1026,6 +1005,7 @@ const tags = [
       };
       fill("plex_lib_history");
       fill("plex_lib_ratings");
+      fill("plex_lib_progress");
       fill("plex_lib_scrobble");
     } catch (e) {
       console.warn("[plex] library select fill failed", e);
@@ -1059,125 +1039,42 @@ const tags = [
       if (host) host.innerHTML = '<div class="sub">Loading libraries…</div>';
     } catch {}
     try { getPlexState().libs = []; } catch {}
-    try { await hydratePlexFromConfigRaw(); } catch {}
+    const hydrate = hydratePlexFromConfigRaw().catch(() => {});
     try { await plexLoadLibraries(); } catch {}
+    try { mountPlexLibraryMatrix(); } catch {}
+    await hydrate;
     try { mountPlexLibraryMatrix(); } catch {}
   }
 
   // Matrix UI
   function mountPlexLibraryMatrix() {
-    const host    = $("plex_lib_matrix");
-    const histSel = $("plex_lib_history");
-    const rateSel = $("plex_lib_ratings");
-    const scrSel  = $("plex_lib_scrobble");
-    const filter  = $("plex_lib_filter");
-    if (!host) return;
-    const firstMount = !host.__wired;
-    if (firstMount) host.__wired = true;
-
+    const host = $("plex_lib_matrix");
+    if (!host || !w.cwWhitelistTable) return;
     const st = getPlexState();
-    let syncing = false;
-
-    const setSelFromSet = (sel, set) => {
-      if (!sel) return;
-      syncing = true;
-      const want = new Set([...set].map(String));
-      Array.from(sel.options).forEach(o => { o.selected = want.has(String(o.value)); });
-      syncing = false;
+    const setKey = { hist: "hist", rate: "rate", prog: "prog", scr: "scr" };
+    const selId  = { hist: "plex_lib_history", rate: "plex_lib_ratings", prog: "plex_lib_progress", scr: "plex_lib_scrobble" };
+    const syncSelects = () => {
+      Object.keys(selId).forEach((k) => {
+        const sel = $(selId[k]); if (!sel) return;
+        const set = st[setKey[k]];
+        Array.from(sel.options).forEach((o) => { o.selected = set.has(String(o.value)); });
+      });
     };
-
-    const rowHTML = (lib) =>
-      `<div class="lm-row" data-id="${lib.id}" data-name="${lib.title.toLowerCase()}">
-         <div class="lm-name" title="#${lib.id}">${lib.title} <span class="lm-id">#${lib.id}</span></div>
-         <button type="button" class="lm-dot hist ${st.hist.has(lib.id) ? "on" : ""}" aria-label="History" aria-pressed="${st.hist.has(lib.id)}"></button>
-         <button type="button" class="lm-dot rate ${st.rate.has(lib.id) ? "on" : ""}" aria-label="Ratings" aria-pressed="${st.rate.has(lib.id)}"></button>
-         <button type="button" class="lm-dot scr ${st.scr.has(lib.id) ? "on" : ""}" aria-label="Scrobble" aria-pressed="${st.scr.has(lib.id)}"></button>
-       </div>`;
-
-    function applyFilter() {
-      const qv = (filter?.value || "").trim().toLowerCase();
-      host.querySelectorAll(".lm-row").forEach(r => {
-        const hit = !qv || r.dataset.name.includes(qv) || (r.querySelector(".lm-id")?.textContent || "").includes(qv);
-        r.classList.toggle("hide", !hit);
-      });
-    }
-
-    function render() {
-      const libs = getPlexState().libs;
-      const hasServer =
-        (document.getElementById("plex_server_url")?.value?.trim() || "") &&
-        getPlexState().connected;
-      if (!libs.length && hasServer) {
-        notify("No libraries could be loaded from Plex. Check the Server URL and make sure this is a Plex server your account can access.");
-      }
-
-      host.innerHTML = libs.length
-        ? libs.map(rowHTML).join("")
-        : `<div class="sub">No libraries loaded.</div>`;
-      applyFilter();
-      setSelFromSet(histSel, st.hist);
-      setSelFromSet(rateSel, st.rate);
-      setSelFromSet(scrSel,  st.scr);
-    }
-
-    function toggleOne(id, which) {
-      if (which === "hist") { st.hist.has(id) ? st.hist.delete(id) : st.hist.add(id); render(); return; }
-      if (which === "rate") { st.rate.has(id) ? st.rate.delete(id) : st.rate.add(id); render(); return; }
-      if (which === "scr")  { st.scr.has(id) ? st.scr.delete(id) : st.scr.add(id);  render(); return; }
-    }
-
-    if (firstMount) {
-      host.addEventListener("click", (ev) => {
-        const btn = ev.target.closest(".lm-dot"); if (!btn) return;
-        const row = ev.target.closest(".lm-row"); const id = row?.dataset?.id; if (!id) return;
-        const which = btn.classList.contains("hist") ? "hist" : (btn.classList.contains("scr") ? "scr" : "rate");
-        toggleOne(id, which);
-      });
-
-      $("plex_hist_all")?.addEventListener("click", () => {
-        const visible = Array.from(host.querySelectorAll(".lm-row:not(.hide)")).map(r => r.dataset.id);
-        const allOn = visible.every(id => st.hist.has(id));
-        if (allOn) visible.forEach(id => st.hist.delete(id)); else visible.forEach(id => st.hist.add(id));
-        render();
-      });
-
-      $("plex_rate_all")?.addEventListener("click", () => {
-        const visible = Array.from(host.querySelectorAll(".lm-row:not(.hide)")).map(r => r.dataset.id);
-        const allOn = visible.every(id => st.rate.has(id));
-        if (allOn) visible.forEach(id => st.rate.delete(id)); else visible.forEach(id => st.rate.add(id));
-        render();
-      });
-
-      $("plex_scr_all")?.addEventListener("click", () => {
-        const visible = Array.from(host.querySelectorAll(".lm-row:not(.hide)")).map(r => r.dataset.id);
-        const allOn = visible.every(id => st.scr.has(id));
-        if (allOn) visible.forEach(id => st.scr.delete(id)); else visible.forEach(id => st.scr.add(id));
-        render();
-      });
-
-      filter?.addEventListener("input", applyFilter);
-
-      histSel?.addEventListener("change", () => {
-        if (syncing) return;
-        st.hist = new Set(Array.from(histSel.selectedOptions || []).map(o => String(o.value)));
-        render();
-      });
-      rateSel?.addEventListener("change", () => {
-        if (syncing) return;
-        st.rate = new Set(Array.from(rateSel.selectedOptions || []).map(o => String(o.value)));
-        render();
-      });
-      scrSel?.addEventListener("change", () => {
-        if (syncing) return;
-        st.scr = new Set(Array.from(scrSel.selectedOptions || []).map(o => String(o.value)));
-        render();
-      });
-    }
-
-    (async () => {
-      if (!getPlexState().libs.length) await plexLoadLibraries();
-      render();
-    })();
+    w.__plexWlHandle = w.cwWhitelistTable.mount({
+      host,
+      features: [
+        { key: "hist", label: "History" },
+        { key: "rate", label: "Ratings" },
+        { key: "prog", label: "Progress" },
+        { key: "scr",  label: "Scrobble" },
+      ],
+      getLibs: () => getPlexState().libs || [],
+      isOn: (fk, id) => st[setKey[fk]].has(String(id)),
+      setOn: (fk, id, on) => { const s = st[setKey[fk]]; if (on) s.add(String(id)); else s.delete(String(id)); },
+      commit: syncSelects,
+      load: async () => { await plexLoadLibraries(); syncSelects(); },
+    });
+    return w.__plexWlHandle;
   }
 
   function mergePlexIntoCfg(cfg) {
@@ -1213,16 +1110,18 @@ const tags = [
 
     const st = getPlexState();
     const uiReady = !!st.hydrated ||
-      !!document.querySelector("#plex_lib_matrix .lm-row") ||
-      !!document.querySelector("#plex_lib_history option, #plex_lib_ratings option, #plex_lib_scrobble option");
+      !!document.querySelector("#plex_lib_matrix .cw-wl-row") ||
+      !!document.querySelector("#plex_lib_history option, #plex_lib_ratings option, #plex_lib_progress option, #plex_lib_scrobble option");
     if (uiReady) {
       const toInts = (set) => Array.from(set || []).map(x => parseInt(String(x), 10)).filter(Number.isFinite);
       const hist = toInts(st.hist);
       const rate = toInts(st.rate);
+      const prog = toInts(st.prog);
       const scr  = toInts(st.scr);
       plex.scrobble = Object.assign({}, plex.scrobble || {}, { libraries: scr });
       plex.history  = Object.assign({}, plex.history  || {}, { libraries: hist });
       plex.ratings  = Object.assign({}, plex.ratings  || {}, { libraries: rate });
+      plex.progress = Object.assign({}, plex.progress || {}, { libraries: prog });
     }
     return cfg;
   }
@@ -1274,6 +1173,15 @@ const tags = [
       try { mergePlexIntoCfg(ev?.detail?.cfg || (w.__cfg ||= {})); } catch {}
     }, true);
 
+    d.addEventListener("cw-auth-profile-created", (ev) => {
+      const provider = String(ev?.detail?.provider || "").toLowerCase();
+      if (provider !== "plex") return;
+      __plexNewProfileInst = getPlexInstance();
+      __plexAutoTabInst = __plexNewProfileInst;
+      try { syncPlexSetupTabs(); } catch {}
+      try { plexAuthSubSelect("auth", { persist: false }); } catch {}
+    }, true);
+
     w.registerSettingsCollector?.((cfg) => { try { mergePlexIntoCfg(cfg); } catch {} });
   }
 
@@ -1302,15 +1210,7 @@ const tags = [
         urlEl.addEventListener("change", () => schedulePlexPmsProbe(300));
         urlEl.addEventListener("blur", () => schedulePlexPmsProbe(300));
         urlEl.addEventListener("input", () => {
-          const v = (urlEl.value || "").trim();
-          const sel = $("plex_server_url_select");
-          const hint = $("plex_server_url_select_hint");
-          if (v) {
-            if (sel) sel.classList.add("hidden");
-            if (hint) hint.classList.add("hidden");
-          } else {
-            try { plexRefreshPmsSuggestions(); } catch {}
-          }
+          if (!(urlEl.value || "").trim()) { try { plexRefreshPmsSuggestions(); } catch {} }
         });
       }
       const sslEl = $("plex_verify_ssl");
@@ -1327,6 +1227,7 @@ const tags = [
   w.cwAuth = w.cwAuth || {};
   w.cwAuth.plex = w.cwAuth.plex || {};
   w.cwAuth.plex.init = initPlexAuthUI;
+  w.cwAuth.plex.rehydrate = () => { try { hydratePlexFromConfigRaw(); } catch {} };
 
   d.addEventListener("tab-changed", async (ev) => {
     const onSettings = ev?.detail?.id ? /settings/i.test(ev.detail.id) : !!q("#sec-plex");
@@ -1340,6 +1241,7 @@ const tags = [
       try { await plexLoadLibraries(); } catch {}
       try { mountPlexLibraryMatrix(); } catch {}
       try { mountPlexUserPicker(); } catch {}
+      try { syncPlexSetupTabs({ auto: true }); } catch {}
     } else {
       try { setPlexSuccess(false); } catch {}
     }

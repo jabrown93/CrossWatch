@@ -9,6 +9,178 @@ import os
 import re
 import datetime as _dt
 
+
+def _emit_item_failures(emit, provider, feature, pair, keys, key2item, bb_res) -> None:
+    try:
+        prom = set((bb_res or {}).get("promoted_keys") or [])
+        all_keys = [k for k in (keys or [])]
+        total = len(all_keys)
+        unresolved_reasons = load_unresolved_map(provider, feature, cross_features=False)
+
+        def _reason_for_key(k: str) -> str:
+            from_state = unresolved_reasons.get(k) if isinstance(unresolved_reasons, dict) else None
+            if isinstance(from_state, Mapping):
+                reason = str(from_state.get("reason") or "").strip()
+                if reason:
+                    return reason
+            item = key2item.get(k)
+            if isinstance(item, Mapping):
+                for field in ("_cw_unresolved_hint", "hint", "reason", "error"):
+                    reason = str(item.get(field) or "").strip()
+                    if reason:
+                        return reason
+            return "apply:add:failed"
+
+        reason_counts: dict[str, int] = {}
+        for k in all_keys:
+            reason = _reason_for_key(k)
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        items = [
+            {"key": k, "item": key2item.get(k), "promoted": k in prom, "reason": _reason_for_key(k)}
+            for k in all_keys
+        ]
+        if prom:
+            reason_counts["promoted"] = len(prom & set(all_keys))
+        emit(
+            "archive:item_failures",
+            provider=provider,
+            feature=feature,
+            pair=pair,
+            op="add",
+            items=items,
+            total=total,
+            shown=len(items),
+            omitted=0,
+            reason_counts=reason_counts,
+        )
+    except Exception:
+        pass
+
+
+def _emit_item_resolutions(emit, provider, feature, pair, keys, key2item) -> None:
+    try:
+        all_keys = [k for k in (keys or []) if k]
+        if not all_keys:
+            return
+        items = [{"key": k, "item": key2item.get(k)} for k in all_keys]
+        emit(
+            "archive:item_resolutions",
+            provider=provider,
+            feature=feature,
+            pair=pair,
+            op="add",
+            items=items,
+            total=len(all_keys),
+        )
+    except Exception:
+        pass
+
+
+def compute_effective_add(
+    *,
+    attempted_keys,
+    prov_confirmed,
+    confirmed_keys,
+    still_unresolved,
+    skipped_keys,
+    have_exact_keys,
+    verify_after_write,
+    provider_skipped,
+) -> dict[str, Any]:
+    conf = list(confirmed_keys or [])
+    pc = int(prov_confirmed or 0)
+    if have_exact_keys:
+        pc = min(pc or len(conf), len(conf))
+    ambiguous_partial = (not have_exact_keys) and bool(provider_skipped) and bool(pc) and (pc < len(conf))
+    strict_pessimist = (not have_exact_keys) and (not verify_after_write) and bool(still_unresolved)
+    if strict_pessimist or ambiguous_partial:
+        eff = 0
+    else:
+        eff = len(conf) if (verify_after_write or have_exact_keys) else min(pc, len(conf))
+    success_keys = conf if (verify_after_write or have_exact_keys) else conf[:eff]
+    skset = set(skipped_keys or set())
+    sset = set(success_keys)
+    failed_keys = [k for k in (attempted_keys or []) if k not in sset and k not in skset]
+    return {
+        "effective": int(eff),
+        "prov_confirmed": int(pc),
+        "ambiguous_partial": bool(ambiguous_partial),
+        "success_keys": success_keys,
+        "failed_keys": failed_keys,
+    }
+
+
+def compute_effective_remove(
+    *,
+    attempted_keys,
+    provider_confirmed_count,
+    provider_confirmed_keys,
+    provider_unresolved_count=0,
+    provider_errors=0,
+) -> dict[str, Any]:
+    attempted = [str(k) for k in (attempted_keys or []) if k]
+    exact = {str(k) for k in (provider_confirmed_keys or []) if k}
+    if exact:
+        success = [k for k in attempted if k in exact]
+        return {
+            "effective": len(success),
+            "ambiguous": False,
+            "have_exact_keys": True,
+            "success_keys": success,
+            "failed_keys": [k for k in attempted if k not in exact],
+        }
+    pc = int(provider_confirmed_count or 0)
+    clean = int(provider_unresolved_count or 0) == 0 and int(provider_errors or 0) == 0
+    if attempted and pc == len(attempted) and clean:
+        return {
+            "effective": len(attempted),
+            "ambiguous": False,
+            "have_exact_keys": False,
+            "success_keys": list(attempted),
+            "failed_keys": [],
+        }
+    return {
+        "effective": 0,
+        "ambiguous": bool(attempted) and pc > 0,
+        "have_exact_keys": False,
+        "success_keys": [],
+        "failed_keys": list(attempted),
+    }
+
+
+def is_remove_retry_reason(reason) -> bool:
+    r = str(reason or "").strip().lower()
+    return r.startswith("apply:remove") or r.startswith("two:apply:remove") or r.startswith("provider_down:remove")
+
+
+def resolve_baseline_writes(baseline_keys, key2item, result) -> list:
+    dest_map = (result or {}).get("confirmed_destinations")
+    dest_map = dest_map if isinstance(dest_map, Mapping) else {}
+    keys = [str(k) for k in (baseline_keys or []) if k]
+    if dest_map:
+        presence_raw = (result or {}).get("presence_confirmed_keys")
+        if isinstance(presence_raw, list) and presence_raw:
+            keys = [str(x) for x in presence_raw if x]
+    out: list = []
+    for k in keys:
+        mapped = dest_map.get(k) if dest_map else None
+        if isinstance(mapped, Mapping) and isinstance(mapped.get("item"), Mapping):
+            out.append((str(mapped.get("key") or "") or k, dict(mapped["item"])))
+            continue
+        v = (key2item or {}).get(k)
+        if v:
+            out.append((k, v))
+    return out
+
+
+def select_baseline_keys(success_keys, result) -> list:
+    presence_raw = (result or {}).get("presence_confirmed_keys")
+    if isinstance(presence_raw, list):
+        pcset = {str(x) for x in presence_raw if x}
+        return [k for k in (success_keys or []) if k in pcset]
+    return list(success_keys or [])
+
+
 from ..provider_instances import normalize_instance_id
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
@@ -19,15 +191,19 @@ from ..anime_mapping.service import (
 )
 from ._snapshots import (
     build_snapshots_for_feature,
+    bust_snapshot_cache,
     coerce_suspect_snapshot,
     module_checkpoint,
+    needs_post_apply_refresh,
+    prepare_source_snapshot,
     provider_index_semantics,
     prev_checkpoint,
+    refresh_destination_after_apply,
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
-from ._unresolved import load_unresolved_keys, record_unresolved
-from ._planner import diff, diff_ratings, diff_progress
+from ._unresolved import load_unresolved_keys, load_unresolved_map, load_unresolved_pending, record_unresolved, clear_unresolved
+from ._planner import diff, diff_ratings, diff_progress, _pick_rating
 from ._phantoms import PhantomGuard
 from ._tombstones import clear_items_for_feature
 
@@ -47,12 +223,13 @@ from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_dele
 from ._pairs_blocklist import apply_blocklist
 
 # Blackbox imports
-from ._blackbox import load_blackbox_keys, record_attempts, record_success  # type: ignore
+from ._blackbox import load_blackbox_keys, record_attempts, record_success
 
 _PROVIDER_KEY_MAP = {
     "PLEX": "plex",
     "JELLYFIN": "jellyfin",
     "EMBY": "emby",
+    "KODI": "kodi",
 }
 
 
@@ -206,31 +383,31 @@ def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens:
 def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None, provider: str = "") -> str:
     return provider_index_semantics(ops, cfg or {}, feature)
 
-def _iso_to_epoch(v: Any) -> int | None:
-    if not v:
-        return None
-    try:
-        s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
-        dt = _dt.datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_dt.timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return None
-
-def _pick_newest(a: Any, b: Any) -> Any:
-    ae = _iso_to_epoch(a)
-    be = _iso_to_epoch(b)
-    if be is None:
-        return a
-    if ae is None or be > ae:
-        return b
-    return a
-
 # Enrichment and hydration of index payloads
 def _enrich_index_payload(cur: dict[str, Any], prev: dict[str, Any], feature: str) -> dict[str, Any]:
     if not cur or not prev:
         return dict(cur or {})
+
+    def _iso_to_epoch(v: Any) -> int | None:
+        if not v:
+            return None
+        try:
+            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    def _pick_newest(a: Any, b: Any) -> Any:
+        ae = _iso_to_epoch(a)
+        be = _iso_to_epoch(b)
+        if be is None:
+            return a
+        if ae is None or be > ae:
+            return b
+        return a
 
     out: dict[str, Any] = {}
     for k, cv in (cur or {}).items():
@@ -280,6 +457,27 @@ def _hydrate_missing_fields(cur: dict[str, Any], donor: dict[str, Any], feature:
     if not cur or not donor:
         return dict(cur or {})
 
+    def _iso_to_epoch(v: Any) -> int | None:
+        if not v:
+            return None
+        try:
+            s = str(v).strip().replace("Z", "+00:00").replace(" ", "T")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    def _pick_newest(a: Any, b: Any) -> Any:
+        ae = _iso_to_epoch(a)
+        be = _iso_to_epoch(b)
+        if be is None:
+            return a
+        if ae is None or be > ae:
+            return b
+        return a
+
     out: dict[str, Any] = {}
     for k, cv in (cur or {}).items():
         dv = (donor or {}).get(k)
@@ -325,7 +523,7 @@ def _effective_library_whitelist(
     feature: str,
     fcfg: Mapping[str, Any],
 ) -> list[str]:
-    if feature not in ("history", "ratings"):
+    if feature not in ("history", "ratings", "progress"):
         return []
 
     libs: list[str] = []
@@ -530,10 +728,7 @@ def run_one_way_feature(
 
     def _bust_snapshot(pname: str) -> None:
         try:
-            sc = getattr(ctx, "snap_cache", None)
-            if isinstance(sc, dict):
-                sc.pop((pname, feature), None)
-                sc.pop(pname, None)
+            bust_snapshot_cache(getattr(ctx, "snap_cache", None), pname, feature)
         except Exception:
             pass
 
@@ -708,6 +903,17 @@ def run_one_way_feature(
 
     pair_providers = {src: src_ops, dst: dst_ops}
 
+    def _on_snapshot(name: str, idx: Mapping[str, Any]) -> None:
+        if name != src:
+            return
+        prepare_source_snapshot(
+            dst_ops,
+            config=provider_cfg,
+            feature=feature,
+            items=idx,
+            dbg=dbg,
+        )
+
     snaps = build_snapshots_for_feature(
         feature=feature,
         config=provider_cfg,
@@ -716,6 +922,8 @@ def run_one_way_feature(
         snap_ttl_sec=ctx.snap_ttl_sec,
         dbg=dbg,
         emit_info=ctx.emit_info,
+        build_order=[src, dst],
+        on_snapshot=_on_snapshot,
     )
 
     src_cur = snaps.get(src) or {}
@@ -792,8 +1000,8 @@ def run_one_way_feature(
     libs_src: list[str] = _effective_library_whitelist(cfg, src, feature, fcfg)
     libs_dst: list[str] = _effective_library_whitelist(cfg, dst, feature, fcfg)
 
-    allow_unknown_src = (str(src).upper() == "PLEX" and feature == "history")
-    allow_unknown_dst = (str(dst).upper() == "PLEX" and feature == "history")
+    allow_unknown_src = (str(src).upper() == "PLEX" and feature == "history") or str(src).upper() == "KODI"
+    allow_unknown_dst = (str(dst).upper() == "PLEX" and feature == "history") or str(dst).upper() == "KODI"
 
     if libs_src:
         prev_src = _filter_index_by_libraries(prev_src, libs_src, allow_unknown=allow_unknown_src)
@@ -838,7 +1046,18 @@ def run_one_way_feature(
             dbg("anime_mapping.rekeyed", feature=feature, src=src, dst=dst, src_items=len(src_idx), dst_items=len(dst_full))
 
     # Repair sparse destination snapshots using the source index.
+    dst_canonical: dict[str, Any] = dict(dst_full) if feature == "history" else {}
     if feature in ("history", "ratings", "progress"):
+        try:
+            _view_hook = getattr(dst_ops, "destination_comparison_view", None)
+            if callable(_view_hook):
+                _view = _view_hook(provider_cfg, feature=feature, index=dst_full)
+                if isinstance(_view, Mapping) and _view:
+                    if len(_view) != len(dst_full) or set(_view) != set(dst_full):
+                        dbg("destination_comparison_view", feature=feature, dst=dst, before=len(dst_full), after=len(_view))
+                    dst_full = dict(_view)
+        except Exception:
+            pass
         dst_full = _hydrate_missing_fields(dst_full, src_idx, feature)
         dst_full = _rekey_to_src_keyspace(dst_full, src_idx)
 
@@ -1034,7 +1253,7 @@ def run_one_way_feature(
         return observed_removes
 
     if allow_removes:
-        if feature == "ratings":
+        if feature == "ratings" and remove_mode == "mirror":
             removes = list(mirror_removes or [])
             if removes:
                 removes = [it for it in removes if not _present(src_idx, src_alias, it)]
@@ -1051,6 +1270,44 @@ def run_one_way_feature(
                     pass
         else:
             removes = _observed_source_removes()
+
+        if not dst_suspect:
+            planned = {k for k in (_ck(it) for it in removes) if k}
+            retry_removes: list[dict[str, Any]] = []
+            stale_pending: list[str] = []
+            try:
+                pending = load_unresolved_pending(dst, feature)
+            except Exception:
+                pending = []
+            for rec in pending or []:
+                if not isinstance(rec, Mapping) or not is_remove_retry_reason(rec.get("reason")):
+                    continue
+                item = rec.get("item")
+                key = str(rec.get("key") or "")
+                if not isinstance(item, Mapping):
+                    continue
+                if _present(src_idx, src_alias, item):
+                    if key:
+                        stale_pending.append(key)
+                    continue
+                dv = _find_in_idx(dst_full, dst_alias, item)
+                if not dv:
+                    if key:
+                        stale_pending.append(key)
+                    continue
+                rk = _ck(dv) or _ck(item)
+                if not rk or rk in planned:
+                    continue
+                planned.add(rk)
+                retry_removes.append(_minimal(dv))
+            if stale_pending and not bool(ctx.dry_run or sync_cfg.get("dry_run", False)):
+                try:
+                    clear_unresolved(dst, feature, stale_pending)
+                except Exception:
+                    pass
+            if retry_removes:
+                removes = list(removes) + retry_removes
+                emit("debug", msg="unresolved.remove_retry", feature=feature, dst=dst, count=len(retry_removes))
 
     if not allow_adds:
         adds = []
@@ -1109,26 +1366,14 @@ def run_one_way_feature(
     except Exception:
         unresolved_known = set()
 
-    if unresolved_known and adds:
-        _before = len(adds)
+    if unresolved_known:
         try:
-            adds = [it for it in adds if _ck(it) not in unresolved_known]
+            retried = sum(1 for it in adds if _ck(it) in unresolved_known) + sum(1 for it in updates if _ck(it) in unresolved_known)
         except Exception:
-            pass
-        _blocked = _before - len(adds)
-        if _blocked:
-            emit("debug", msg="blocked.unresolved", feature=feature, dst=dst, blocked=_blocked)
-
-    if unresolved_known and updates:
-        _before = len(updates)
-        try:
-            updates = [it for it in updates if _ck(it) not in unresolved_known]
-        except Exception:
-            pass
-        _blocked = _before - len(updates)
-        if _blocked:
-            emit("debug", msg="blocked.unresolved", feature=feature, dst=dst, blocked=_blocked)
-
+            retried = 0
+        if retried:
+            emit("debug", msg="unresolved.retry", feature=feature, dst=dst, retried=retried)
+            
     emit("one:plan", src=src, dst=dst, feature=feature,
         adds=len(adds), removes=len(removes), updates=len(updates),
         src_count=len(src_idx), dst_count=len(dst_full))
@@ -1169,6 +1414,7 @@ def run_one_way_feature(
 
     updated_effective = 0
     added_effective = 0
+    added_provider_reported = 0
     res_update: dict[str, Any] = {
         "attempted": 0,
         "confirmed": 0,
@@ -1194,6 +1440,7 @@ def run_one_way_feature(
     unresolved_new_total = 0
     dry_run_flag = bool(ctx.dry_run or sync_cfg.get("dry_run", False))
     verify_after_write = bool(sync_cfg.get("verify_after_write", False))
+    post_apply_add_res: dict[str, Any] | None = None
 
     if updates:
         if dst_down:
@@ -1284,9 +1531,8 @@ def run_one_way_feature(
             prov_unresolved_set: set[str] = set(prov_unresolved_keys)
 
             new_unresolved = (unresolved_after - unresolved_before) | (prov_unresolved_set - unresolved_before)
-            unresolved_new_total += len(new_unresolved)
             still_unresolved = set(attempted_keys) & (unresolved_after | prov_unresolved_set)
-            
+                        
             prov_confirmed_keys_raw = (add_res or {}).get("confirmed_keys")
             prov_skipped_keys_raw = (add_res or {}).get("skipped_keys")
 
@@ -1315,28 +1561,37 @@ def run_one_way_feature(
                     pass
             
             prov_confirmed = int((add_res or {}).get("confirmed", (add_res or {}).get("count", 0)) or 0)
-            if have_exact_keys:
-                prov_confirmed = min(prov_confirmed or len(confirmed_keys), len(confirmed_keys))
-            
-            if not dry_run_flag and not new_unresolved and prov_confirmed == 0 and adds:
+            added_provider_reported = prov_confirmed
+
+            if not dry_run_flag and not new_unresolved and prov_confirmed == 0 and adds and not have_exact_keys:
                 try:
                     record_unresolved(dst, feature, adds, hint="apply:add:no_confirmations_fallback")
                     new_unresolved = set(attempted_keys)
-                    unresolved_new_total += len(new_unresolved)
                     still_unresolved = set(attempted_keys)
                     confirmed_keys = []
                     skipped_keys_set = set()
                     have_exact_keys = False
                 except Exception:
                     pass
-            
-            ambiguous_partial = (not have_exact_keys) and bool(res_add.get("skipped")) and prov_confirmed and (prov_confirmed < len(confirmed_keys))
-            strict_pessimist = (not have_exact_keys) and (not verify_after_write) and bool(still_unresolved)
-            if strict_pessimist or ambiguous_partial:
-                added_effective = 0
-            else:
-                added_effective = len(confirmed_keys) if (verify_after_write or have_exact_keys) else min(prov_confirmed, len(confirmed_keys))
-            
+
+            unresolved_new_total += len(still_unresolved)
+
+            _decision = compute_effective_add(
+                attempted_keys=attempted_keys,
+                prov_confirmed=prov_confirmed,
+                confirmed_keys=confirmed_keys,
+                still_unresolved=still_unresolved,
+                skipped_keys=skipped_keys_set,
+                have_exact_keys=have_exact_keys,
+                verify_after_write=verify_after_write,
+                provider_skipped=bool(res_add.get("skipped")),
+            )
+            prov_confirmed = _decision["prov_confirmed"]
+            added_effective = _decision["effective"]
+            ambiguous_partial = _decision["ambiguous_partial"]
+            success_keys = _decision["success_keys"]
+            failed_keys = _decision["failed_keys"]
+
             if added_effective != prov_confirmed and not have_exact_keys:
                 dbg("apply:add:corrected", dst=dst, feature=feature,
                     provider_count=prov_confirmed, effective=added_effective,
@@ -1352,19 +1607,26 @@ def run_one_way_feature(
                     skipped_inferred=int(res_add.get("skipped_inferred", 0) or 0),
                     skip_basis=str(res_add.get("skip_basis") or "provider_keys"),
                 )
-            
-            success_keys = confirmed_keys if (verify_after_write or have_exact_keys) else confirmed_keys[:added_effective]
-            failed_keys = [k for k in attempted_keys if k not in set(success_keys) and k not in skipped_keys_set]
             try:
                 if failed_keys and not ambiguous_partial:
-                    record_attempts(dst, feature, failed_keys, reason="apply:add:failed", op="add",
+                    _bb = record_attempts(dst, feature, failed_keys, reason="apply:add:failed", op="add",
                         pair=pair_key, cfg=cfg)
-                    failed_items = [key2item[k] for k in failed_keys if k in key2item]
+                    promoted_keys = {str(x) for x in ((_bb or {}).get("promoted_keys") or []) if x}
+                    failed_items = [key2item[k] for k in failed_keys if k in key2item and k not in promoted_keys]
                     if failed_items:
                         record_unresolved(dst, feature, failed_items, hint="apply:add:failed")
-            
+                    if promoted_keys:
+                        clear_unresolved(dst, feature, promoted_keys)
+                        unresolved_new_total = max(0, unresolved_new_total - len(promoted_keys & set(still_unresolved)))
+                        
+                    _emit_item_failures(emit, dst, feature, pair_key, failed_keys, key2item, _bb)
+                            
                 if success_keys and not ambiguous_partial:
                     record_success(dst, feature, success_keys, pair=pair_key, cfg=cfg)
+                    clear_unresolved(dst, feature, success_keys)
+                    resolved_keys = [k for k in success_keys if k in unresolved_before]
+                    if resolved_keys:
+                        _emit_item_resolutions(emit, dst, feature, pair_key, resolved_keys, key2item)
                     clear_items_for_feature(
                         ctx.state_store,
                         dbg,
@@ -1376,26 +1638,39 @@ def run_one_way_feature(
                     guard.record_success(success_keys)
             except Exception:
                 pass
-            if success_keys and not dry_run_flag:
-                for k in success_keys:
-                    v = key2item.get(k)
-                    if v:
-                        dst_full[k] = v
+            baseline_keys = select_baseline_keys(success_keys, add_res)
+            baseline_writes = resolve_baseline_writes(baseline_keys, key2item, add_res)
+            if baseline_writes and not dry_run_flag:
+                for dk, item in baseline_writes:
+                    dst_full[dk] = item
+                    if feature == "history":
+                        dst_canonical[dk] = item
                 _bust_snapshot(dst)
+            post_apply_add_res = add_res
 
     removed_count = 0
     rem_keys_attempted: list[str] = []
     res_remove: dict[str, Any] = {"attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0}
+    rem_key2item: dict[str, dict[str, Any]] = {}
     if removes:
         try:
-            rem_keys_attempted = [
-                _ck(_minimal(it)) for it in removes if _ck(_minimal(it))
-            ]
+            for it in removes:
+                k = _ck(_minimal(it))
+                if k:
+                    rem_key2item.setdefault(k, it)
+            rem_keys_attempted = list(rem_key2item.keys())
         except Exception:
             rem_keys_attempted = []
 
         if dst_down:
             record_unresolved(dst, feature, removes, hint="provider_down:remove")
+            res_remove = {
+                "attempted": len(rem_keys_attempted),
+                "confirmed": 0,
+                "skipped": 0,
+                "unresolved": len(rem_keys_attempted),
+                "errors": 0,
+            }
             emit("writes:skipped", dst=dst, feature=feature, reason="provider_down", op="remove", count=len(removes))
         else:
             rem_res = apply_remove(
@@ -1410,14 +1685,27 @@ def run_one_way_feature(
                 chunk_size=effective_chunk_size(ctx, dst),
                 chunk_pause_ms=_pause_for(dst),
             )
-            removed_count = int((rem_res or {}).get("confirmed", (rem_res or {}).get("count", 0)) or 0)
+            _rem_decision = compute_effective_remove(
+                attempted_keys=rem_keys_attempted,
+                provider_confirmed_count=int((rem_res or {}).get("confirmed", (rem_res or {}).get("count", 0)) or 0),
+                provider_confirmed_keys=[str(x) for x in ((rem_res or {}).get("confirmed_keys") or []) if x],
+                provider_unresolved_count=int((rem_res or {}).get("unresolved", 0)),
+                provider_errors=int((rem_res or {}).get("errors", 0)),
+            )
+            rem_success_keys = list(_rem_decision["success_keys"])
+            rem_failed_keys = list(_rem_decision["failed_keys"])
+            removed_count = len(rem_success_keys)
             res_remove = {
                 "attempted": int((rem_res or {}).get("attempted", 0)),
-                "confirmed": int((rem_res or {}).get("confirmed", (rem_res or {}).get("count", 0)) or 0),
+                "confirmed": removed_count,
                 "skipped": int((rem_res or {}).get("skipped", 0)),
-                "unresolved": int((rem_res or {}).get("unresolved", 0)),
+                "unresolved": max(int((rem_res or {}).get("unresolved", 0)), len(rem_failed_keys)),
                 "errors": int((rem_res or {}).get("errors", 0)),
             }
+            if _rem_decision["ambiguous"]:
+                emit("debug", msg="remove.ambiguous_partial", feature=feature, dst=dst,
+                     attempted=len(rem_keys_attempted),
+                     provider_confirmed=int((rem_res or {}).get("confirmed", 0)))
 
             if removed_count and not dry_run_flag:
                 try:
@@ -1427,11 +1715,12 @@ def run_one_way_feature(
                     ks = t.setdefault("keys", {})
 
                     removed_tokens = set()
-                    for it in (removes or []):
+                    for k in rem_success_keys:
+                        it = rem_key2item.get(k)
+                        if not it:
+                            continue
                         try:
-                            ck = _ck(_minimal(it))
-                            if ck:
-                                removed_tokens.add(ck)
+                            removed_tokens.add(k)
                             ids = (it.get("ids") or {})
                             for idk, idv in (ids or {}).items():
                                 if idv is None or str(idv) == "":
@@ -1449,10 +1738,60 @@ def run_one_way_feature(
                 except Exception:
                     pass
             if not dry_run_flag and removed_count:
-                for k in rem_keys_attempted:
+                for k in rem_success_keys:
                     if k in dst_full:
                         dst_full.pop(k, None)
+                if feature == "history":
+                    dest_removed = [str(x) for x in ((rem_res or {}).get("removed_destination_keys") or []) if x]
+                    for dk in dest_removed:
+                        dst_canonical.pop(dk, None)
+                    if not dest_removed:
+                        base_removed = {str(k).split("@", 1)[0] for k in rem_success_keys}
+                        for ck0 in list(dst_canonical.keys()):
+                            if str(ck0).split("@", 1)[0] in base_removed:
+                                dst_canonical.pop(ck0, None)
                 _bust_snapshot(dst)
+                try:
+                    clear_unresolved(dst, feature, rem_success_keys)
+                except Exception:
+                    pass
+            if not dry_run_flag and rem_failed_keys:
+                try:
+                    record_unresolved(
+                        dst,
+                        feature,
+                        [rem_key2item[k] for k in rem_failed_keys if k in rem_key2item],
+                        hint="apply:remove:unconfirmed",
+                    )
+                except Exception:
+                    pass
+
+    if (not dry_run_flag) and (not dst_down) and needs_post_apply_refresh(post_apply_add_res):
+        _r = post_apply_add_res or {}
+        emit("post_apply_refresh:start", provider=dst, instance=dst_inst, feature=feature,
+             reason="accepted_not_live_confirmed",
+             accepted_keys=len(_r.get("accepted_keys") or []),
+             accepted_not_seen_live_keys=len(_r.get("accepted_not_seen_live_keys") or []),
+             presence_confirmed_keys=len(_r.get("presence_confirmed_keys") or []))
+        try:
+            refreshed = refresh_destination_after_apply(
+                ops=dst_ops, config=provider_cfg, feature=feature, provider=dst, snap_cache=ctx.snap_cache,
+            )
+        except Exception:
+            refreshed = None
+        base_update = 0
+        if refreshed:
+            for rk, rv in refreshed.items():
+                if rk not in dst_full:
+                    base_update += 1
+                dst_full[rk] = rv
+                if feature == "history":
+                    dst_canonical[rk] = rv
+        tk = str(os.environ.get("CW_PLEX_TRACE_KEY", "") or "").strip().lower()
+        contains_trace = bool(tk) and any(str(k).split("@", 1)[0].lower() == tk for k in (refreshed or {}))
+        emit("post_apply_refresh:done", provider=dst, instance=dst_inst, feature=feature,
+             refreshed_count=len(refreshed or {}), first_keys=list(refreshed or {})[:10],
+             contains_trace_key=contains_trace, baseline_update_count=base_update)
 
     try:
         st = ctx.state_store.load_state() or {}
@@ -1539,11 +1878,16 @@ def run_one_way_feature(
                 merge_payload=_merge_payload,
             )
 
-        if feature in ("history", "ratings", "progress"):
+        if feature in ("ratings", "progress"):
             dst_full = _rekey_state_to_src_keyspace(dst_full, src_idx)
 
+        dst_commit = dst_canonical if feature == "history" else dst_full
+        if feature == "history" and len(dst_commit) != len(dst_full):
+            dbg("baseline.provider_native", feature=feature, dst=dst,
+                canonical=len(dst_commit), comparison=len(dst_full))
+
         _commit_baseline(provs_block, src, src_inst, feature, src_idx)
-        _commit_baseline(provs_block, dst, dst_inst, feature, dst_full)
+        _commit_baseline(provs_block, dst, dst_inst, feature, dst_commit)
         _commit_checkpoint(provs_block, src, src_inst, feature, now_cp_src)
         _commit_checkpoint(provs_block, dst, dst_inst, feature, now_cp_dst)
 
@@ -1555,13 +1899,18 @@ def run_one_way_feature(
 
     emit("feature:done", src=src, dst=dst, feature=feature)
 
+    unresolved_total = (
+        int(unresolved_new_total)
+        + int((res_remove or {}).get("unresolved", 0))
+    )
+
     return {
         "ok": True,
         "updated": int(updated_effective),
         "added": int(added_effective),
         "removed": int(removed_count),
         "skipped": int((res_update or {}).get("skipped", 0)) + int((res_add or {}).get("skipped", 0)) + int((res_remove or {}).get("skipped", 0)),
-        "unresolved": int((res_update or {}).get("unresolved", 0)) + int((res_add or {}).get("unresolved", 0)) + int((res_remove or {}).get("unresolved", 0)),
+        "unresolved": unresolved_total,
         "errors": int((res_update or {}).get("errors", 0)) + int((res_add or {}).get("errors", 0)) + int((res_remove or {}).get("errors", 0)),
         "skipped_exact": int((res_update or {}).get("skipped_exact", 0)) + int((res_add or {}).get("skipped_exact", 0)),
         "skipped_inferred": int((res_update or {}).get("skipped_inferred", 0)) + int((res_add or {}).get("skipped_inferred", 0)),

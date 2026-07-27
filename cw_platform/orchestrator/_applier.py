@@ -7,6 +7,20 @@ from typing import Any, Callable, cast
 from . import _unresolved as _unresolved_mod
 record_unresolved = cast(Callable[..., dict[str, Any]], getattr(_unresolved_mod, "record_unresolved"))
 
+_UNRESOLVED_EXAMPLE_CAP = 25
+
+_PASSTHROUGH_KEY_LISTS = (
+    "presence_confirmed_keys",
+    "accepted_keys",
+    "live_confirmed_keys",
+    "accepted_not_seen_live_keys",
+    "date_confirmed_keys",
+    "date_mismatch_keys",
+    "removed_destination_keys",
+)
+
+_PASSTHROUGH_KEY_MAPS = ("confirmed_destinations",)
+
 def _retry(fn: Callable[[], Any], *, attempts: int = 3, base_sleep: float = 0.5) -> Any:
     last = None
     for i in range(attempts):
@@ -128,9 +142,12 @@ def _normalize(
     unresolved_list = res.get("unresolved") or []
     unresolved_keys: list[str] = []
 
-    if isinstance(unresolved_list, list) and unresolved_list:
-        emit("apply:unresolved", provider=dst, feature=feature, count=len(unresolved_list))
+    try:
+        from ..id_map import canonical_key as _ckey  # type: ignore
+    except Exception:  # pragma: no cover
+        _ckey = None  # type: ignore
 
+    if isinstance(unresolved_list, list) and unresolved_list:
         def _unwrap(x: Mapping[str, Any]) -> tuple[Mapping[str, Any], str | None]:
             inner = x.get("item")
             if isinstance(inner, Mapping):
@@ -138,6 +155,40 @@ def _normalize(
                 return inner, (str(hint).strip() or None) if hint is not None else None
             hint = x.get("hint") or x.get("reason") or x.get("error")
             return x, (str(hint).strip() or None) if hint is not None else None
+
+        unresolved_details: list[dict[str, Any]] = []
+        reason_counts: dict[str, int] = {}
+        for raw in unresolved_list:
+            if not isinstance(raw, Mapping):
+                continue
+            item_u, hint_u = _unwrap(raw)
+            if not isinstance(item_u, Mapping):
+                continue
+            reason_key = str(hint_u) if hint_u else "unknown"
+            reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+            if len(unresolved_details) >= _UNRESOLVED_EXAMPLE_CAP:
+                continue
+            detail: dict[str, Any] = {}
+            for field in ("type", "title", "name", "year", "season", "episode", "series_title", "show_title"):
+                val = item_u.get(field)
+                if val not in (None, ""):
+                    detail[field] = val
+            if hint_u:
+                detail["reason"] = str(hint_u)
+            unresolved_details.append(detail)
+
+        _total = len(unresolved_list)
+        emit(
+            "apply:unresolved",
+            provider=dst,
+            feature=feature,
+            count=_total,
+            items=unresolved_details,
+            total=_total,
+            shown=len(unresolved_details),
+            omitted=max(0, _total - len(unresolved_details)),
+            reason_counts=reason_counts,
+        )
 
         def _has_ids(x: Mapping[str, Any] | None) -> bool:
             _id_keys = ("tmdb", "imdb", "tvdb", "trakt", "slug")
@@ -148,28 +199,31 @@ def _normalize(
             show_ids = (x or {}).get("show_ids") or {}
             return any(show_ids.get(k) for k in _id_keys)
 
-        try:
-            from ..id_map import canonical_key as _ckey  # type: ignore
-        except Exception:  # pragma: no cover
-            _ckey = None  # type: ignore
-
         # Extract unresolved canonical keys for the orchestrator (used for blackbox/flap decisions).
-        try:
-            for raw in unresolved_list:
-                if not isinstance(raw, Mapping):
-                    continue
-                item_u, _ = _unwrap(raw)
-                if not isinstance(item_u, Mapping):
-                    continue
-                if _ckey:
-                    try:
-                        k = _ckey(item_u) or ""
-                    except Exception:
-                        k = ""
-                    if k:
-                        unresolved_keys.append(str(k))
-        except Exception:
-            pass
+        provider_ukeys = res.get("unresolved_keys")
+        if isinstance(provider_ukeys, list) and provider_ukeys:
+            unresolved_keys.extend(str(k) for k in provider_ukeys if k)
+        else:
+            try:
+                for raw in unresolved_list:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    explicit = raw.get("key")
+                    if isinstance(explicit, str) and explicit.strip():
+                        unresolved_keys.append(explicit.strip())
+                        continue
+                    item_u, _ = _unwrap(raw)
+                    if not isinstance(item_u, Mapping):
+                        continue
+                    if _ckey:
+                        try:
+                            k = _ckey(item_u) or ""
+                        except Exception:
+                            k = ""
+                        if k:
+                            unresolved_keys.append(str(k))
+            except Exception:
+                pass
 
         # Persist unresolved items so the operator can inspect them.
         try:
@@ -203,7 +257,39 @@ def _normalize(
     skipped_reported_raw = res.get("skipped")
     skipped_exact = len(skeys)
     inferred_remainder = max(0, attempted - int(confirmed) - unresolved - errors)
-    if skipped_reported_raw is not None:
+    exact_basis = bool(res.get("ambiguous")) or (tag == "apply:add" and bool(ckeys))
+    if exact_basis:
+        skipped = skipped_exact
+        skipped_inferred = 0
+        skip_basis = "provider_keys_exact"
+        accounted = set(ckeys) | set(skeys) | set(unresolved_keys)
+        leftover: list[Mapping[str, Any]] = []
+        for it in items:
+            if not isinstance(it, Mapping):
+                continue
+            k = ""
+            if _ckey:
+                try:
+                    k = str(_ckey(it) or "")
+                except Exception:
+                    k = ""
+            if k and k in accounted:
+                continue
+            leftover.append(it)
+            if k:
+                unresolved_keys.append(k)
+        if leftover:
+            unresolved += len(leftover)
+            try:
+                record_unresolved(
+                    dst,
+                    feature,
+                    [dict(it) for it in leftover],
+                    hint=f"{tag}:unaccounted",
+                )
+            except Exception:
+                pass
+    elif skipped_reported_raw is not None:
         skipped = max(0, int(skipped_reported_raw or 0))
         skipped_inferred = 0
         skip_basis = "provider_keys+count" if skeys else "provider_count"
@@ -211,6 +297,9 @@ def _normalize(
         skipped = inferred_remainder
         skipped_inferred = max(0, skipped - skipped_exact)
         skip_basis = "provider_keys+inferred_remainder" if skeys else "inferred_remainder"
+    if unresolved_keys:
+        _seen: set[str] = set()
+        unresolved_keys = [k for k in unresolved_keys if k and (k not in _seen and not _seen.add(k))]
     out = {
         "ok": ok,
         "attempted": attempted,
@@ -226,6 +315,17 @@ def _normalize(
         "unresolved": int(unresolved),
         "errors": int(errors),
     }
+    for f in _PASSTHROUGH_KEY_LISTS:
+        v = res.get(f)
+        if isinstance(v, list):
+            out[f] = [str(x) for x in v if x]
+    for f in _PASSTHROUGH_KEY_MAPS:
+        v = res.get(f)
+        if isinstance(v, Mapping):
+            out[f] = {str(k): dict(vv) if isinstance(vv, Mapping) else vv for k, vv in v.items()}
+    rc = res.get("reason_counts")
+    if isinstance(rc, Mapping):
+        out["reason_counts"] = dict(rc)
     out["count"] = out["confirmed"]
     return out
 
@@ -262,6 +362,7 @@ def _apply_chunked(
         "skipped_reported": 0,
         "skip_basis": "provider_keys",
         "unresolved": 0,
+        "unresolved_keys": [],
         "errors": 0,
     }
     for i in range(0, total, csize):
@@ -281,6 +382,21 @@ def _apply_chunked(
             agg["confirmed_keys"].extend(res["confirmed_keys"])
         if res.get("skipped_keys"):
             agg["skipped_keys"].extend(res["skipped_keys"])
+        if res.get("unresolved_keys"):
+            agg["unresolved_keys"].extend(res["unresolved_keys"])
+        for f in _PASSTHROUGH_KEY_LISTS:
+            v = res.get(f)
+            if isinstance(v, list):
+                agg.setdefault(f, []).extend(v)
+        for f in _PASSTHROUGH_KEY_MAPS:
+            v = res.get(f)
+            if isinstance(v, Mapping):
+                agg.setdefault(f, {}).update(v)
+        rc = res.get("reason_counts")
+        if isinstance(rc, Mapping):
+            agg_rc = agg.setdefault("reason_counts", {})
+            for rk, rv in rc.items():
+                agg_rc[rk] = int(agg_rc.get(rk, 0)) + int(rv or 0)
         basis = str(res.get("skip_basis") or "provider_keys")
         if agg.get("skip_basis") != basis:
             agg["skip_basis"] = "mixed"
