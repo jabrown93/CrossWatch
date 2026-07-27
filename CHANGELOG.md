@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/jabrown93/CrossWatch/compare/v1.0.0...v1.0.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* **deps:** update dependency com.android.tools.build:gradle to v9.3.1 ([fc3b57b](https://github.com/jabrown93/CrossWatch/commit/fc3b57b71435d83518f59f4b494a578e7d64f0e7))
+
 # [1.0.0](https://github.com/jabrown93/CrossWatch/compare/v0.9.15...v1.0.0) (2026-07-20)
 
 
