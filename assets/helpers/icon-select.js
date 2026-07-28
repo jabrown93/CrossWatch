@@ -70,17 +70,34 @@
   // Menus live on document.body, so they outlive their wrap when a settings
   // pane is rebuilt via innerHTML; drop any menu whose wrap left the DOM.
   // Callers may enhance selects inside a subtree that is not inserted yet
-  // (e.g. scheduler event rows build cells before appendChild), so only treat
-  // a wrap as orphaned after it has been seen connected at least once.
+  // (e.g. scheduler event rows build cells before appendChild), so a wrap
+  // becomes sweepable once seen connected, or — for wraps that are inserted
+  // and removed again between sweeps and are therefore never observed
+  // connected — after a detachment grace period.
+  const ORPHAN_GRACE_MS = 5000;
+  function markMenuConnected(wrap) {
+    const menu = wrap && wrap.__cwMenu;
+    if (menu && wrap.isConnected) {
+      menu.__cwWrapWasConnected = true;
+      menu.__cwDetachedSince = 0;
+    }
+  }
   function sweepOrphanMenus() {
+    const now = Date.now();
     d.querySelectorAll("body > .cw-icon-select-menu").forEach((menu) => {
       const wrap = menu.__cwWrap;
       if (!wrap) return;
       if (wrap.isConnected) {
-        menu.__cwWrapWasConnected = true;
+        markMenuConnected(wrap);
         return;
       }
-      if (!menu.__cwWrapWasConnected) return;
+      if (!menu.__cwWrapWasConnected) {
+        if (!menu.__cwDetachedSince) {
+          menu.__cwDetachedSince = now;
+          return;
+        }
+        if (now - menu.__cwDetachedSince < ORPHAN_GRACE_MS) return;
+      }
       if (OPEN?.menu === menu) OPEN = null;
       menu.remove();
     });
@@ -405,7 +422,10 @@
       });
       select.__cwOptionsObserver = obs;
     }
-    if (wrap.isConnected && wrap.__cwMenu) wrap.__cwMenu.__cwWrapWasConnected = true;
+    // Detached-enhanced wraps are usually appended later in the same task;
+    // the microtask marks them connected before any subsequent sweep runs.
+    if (wrap.isConnected) markMenuConnected(wrap);
+    else queueMicrotask(() => markMenuConnected(wrap));
     bindReposition();
     return wrap;
   }
