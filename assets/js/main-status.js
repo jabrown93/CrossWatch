@@ -128,10 +128,12 @@
 
   window.syncMetadataProviderDot = syncMetadataProviderDot;
 
-  function observeMeta(fn) {
+  function observeMeta(fn, delay = 150) {
     const host = $("meta-tmdb-dot");
     if (!host) {
-      setTimeout(() => observeMeta(fn), 150);
+      // The dot only exists once the Settings metadata panel renders, which
+      // may be never; back off instead of spinning at 150ms for the session.
+      setTimeout(() => observeMeta(fn, Math.min(5000, delay * 2)), delay);
       return;
     }
     fn();
