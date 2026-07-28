@@ -69,10 +69,18 @@
 
   // Menus live on document.body, so they outlive their wrap when a settings
   // pane is rebuilt via innerHTML; drop any menu whose wrap left the DOM.
+  // Callers may enhance selects inside a subtree that is not inserted yet
+  // (e.g. scheduler event rows build cells before appendChild), so only treat
+  // a wrap as orphaned after it has been seen connected at least once.
   function sweepOrphanMenus() {
     d.querySelectorAll("body > .cw-icon-select-menu").forEach((menu) => {
       const wrap = menu.__cwWrap;
-      if (!wrap || wrap.isConnected) return;
+      if (!wrap) return;
+      if (wrap.isConnected) {
+        menu.__cwWrapWasConnected = true;
+        return;
+      }
+      if (!menu.__cwWrapWasConnected) return;
       if (OPEN?.menu === menu) OPEN = null;
       menu.remove();
     });
@@ -397,6 +405,7 @@
       });
       select.__cwOptionsObserver = obs;
     }
+    if (wrap.isConnected && wrap.__cwMenu) wrap.__cwMenu.__cwWrapWasConnected = true;
     bindReposition();
     return wrap;
   }
