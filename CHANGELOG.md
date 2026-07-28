@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/jabrown93/CrossWatch/compare/v1.0.1...v1.1.0) (2026-07-28)
+
+
+### Features
+
+* sync with upstream cenodude/CrossWatch v0.10.6 ([351cb36](https://github.com/jabrown93/CrossWatch/commit/351cb36fdb2acb19ab8e753d3e4f6b8e2a751e98)), closes [#40](https://github.com/jabrown93/CrossWatch/issues/40) [#58](https://github.com/jabrown93/CrossWatch/issues/58) [#59](https://github.com/jabrown93/CrossWatch/issues/59) [#57](https://github.com/jabrown93/CrossWatch/issues/57) [#385](https://github.com/jabrown93/CrossWatch/issues/385) [#426](https://github.com/jabrown93/CrossWatch/issues/426) [#395](https://github.com/jabrown93/CrossWatch/issues/395) [pre-#426](https://github.com/pre-/issues/426)
+
 ## [1.0.1](https://github.com/jabrown93/CrossWatch/compare/v1.0.0...v1.0.1) (2026-07-27)
 
 
