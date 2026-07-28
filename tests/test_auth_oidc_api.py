@@ -228,3 +228,82 @@ def test_oidc_status_reports_availability(monkeypatch) -> None:
     resp = oidc_api.api_oidc_status(_request("/api/app-auth/oidc/status"))
     body = json.loads(resp.body.decode("utf-8"))
     assert body["login_available"] is True
+
+
+def _login_route(monkeypatch, cfg):
+    """Register routes on a throwaway FastAPI app and return the /login endpoint."""
+    from fastapi import FastAPI
+
+    from api import appAuthAPI as auth
+
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_a, **_k: None)
+    app = FastAPI()
+    auth.register_app_auth(app)
+    for route in app.routes:
+        if getattr(route, "path", "") == "/login" and "GET" in getattr(route, "methods", set()):
+            return route.endpoint
+    raise AssertionError("/login route not registered")
+
+
+def test_login_auto_redirects_to_oidc(monkeypatch) -> None:
+    from services import authOIDC
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
+    endpoint = _login_route(monkeypatch, cfg)
+
+    resp = endpoint(_request("/login", query="next=/watchlist"))
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2Fwatchlist"
+
+
+def test_login_local_escape_hatch_renders_form(monkeypatch) -> None:
+    from services import authOIDC
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
+    endpoint = _login_route(monkeypatch, cfg)
+
+    resp = endpoint(_request("/login", query="local=1"))
+    assert resp.status_code == 200
+    body = resp.body.decode("utf-8")
+    assert 'id="p"' in body
+    assert "/api/app-auth/oidc/login" in body
+
+
+def test_login_falls_back_to_form_when_issuer_down(monkeypatch) -> None:
+    from services import authOIDC
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: False)
+    endpoint = _login_route(monkeypatch, cfg)
+
+    resp = endpoint(_request("/login"))
+    assert resp.status_code == 200
+    assert 'id="p"' in resp.body.decode("utf-8")
+
+
+def test_login_shows_mapped_error_not_raw_query(monkeypatch) -> None:
+    from services import authOIDC
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
+    endpoint = _login_route(monkeypatch, cfg)
+
+    resp = endpoint(_request("/login", query="oidc_error=%3Cscript%3E"))
+    assert resp.status_code == 200
+    body = resp.body.decode("utf-8")
+    assert "<script>alert" not in body
+    assert "Single sign-on failed" in body
+
+
+def test_login_no_redirect_when_oidc_disabled(monkeypatch) -> None:
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc"]["enabled"] = False
+    endpoint = _login_route(monkeypatch, cfg)
+
+    resp = endpoint(_request("/login"))
+    assert resp.status_code == 200
+    body = resp.body.decode("utf-8")
+    assert "/api/app-auth/oidc/login" not in body
