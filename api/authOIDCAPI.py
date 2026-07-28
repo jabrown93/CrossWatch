@@ -132,10 +132,24 @@ def api_oidc_callback(request: Request) -> Response:
     # Re-load: the cfg from the top of this handler is seconds stale by now
     # (discovery + token exchange + JWKS round-trips); writing it back would
     # clobber any settings saved during that window.
-    cfg = load_config()
-    token, exp = app_auth._issue_session(cfg, request, ttl_sec=authOIDC.session_ttl_sec(cfg))
-    save_config(cfg)
+    fresh = load_config()
     identity = res.get("identity") or {}
+    # A policy edit made during those round-trips must win over the snapshot
+    # the token was authorized against: OIDC must still be enabled, the
+    # issuer/client the token came from must still be the configured ones,
+    # and the identity must still pass the group allowlist.
+    if not authOIDC.login_available(fresh):
+        return _local_login_redirect("failed")
+    o_old, o_new = authOIDC._oidc_cfg(cfg), authOIDC._oidc_cfg(fresh)
+    if str(o_new.get("issuer") or "").strip() != str(o_old.get("issuer") or "").strip() or str(
+        o_new.get("client_id") or ""
+    ).strip() != str(o_old.get("client_id") or "").strip():
+        return _local_login_redirect("failed")
+    if not authOIDC.identity_allowed(fresh, identity):
+        return _local_login_redirect("denied")
+
+    token, exp = app_auth._issue_session(fresh, request, ttl_sec=authOIDC.session_ttl_sec(fresh))
+    save_config(fresh)
     _log(f"OIDC sign-in ok for sub={identity.get('sub')} ({identity.get('username')})")
 
     resp = RedirectResponse(url=_safe_next(str(res.get("next") or "/")), status_code=302, headers={"Cache-Control": "no-store"})

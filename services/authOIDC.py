@@ -237,6 +237,22 @@ def _extract_groups(claims: Any, groups_claim: str) -> list[str]:
     return [s for s in (str(x or "").strip() for x in items) if s]
 
 
+def _allowed_groups(o: dict[str, Any]) -> list[str]:
+    return [str(g or "").strip() for g in (o.get("allowed_groups") or []) if str(g or "").strip()]
+
+
+def identity_allowed(cfg: dict[str, Any], identity: dict[str, Any]) -> bool:
+    """Whether an already-authenticated identity passes cfg's group allowlist.
+
+    Used to recheck policy against a config reloaded after the token was
+    validated; empty allowlist denies, same as complete_flow.
+    """
+    allowed = _allowed_groups(_oidc_cfg(cfg))
+    groups = identity.get("groups") if isinstance(identity, dict) else None
+    groups = [str(g or "").strip() for g in (groups or []) if str(g or "").strip()]
+    return bool(allowed) and any(g in allowed for g in groups)
+
+
 def complete_flow(cfg: dict[str, Any], *, state: str, code: str) -> dict[str, Any]:
     _prune_pending()
     rec = _PENDING_FLOWS.pop(str(state or "").strip(), None)
@@ -272,7 +288,7 @@ def complete_flow(cfg: dict[str, Any], *, state: str, code: str) -> dict[str, An
     if str(claims.get("nonce") or "") != str(rec.get("nonce") or ""):
         return _failed("Sign-in failed")
 
-    allowed = [str(g or "").strip() for g in (o.get("allowed_groups") or []) if str(g or "").strip()]
+    allowed = _allowed_groups(o)
     groups = _extract_groups(claims, str(o.get("groups_claim") or "groups"))
     if not allowed:
         _log("OIDC login denied: allowed_groups is empty; refusing all OIDC logins", level="WARNING")

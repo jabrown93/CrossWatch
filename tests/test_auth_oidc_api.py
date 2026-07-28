@@ -223,6 +223,63 @@ def test_oidc_callback_requires_matching_flow_cookie(monkeypatch) -> None:
     assert cfg["app_auth"]["sessions"] == []
 
 
+def _callback_with_policy_change(monkeypatch, mutate_fresh) -> "object":
+    """Run a successful-token callback where the config reloaded before the
+    session save has been changed by mutate_fresh."""
+    from api import authOIDCAPI as oidc_api
+
+    stale = _auth_cfg()
+    fresh = _auth_cfg()
+    mutate_fresh(fresh)
+    loads = [stale, fresh]
+    monkeypatch.setattr(oidc_api, "load_config", lambda: loads.pop(0))
+    saved: dict = {}
+    monkeypatch.setattr(oidc_api, "save_config", lambda c: saved.setdefault("cfg", c))
+    monkeypatch.setattr(
+        oidc_api.authOIDC,
+        "complete_flow",
+        lambda *_a, **_k: {
+            "ok": True,
+            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-nonce"),
+            "next": "/",
+            "identity": {"sub": "user-1", "username": "jared", "email": "", "groups": ["crosswatch"]},
+        },
+    )
+    req = _request(
+        "/api/app-auth/oidc/callback",
+        query="code=abc&state=st",
+        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"},
+    )
+    resp = oidc_api.api_oidc_callback(req)
+    assert saved == {}  # nothing may be written when policy rechecks fail
+    assert not fresh["app_auth"]["sessions"]
+    return resp
+
+
+def test_oidc_callback_rejects_when_oidc_disabled_mid_flow(monkeypatch) -> None:
+    def _disable(fresh):
+        fresh["app_auth"]["oidc"]["enabled"] = False
+
+    resp = _callback_with_policy_change(monkeypatch, _disable)
+    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
+
+
+def test_oidc_callback_rejects_when_group_revoked_mid_flow(monkeypatch) -> None:
+    def _revoke(fresh):
+        fresh["app_auth"]["oidc"]["allowed_groups"] = ["other-team"]
+
+    resp = _callback_with_policy_change(monkeypatch, _revoke)
+    assert resp.headers["location"] == "/login?local=1&oidc_error=denied"
+
+
+def test_oidc_callback_rejects_when_issuer_changed_mid_flow(monkeypatch) -> None:
+    def _swap(fresh):
+        fresh["app_auth"]["oidc"]["issuer"] = "https://new-idp.test/application/o/crosswatch/"
+
+    resp = _callback_with_policy_change(monkeypatch, _swap)
+    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
+
+
 def test_oidc_callback_mismatch_keeps_newer_flow_cookie(monkeypatch) -> None:
     """A stale callback losing the cookie race (two login tabs) must not
     delete the cookie that the newer pending flow still needs."""
