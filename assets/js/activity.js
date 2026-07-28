@@ -210,7 +210,10 @@
     if (!block || !host) return;
 
     if (authSetupPending()) {
-      if (!host.children.length) host.innerHTML = `<div class="activity-empty">Loading scrobble...</div>`;
+      if (!host.children.length) {
+        host.__cwLastHtml = `<div class="activity-empty">Loading scrobble...</div>`;
+        host.innerHTML = host.__cwLastHtml;
+      }
       scheduleRetry();
       return;
     }
@@ -229,12 +232,18 @@
         throw new Error("invalid_activity_response");
       }
       const items = data.items;
-      host.innerHTML = items.length
+      const html = items.length
         ? items.map((item) => rowHTML(item)).join("")
         : `<div class="activity-empty">${display.mode === "hours" ? `No recent scrobble in the last ${display.hours} hours.` : "No recent scrobble yet."}</div>`;
+      // Most 60s ticks return identical data; skip the list rebuild then.
+      if (host.__cwLastHtml !== html) {
+        host.__cwLastHtml = html;
+        host.innerHTML = html;
+      }
     } catch {
       if (!host.children.length || host.textContent.trim() === "Loading scrobble...") {
-        host.innerHTML = `<div class="activity-empty">Recent scrobble could not be loaded.</div>`;
+        host.__cwLastHtml = `<div class="activity-empty">Recent scrobble could not be loaded.</div>`;
+        host.innerHTML = host.__cwLastHtml;
       }
       scheduleRetry(2500);
     }
@@ -401,7 +410,12 @@
     injectCSS();
     bindViewAllButton();
     refreshRecentActivity();
-    if (!refreshTimer) refreshTimer = setInterval(refreshRecentActivity, 60000);
+    if (!refreshTimer) {
+      refreshTimer = setInterval(() => { if (!document.hidden) refreshRecentActivity(); }, 60000);
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") refreshRecentActivity();
+      });
+    }
   }
 
   if (document.readyState === "loading") {

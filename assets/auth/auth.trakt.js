@@ -258,7 +258,16 @@
 
     try {
       if (!window.__traktBannerTick) {
-        window.__traktBannerTick = setInterval(function(){ try { updateTraktBanner(); } catch (_) {} }, 800);
+        // Skip ticks while the tab is hidden or Settings is not on screen;
+        // this interval is never cleared, so idle cost must stay near zero.
+        window.__traktBannerTick = setInterval(function(){
+          try {
+            if (document.hidden) return;
+            var page = _el("page-settings");
+            if (!page || page.classList.contains("hidden")) return;
+            updateTraktBanner();
+          } catch (_) {}
+        }, 800);
       }
     } catch (_) {}
   }
