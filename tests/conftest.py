@@ -14,4 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 @pytest.fixture()
 def config_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CONFIG_BASE", str(tmp_path))
+    # Update the CONFIG variable in the config_base module to use the temp path
+    import cw_platform.config_base
+    monkeypatch.setattr(cw_platform.config_base, "CONFIG", tmp_path)
     return tmp_path

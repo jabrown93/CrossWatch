@@ -761,6 +761,18 @@ DEFAULT_CFG: dict[str, Any] = {
         },
         "sessions": [],
         "last_login_at": 0,
+        # External OIDC SSO (e.g. Authentik). Local credentials stay required
+        # as the break-glass login; OIDC only adds a second way in.
+        "oidc": {
+            "enabled": False,
+            "issuer": "",                # e.g. https://auth.example.com/application/o/crosswatch/ (keep trailing slash)
+            "client_id": "",
+            "client_secret": "",
+            "public_base_url": "",       # External base URL of CrossWatch, e.g. https://cw.example.com
+            "groups_claim": "groups",
+            "allowed_groups": [],        # Empty list denies every OIDC login
+            "session_hours": 12,         # OIDC-minted session lifetime, 1-168
+        },
     },
 
     # --- Pairs (UI-driven) ---------------------------------------------------
@@ -828,6 +840,9 @@ _SECRET_PATHS: list[tuple[str, ...]] = [
     ("app_auth", "password", "hash"),
     ("app_auth", "password", "salt"),
     ("app_auth", "session", "token_hash"),
+    ("app_auth", "oidc", "client_secret"),
+    # API key
+    ("security", "api_key"),
 ]
 
 
@@ -1634,6 +1649,23 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
         plex_sso["linked_email"] = ""
         plex_sso["linked_thumb"] = ""
         plex_sso["linked_at"] = 0
+
+    oidc = _ensure_dict(a, "oidc")
+    oidc["enabled"] = bool(oidc.get("enabled", False))
+    # Trailing slash is significant (Authentik issuers end with one) -- strip whitespace only.
+    oidc["issuer"] = str(oidc.get("issuer", "") or "").strip()
+    oidc["client_id"] = str(oidc.get("client_id", "") or "").strip()
+    oidc["client_secret"] = str(oidc.get("client_secret", "") or "").strip()
+    oidc["public_base_url"] = str(oidc.get("public_base_url", "") or "").strip().rstrip("/")
+    oidc["groups_claim"] = str(oidc.get("groups_claim", "groups") or "").strip() or "groups"
+    raw_groups = oidc.get("allowed_groups")
+    items = raw_groups if isinstance(raw_groups, list) else ([raw_groups] if raw_groups else [])
+    oidc["allowed_groups"] = [s for s in (str(x or "").strip() for x in items) if s]
+    try:
+        hours = int(oidc.get("session_hours", 12) or 12)
+    except Exception:
+        hours = 12
+    oidc["session_hours"] = min(max(hours, 1), 168)
 
     pwd = _ensure_dict(a, "password")
     pwd["scheme"] = str(pwd.get("scheme", "pbkdf2_sha256") or "pbkdf2_sha256").strip() or "pbkdf2_sha256"
