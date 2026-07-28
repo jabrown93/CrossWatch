@@ -74,12 +74,15 @@
   let pairsRefreshTO = null;
   let spotsModal = null;
   let esSummary = null;
-  // Highest SSE id seen from the summary stream; passed as ?since= on reopen
-  // so the server skips the full SYNC-buffer replay on every reconnect.
+  // Resume cursor for the summary stream, passed as ?since= on reopen so the
+  // server skips the full SYNC-buffer replay on every reconnect. Assigned (not
+  // maxed) from the dedicated cw:seq marker: after a backend restart the
+  // sequence space starts over, so a smaller id is newer, and the server
+  // treats an ahead-of-buffer cursor as stale either way.
   let lastSummarySeq = 0;
   const trackSummarySeq = (ev) => {
     const n = Number(ev?.lastEventId);
-    if (Number.isFinite(n) && n > lastSummarySeq) lastSummarySeq = n;
+    if (Number.isFinite(n) && n > 0) lastSummarySeq = n;
   };
   let esLogs = null;
   let runButtonWired = false;
@@ -722,14 +725,7 @@
       on(esSummary, ["run:error", "run:aborted"], () => {
         try { sync.error(); setRunButtonState(false); } catch {}
       });
-      on(esSummary, [
-        "log", "run:start", "run:pair", "feature:start", "one:plan", "two:plan",
-        "progress:snapshot", "snapshot:progress", "progress:apply",
-        "apply:add:progress", "apply:update:progress", "apply:remove:progress",
-        "apply:add:start", "apply:update:start", "apply:remove:start",
-        "apply:add:done", "apply:update:done", "apply:remove:done",
-        "run:error", "run:aborted",
-      ], trackSummarySeq);
+      on(esSummary, ["cw:seq"], trackSummarySeq);
       esSummary.onopen = () => safe(summaryStream.onOpen.bind(summaryStream));
       esSummary.onerror = () => summaryStream.onError();
     } catch {}

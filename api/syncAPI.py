@@ -2354,6 +2354,13 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
                 buf = LOG_BUFFERS.get("SYNC") or []
                 buf_len = len(buf)
                 base = _sync_log_base_seq()
+                # A cursor beyond the newest sequence is stale (client kept
+                # its position across a backend restart, where sequences
+                # begin again at 1); fall back to a full replay rather than
+                # suppressing events until the counter catches up.
+                newest = base + len(buf) - 1
+                if last_seq > newest:
+                    last_seq = base - 1
                 start_idx = max(0, last_seq + 1 - base)
                 if start_idx < len(buf):
                     for i in range(start_idx, len(buf)):
@@ -2370,6 +2377,12 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
                             yield f"data: {json.dumps(obj, separators=(',',':'))}\n\n"
                             emitted = True
                     last_seq = base + len(buf) - 1
+                    # Cursor marker: the client advances its resume position
+                    # from this event alone, so consumed batches count even
+                    # when their event types have no UI listener.
+                    yield f"id: {last_seq}\n"
+                    yield "event: cw:seq\n"
+                    yield f"data: {last_seq}\n\n"
             except Exception:
                 pass
 
