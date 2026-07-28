@@ -1,3 +1,10 @@
+## [1.1.4](https://github.com/jabrown93/CrossWatch/compare/v1.1.3...v1.1.4) (2026-07-28)
+
+
+### Performance Improvements
+
+* **sse:** resumable summary stream and reconnect backoff ([#68](https://github.com/jabrown93/CrossWatch/issues/68)) ([23effc6](https://github.com/jabrown93/CrossWatch/commit/23effc6902c3630f3848d4000556839739d21dfa))
+
 ## [1.1.3](https://github.com/jabrown93/CrossWatch/compare/v1.1.2...v1.1.3) (2026-07-28)
 
 
