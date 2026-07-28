@@ -1078,6 +1078,8 @@
   document.addEventListener("tab-changed", syncVisibility);
   document.addEventListener("config-saved", syncVisibility);
   window.addEventListener("load", syncVisibility, { once: true });
-  window.setInterval(syncVisibility, 1500);
+  // Safety net only — resize/visibility/tab/config events above cover every
+  // known state change, so poll slowly and never while hidden.
+  window.setInterval(() => { if (!document.hidden) syncVisibility(); }, 10000);
   refreshSoon();
 })();
