@@ -2258,6 +2258,26 @@ _SSE_HEARTBEAT_SEC = 15.0
 _SSE_HEARTBEAT_COMMENT = ": keep-alive\n\n"
 
 
+# Identifies this process's sequence space. Cursors are "<gen>:<seq>"; a
+# cursor minted by a previous process fails the generation match and falls
+# back to a full replay, regardless of how its numeric part compares to the
+# new process's counters.
+_STREAM_GEN = uuid.uuid4().hex[:12]
+
+
+def _parse_resume_cursor(value: Any) -> int:
+    s = str(value or "").strip()
+    if not s:
+        return 0
+    gen, _, seq = s.rpartition(":")
+    if gen != _STREAM_GEN:
+        return 0
+    try:
+        return max(0, int(seq))
+    except ValueError:
+        return 0
+
+
 def _sync_log_base_seq() -> int:
     """Absolute sequence number of the first line currently in the SYNC buffer."""
     import sys, importlib
@@ -2268,7 +2288,7 @@ def _sync_log_base_seq() -> int:
 
 
 @router.get("/run/summary/stream")
-async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingResponse:
+async def api_run_summary_stream(request: Request, since: str = "") -> StreamingResponse:
     import html, re
     TAG_RE = re.compile(r"<[^>]+>")
 
@@ -2327,16 +2347,12 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
     # fresh page loads; anything else skips already-delivered lines so a
     # flapping connection no longer re-parses and re-emits the whole 3000-line
     # SYNC buffer on every reconnect.
-    resume_seq = 0
     try:
-        resume_seq = max(0, int(request.headers.get("last-event-id") or 0))
+        resume_seq = _parse_resume_cursor(request.headers.get("last-event-id"))
     except Exception:
         resume_seq = 0
     if not resume_seq:
-        try:
-            resume_seq = max(0, int(since or 0))
-        except Exception:
-            resume_seq = 0
+        resume_seq = _parse_resume_cursor(since)
 
     async def agen():
         last_key = None
@@ -2377,7 +2393,7 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
                             except Exception:
                                 continue
                             evt = (str(obj.get("event") or "log").strip() or "log")
-                            yield f"id: {base + start_idx + j}\n"
+                            yield f"id: {_STREAM_GEN}:{base + start_idx + j}\n"
                             yield f"event: {evt}\n"
                             yield f"data: {json.dumps(obj, separators=(',',':'))}\n\n"
                             emitted = True
@@ -2385,9 +2401,9 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
                     # Cursor marker: the client advances its resume position
                     # from this event alone, so consumed batches count even
                     # when their event types have no UI listener.
-                    yield f"id: {last_seq}\n"
+                    yield f"id: {_STREAM_GEN}:{last_seq}\n"
                     yield "event: cw:seq\n"
-                    yield f"data: {last_seq}\n\n"
+                    yield f"data: {_STREAM_GEN}:{last_seq}\n\n"
             except Exception:
                 pass
 
