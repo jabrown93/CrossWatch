@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/jabrown93/CrossWatch/compare/v1.1.6...v1.2.0) (2026-07-28)
+
+
+### Features
+
+* **auth:** OIDC (Authentik) SSO + static API key ([#72](https://github.com/jabrown93/CrossWatch/issues/72)) ([d947b3b](https://github.com/jabrown93/CrossWatch/commit/d947b3bccb4e4a85bc8bf0827bab2dcf46fa198a))
+
 ## [1.1.6](https://github.com/jabrown93/CrossWatch/compare/v1.1.5...v1.1.6) (2026-07-28)
 
 
