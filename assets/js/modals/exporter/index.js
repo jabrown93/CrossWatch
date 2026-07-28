@@ -47,13 +47,17 @@ function enableColumnResize(table,key="cw.exporter.cols.v2"){
 
 // Document-level listener must outlive mount() but not the modal; kept here so
 // unmount() can remove it — otherwise each open leaks a handler pinning the
-// discarded modal subtree.
-let onDocClick=null;
+// discarded modal subtree. The generation counter stops a stale mount (its
+// awaits still in flight when the modal is reopened or unmounted) from
+// wiring its handler over the live mount's.
+let onDocClick=null, mountGen=0;
 
 export default {
   async mount(root){
+    const gen=++mountGen;
     injectCSS();
     await injectExporterStyles();
+    if(gen!==mountGen) return;
     const shell=root.closest(".cx-modal-shell");
     shell?.classList.add("cw-exporter-modal");
     root.classList.add("cw-exporter-modal");
@@ -140,6 +144,7 @@ export default {
     const autoRefresh=debounce(()=>renderPreview(true),200), reset=cb=>()=>{state.selected.clear(); state.mode="all"; allChk.checked=true; cb?.(); savePrefs(); autoRefresh()};
     provBtn.addEventListener("click",e=>{e.stopPropagation(); provMenu.classList.contains("open")?closeProv():openProv()});
     provMenu.addEventListener("click",e=>{const btn=e.target.closest(".prov-opt"); if(!btn) return; provSel.value=btn.dataset.provider; closeProv(); reset(syncInstances)()});
+    if(gen!==mountGen) return;
     if(onDocClick) document.removeEventListener("click",onDocClick);
     onDocClick=e=>{if(!e.target.closest(".provider-field")) closeProv()};
     document.addEventListener("click",onDocClick);
@@ -158,6 +163,7 @@ export default {
     await renderPreview(false);
   },
   unmount(){
+    mountGen++;
     if(onDocClick){document.removeEventListener("click",onDocClick); onDocClick=null;}
   }
 };
