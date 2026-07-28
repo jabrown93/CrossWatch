@@ -579,8 +579,16 @@ def _norm_log_tag(tag: str | None) -> str:
         return "SYNC"
     return t
 
-def _get_log_buf(tag: str | None) -> List[str]:
+def _get_log_buf(tag: str | None, *, create: bool = True) -> List[str]:
+    """Return the buffer for ``tag``.
+
+    Readers must pass ``create=False``: the tag flows straight from query
+    strings, and setdefault would permanently add a buffer (plus seq entries)
+    per distinct value — unbounded, client-driven memory growth.
+    """
     t = _norm_log_tag(tag)
+    if not create and t not in LOG_BUFFERS:
+        return []
     buf = LOG_BUFFERS.setdefault(t, [])
     if t not in LOG_NEXT_SEQ:
         LOG_NEXT_SEQ[t] = 1
@@ -591,7 +599,7 @@ def _get_log_buf(tag: str | None) -> List[str]:
     return buf
 
 def _log_lines(tag: str | None, tail: int | None = None) -> List[str]:
-    buf = _get_log_buf(tag)
+    buf = _get_log_buf(tag, create=False)
     if not tail:
         return list(buf)
     return buf[-int(tail):]
@@ -936,7 +944,7 @@ async def api_logs_stream_initial(
     tag = _norm_log_tag(tag)
 
     async def agen():
-        buf = list(_get_log_buf(tag))
+        buf = list(_get_log_buf(tag, create=False))
         base = int(LOG_BASE_SEQ.get(tag, int(LOG_NEXT_SEQ.get(tag, 1))))
         if since is not None:
             last_seq = max(int(since), base - 1)
@@ -954,7 +962,7 @@ async def api_logs_stream_initial(
         while True:
             if await request.is_disconnected():
                 break
-            new_buf = _get_log_buf(tag)
+            new_buf = _get_log_buf(tag, create=False)
             base = int(LOG_BASE_SEQ.get(tag, int(LOG_NEXT_SEQ.get(tag, 1))))
             if last_seq < base - 1:
                 last_seq = base - 1
@@ -998,7 +1006,7 @@ async def api_logs_watcher(
         last_seq: Dict[str, int] = {}
 
         for t in tags_sel:
-            buf = _get_log_buf(t)
+            buf = _get_log_buf(t, create=False)
             start = max(0, len(buf) - int(tail))
             for line in buf[start:]:
                 safe = _log_stream_text(line, plain)
@@ -1012,7 +1020,7 @@ async def api_logs_watcher(
                 break
 
             for t in tags_sel:
-                buf = _get_log_buf(t)
+                buf = _get_log_buf(t, create=False)
                 base = int(LOG_BASE_SEQ.get(t, int(LOG_NEXT_SEQ.get(t, 1))))
                 seen = int(last_seq.get(t, base - 1))
                 if seen < base - 1:

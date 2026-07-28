@@ -2258,8 +2258,17 @@ _SSE_HEARTBEAT_SEC = 15.0
 _SSE_HEARTBEAT_COMMENT = ": keep-alive\n\n"
 
 
+def _sync_log_base_seq() -> int:
+    """Absolute sequence number of the first line currently in the SYNC buffer."""
+    import sys, importlib
+    m = sys.modules.get("crosswatch") or sys.modules.get("__main__")
+    if m is None or not hasattr(m, "LOG_BASE_SEQ"):
+        m = importlib.import_module("crosswatch")
+    return int(m.LOG_BASE_SEQ.get("SYNC", int(m.LOG_NEXT_SEQ.get("SYNC", 1))))
+
+
 @router.get("/run/summary/stream")
-async def api_run_summary_stream(request: Request) -> StreamingResponse:
+async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingResponse:
     import html, re
     TAG_RE = re.compile(r"<[^>]+>")
 
@@ -2313,9 +2322,25 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             return tuple(sorted((str(k).upper(), int(v or 0)) for k, v in counts.items()))
         except Exception:
             return ()
+    # Resume point: Last-Event-ID (browser auto-reconnect) wins over ?since=
+    # (explicit client reopen). 0 keeps the historic full-buffer replay for
+    # fresh page loads; anything else skips already-delivered lines so a
+    # flapping connection no longer re-parses and re-emits the whole 3000-line
+    # SYNC buffer on every reconnect.
+    resume_seq = 0
+    try:
+        resume_seq = max(0, int(request.headers.get("last-event-id") or 0))
+    except Exception:
+        resume_seq = 0
+    if not resume_seq:
+        try:
+            resume_seq = max(0, int(since or 0))
+        except Exception:
+            resume_seq = 0
+
     async def agen():
         last_key = None
-        last_idx = 0
+        last_seq = resume_seq
         last_hydrate_sig = None
         last_emit = time.monotonic()
         LOG_BUFFERS = _rt()[0]
@@ -2328,10 +2353,22 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             try:
                 buf = LOG_BUFFERS.get("SYNC") or []
                 buf_len = len(buf)
-                if last_idx > len(buf):
-                    last_idx = 0
-                if last_idx < len(buf):
-                    for line in buf[last_idx:]:
+                base = _sync_log_base_seq()
+                # A cursor beyond the newest sequence is stale (client kept
+                # its position across a backend restart, where sequences
+                # begin again at 1); fall back to a full replay rather than
+                # suppressing events until the counter catches up.
+                newest = base + len(buf) - 1
+                if last_seq > newest:
+                    last_seq = base - 1
+                start_idx = max(0, last_seq + 1 - base)
+                # Snapshot the batch: buf is the live buffer and each yield is
+                # a suspension point, so appends (or head trims) during
+                # emission would otherwise let the cursor advance past records
+                # that were never iterated.
+                batch = buf[start_idx:]
+                if batch:
+                    for j, line in enumerate(batch):
                         raw = dehtml(line).strip()
                         if raw.startswith("{"):
                             try:
@@ -2340,10 +2377,17 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
                             except Exception:
                                 continue
                             evt = (str(obj.get("event") or "log").strip() or "log")
+                            yield f"id: {base + start_idx + j}\n"
                             yield f"event: {evt}\n"
                             yield f"data: {json.dumps(obj, separators=(',',':'))}\n\n"
                             emitted = True
-                    last_idx = len(buf)
+                    last_seq = base + start_idx + len(batch) - 1
+                    # Cursor marker: the client advances its resume position
+                    # from this event alone, so consumed batches count even
+                    # when their event types have no UI listener.
+                    yield f"id: {last_seq}\n"
+                    yield "event: cw:seq\n"
+                    yield f"data: {last_seq}\n\n"
             except Exception:
                 pass
 

@@ -74,6 +74,16 @@
   let pairsRefreshTO = null;
   let spotsModal = null;
   let esSummary = null;
+  // Resume cursor for the summary stream, passed as ?since= on reopen so the
+  // server skips the full SYNC-buffer replay on every reconnect. Assigned (not
+  // maxed) from the dedicated cw:seq marker: after a backend restart the
+  // sequence space starts over, so a smaller id is newer, and the server
+  // treats an ahead-of-buffer cursor as stale either way.
+  let lastSummarySeq = 0;
+  const trackSummarySeq = (ev) => {
+    const n = Number(ev?.lastEventId);
+    if (Number.isFinite(n) && n > 0) lastSummarySeq = n;
+  };
   let esLogs = null;
   let runButtonWired = false;
   let hubLayoutHost = null;
@@ -455,7 +465,11 @@
           more.style.marginLeft = "auto";
           more.addEventListener("click", (ev) => {
             ev.stopPropagation();
-            openSpotsModal(feat.label, { add: spotAdd, rem: spotRem, upd: spotUpd });
+            // Read the lane fresh: the render skip below can keep this
+            // listener alive across summaries whose visible rows are
+            // identical but whose full spotlight lists changed.
+            const cur = getLaneStats(summary || {}, feat.key);
+            openSpotsModal(feat.label, { add: cur.spotAdd, rem: cur.spotRem, upd: cur.spotUpd });
           });
           lastRow.appendChild(more);
         }
@@ -464,6 +478,11 @@
       lane.appendChild(body);
       wrap.appendChild(lane);
     }
+    // Polling re-renders identical payloads; skip the live-DOM swap (and its
+    // style/layout invalidation + repaint) when nothing visible changed.
+    const html = wrap.innerHTML;
+    if (html === renderLanes._lastHtml && elLanes.firstChild) return;
+    renderLanes._lastHtml = html;
     elLanes.replaceChildren(wrap);
   }
 
@@ -690,6 +709,7 @@
       safe(esSummary?.close?.bind(esSummary));
       const url = new URL("/api/run/summary/stream", document.baseURI);
       url.searchParams.set("_ts", String(nowTs()));
+      if (lastSummarySeq > 0) url.searchParams.set("since", String(lastSummarySeq));
       esSummary = new EventSource(url.toString());
       window.esSum = esSummary;
       esSummary.onmessage = (ev) => {
@@ -714,6 +734,7 @@
       on(esSummary, ["run:error", "run:aborted"], () => {
         try { sync.error(); setRunButtonState(false); } catch {}
       });
+      on(esSummary, ["cw:seq"], trackSummarySeq);
       esSummary.onopen = () => safe(summaryStream.onOpen.bind(summaryStream));
       esSummary.onerror = () => summaryStream.onError();
     } catch {}
@@ -752,6 +773,7 @@
     if (authSetupPending()) return;
     summaryStream.onVisibility();
     openLogStream();
+    tick();
   });
 
   window.addEventListener("auth-changed", () => {
@@ -770,6 +792,15 @@
   });
 
   async function tick() {
+    if (document.hidden) {
+      // SSE closes on hide (summaryStream.onVisibility), which flips sseUp
+      // false and turned this loop into a fetch + full lanes rebuild every 6s
+      // for as long as the tab was backgrounded. Idle until visible again;
+      // the visibilitychange handler re-syncs immediately on return.
+      clearTimeout(tick._t);
+      tick._t = setTimeout(tick, 30000);
+      return;
+    }
     if (authSetupPending()) {
       try { esSummary?.close?.(); } catch {}
       esSummary = null;

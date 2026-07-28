@@ -686,6 +686,7 @@ function openDebugLog() {
     const es = new EventSource(url.toString());
     window.esDebug = es;
     es.onopen = () => {
+      window._debugRetryN = 0;
       tabDebug?.classList.add("connected");
       tabDebug?.classList.remove("stale");
       _updateDetailsConsoleStatus();
@@ -713,10 +714,14 @@ function openDebugLog() {
       try { window.esDebug?.close?.(); } catch {}
       window.esDebug = null;
 
+      // Exponential backoff: a persistently failing stream retried every
+      // 1.2s forever, and each connect replays the tail. Reset on open.
+      const n = Math.max(0, Number(window._debugRetryN || 0));
+      window._debugRetryN = n + 1;
       if (window._debugRetryTO) clearTimeout(window._debugRetryTO);
       window._debugRetryTO = setTimeout(() => {
         if (_detailsVisible() && window._detailsTab === "debug") { try { openDebugLog(); } catch {} }
-      }, 1200);
+      }, Math.min(15000, 1200 * Math.pow(2, n)));
     };
 
     if (window._debugStaleIV) clearInterval(window._debugStaleIV);
@@ -806,6 +811,7 @@ async function openWatcherLog() {
     url.searchParams.set("_ts", String(Date.now()));
     const es = new EventSource(url.toString());
     window.esWatch = es;
+    es.onopen = () => { window._watchRetryN = 0; };
     tabWatch?.classList.add("connected");
     tabWatch?.classList.remove("stale");
     _updateDetailsConsoleStatus();
@@ -823,10 +829,14 @@ async function openWatcherLog() {
       try { window.esWatch?.close?.(); } catch {}
       window.esWatch = null;
 
+      // Exponential backoff: a persistently failing stream retried every
+      // 1.2s forever, and /api/logs/watcher replays its tail per connect.
+      const n = Math.max(0, Number(window._watchRetryN || 0));
+      window._watchRetryN = n + 1;
       if (window._watchRetryTO) clearTimeout(window._watchRetryTO);
       window._watchRetryTO = setTimeout(() => {
         if (_detailsVisible() && window._detailsTab === "watcher") { try { openWatcherLog(); } catch {} }
-      }, 1200);
+      }, Math.min(15000, 1200 * Math.pow(2, n)));
     };
 
     if (window._watchStaleIV) clearInterval(window._watchStaleIV);

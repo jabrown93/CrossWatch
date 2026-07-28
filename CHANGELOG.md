@@ -1,3 +1,24 @@
+## [1.1.4](https://github.com/jabrown93/CrossWatch/compare/v1.1.3...v1.1.4) (2026-07-28)
+
+
+### Performance Improvements
+
+* **sse:** resumable summary stream and reconnect backoff ([#68](https://github.com/jabrown93/CrossWatch/issues/68)) ([23effc6](https://github.com/jabrown93/CrossWatch/commit/23effc6902c3630f3848d4000556839739d21dfa))
+
+## [1.1.3](https://github.com/jabrown93/CrossWatch/compare/v1.1.2...v1.1.3) (2026-07-28)
+
+
+### Bug Fixes
+
+* **logs:** stop unbounded log-buffer growth from reader endpoints ([#70](https://github.com/jabrown93/CrossWatch/issues/70)) ([a1cea79](https://github.com/jabrown93/CrossWatch/commit/a1cea79d72d3a6717109a3a2ba504c973eb31636))
+
+## [1.1.2](https://github.com/jabrown93/CrossWatch/compare/v1.1.1...v1.1.2) (2026-07-28)
+
+
+### Performance Improvements
+
+* **ui:** stop hidden-tab poll churn and redundant lane rebuilds ([#67](https://github.com/jabrown93/CrossWatch/issues/67)) ([62ab99c](https://github.com/jabrown93/CrossWatch/commit/62ab99c11b0a1561acf9dade522311c05bc25f14))
+
 ## [1.1.1](https://github.com/jabrown93/CrossWatch/compare/v1.1.0...v1.1.1) (2026-07-28)
 
 
