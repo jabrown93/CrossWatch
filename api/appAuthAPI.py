@@ -13,7 +13,7 @@ import os
 import secrets
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -29,6 +29,7 @@ __all__ = [
     "auth_required",
     "credentials_configured",
     "is_authenticated",
+    "api_key_authenticated",
     "reset_pending",
     "setup_lock_required",
     "verify_setup_token",
@@ -399,6 +400,20 @@ def is_authenticated(cfg: dict[str, Any], token: str | None) -> bool:
     return _find_session(a, token) is not None
 
 
+API_KEY_HEADER = "x-api-key"
+
+
+def api_key_authenticated(cfg: dict[str, Any], request: Request) -> bool:
+    sec = cfg.get("security") if isinstance(cfg, dict) else {}
+    want = str((sec or {}).get("api_key") or "").strip() if isinstance(sec, dict) else ""
+    if not want:
+        return False
+    got = str(request.headers.get(API_KEY_HEADER) or "").strip()
+    if not got:
+        return False
+    return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+
+
 def _rate_limit_ok(request: Request) -> tuple[bool, int]:
     ip = _effective_client_ip(request)
     rec = _LOGIN_FAILS.get(ip) or {"n": 0, "until": 0}
@@ -452,13 +467,14 @@ def _login_error_payload(*, error: str, attempts: int, retry_after: int = 0) -> 
     }
 
 
-def _issue_session(cfg: dict[str, Any], request: Request) -> tuple[str, int]:
+def _issue_session(cfg: dict[str, Any], request: Request, *, ttl_sec: int | None = None) -> tuple[str, int]:
     token = secrets.token_urlsafe(32)
     a = cfg.setdefault("app_auth", {})
     if not isinstance(a, dict):
         a = {}
         cfg["app_auth"] = a
-    exp = _now() + _session_ttl_sec(a)
+    ttl = int(ttl_sec) if ttl_sec and int(ttl_sec) > 0 else _session_ttl_sec(a)
+    exp = _now() + ttl
 
     sessions = _prune_sessions(_iter_sessions(a))
     ip = getattr(getattr(request, "client", None), "host", "") or ""
@@ -852,8 +868,13 @@ body::before{
 }
 """
 
+_OIDC_ERROR_TEXT = {
+    "denied": "Your account is not allowed to sign in to CrossWatch. Use local sign-in below.",
+    "start_failed": "Single sign-on could not start. Use local sign-in below.",
+    "failed": "Single sign-on failed. Use local sign-in below or try again.",
+}
 
-def _login_html(username: str, *, plex_sso_available: bool = False) -> str:
+def _login_html(username: str, *, plex_sso_available: bool = False, oidc_login_url: str = "", oidc_error_text: str = "") -> str:
     u = (username or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     plex_html = ""
     if plex_sso_available:
@@ -863,6 +884,15 @@ def _login_html(username: str, *, plex_sso_available: bool = False) -> str:
           <p class="cw-plex-copy">Use your linked Plex account, then return here to finish sign-in.</p>
         </div>
         """
+    oidc_html = ""
+    if oidc_login_url:
+        oidc_html = f"""
+        <div class="cw-action-plex">
+          <a class="btn" style="display:grid;place-items:center;text-decoration:none;width:100%;min-height:52px" href="{oidc_login_url}">Sign in with SSO</a>
+        </div>
+        """
+    err = (oidc_error_text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    msg_cls = "cw-msg show" if err else "cw-msg"
     return f"""<!doctype html>
 <html lang=\"en\"><head>
   <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
@@ -901,7 +931,7 @@ def _login_html(username: str, *, plex_sso_available: bool = False) -> str:
         <p class=\"sub\">Use your local CrossWatch admin credentials to continue.</p>
       </div>
       <div id=\"help\" class=\"cw-banner\" role=\"status\" aria-live=\"polite\"></div>
-      <div id=\"msg\" class=\"cw-msg\" role=\"alert\" aria-live=\"assertive\"></div>
+      <div id=\"msg\" class=\"{msg_cls}\" role=\"alert\" aria-live=\"assertive\">{err}</div>
       <div class=\"cw-form\">
         <div class=\"cw-field\">
           <label for=\"u\">Username</label>
@@ -920,6 +950,7 @@ def _login_html(username: str, *, plex_sso_available: bool = False) -> str:
             <button class=\"btn acc\" id=\"go\">Sign in</button>
           </div>
           {plex_html}
+          {oidc_html}
         </div>
       </div>
     </section>
@@ -1317,11 +1348,50 @@ def register_app_auth(app) -> None:
     except Exception:
         pass
 
+    try:
+        from .authOIDCAPI import register_auth_oidc
+
+        register_auth_oidc(app)
+    except Exception:
+        pass
+
     @app.get("/login", include_in_schema=False, tags=["ui"])
-    def ui_login() -> Response:
+    def ui_login(request: Request) -> Response:
         cfg = load_config()
         if not auth_required(cfg):
             return RedirectResponse(url="/", status_code=302)
+
+        qp = request.query_params
+        force_local = str(qp.get("local") or "").strip().lower() in {"1", "true", "yes"}
+        oidc_error = str(qp.get("oidc_error") or "").strip()
+        next_path = str(qp.get("next") or "/")
+        if not (next_path.startswith("/") and not next_path.startswith("//")):
+            next_path = "/"
+
+        oidc_available = False
+        authOIDC = None
+        try:
+            from services import authOIDC as _authOIDC
+
+            authOIDC = _authOIDC
+            oidc_available = authOIDC.login_available(cfg)
+        except Exception:
+            oidc_available = False
+
+        # oidc_error present means we just bounced back from a failed SSO
+        # attempt -- rendering the form instead of redirecting again breaks
+        # the redirect loop. setup_lock_required prevents redirect during password-reset state.
+        if oidc_available and not force_local and not oidc_error and not setup_lock_required(cfg):
+            try:
+                if authOIDC and authOIDC.issuer_reachable(cfg):
+                    return RedirectResponse(
+                        url="/api/app-auth/oidc/login?" + urlencode({"next": next_path}),
+                        status_code=302,
+                        headers={"Cache-Control": "no-store"},
+                    )
+            except Exception:
+                pass
+
         a = _cfg_auth(cfg)
         username = str(a.get("username") or "")
         try:
@@ -1330,7 +1400,19 @@ def register_app_auth(app) -> None:
             plex_sso_available = authPlex.login_available(cfg)
         except Exception:
             plex_sso_available = False
-        return HTMLResponse(_login_html(username, plex_sso_available=plex_sso_available), headers={"Cache-Control": "no-store"})
+
+        oidc_login_url = ""
+        if oidc_available:
+            oidc_login_url = "/api/app-auth/oidc/login?" + urlencode({"next": next_path})
+        return HTMLResponse(
+            _login_html(
+                username,
+                plex_sso_available=plex_sso_available,
+                oidc_login_url=oidc_login_url,
+                oidc_error_text=_OIDC_ERROR_TEXT.get(oidc_error, _OIDC_ERROR_TEXT["failed"]) if oidc_error else "",
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/logout", include_in_schema=False, tags=["ui"])
     def ui_logout(request: Request) -> Response:
@@ -1338,6 +1420,10 @@ def register_app_auth(app) -> None:
         token = request.cookies.get(COOKIE_NAME)
         _drop_session(cfg, token)
         save_config(cfg)
-        resp = RedirectResponse(url="/login" if auth_required(cfg) else "/")
+        if auth_required(cfg):
+            url = "/login?local=1"
+        else:
+            url = "/"
+        resp = RedirectResponse(url=url)
         _del_cookie(resp, request)
         return resp
