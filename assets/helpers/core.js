@@ -75,7 +75,6 @@
   const PAIRS_CACHE_KEY = "cw.pairs.v1";
   const PAIRS_TTL_MS = 15_000;
   const STATUS_CACHE_KEY = "cw.status.v1";
-  const DETAILS_MAX_LINES = 2500;
   const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
   const ROUTE_TABS = new Set(["main", "watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"]);
   const SETTINGS_PANES = new Set(["overview", "providers", "sync", "scrobbler", "scheduling", "app", "maintenance"]);
@@ -1928,7 +1927,7 @@ Object.assign(window, {
   computeRedirectURI, recomputeRunDisabled, relTimeFromEpoch,
   showTab, toggleSection, runSync,
   copySummary, loadPairs, cxSavePair,
-  cwToggleSyncMenu, DETAILS_MAX_LINES,
+  cwToggleSyncMenu,
 });
 CW.checkForUpdate = checkForUpdate;
 

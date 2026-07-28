@@ -1,3 +1,10 @@
+## [1.1.2](https://github.com/jabrown93/CrossWatch/compare/v1.1.1...v1.1.2) (2026-07-28)
+
+
+### Performance Improvements
+
+* **ui:** stop hidden-tab poll churn and redundant lane rebuilds ([#67](https://github.com/jabrown93/CrossWatch/issues/67)) ([62ab99c](https://github.com/jabrown93/CrossWatch/commit/62ab99c11b0a1561acf9dade522311c05bc25f14))
+
 ## [1.1.1](https://github.com/jabrown93/CrossWatch/compare/v1.1.0...v1.1.1) (2026-07-28)
 
 
