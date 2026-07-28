@@ -7,6 +7,8 @@ import logging
 import os
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 _LOG = logging.getLogger("crosswatch.event_archive")
@@ -21,6 +23,8 @@ _LOCAL = threading.local()
 # Registry so close_conn() can still drop every handle, not just the caller's.
 _CONNS: dict[int, sqlite3.Connection] = {}
 _GENERATION = 0
+# Set while the database files are being replaced; see suspended().
+_SUSPENDED = False
 
 _MEMORY_URI = "file:crosswatch_events_mem?mode=memory&cache=shared"
 
@@ -112,11 +116,16 @@ def get_conn() -> sqlite3.Connection | None:
         if not stale:
             _LOG.warning("event archive database file missing; recreating %s", want)
         _forget_local()
-    # Retry if close_conn() lands between connect() and registration: rebuild()
-    # unlinks the file straight after, so a handle opened in that window points
-    # at a dead inode while looking current.
+    # Retry if the generation moves between connect() and registration: a handle
+    # opened in that window can point at an inode suspended() is about to unlink,
+    # while still looking current.
     for _ in range(3):
-        generation = _GENERATION
+        with _LOCK:
+            if _SUSPENDED:
+                _LOCAL.conn = None
+                _LOCAL.path = None
+                return None
+            generation = _GENERATION
         try:
             conn = connect(want)
         except Exception as exc:
@@ -125,7 +134,7 @@ def get_conn() -> sqlite3.Connection | None:
             _LOCAL.path = None
             return None
         with _LOCK:
-            if _GENERATION == generation:
+            if not _SUSPENDED and _GENERATION == generation:
                 _prune_dead_locked()
                 _CONNS[threading.get_ident()] = conn
                 _LOCAL.generation = generation
@@ -158,22 +167,56 @@ def _prune_dead_locked() -> None:
             pass
 
 
-def close_conn() -> None:
-    """Drop every thread's connection, not just the caller's.
+def _invalidate_locked() -> None:
+    """Close every registered connection and make outstanding handles stale.
 
-    rebuild() unlinks the database file right after this returns, so a handle
-    left open in a watcher thread would keep writing into the dead inode. The
-    generation bump makes those threads reconnect on their next get_conn()
-    instead of reusing a closed handle.
+    Callers hold _LOCK. The generation bump is what stops a thread that is
+    holding a now-closed handle from reusing it on its next get_conn().
     """
     global _GENERATION
+    _GENERATION += 1
+    for conn in _CONNS.values():
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _CONNS.clear()
+
+
+def close_conn() -> None:
+    """Drop every thread's connection, not just the caller's."""
     with _LOCK:
-        _GENERATION += 1
-        for conn in _CONNS.values():
-            try:
-                conn.close()
-            except Exception:
-                pass
-        _CONNS.clear()
+        _invalidate_locked()
     _LOCAL.conn = None
     _LOCAL.path = None
+
+
+@contextmanager
+def suspended() -> Iterator[None]:
+    """Bar connection creation for the duration of the block.
+
+    close_conn() alone is not enough for rebuild(): it unlinks the database
+    files a moment later, and a watcher calling get_conn() in between would
+    register a connection against the doomed inode carrying the current
+    generation. Nothing would mark it stale afterwards -- rebuild recreates the
+    file, so the existence check passes -- and that thread's writes would
+    disappear into the deleted inode.
+
+    get_conn() returns None while suspended. Recorders already treat that as
+    "archive unavailable" and skip the write, which is the correct outcome
+    while the archive is being replaced.
+    """
+    global _SUSPENDED
+    with _LOCK:
+        _SUSPENDED = True
+        _invalidate_locked()
+    _LOCAL.conn = None
+    _LOCAL.path = None
+    try:
+        yield
+    finally:
+        with _LOCK:
+            # Bump again so anything opened against the old files during the
+            # block is treated as stale rather than current.
+            _invalidate_locked()
+            _SUSPENDED = False

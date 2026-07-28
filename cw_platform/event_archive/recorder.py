@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from ..provider_instances import normalize_instance_id
 from .db import get_conn
 
 _LOG = logging.getLogger("crosswatch.event_archive")
@@ -63,10 +64,11 @@ _INSTANCE_FIELDS = frozenset({"source_instance", "destination_instance", "origin
 
 def _instance_token(v: Any) -> str:
     # Producers spell the default instance as None, "", or "default" depending on
-    # whether they went through normalize_instance_id(). Folding them together
-    # keeps single-instance setups deduplicating exactly as they did before.
-    s = str(v or "").strip().lower()
-    return "default" if not s else s
+    # whether they went through normalize_instance_id(). Reuse that function so
+    # two ids hash alike exactly when they resolve to the same config block --
+    # it folds the default spellings but preserves case elsewhere, and
+    # get_provider_block() looks instances up by exact key.
+    return normalize_instance_id(v)
 
 
 def compute_event_hash(row: Mapping[str, Any], *, extra: Any = None) -> str:

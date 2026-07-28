@@ -159,6 +159,78 @@ def test_writers_survive_concurrent_close_conn(archive):
     assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == sum(written)
 
 
+def test_no_connection_survives_the_rebuild_unlink(archive):
+    """A connection opened mid-rebuild must not outlive the unlink.
+
+    close_conn() alone left a window: a thread connecting after it returned but
+    before the files were removed held the current generation, so nothing marked
+    it stale once rebuild recreated the file, and its writes went to the
+    deleted inode.
+    """
+    from cw_platform.event_archive import maintenance
+
+    escaped: dict[str, object] = {}
+
+    real_unlink = ea_db.Path.unlink
+
+    def unlink_racing_a_writer(self, *args, **kwargs):
+        # Stand in for a watcher thread that wakes up mid-rebuild.
+        def racer():
+            escaped["conn"] = ea_db.get_conn()
+
+        t = threading.Thread(target=racer)
+        t.start()
+        t.join(timeout=5)
+        return real_unlink(self, *args, **kwargs)
+
+    ea_recorder.record_events([_row()])
+    ea_db.Path.unlink = unlink_racing_a_writer
+    try:
+        result = maintenance.rebuild(reimport=False)
+    finally:
+        ea_db.Path.unlink = real_unlink
+
+    assert result["ok"] is True
+    # The racing thread is barred while the files are being replaced.
+    assert escaped["conn"] is None
+
+    # Post-rebuild writes land in the database the rebuild created.
+    assert ea_recorder.record_events([_row(item_key="imdb:tt9999999")]) == 1
+    fresh = sqlite3.connect(str(archive))
+    try:
+        rows = fresh.execute("SELECT item_key FROM events").fetchall()
+    finally:
+        fresh.close()
+    assert [r[0] for r in rows] == ["imdb:tt9999999"]
+
+
+def test_suspension_lifts_after_rebuild(archive):
+    from cw_platform.event_archive import maintenance
+
+    maintenance.rebuild(reimport=False)
+    assert ea_db.get_conn() is not None
+
+
+def test_suspension_lifts_when_rebuild_fails(archive):
+    """rebuild() returns early on unlink failure; suspension must not stick."""
+    from cw_platform.event_archive import maintenance
+
+    real_unlink = ea_db.Path.unlink
+
+    def boom(self, *args, **kwargs):
+        raise OSError("nope")
+
+    ea_recorder.record_events([_row()])
+    ea_db.Path.unlink = boom
+    try:
+        result = maintenance.rebuild(reimport=False)
+    finally:
+        ea_db.Path.unlink = real_unlink
+
+    assert result["ok"] is False
+    assert ea_db.get_conn() is not None
+
+
 def test_dead_threads_do_not_leak_connections(archive):
     for _ in range(5):
         t = threading.Thread(target=ea_db.get_conn)
@@ -178,6 +250,18 @@ def test_hash_separates_destination_instances():
 def test_hash_separates_source_and_origin_instances():
     assert _row(source_instance="a")["event_hash"] != _row(source_instance="b")["event_hash"]
     assert _row(origin_instance="a")["event_hash"] != _row(origin_instance="b")["event_hash"]
+
+
+def test_hash_preserves_instance_case():
+    """normalize_instance_id() only folds case for the default instance.
+
+    get_provider_block() looks instances up by exact key, so "Family" and
+    "family" can select different configured accounts and must not collide.
+    """
+    assert (
+        _row(destination_instance="Family")["event_hash"]
+        != _row(destination_instance="family")["event_hash"]
+    )
 
 
 @pytest.mark.parametrize("spelling", [None, "", "  ", "default", "DEFAULT"])
