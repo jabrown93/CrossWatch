@@ -1354,9 +1354,11 @@ def register_app_auth(app) -> None:
             next_path = "/"
 
         oidc_available = False
+        authOIDC = None
         try:
-            from services import authOIDC
+            from services import authOIDC as _authOIDC
 
+            authOIDC = _authOIDC
             oidc_available = authOIDC.login_available(cfg)
         except Exception:
             oidc_available = False
@@ -1366,9 +1368,7 @@ def register_app_auth(app) -> None:
         # the redirect loop.
         if oidc_available and not force_local and not oidc_error:
             try:
-                from services import authOIDC
-
-                if authOIDC.issuer_reachable(cfg):
+                if authOIDC and authOIDC.issuer_reachable(cfg):
                     return RedirectResponse(
                         url="/api/app-auth/oidc/login?" + urlencode({"next": next_path}),
                         status_code=302,

@@ -296,6 +296,7 @@ def test_login_shows_mapped_error_not_raw_query(monkeypatch) -> None:
     body = resp.body.decode("utf-8")
     assert "<script>alert" not in body
     assert "Single sign-on failed" in body
+    assert 'class="cw-msg show"' in body
 
 
 def test_login_no_redirect_when_oidc_disabled(monkeypatch) -> None:
@@ -307,3 +308,21 @@ def test_login_no_redirect_when_oidc_disabled(monkeypatch) -> None:
     assert resp.status_code == 200
     body = resp.body.decode("utf-8")
     assert "/api/app-auth/oidc/login" not in body
+
+
+def test_login_sanitizes_malicious_next_paths(monkeypatch) -> None:
+    from services import authOIDC
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
+    endpoint = _login_route(monkeypatch, cfg)
+
+    # Protocol-relative URL should be sanitized to "/"
+    resp = endpoint(_request("/login", query="next=//evil.example"))
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2F"
+
+    # Absolute URL should be sanitized to "/"
+    resp = endpoint(_request("/login", query="next=https://evil.example"))
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2F"
