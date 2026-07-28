@@ -272,6 +272,17 @@ def test_oidc_callback_rejects_when_group_revoked_mid_flow(monkeypatch) -> None:
     assert resp.headers["location"] == "/login?local=1&oidc_error=denied"
 
 
+def test_oidc_callback_rejects_when_groups_claim_changed_mid_flow(monkeypatch) -> None:
+    """Groups in the identity were extracted under the old claim; a changed
+    claim invalidates them even if the allowlist still matches."""
+
+    def _swap_claim(fresh):
+        fresh["app_auth"]["oidc"]["groups_claim"] = "roles"
+
+    resp = _callback_with_policy_change(monkeypatch, _swap_claim)
+    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
+
+
 def test_oidc_callback_rejects_when_issuer_changed_mid_flow(monkeypatch) -> None:
     def _swap(fresh):
         fresh["app_auth"]["oidc"]["issuer"] = "https://new-idp.test/application/o/crosswatch/"

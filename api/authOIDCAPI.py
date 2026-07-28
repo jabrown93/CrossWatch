@@ -135,16 +135,16 @@ def api_oidc_callback(request: Request) -> Response:
     fresh = load_config()
     identity = res.get("identity") or {}
     # A policy edit made during those round-trips must win over the snapshot
-    # the token was authorized against: OIDC must still be enabled, the
-    # issuer/client the token came from must still be the configured ones,
-    # and the identity must still pass the group allowlist.
+    # the token was authorized against: OIDC must still be enabled; the
+    # issuer/client the token came from and the claim the groups were
+    # extracted under must be unchanged; the identity must still pass the
+    # group allowlist.
     if not authOIDC.login_available(fresh):
         return _local_login_redirect("failed")
     o_old, o_new = authOIDC._oidc_cfg(cfg), authOIDC._oidc_cfg(fresh)
-    if str(o_new.get("issuer") or "").strip() != str(o_old.get("issuer") or "").strip() or str(
-        o_new.get("client_id") or ""
-    ).strip() != str(o_old.get("client_id") or "").strip():
-        return _local_login_redirect("failed")
+    for field, default in (("issuer", ""), ("client_id", ""), ("groups_claim", "groups")):
+        if str(o_new.get(field) or default).strip() != str(o_old.get(field) or default).strip():
+            return _local_login_redirect("failed")
     if not authOIDC.identity_allowed(fresh, identity):
         return _local_login_redirect("denied")
 
