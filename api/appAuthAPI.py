@@ -29,6 +29,7 @@ __all__ = [
     "auth_required",
     "credentials_configured",
     "is_authenticated",
+    "api_key_authenticated",
     "reset_pending",
     "setup_lock_required",
     "verify_setup_token",
@@ -397,6 +398,20 @@ def is_authenticated(cfg: dict[str, Any], token: str | None) -> bool:
         return False
     a = _cfg_auth(cfg)
     return _find_session(a, token) is not None
+
+
+API_KEY_HEADER = "x-api-key"
+
+
+def api_key_authenticated(cfg: dict[str, Any], request: Request) -> bool:
+    sec = cfg.get("security") if isinstance(cfg, dict) else {}
+    want = str((sec or {}).get("api_key") or "").strip() if isinstance(sec, dict) else ""
+    if not want:
+        return False
+    got = str(request.headers.get(API_KEY_HEADER) or "").strip()
+    if not got:
+        return False
+    return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
 
 
 def _rate_limit_ok(request: Request) -> tuple[bool, int]:

@@ -36,6 +36,7 @@ from api import (
 
 from api.appAuthAPI import (
     COOKIE_NAME as APP_AUTH_COOKIE,
+    api_key_authenticated as app_api_key_authenticated,
     auth_required as app_auth_required,
     is_authenticated as app_is_authenticated,
     setup_lock_required as app_auth_setup_lock_required,
@@ -507,6 +508,9 @@ async def app_auth_gate(request: Request, call_next):
 
     token = request.cookies.get(APP_AUTH_COOKIE)
     if app_is_authenticated(cfg, token):
+        return await call_next(request)
+
+    if app_api_key_authenticated(cfg, request):
         return await call_next(request)
 
     if path.startswith("/api/"):
