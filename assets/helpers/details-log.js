@@ -726,6 +726,7 @@ function openDebugLog() {
 
     if (window._debugStaleIV) clearInterval(window._debugStaleIV);
     window._debugStaleIV = setInterval(() => {
+      if (document.hidden) return;
       const stale = (Date.now() - lastMsgAt) > 20000;
       tabDebug?.classList.toggle("stale", stale);
       _updateDetailsConsoleStatus();
@@ -840,6 +841,7 @@ async function openWatcherLog() {
 
     if (window._watchStaleIV) clearInterval(window._watchStaleIV);
     window._watchStaleIV = setInterval(() => {
+      if (document.hidden) return;
       const stale = (Date.now() - lastMsgAt) > 20000;
       tabWatch?.classList.toggle("stale", stale);
       _updateDetailsConsoleStatus();
