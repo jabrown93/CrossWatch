@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 import io
 import json
@@ -15,22 +15,16 @@ from fastapi.responses import StreamingResponse
 
 from cw_platform.config_base import load_config
 from cw_platform.id_map import canonical_key, merge_ids, minimal
-from cw_platform.modules_registry import load_sync_ops, state_read_features
+from cw_platform.modules_registry import load_sync_ops, state_read_features, sync_provider_names
 from cw_platform.orchestrator._snapshots import module_checkpoint
 from cw_platform.orchestrator._state_store import StateStore
+from cw_platform.playlists import PlaylistSnapshot, supports_playlists
+from cw_platform import playlists_runner
 from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id
+from services import playlists as playlist_svc
 
 from services.editor import (
     Kind,
-    export_tracker_zip,
-    import_tracker_upload,
-    list_snapshots,
-    load_state,
-    save_state,
-    list_pairs,
-    list_pair_datasets,
-    load_pair_state,
-    save_pair_state,
 )
 
 router = APIRouter(prefix="/api/editor", tags=["editor"])
@@ -114,33 +108,12 @@ def _merge_blocks(a: list[str], b: list[str]) -> list[str]:
 
 
 
-def _dedupe_block_list(blocks_raw: Any) -> list[str]:
-    """Case-insensitive de-dupe of a manual-block list, accepting either a list/tuple/set
-    of ids or a dict whose keys are ids (both shapes occur in stored policy/state json)."""
-    if isinstance(blocks_raw, (list, tuple, set)):
-        keys: Any = blocks_raw
-    elif isinstance(blocks_raw, dict):
-        keys = blocks_raw.keys()
-    else:
-        return []
+def _load_policy_manual(kind: Kind, provider: str, provider_instance: str | None = None) -> tuple[dict[str, Any], list[str]]:
+    raw = _load_policy()
+    providers = raw.get("providers") or {}
+    if not isinstance(providers, dict):
+        return {}, []
 
-    blocks: list[str] = []
-    seen: set[str] = set()
-    for x in keys:
-        s = str(x).strip()
-        if not s:
-            continue
-        sl = s.lower()
-        if sl in seen:
-            continue
-        seen.add(sl)
-        blocks.append(s)
-    return blocks
-
-
-def _find_manual_node(providers: dict[str, Any], provider: str, provider_instance: str | None) -> dict[str, Any] | None:
-    """Look up a provider's node (case-insensitive), then descend into its instance
-    sub-node if `provider_instance` is not the default. Returns None if any step misses."""
     node = providers.get(provider)
     if not isinstance(node, dict):
         pl = str(provider).lower()
@@ -149,21 +122,68 @@ def _find_manual_node(providers: dict[str, Any], provider: str, provider_instanc
                 node = v
                 break
     if not isinstance(node, dict):
-        return None
+        return {}, []
 
     inst = normalize_instance_id(provider_instance)
     if inst != "default":
         insts = node.get("instances") or {}
         if not isinstance(insts, dict):
-            return None
+            return {}, []
         node = insts.get(inst)
         if not isinstance(node, dict):
-            return None
-    return node
+            return {}, []
+
+    f = node.get(kind) or {}
+    if not isinstance(f, dict):
+        return {}, []
+
+    blocks_raw = f.get("blocks") or []
+    blocks: list[str] = []
+    seen: set[str] = set()
+    if isinstance(blocks_raw, (list, tuple, set)):
+        for x in blocks_raw:
+            s = str(x).strip()
+            if not s:
+                continue
+            sl = s.lower()
+            if sl in seen:
+                continue
+            seen.add(sl)
+            blocks.append(s)
+    elif isinstance(blocks_raw, dict):
+        for k in blocks_raw.keys():
+            s = str(k).strip()
+            if not s:
+                continue
+            sl = s.lower()
+            if sl in seen:
+                continue
+            seen.add(sl)
+            blocks.append(s)
+
+    adds_raw = f.get("adds") or {}
+    adds_items: dict[str, Any] = {}
+    if isinstance(adds_raw, dict):
+        items = adds_raw.get("items") or {}
+        if isinstance(items, dict):
+            adds_items = {str(k): v for k, v in items.items()}
+    return adds_items, blocks
 
 
-def _find_or_create_manual_node(providers: dict[str, Any], provider: str, provider_instance: str | None) -> dict[str, Any]:
-    """Same lookup as `_find_manual_node`, but creates the provider/instance node(s) when missing."""
+def _save_policy_manual(
+    kind: Kind,
+    provider: str,
+    adds_items: dict[str, Any],
+    blocks: list[str],
+    provider_instance: str | None = None,
+) -> None:
+    adds_items = _canonicalize_manual_items(adds_items)
+    raw = _load_policy()
+    providers = raw.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        raw["providers"] = providers
+
     key = None
     if provider in providers:
         key = provider
@@ -193,87 +213,11 @@ def _find_or_create_manual_node(providers: dict[str, Any], provider: str, provid
             in_node = {}
             insts[inst] = in_node
         node = in_node
-    return node
 
-
-def _load_manual_entry(
-    loader: Callable[[], dict[str, Any]],
-    kind: Kind,
-    provider: str,
-    provider_instance: str | None,
-    *,
-    wrap_in_manual: bool,
-) -> tuple[dict[str, Any], list[str]]:
-    """Shared core for `_load_policy_manual`/`_load_state_manual`: read `kind`'s adds/blocks
-    for a provider(+instance) out of the doc returned by `loader`. `wrap_in_manual` selects
-    whether `kind` lives directly under the provider node (policy doc) or under a "manual"
-    sub-key (state doc)."""
-    raw = loader()
-    providers = raw.get("providers") or {}
-    if not isinstance(providers, dict):
-        return {}, []
-
-    node = _find_manual_node(providers, provider, provider_instance)
-    if node is None:
-        return {}, []
-
-    if wrap_in_manual:
-        manual = node.get("manual") or {}
-        if not isinstance(manual, dict):
-            return {}, []
-        f = manual.get(kind) or {}
-    else:
-        f = node.get(kind) or {}
-    if not isinstance(f, dict):
-        return {}, []
-
-    blocks = _dedupe_block_list(f.get("blocks") or [])
-
-    adds_raw = f.get("adds") or {}
-    adds_items: dict[str, Any] = {}
-    if isinstance(adds_raw, dict):
-        items = adds_raw.get("items") or {}
-        if isinstance(items, dict):
-            adds_items = {str(k): v for k, v in items.items()}
-    return adds_items, blocks
-
-
-def _save_manual_entry(
-    loader: Callable[[], dict[str, Any]],
-    write_path: Path,
-    kind: Kind,
-    provider: str,
-    adds_items: dict[str, Any],
-    blocks: list[str],
-    provider_instance: str | None,
-    *,
-    wrap_in_manual: bool,
-) -> None:
-    """Shared core for `_save_policy_manual`/`_save_state_manual`: write `kind`'s adds/blocks
-    for a provider(+instance) into the doc returned by `loader`, then atomically write it
-    back to `write_path`. `wrap_in_manual` mirrors `_load_manual_entry`."""
-    adds_items = _canonicalize_manual_items(adds_items)
-    raw = loader()
-    providers = raw.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        raw["providers"] = providers
-
-    node = _find_or_create_manual_node(providers, provider, provider_instance)
-
-    if wrap_in_manual:
-        manual = node.get("manual")
-        if not isinstance(manual, dict):
-            manual = {}
-            node["manual"] = manual
-        container = manual
-    else:
-        container = node
-
-    f = container.get(kind)
+    f = node.get(kind)
     if not isinstance(f, dict):
         f = {}
-        container[kind] = f
+        node[kind] = f
 
     f["blocks"] = list(blocks or [])
 
@@ -283,21 +227,7 @@ def _save_manual_entry(
         f["adds"] = adds
     adds["items"] = dict(adds_items or {})
 
-    _atomic_write_json(write_path, raw)
-
-
-def _load_policy_manual(kind: Kind, provider: str, provider_instance: str | None = None) -> tuple[dict[str, Any], list[str]]:
-    return _load_manual_entry(_load_policy, kind, provider, provider_instance, wrap_in_manual=False)
-
-
-def _save_policy_manual(
-    kind: Kind,
-    provider: str,
-    adds_items: dict[str, Any],
-    blocks: list[str],
-    provider_instance: str | None = None,
-) -> None:
-    _save_manual_entry(_load_policy, _POLICY_PATH, kind, provider, adds_items, blocks, provider_instance, wrap_in_manual=False)
+    _atomic_write_json(_POLICY_PATH, raw)
 
 
 def _policy_from_state() -> dict[str, Any]:
@@ -697,7 +627,68 @@ def _save_state_items(kind: Kind, provider: str, items: dict[str, Any], provider
 
 
 def _load_state_manual(kind: Kind, provider: str, provider_instance: str | None = None) -> tuple[dict[str, Any], list[str]]:
-    return _load_manual_entry(_load_current_state, kind, provider, provider_instance, wrap_in_manual=True)
+    raw = _load_current_state()
+    providers = raw.get("providers") or {}
+    if not isinstance(providers, dict):
+        return {}, []
+    node = providers.get(provider)
+    if not isinstance(node, dict):
+        pl = str(provider).lower()
+        for k, v in providers.items():
+            if str(k).lower() == pl and isinstance(v, dict):
+                node = v
+                break
+    if not isinstance(node, dict):
+        return {}, []
+
+    inst = normalize_instance_id(provider_instance)
+    if inst != "default":
+        insts = node.get("instances") or {}
+        if not isinstance(insts, dict):
+            return {}, []
+        node = insts.get(inst)
+        if not isinstance(node, dict):
+            return {}, []
+
+    manual = node.get("manual") or {}
+    if not isinstance(manual, dict):
+        return {}, []
+    f = manual.get(kind) or {}
+    if not isinstance(f, dict):
+        return {}, []
+
+    blocks_raw = f.get("blocks") or []
+    blocks: list[str] = []
+    seen: set[str] = set()
+    if isinstance(blocks_raw, (list, tuple, set)):
+        for x in blocks_raw:
+            s = str(x).strip()
+            if not s:
+                continue
+            sl = s.lower()
+            if sl in seen:
+                continue
+            seen.add(sl)
+            blocks.append(s)
+    elif isinstance(blocks_raw, dict):
+        for k in blocks_raw.keys():
+            s = str(k).strip()
+            if not s:
+                continue
+            sl = s.lower()
+            if sl in seen:
+                continue
+            seen.add(sl)
+            blocks.append(s)
+
+    adds_raw = f.get("adds") or {}
+    adds_items: dict[str, Any] = {}
+    if isinstance(adds_raw, dict):
+        items = adds_raw.get("items") or {}
+        if isinstance(items, dict):
+            adds_items = {str(k): v for k, v in items.items()}
+
+    return adds_items, blocks
 
 
 def _save_state_manual(
@@ -707,13 +698,448 @@ def _save_state_manual(
     blocks: list[str],
     provider_instance: str | None = None,
 ) -> None:
-    _save_manual_entry(_load_current_state, _STATE_PATH, kind, provider, adds_items, blocks, provider_instance, wrap_in_manual=True)
+    adds_items = _canonicalize_manual_items(adds_items)
+    raw = _load_current_state()
+    providers = raw.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        raw["providers"] = providers
+
+    key = None
+    if provider in providers:
+        key = provider
+    else:
+        pl = str(provider).lower()
+        for k in providers.keys():
+            if str(k).lower() == pl:
+                key = str(k)
+                break
+    if key is None:
+        key = provider
+        providers[key] = {}
+
+    node = providers.get(key)
+    if not isinstance(node, dict):
+        node = {}
+        providers[key] = node
+
+    inst = normalize_instance_id(provider_instance)
+    if inst != "default":
+        insts = node.get("instances")
+        if not isinstance(insts, dict):
+            insts = {}
+            node["instances"] = insts
+        in_node = insts.get(inst)
+        if not isinstance(in_node, dict):
+            in_node = {}
+            insts[inst] = in_node
+        node = in_node
+
+    manual = node.get("manual")
+    if not isinstance(manual, dict):
+        manual = {}
+        node["manual"] = manual
+
+    f = manual.get(kind)
+    if not isinstance(f, dict):
+        f = {}
+        manual[kind] = f
+
+    f["blocks"] = list(blocks or [])
+
+    adds = f.get("adds")
+    if not isinstance(adds, dict):
+        adds = {}
+        f["adds"] = adds
+    adds["items"] = dict(adds_items or {})
+
+    _atomic_write_json(_STATE_PATH, raw)
 
 def _normalize_kind(val: str | None) -> Kind:
     k = (val or "watchlist").strip().lower()
     if k not in ("watchlist", "history", "ratings", "progress"):
         raise HTTPException(status_code=400, detail=f"Unsupported kind: {k}")
     return k  # type: ignore[return-value]
+
+
+def _playlist_endpoint(cfg: dict[str, Any], endpoint_id: str) -> dict[str, Any]:
+    eid = str(endpoint_id or "").strip()
+    if not eid:
+        raise HTTPException(status_code=400, detail="Missing playlist endpoint")
+    ep = playlists_runner.get_endpoint(cfg, eid)
+    if not ep:
+        raise HTTPException(status_code=404, detail="Playlist endpoint not found")
+    provider = str(ep.get("provider") or "").strip().upper()
+    ops = load_sync_ops(provider)
+    if not ops or not supports_playlists(ops):
+        raise HTTPException(status_code=400, detail=f"Provider not playlist-capable: {provider or '?'}")
+    playlist_id = str(ep.get("playlist_id") or "").strip()
+    if not playlist_id:
+        raise HTTPException(status_code=400, detail="Playlist endpoint has no provider playlist id")
+    inst = normalize_instance_id(ep.get("instance"))
+    view = build_provider_config_view(cfg, provider, inst)
+    return {"endpoint": dict(ep), "provider": provider, "instance": inst, "playlist_id": playlist_id, "ops": ops, "view": view}
+
+
+def _playlist_endpoint_rows(snap: PlaylistSnapshot) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for item in snap.items or []:
+        media = dict(item.item or {})
+        try:
+            media = minimal(media)
+        except Exception:
+            pass
+        if item.playlist_item_id:
+            media["_playlist_item_id"] = item.playlist_item_id
+        if item.provider_media_id:
+            media["_provider_media_id"] = item.provider_media_id
+        if item.position is not None:
+            media["_position"] = item.position
+        key = str(item.key or canonical_key(media) or "").strip()
+        if key:
+            out[key] = media
+    return out
+
+
+def _playlist_resource_meta(resource: Any) -> dict[str, Any]:
+    extra = getattr(resource, "extra", None)
+    extra = extra if isinstance(extra, dict) else {}
+    warnings = [str(w) for w in (extra.get("warnings") or []) if str(w).strip()]
+    if extra.get("remove_warning"):
+        warnings.append(str(extra.get("remove_warning")))
+    seen: set[str] = set()
+    warnings = [w for w in warnings if not (w in seen or seen.add(w))]
+    return {
+        "id": getattr(resource, "id", ""),
+        "name": getattr(resource, "name", ""),
+        "provider": getattr(resource, "provider", ""),
+        "instance": getattr(resource, "instance", "default"),
+        "kind": getattr(resource, "kind", ""),
+        "can_read": bool(getattr(resource, "can_read", False)),
+        "can_add": bool(getattr(resource, "can_add", False)),
+        "can_remove": bool(getattr(resource, "can_remove", False)),
+        "can_reorder": bool(getattr(resource, "can_reorder", False)),
+        "smart": bool(getattr(resource, "is_smart", False)),
+        "media_types": list(getattr(resource, "media_types", ()) or []),
+        "warnings": warnings,
+        "extra": dict(extra),
+    }
+
+
+def _playlist_clean_items(items_raw: Any) -> dict[str, dict[str, Any]]:
+    items = _normalize_items(items_raw)
+    out: dict[str, dict[str, Any]] = {}
+    for key, raw in items.items():
+        item = dict(raw) if isinstance(raw, dict) else {}
+        try:
+            clean = minimal(item)
+        except Exception:
+            clean = item
+        final_key = str(canonical_key(clean) or key or "").strip()
+        if final_key:
+            out[final_key] = clean
+    return out
+
+
+def _merge_result_warnings(result: dict[str, Any], source: Any) -> None:
+    raw = source.get("warnings") if isinstance(source, dict) else []
+    values = [raw] if isinstance(raw, str) else list(raw or []) if isinstance(raw, list) else []
+    warnings = result.setdefault("warnings", [])
+    seen = {str(w) for w in warnings}
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            warnings.append(text)
+            seen.add(text)
+
+
+@router.get("/playlists/endpoints")
+def api_editor_playlist_endpoints() -> dict[str, Any]:
+    cfg = load_config() or {}
+    endpoints = playlist_svc.list_endpoints(cfg)
+    return {"ok": True, "endpoints": endpoints}
+
+
+@router.get("/playlists/{endpoint_id}")
+def api_editor_playlist_endpoint(endpoint_id: str) -> dict[str, Any]:
+    cfg = load_config() or {}
+    ctx = _playlist_endpoint(cfg, endpoint_id)
+    snap = ctx["ops"].get_playlist_snapshot(ctx["view"], ctx["playlist_id"], instance=ctx["instance"])
+    if not isinstance(snap, PlaylistSnapshot):
+        raise HTTPException(status_code=500, detail="Provider returned an invalid playlist snapshot")
+    items = _playlist_endpoint_rows(snap)
+    resource = _playlist_resource_meta(snap.resource)
+    return {
+        "ok": True,
+        "kind": "playlist",
+        "source": "playlist",
+        "endpoint": ctx["endpoint"],
+        "resource": resource,
+        "ts": None,
+        "checkpoint": snap.checkpoint,
+        "count": len(items),
+        "items": items,
+        "original_keys": list(items.keys()),
+    }
+
+
+@router.post("/playlists/{endpoint_id}")
+def api_editor_playlist_endpoint_save(endpoint_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    cfg = load_config() or {}
+    ctx = _playlist_endpoint(cfg, endpoint_id)
+    snap = ctx["ops"].get_playlist_snapshot(ctx["view"], ctx["playlist_id"], instance=ctx["instance"])
+    if not isinstance(snap, PlaylistSnapshot):
+        raise HTTPException(status_code=500, detail="Provider returned an invalid playlist snapshot")
+    resource = snap.resource
+    if resource.is_smart:
+        raise HTTPException(status_code=400, detail="Smart or read-only playlist endpoints cannot be edited")
+    submitted = _playlist_clean_items(payload.get("items"))
+    current = snap.by_key()
+    current_keys = set(current.keys())
+    desired_keys = list(submitted.keys())
+    desired_set = set(desired_keys)
+    add_keys = [k for k in desired_keys if k not in current_keys]
+    remove_keys = [k for k in current_keys if k not in desired_set]
+    if add_keys and not resource.can_add:
+        raise HTTPException(status_code=400, detail="Playlist endpoint does not support adding items")
+    if remove_keys and not resource.can_remove:
+        raise HTTPException(status_code=400, detail="Playlist endpoint does not support removing items")
+    result: dict[str, Any] = {
+        "ok": True,
+        "source": "playlist",
+        "endpoint_id": endpoint_id,
+        "planned_additions": len(add_keys),
+        "planned_removals": len(remove_keys),
+        "added": 0,
+        "removed": 0,
+        "reordered": 0,
+        "unresolved": [],
+        "warnings": list(_playlist_resource_meta(resource).get("warnings") or []),
+    }
+    if add_keys:
+        add_res = ctx["ops"].add_playlist_items(ctx["view"], ctx["playlist_id"], [submitted[k] for k in add_keys], instance=ctx["instance"]) or {}
+        result["added"] = int(add_res.get("count") or 0)
+        result["unresolved"].extend(add_res.get("unresolved") or [])
+        _merge_result_warnings(result, add_res)
+    if remove_keys:
+        remove_res = ctx["ops"].remove_playlist_items(ctx["view"], ctx["playlist_id"], [dict(current[k].item or {}) for k in remove_keys if k in current], instance=ctx["instance"]) or {}
+        result["removed"] = int(remove_res.get("count") or 0)
+        result["unresolved"].extend(remove_res.get("unresolved") or [])
+        _merge_result_warnings(result, remove_res)
+    final_order = [k for k in desired_keys if k in desired_set]
+    current_order = [k for k in snap.ordered_keys() if k in desired_set]
+    if resource.can_reorder and final_order and final_order != current_order:
+        reorder_res = ctx["ops"].reorder_playlist_items(ctx["view"], ctx["playlist_id"], final_order, instance=ctx["instance"]) or {}
+        result["reordered"] = int(reorder_res.get("reordered") or reorder_res.get("count") or 0)
+        _merge_result_warnings(result, reorder_res)
+    result["unresolved_count"] = len(result["unresolved"])
+    result["ok"] = result["unresolved_count"] == 0
+    return result
+
+_TRACKER_PROVIDER = "CROSSWATCH"
+_TRACKER_FEATURES: tuple[str, ...] = ("watchlist", "history", "ratings", "progress")
+_TRACKER_RESERVED_SCOPES = frozenset({"unresolved", "restore_state", "tmp", "snapshots"})
+_TRACKER_DEFAULT_ROOT = Path("/config/.cw_provider")
+
+
+def _tracker_root() -> Path:
+    node: Any = {}
+    try:
+        cfg = load_config() or {}
+        node = cfg.get("CrossWatch") or cfg.get("crosswatch") or {}
+    except Exception:
+        node = {}
+    raw = ""
+    if isinstance(node, dict):
+        raw = str(node.get("root_dir") or "").strip()
+    try:
+        return Path(raw or _TRACKER_DEFAULT_ROOT).resolve()
+    except Exception:
+        return _TRACKER_DEFAULT_ROOT
+
+
+def _tracker_scan(root: Path) -> dict[str, dict[str, str]]:
+    found: dict[str, dict[str, str]] = {}
+    try:
+        entries = sorted(root.iterdir())
+    except Exception:
+        return found
+    for p in entries:
+        try:
+            if not p.is_file() or p.suffix != ".json":
+                continue
+        except Exception:
+            continue
+        parts = p.name.split(".")
+        if len(parts) == 2:
+            feat, scope = parts[0], ""
+        elif len(parts) == 3:
+            feat, scope = parts[0], parts[1]
+            if scope.lower() in _TRACKER_RESERVED_SCOPES:
+                continue
+        else:
+            continue
+        if feat not in _TRACKER_FEATURES:
+            continue
+        found.setdefault(scope, {})[feat] = p.name
+    return found
+
+
+def _tracker_provider_label(name: str) -> str:
+    n = str(name or "").strip().upper()
+    if not n:
+        return ""
+    if n == _TRACKER_PROVIDER:
+        return "Local Tracker"
+    try:
+        ops = load_sync_ops(n)
+        label = str((getattr(ops, "label", None) or (lambda: ""))() or "").strip()
+        if label:
+            return label
+    except Exception:
+        pass
+    return n.title()
+
+
+def _tracker_pair_labels() -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        from cw_platform.orchestrator._pairs import _pair_scope_key
+        from providers.sync.crosswatch._common import _safe_scope
+    except Exception:
+        return out
+    try:
+        pairs = (load_config() or {}).get("pairs") or []
+    except Exception:
+        return out
+    if not isinstance(pairs, list):
+        return out
+    for i, pair in enumerate(pairs):
+        if not isinstance(pair, dict):
+            continue
+        src = str(pair.get("source") or "").strip().upper()
+        dst = str(pair.get("target") or "").strip().upper()
+        if not src or not dst or _TRACKER_PROVIDER not in (src, dst):
+            continue
+        mode = str(pair.get("mode") or "one-way").strip().lower()
+        try:
+            scope = _safe_scope(_pair_scope_key(pair, i=i, src=src, dst=dst, mode=mode))
+        except Exception:
+            continue
+        if scope and scope not in out:
+            out[scope] = f"{_tracker_provider_label(src)} → {_tracker_provider_label(dst)}"
+    return out
+
+
+def _tracker_workspace_index() -> dict[str, dict[str, Any]]:
+    root = _tracker_root()
+    found = _tracker_scan(root)
+    if not found:
+        return {}
+    pair_labels = _tracker_pair_labels()
+    out: dict[str, dict[str, Any]] = {}
+    fallback = 0
+    for scope in sorted(found.keys(), key=lambda s: (s != "", s)):
+        files = found[scope]
+        wid = "default" if not scope else scope
+        if wid in out:
+            n = 2
+            while f"{wid}-{n}" in out:
+                n += 1
+            wid = f"{wid}-{n}"
+        if not scope:
+            label = "Default"
+        else:
+            label = pair_labels.get(scope) or ""
+            if not label:
+                fallback += 1
+                label = "Local tracker" if fallback == 1 else f"Local tracker {fallback}"
+        out[wid] = {
+            "id": wid,
+            "label": label,
+            "features": {f: (f in files) for f in _TRACKER_FEATURES},
+            "files": files,
+            "root": root,
+        }
+    return out
+
+
+def _tracker_workspaces() -> list[dict[str, Any]]:
+    return [
+        {"id": w["id"], "label": w["label"], "features": w["features"]}
+        for w in _tracker_workspace_index().values()
+    ]
+
+
+def _tracker_workspace(workspace: Any) -> dict[str, Any]:
+    index = _tracker_workspace_index()
+    if not index:
+        raise HTTPException(status_code=404, detail="No Local Tracker data found")
+    wid = str(workspace or "").strip()
+    if not wid:
+        wid = next(iter(index))
+    node = index.get(wid)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Unknown Local Tracker workspace")
+    return node
+
+
+def _tracker_read(root: Path, filename: str) -> tuple[dict[str, Any], int | None]:
+    path = root / filename
+    try:
+        raw = json.loads(path.read_text("utf-8"))
+    except Exception:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, None
+    items_raw = raw.get("items")
+    items: dict[str, Any] = {}
+    if isinstance(items_raw, dict):
+        for key, val in items_raw.items():
+            k = str(key or "").strip()
+            if k:
+                items[k] = dict(val) if isinstance(val, dict) else {}
+    ts: int | None = None
+    ts_raw = raw.get("ts")
+    if isinstance(ts_raw, (int, float, str)):
+        try:
+            ts = int(ts_raw)
+        except (TypeError, ValueError):
+            ts = None
+    if ts is None:
+        try:
+            ts = int(path.stat().st_mtime)
+        except OSError:
+            ts = None
+    return items, ts
+
+
+def _normalize_blocks(blocks_raw: Any) -> list[str]:
+    keys: Any
+    if isinstance(blocks_raw, dict):
+        keys = blocks_raw.keys()
+    elif isinstance(blocks_raw, (list, tuple, set)):
+        keys = blocks_raw
+    else:
+        return []
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for x in keys:
+        s = str(x).strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if sl in seen:
+            continue
+        seen.add(sl)
+        blocks.append(s)
+    return blocks
+
+
+@router.get("/tracker/workspaces")
+def api_editor_tracker_workspaces() -> dict[str, Any]:
+    return {"workspaces": _tracker_workspaces()}
+
 
 @router.get("/state/providers")
 def api_editor_state_providers() -> dict[str, Any]:
@@ -726,55 +1152,43 @@ def api_editor_state_providers() -> dict[str, Any]:
 def api_editor_get_state(
     kind: str = Query("watchlist"),
     snapshot: str | None = Query(None),
-    source: str = Query("tracker"),
+    source: str = Query("state"),
     provider: str | None = Query(None),
     provider_instance: str | None = Query(None),
-    pair: str | None = Query(None),
-    dataset: str | None = Query(None),
+    endpoint: str | None = Query(None),
+    workspace: str | None = Query(None),
 ) -> dict[str, Any]:
     k = _normalize_kind(kind)
-    src = (source or "tracker").strip().lower()
-    if src in ("tracker", "cw", "crosswatch"):
-        state = load_state(k, snapshot=snapshot)
-        items = state.get("items") or {}
-        if not isinstance(items, dict):
-            items = {}
+    src = (source or "state").strip().lower()
+    if src in ("playlist", "playlists", "playlist-endpoint"):
+        return api_editor_playlist_endpoint((endpoint or snapshot or "").strip())
+
+    if src in ("tracker", "crosswatch"):
+        ws = _tracker_workspace(workspace or snapshot)
+        filename = (ws["files"] or {}).get(k)
+        items, ts = _tracker_read(ws["root"], filename) if filename else ({}, None)
+
+        pol_adds, pol_blocks = _load_policy_manual(k, _TRACKER_PROVIDER, "default")
+        st_adds, st_blocks = (
+            _load_state_manual(k, _TRACKER_PROVIDER, "default") if _STATE_PATH.exists() else ({}, [])
+        )
+        manual_adds = dict(st_adds or {})
+        manual_adds.update(dict(pol_adds or {}))
+        manual_blocks = _merge_blocks(st_blocks or [], pol_blocks or [])
+
         return {
             "kind": k,
             "source": "tracker",
-            "snapshot": snapshot,
-            "provider": None,
-            "provider_instance": None,
-            "ts": state.get("ts"),
+            "workspace": ws["id"],
+            "label": ws["label"],
+            "features": ws["features"],
+            "provider": _TRACKER_PROVIDER,
+            "provider_instance": "default",
+            "ts": ts,
             "count": len(items),
             "items": items,
-        }
-
-    if src in ("pair", "pair-cache", "cache"):
-        scope = (pair or "").strip()
-        if not scope:
-            return {
-                "kind": k,
-                "source": "pair",
-                "pair": None,
-                "dataset": None,
-                "ts": None,
-                "count": 0,
-                "items": {},
-            }
-        ds = (dataset or snapshot or "").strip() or None
-        state = load_pair_state(k, scope, dataset=ds)
-        items = state.get("items") or {}
-        if not isinstance(items, dict):
-            items = {}
-        return {
-            "kind": k,
-            "source": "pair",
-            "pair": scope,
-            "dataset": state.get("file"),
-            "ts": state.get("ts"),
-            "count": len(items),
-            "items": items,
+            "manual_adds": manual_adds,
+            "manual_blocks": manual_blocks,
         }
 
     if src in ("state", "current"):
@@ -832,31 +1246,6 @@ def api_editor_get_state(
         }
     raise HTTPException(status_code=400, detail=f"Unsupported source: {src}")
 
-@router.get("/pairs")
-def api_editor_list_pairs() -> dict[str, Any]:
-    return list_pairs()
-
-@router.get("/pairs/datasets")
-def api_editor_pair_datasets(
-    kind: str = Query("watchlist"),
-    pair: str = Query(""),
-) -> dict[str, Any]:
-    k = _normalize_kind(kind)
-    scope = str(pair or "").strip()
-    if not scope:
-        return {"kind": k, "pair": "", "datasets": [], "default_dataset": ""}
-    dsets = list_pair_datasets(k, scope)
-    default_dataset = str(dsets[0]["name"]) if dsets else ""
-    return {"kind": k, "pair": scope, "datasets": dsets, "default_dataset": default_dataset}
-
-@router.get("/snapshots")
-def api_editor_list_snapshots(
-    kind: str = Query("watchlist"),
-) -> dict[str, Any]:
-    k = _normalize_kind(kind)
-    snaps = list_snapshots(k)
-    return {"kind": k, "snapshots": snaps}
-
 def _normalize_items(items: Any) -> dict[str, Any]:
     if isinstance(items, dict):
         return {str(k): v for k, v in items.items()}
@@ -913,35 +1302,35 @@ def _canonicalize_manual_items(items: dict[str, Any]) -> dict[str, Any]:
 @router.post("")
 def api_editor_save_state(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     kind = _normalize_kind(str(payload.get("kind") or "watchlist"))
-    src = str(payload.get("source") or "tracker").strip().lower()
+    src = str(payload.get("source") or "state").strip().lower()
     items_raw = payload.get("items")
     items = _normalize_items(items_raw)
-    if src in ("tracker", "cw", "crosswatch"):
-        state = save_state(kind, items)
+    if src in ("playlist", "playlists", "playlist-endpoint"):
+        endpoint_id = str(payload.get("endpoint") or payload.get("snapshot") or "").strip()
+        return api_editor_playlist_endpoint_save(endpoint_id, payload)
+
+    if src in ("tracker", "crosswatch"):
+        ws = _tracker_workspace(payload.get("workspace") or payload.get("snapshot"))
+        items = _canonicalize_manual_items(items)
+        blocks = _normalize_blocks(payload.get("blocks"))
+        _save_policy_manual(kind, _TRACKER_PROVIDER, items, blocks, "default")
+        ts = None
+        try:
+            ts = int(_POLICY_PATH.stat().st_mtime)
+        except Exception:
+            ts = None
         return {
             "ok": True,
             "kind": kind,
             "source": "tracker",
-            "provider": None,
-            "provider_instance": None,
+            "workspace": ws["id"],
+            "provider": _TRACKER_PROVIDER,
+            "provider_instance": "default",
             "count": len(items),
-            "ts": state.get("ts"),
+            "blocks": len(blocks),
+            "ts": ts,
         }
-    if src in ("pair", "pair-cache", "cache"):
-        scope = str(payload.get("pair") or "").strip()
-        if not scope:
-            raise HTTPException(status_code=400, detail="Missing pair for source=pair")
-        ds = str(payload.get("dataset") or payload.get("snapshot") or "").strip() or None
-        state = save_pair_state(kind, scope, ds, items)
-        return {
-            "ok": True,
-            "kind": kind,
-            "source": "pair",
-            "pair": scope,
-            "dataset": state.get("file"),
-            "count": len(items),
-            "ts": state.get("ts"),
-        }
+
     if src in ("state", "current"):
         provider = str(payload.get("provider") or "").strip()
         if not provider:
@@ -950,7 +1339,7 @@ def api_editor_save_state(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
 
         inst = normalize_instance_id(payload.get("provider_instance"))
 
-        blocks = _dedupe_block_list(payload.get("blocks") or [])
+        blocks = _normalize_blocks(payload.get("blocks"))
 
         _save_policy_manual(kind, provider, items, blocks, inst)
         if _STATE_PATH.exists():
@@ -1013,27 +1402,6 @@ async def api_editor_state_manual_import(
 
     stats = _policy_stats(merged)
     return {"ok": True, "mode": mode_n, **stats}
-
-@router.get("/export")
-def api_editor_export() -> StreamingResponse:
-    data = export_tracker_zip()
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=crosswatch-tracker.zip"},
-    )
-
-@router.post("/import")
-async def api_editor_import(file: UploadFile = File(...)) -> dict[str, Any]:
-    payload = await file.read()
-    filename = file.filename or "upload.json"
-    try:
-        stats = import_tracker_upload(payload, filename)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"ok": True, **stats}
-
-
 
 def _import_enabled() -> bool:
     try:
@@ -1103,10 +1471,9 @@ def api_editor_state_import_providers() -> dict[str, Any]:
         return {"enabled": False, "providers": []}
 
     cfg = load_config()
-    names = ["PLEX", "SIMKL", "TRAKT", "TMDB", "ANILIST", "JELLYFIN", "EMBY", "MDBLIST", "PUBLICMETADB", "TAUTULLI"]
     out: list[dict[str, Any]] = []
 
-    for name in names:
+    for name in sync_provider_names(upper=True):
         ops = load_sync_ops(name)
         if not ops:
             continue

@@ -3,24 +3,62 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 import shutil
 import threading
 from datetime import datetime
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, File, UploadFile
+from fastapi.responses import StreamingResponse
+
+_LOG = logging.getLogger("crosswatch.api.maintenance")
 
 router = APIRouter(prefix="/api/maintenance", tags=["maintenance"])
 
+SYNC_STATE_PATTERNS = (
+    "*pair_alias*.json",
+    "*source_alias*.json",
+    "*anime_episode_alias*.json",
+    "*anime_episode_map*.json",
+    "*anime_resolve*.json",
+    "*.unresolved*.json",
+    "*history.cache*.json",
+    "*_history.index*.json",
+    "*watermark*.json",
+    "tombstones.json",
+    "*.tombstones.json",
+)
+
+CW_STATE_KEEP_DIRS = {"id"}
 CW_STATE_KEEP_FILES = {
     "activity_history.json",
     "currently_watching.json",
     "auto_remove_seen.json",
     "watchlist_wl_autoremove.json",
 }
+
+
+def _is_sync_state_file(name: str) -> bool:
+    candidate = str(name or "")
+    return any(fnmatch(candidate, pattern) for pattern in SYNC_STATE_PATTERNS)
+
+
+def _sync_state_files() -> list[Path]:
+    _, _, CW_STATE_DIR, *_ = _cw()
+    if not CW_STATE_DIR.exists():
+        return []
+    found: dict[str, Path] = {}
+    for pattern in SYNC_STATE_PATTERNS:
+        for p in CW_STATE_DIR.glob(pattern):
+            if p.is_file() and p.name not in CW_STATE_KEEP_FILES:
+                found[p.name] = p
+    return [found[name] for name in sorted(found)]
 
 
 def _cw() -> tuple[Any, Any, Any, Any, Any, Any]:
@@ -47,11 +85,13 @@ def _clear_cw_state_files() -> list[str]:
     if not CW_STATE_DIR.exists():
         return removed
     for p in CW_STATE_DIR.iterdir():
-        # Preserve identity cache (.cw_state/id) and any other subdirectories.
         if p.is_dir():
+            # Preserve identity cache (.cw_state/id)
+            if p.name in CW_STATE_KEEP_DIRS:
+                continue
             continue
         if p.is_file():
-            if p.name in CW_STATE_KEEP_FILES:
+            if p.name in CW_STATE_KEEP_FILES or _is_sync_state_file(p.name):
                 continue
             try:
                 p.unlink(missing_ok=True)
@@ -239,13 +279,16 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
         path = CONFIG_DIR / "state.json"
         usage = _path_usage(path)
         providers, baselines = _sync_state_inventory(path)
+        scoped = _sync_state_files()
+        scoped_usage = _paths_usage([path, *scoped])
         response.update(
             title="Rebuild sync state",
-            note="These provider baselines are removed; the next sync reads fresh provider data.",
+            note="These provider baselines are removed together with pair-scoped history aliases, mapping caches, watermarks and tombstones; the next sync reads fresh provider data and rebuilds translated aliases.",
             metrics=[
                 _metric("Providers", providers),
                 _metric("Feature baselines", baselines),
-                _metric("State storage", usage["bytes"], "bytes"),
+                _metric("Pair mapping files", len(scoped)),
+                _metric("State storage", scoped_usage["bytes"], "bytes"),
                 _metric("Last updated", usage["modified"], "datetime"),
             ],
         )
@@ -256,7 +299,7 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
         retry_files = sum(1 for item in files if any(token in str(item.get("name") or "").lower() for token in retry_names))
         response.update(
             title="Retry provider items",
-            note="Clears retry guards, tombstones, phantom records and provider health state. Playback and activity files stay untouched.",
+            note="Clears provider runtime caches such as retry guards, phantom records and provider health. Sync aliases, mappings, history indexes, watermarks and tombstones stay untouched.",
             metrics=[
                 _metric("Runtime files", len(files)),
                 _metric("Retry / guard files", retry_files),
@@ -366,6 +409,7 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
             CONFIG_DIR / "statistics.json",
             CONFIG_DIR / "sync_reports",
             CW_STATE_DIR,
+            CONFIG_DIR / ".cw_databases",
             _cw_tracker_root(CONFIG_DIR),
             CACHE_DIR,
             CONFIG_DIR / "tls",
@@ -374,7 +418,7 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
         captures = _path_usage(Path(snapshots_dir))
         response.update(
             title="Factory reset",
-            note="Deletes all local runtime data and backs up config.json. Saved captures are kept.",
+            note="Deletes all local runtime data and backs up config.json. The event history archive (.cw_databases) is also removed. Saved captures are kept.",
             metrics=[
                 _metric("Files removed", sum(int(item["files"] or 0) for item in usages)),
                 _metric("Data removed", sum(int(item["bytes"] or 0) for item in usages), "bytes"),
@@ -382,6 +426,46 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
                 _metric("Capture storage kept", captures["bytes"], "bytes"),
             ],
         )
+    elif action in ("events-health", "events-optimize", "events-rebuild"):
+        from cw_platform import event_archive as _ea
+        st = _ea.status()
+        db_path = Path(_ea.events_db_path())
+        usage = _path_usage(db_path)
+        events = int(st.get("events") or 0)
+        acknowledged = int(st.get("acknowledged") or 0)
+        runs = int(st.get("runs") or 0)
+        size = int(usage.get("bytes") or 0)
+        if action == "events-health":
+            response.update(
+                title="Health check",
+                note="Checks database integrity, archive size and event totals. Read-only.",
+                metrics=[
+                    _metric("Events", events),
+                    _metric("Acknowledged", acknowledged),
+                    _metric("Archive size", size, "bytes"),
+                    _metric("Available", "yes" if st.get("available") else "no"),
+                ],
+            )
+        elif action == "events-optimize":
+            response.update(
+                title="Optimize archive",
+                note="Compacts and re-indexes the event archive to reclaim space.",
+                metrics=[
+                    _metric("Events", events),
+                    _metric("Archive size", size, "bytes"),
+                    _metric("Last updated", usage.get("modified"), "datetime"),
+                ],
+            )
+        else:
+            response.update(
+                title="Clear archive",
+                note="Deletes all events from the archive. New syncs record events again automatically. This cannot be undone.",
+                metrics=[
+                    _metric("Events removed", events),
+                    _metric("Sync runs removed", runs),
+                    _metric("Archive size", size, "bytes"),
+                ],
+            )
     else:
         return {"ok": False, "error": "unknown_maintenance_action", "action": action}
 
@@ -405,7 +489,7 @@ def _scan_provider_cache() -> dict[str, Any]:
     except Exception:
         candidates = []
     for p in candidates:
-        if p.name in CW_STATE_KEEP_FILES:
+        if p.name in CW_STATE_KEEP_FILES or _is_sync_state_file(p.name):
             continue
         if p.is_file():
             files.append(_file_meta(p))
@@ -523,19 +607,51 @@ def crosswatch_tracker_status() -> dict[str, Any]:
     }
 
 
+@router.get("/crosswatch-tracker/export")
+def crosswatch_tracker_export() -> StreamingResponse:
+    from services.editor import export_tracker_zip
+
+    data = export_tracker_zip()
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=crosswatch-tracker.zip"},
+    )
+
+
+@router.post("/crosswatch-tracker/import")
+async def crosswatch_tracker_import(file: UploadFile = File(...)) -> dict[str, Any]:
+    from services.editor import import_tracker_upload
+
+    payload = await file.read()
+    filename = file.filename or "upload.json"
+    try:
+        stats = import_tracker_upload(payload, filename)
+    except ValueError:
+        _LOG.warning("tracker import rejected: %s", filename, exc_info=True)
+        return {"ok": False, "error": "Import failed; expected a valid CrossWatch tracker ZIP or JSON file."}
+    return {"ok": True, **stats}
+
+
 @router.post("/clear-state")
 def clear_state_minimal() -> dict[str, Any]:
     _, CONFIG_DIR, *_ = _cw()
     state_path = CONFIG_DIR / "state.json"
     existed = state_path.exists()
-    before_usage = _path_usage(state_path)
+    scoped = _sync_state_files()
+    before_usage = _paths_usage([state_path, *scoped])
     try:
         state_path.unlink(missing_ok=True)
-        after_usage = _path_usage(state_path)
+        removed_scoped: list[str] = []
+        for p in scoped:
+            if _safe_remove_path(p):
+                removed_scoped.append(p.name)
+        after_usage = _paths_usage([state_path, *_sync_state_files()])
         return {
             "ok": True,
             "path": str(state_path),
             "existed": bool(existed),
+            "removed_sync_state": removed_scoped,
             "summary": _cleanup_summary(before_usage, after_usage),
         }
     except Exception as e:
@@ -653,6 +769,39 @@ def action_status(action: str) -> dict[str, Any]:
     return maintenance_action_status(action)
 
 
+@router.post("/events-health")
+def maintenance_events_health() -> dict[str, Any]:
+    try:
+        from cw_platform.event_archive.maintenance import health
+        return health()
+    except Exception:
+        _LOG.exception("events-health failed")
+        return {"ok": False, "error": "internal_error"}
+
+
+@router.post("/events-optimize")
+def maintenance_events_optimize() -> dict[str, Any]:
+    try:
+        from cw_platform.event_archive.maintenance import optimize
+        return optimize()
+    except Exception:
+        _LOG.exception("events-optimize failed")
+        return {"ok": False, "error": "internal_error"}
+
+
+@router.post("/events-rebuild")
+def maintenance_events_rebuild(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
+    if not bool((payload or {}).get("confirm")):
+        return {"ok": False, "error": "confirmation_required", "confirm": False}
+    try:
+        from cw_platform.event_archive.maintenance import rebuild
+        # DB-driven archive: clear only, do not re-import from runtime JSON state.
+        return rebuild(reimport=False)
+    except Exception:
+        _LOG.exception("events-rebuild failed")
+        return {"ok": False, "error": "internal_error"}
+
+
 @router.post("/reset-all-default")
 def reset_all_to_default(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
     _, CONFIG_DIR, *_rest = _cw()
@@ -679,13 +828,14 @@ def reset_all_to_default(payload: dict[str, Any] | None = Body(None)) -> dict[st
         try:
             cfg_path.rename(dst)
             report["backup"] = str(dst)
-        except Exception as e:
+        except Exception:
+            _LOG.exception("reset-all-default config backup failed")
             report["ok"] = False
-            report["errors"].append(f"config_backup_failed: {e}")
+            report["errors"].append("config_backup_failed")
             return report
 
     files = ["last_sync.json", "state.json", "statistics.json"]
-    dirs = [".cw_state", "sync_reports", ".cw_provider", "cache", "tls"]
+    dirs = [".cw_state", ".cw_databases", "sync_reports", ".cw_provider", "cache", "tls"]
 
     for name in files:
         p = CONFIG_DIR / name

@@ -12,11 +12,15 @@
 
   let H = new Set(); // history lib ids
   let R = new Set(); // ratings lib ids
+  let P = new Set(); // progress lib ids
   let S = new Set(); // scrobble lib ids
+  let lastLibraries = [];
   let hydrated = false;
   let connected = false;
 
   const EMBY_SUBTAB_KEY = "cw.ui.emby.auth.subtab.v1";
+  let embyAutoTabInst = "";
+  let embyNewProfileInst = "";
 
   const embyProfile = Shared.createProfileAdapter({
     provider: "emby",
@@ -60,7 +64,11 @@
     if (!root) return;
 
     const want = String(tab || "auth").toLowerCase();
-    const sub = ["auth", "settings", "whitelist"].includes(want) ? want : "auth";
+    let sub = ["auth", "settings", "whitelist"].includes(want) ? want : "auth";
+    const state = getEmbySetupState();
+    if (sub === "settings" && !state.settingsEnabled) sub = "auth";
+    if (sub === "whitelist" && !state.whitelistEnabled) sub = state.settingsEnabled ? "settings" : "auth";
+    try { Shared.applyMediaTabState(root, state); } catch {}
 
     root.querySelectorAll(".cw-subtile[data-sub]").forEach((btn) => {
       btn.classList.toggle("active", String(btn.dataset.sub || "").toLowerCase() === sub);
@@ -78,13 +86,23 @@
     }
 
     if (sub === "whitelist") {
-      try { embyLoadLibraries(); } catch {}
+      try { embyLoadLibraries(true); } catch {}
     }
+    try { Shared.setMediaAuthStep(root, sub); } catch {}
   }
 
   function mountEmbyAuthTabs() {
     const root = Q('#sec-emby .cw-meta-provider-panel[data-provider="emby"]');
     if (!root) return;
+    try {
+      Shared.mediaAuthGuide(root, {
+        kind: "emby",
+        label: "Emby",
+        title: "Connect to Emby",
+        copy: "Enter your Emby server URL, username and password, then sign in. Next, validate the settings, pick the user, and optionally whitelist libraries."
+      });
+      syncEmbySetupTabs();
+    } catch {}
 
     root.querySelectorAll(".cw-subtile[data-sub]").forEach((btn) => {
       if (btn.__embyTabWired) return;
@@ -100,6 +118,44 @@
     embyAuthSubSelect(last, { persist: false });
   }
 
+  function getEmbySetupState() {
+    const server = (Q("#emby_server_url")?.value || Q("#emby_server")?.value || "").trim();
+    const user = (Q("#emby_username")?.value || Q("#emby_user")?.value || "").trim();
+    const userId = (Q("#emby_user_id")?.value || "").trim();
+    const configured = connected || !!(server || user || userId);
+    return {
+      configured,
+      connected,
+      settingsEnabled: connected,
+      whitelistEnabled: connected,
+    };
+  }
+
+  function syncEmbySetupTabs(opts = {}) {
+    const root = Q('#sec-emby .cw-meta-provider-panel[data-provider="emby"]') || Q("#sec-emby .cw-panel");
+    if (!root) return;
+    const state = getEmbySetupState();
+    try { Shared.applyMediaTabState(root, state); } catch {}
+    if (opts.auto) {
+      const inst = getEmbyInstance();
+      if (embyAutoTabInst !== inst) {
+        embyAutoTabInst = inst;
+        const cur = root.querySelector(".cw-subtile.active[data-sub]")?.dataset?.sub || "auth";
+        if (cur === "auth") embyAuthSubSelect("auth", { persist: false });
+        return;
+      }
+    }
+    if (opts.preferSettings && state.settingsEnabled) {
+      const cur = root.querySelector(".cw-subtile.active[data-sub]")?.dataset?.sub || "auth";
+      if (cur === "auth") {
+        embyAuthSubSelect("settings", { persist: opts.persist !== false });
+        return;
+      }
+    }
+    const active = root.querySelector(".cw-subtile.active[data-sub]");
+    embyAuthSubSelect(active?.dataset?.sub || "auth", { persist: false });
+  }
+
   // helpers
   const put = (sel, val) => { const el = Q(sel); if (el != null) el.value = (val ?? "") + ""; };
   const visible = (el) => !!el && getComputedStyle(el).display !== "none" && !el.hidden;
@@ -113,61 +169,57 @@
     const msg = Q("#emby_msg");
     if (connected) setMsgBanner(msg, "ok", "Connected");
     else setMsgBanner(msg, null, "");
-  }
-
-  // libraries UI
-  function applyFilter() {
-    const qv = (Q("#emby_lib_filter")?.value || "").toLowerCase().trim();
-    Qa("#emby_lib_matrix .lm-row").forEach((r) => {
-      const name = (r.querySelector(".lm-name")?.textContent || "").toLowerCase();
-      r.classList.toggle("hide", !!qv && !name.includes(qv));
-    });
+    try { Shared.setConnectLocked("btn-emby-login", connected); } catch {}
+    try { syncEmbySetupTabs(); } catch {}
   }
 
   function syncHidden() {
     const selH = Q("#emby_lib_history");
     const selR = Q("#emby_lib_ratings");
+    const selP = Q("#emby_lib_progress");
     const selS = Q("#emby_lib_scrobble");
     if (selH) selH.innerHTML = [...H].map(id => `<option selected value="${id}">${id}</option>`).join("");
     if (selR) selR.innerHTML = [...R].map(id => `<option selected value="${id}">${id}</option>`).join("");
+    if (selP) selP.innerHTML = [...P].map(id => `<option selected value="${id}">${id}</option>`).join("");
     if (selS) selS.innerHTML = [...S].map(id => `<option selected value="${id}">${id}</option>`).join("");
   }
 
-  function syncSelectAll() {
-    const rows = Qa("#emby_lib_matrix .lm-row:not(.hide)");
-    const allHist = rows.length && rows.every(r => r.querySelector(".lm-dot.hist")?.classList.contains("on"));
-    const allRate = rows.length && rows.every(r => r.querySelector(".lm-dot.rate")?.classList.contains("on"));
-    const allScr = rows.length && rows.every(r => r.querySelector(".lm-dot.scr")?.classList.contains("on"));
-    const h = Q("#emby_hist_all"), r = Q("#emby_rate_all"), s = Q("#emby_scr_all");
-    if (h) { h.classList.toggle("on", !!allHist); h.setAttribute("aria-pressed", allHist ? "true" : "false"); }
-    if (r) { r.classList.toggle("on", !!allRate); r.setAttribute("aria-pressed", allRate ? "true" : "false"); }
-    if (s) { s.classList.toggle("on", !!allScr); s.setAttribute("aria-pressed", allScr ? "true" : "false"); }
-  }
+  let wlHandle = null;
+  const setFor = (fk) => ({ hist: H, rate: R, prog: P, scr: S }[fk]);
 
   function renderLibraries(libs) {
-    const box = Q("#emby_lib_matrix"); if (!box) return;
-    box.innerHTML = "";
-    const f = document.createDocumentFragment();
-    (Array.isArray(libs) ? libs : []).forEach((it) => {
-      const id = String(it.key);
-      const row = document.createElement("div");
-      row.className = "lm-row"; row.dataset.id = id;
-      row.innerHTML = `
-        <div class="lm-name">${ESC(it.title)}</div>
-        <button class="lm-dot hist${H.has(id) ? " on" : ""}" data-kind="history" aria-pressed="${H.has(id)}" title="Toggle History"></button>
-        <button class="lm-dot rate${R.has(id) ? " on" : ""}" data-kind="ratings" aria-pressed="${R.has(id)}" title="Toggle Ratings"></button>
-        <button class="lm-dot scr${S.has(id) ? " on" : ""}" data-kind="scrobble" aria-pressed="${S.has(id)}" title="Toggle Scrobble"></button>`;
-      f.appendChild(row);
-    });
-    box.appendChild(f);
-    applyFilter();
+    if (Array.isArray(libs)) lastLibraries = libs;
     syncHidden();
-    syncSelectAll();
+    const host = Q("#emby_lib_matrix");
+    if (!host || !window.cwWhitelistTable) return;
+    if (wlHandle) { wlHandle.render(); return; }
+    wlHandle = window.cwWhitelistTable.mount({
+      host,
+      features: [ { key: "hist", label: "History" }, { key: "rate", label: "Ratings" }, { key: "prog", label: "Progress" }, { key: "scr", label: "Scrobble" } ],
+      getLibs: () => lastLibraries,
+      isOn: (fk, id) => setFor(fk).has(String(id)),
+      setOn: (fk, id, on) => { const s = setFor(fk); if (on) s.add(String(id)); else s.delete(String(id)); },
+      commit: syncHidden,
+      load: async () => { await embyLoadLibraries(true); },
+    });
   }
 
-  async function embyLoadLibraries() {
+  function embyLiveQS() {
+    let qs = "";
+    const server = (Q("#emby_server_url")?.value || Q("#emby_server")?.value || "").trim();
+    if (server) qs += `&server=${encodeURIComponent(server)}`;
+    const cb = Q("#emby_verify_ssl") || Q("#emby_verify_ssl_dup");
+    if (cb) qs += `&verify_ssl=${(Q("#emby_verify_ssl")?.checked || Q("#emby_verify_ssl_dup")?.checked) ? 1 : 0}`;
+    return qs;
+  }
+
+  async function embyLoadLibraries(force = false) {
+    if (!force && lastLibraries.length) {
+      renderLibraries(lastLibraries);
+      return;
+    }
     try {
-      const r = await fetch(embyApi(LIB_URL), { cache: "no-store" });
+      const r = await fetch(embyApi(LIB_URL) + embyLiveQS(), { cache: "no-store" });
       const d = r.ok ? await r.json().catch(() => ({})) : {};
       const libs = Array.isArray(d?.libraries) ? d.libraries : (Array.isArray(d) ? d : []);
       renderLibraries(libs);
@@ -185,9 +237,12 @@
   async function hydrateFromConfig(force = false) {
     if (hydrated && !force) return;
     try {
-      const r = await fetch("/api/config", { cache: "no-store" });
-      if (!r.ok) return;
-      const cfg = await r.json();
+      let cfg = !force && window.__cfg && Object.keys(window.__cfg).length ? window.__cfg : null;
+      if (!cfg) {
+        const r = await fetch("/api/config", { cache: "no-store" });
+        if (!r.ok) return;
+        cfg = await r.json();
+      }
       window.__cfg = cfg;
       const em = getEmbyCfgBlock(cfg);
 
@@ -201,10 +256,13 @@
 
       H = new Set((em.history?.libraries || []).map(String));
       R = new Set((em.ratings?.libraries || []).map(String));
+      P = new Set((em.progress?.libraries || []).map(String));
       S = new Set((em.scrobble?.libraries || []).map(String));
 
       hydrated = true;
-      await embyLoadLibraries();
+      if (lastLibraries.length) renderLibraries(lastLibraries);
+      else await embyLoadLibraries();
+      syncEmbySetupTabs({ auto: true });
     } catch { /* ignore */ }
   }
 
@@ -294,11 +352,16 @@
         cache: "no-store",
       });
       const j = await r.json().catch(() => ({}));
+      if (Shared.reportProviderUsage({ status: r.status, data: j })) {
+        setMsgBanner(msg, null, "");
+        return;
+      }
       if (!r.ok || j?.ok === false) throw new Error(String(j?.error || `HTTP ${r.status}`));
       setConnected(false);
       setMsgBanner(msg, "ok", "Disconnected");
       hydrated = false;
       try { await hydrateFromConfig(true); } catch {}
+      try { syncEmbySetupTabs(); } catch {}
     } catch (e) {
       setMsgBanner(msg, "warn", String(e?.message || e || "Delete failed."));
     }
@@ -322,77 +385,16 @@
 
     em.history = em.history || {};
     em.ratings = em.ratings || {};
+    em.progress = em.progress || {};
     em.scrobble = em.scrobble || {};
 
     em.history.libraries = [...H];
     em.ratings.libraries = [...R];
+    em.progress.libraries = [...P];
     em.scrobble.libraries = [...S];
 
     return cfg;
   }
-
-  // library toggles
-  document.addEventListener("click", (ev) => {
-    const btn = ev?.target?.closest ? ev.target.closest("#emby_lib_matrix .lm-dot") : null;
-    if (btn) {
-      const row = btn.closest(".lm-row");
-      const id = row ? String(row.dataset.id || "") : "";
-      const kind = String(btn.dataset.kind || "");
-      const on = !btn.classList.contains("on");
-      btn.classList.toggle("on", on);
-      btn.setAttribute("aria-pressed", on ? "true" : "false");
-
-      if (id) {
-        if (kind === "history") { on ? H.add(id) : H.delete(id); }
-        if (kind === "ratings") { on ? R.add(id) : R.delete(id); }
-        if (kind === "scrobble") { on ? S.add(id) : S.delete(id); }
-      }
-      syncHidden();
-      syncSelectAll();
-      return;
-    }
-
-    if (ev?.target?.id === "emby_hist_all") {
-      const b = Q("#emby_hist_all");
-      if (!b) return;
-      const on = !b.classList.contains("on");
-      b.classList.toggle("on", on); b.setAttribute("aria-pressed", on ? "true" : "false");
-      H = new Set();
-      Qa("#emby_lib_matrix .lm-dot.hist").forEach((x) => {
-        x.classList.toggle("on", on); x.setAttribute("aria-pressed", on ? "true" : "false");
-        if (on) { const r = x.closest(".lm-row"); if (r) H.add(String(r.dataset.id || "")); }
-      });
-      syncHidden(); syncSelectAll(); return;
-    }
-
-    if (ev?.target?.id === "emby_rate_all") {
-      const b = Q("#emby_rate_all");
-      if (!b) return;
-      const on = !b.classList.contains("on");
-      b.classList.toggle("on", on); b.setAttribute("aria-pressed", on ? "true" : "false");
-      R = new Set();
-      Qa("#emby_lib_matrix .lm-dot.rate").forEach((x) => {
-        x.classList.toggle("on", on); x.setAttribute("aria-pressed", on ? "true" : "false");
-        if (on) { const r = x.closest(".lm-row"); if (r) R.add(String(r.dataset.id || "")); }
-      });
-      syncHidden(); syncSelectAll(); return;
-    }
-
-    if (ev?.target?.id === "emby_scr_all") {
-      const b = Q("#emby_scr_all");
-      if (!b) return;
-      const on = !b.classList.contains("on");
-      b.classList.toggle("on", on); b.setAttribute("aria-pressed", on ? "true" : "false");
-      S = new Set();
-      Qa("#emby_lib_matrix .lm-dot.scr").forEach((x) => {
-        x.classList.toggle("on", on); x.setAttribute("aria-pressed", on ? "true" : "false");
-        if (on) { const r = x.closest(".lm-row"); if (r) S.add(String(r.dataset.id || "")); }
-      });
-      syncHidden(); syncSelectAll(); return;
-    }
-  }, true);
-
-  document.addEventListener("input", (ev) => { if (ev.target?.id === "emby_lib_filter") applyFilter(); }, true);
 
   function findEmbyPickUserButton() {
     const root = Q('#sec-emby .cw-meta-provider-panel[data-provider="emby"]') || Q("#sec-emby");
@@ -425,6 +427,8 @@
     window.cwMediaUserPicker.open({
       provider: "emby",
       instance: inst,
+      server: (Q("#emby_server_url")?.value || Q("#emby_server")?.value || "").trim(),
+      verifySsl: !!(Q("#emby_verify_ssl")?.checked || Q("#emby_verify_ssl_dup")?.checked),
       anchorEl: findEmbyPickUserButton() || Q("#emby_pick_user") || null,
       title: "Pick Emby user",
       onPick: (u) => {
@@ -448,7 +452,7 @@
     if (t && t.id === "btn-emby-login") embyLogin();
     if (t && t.id === "btn-emby-delete") embyDeleteToken();
     if (t && t.id === "btn-emby-auto") embyAuto();
-    if (t && t.id === "btn-emby-load-libraries") embyLoadLibraries();
+    if (t && t.id === "btn-emby-load-libraries") embyLoadLibraries(true);
   }, true);
 
   document.addEventListener("change", (ev) => {
@@ -459,7 +463,26 @@
     }
   }, true);
 
+  document.addEventListener("input", (ev) => {
+    const id = ev?.target?.id || "";
+    if (["emby_server", "emby_server_url", "emby_user", "emby_username", "emby_user_id"].includes(id)) syncEmbySetupTabs();
+  }, true);
+
+  document.addEventListener("cw-auth-profile-created", (ev) => {
+    const provider = String(ev?.detail?.provider || "").toLowerCase();
+    if (provider !== "emby") return;
+    embyNewProfileInst = getEmbyInstance();
+    embyAutoTabInst = embyNewProfileInst;
+    try { syncEmbySetupTabs(); } catch {}
+    try { embyAuthSubSelect("auth", { persist: false }); } catch {}
+  }, true);
+
   // expose
+  window.cwAuth = window.cwAuth || {};
+  window.cwAuth.emby = window.cwAuth.emby || {};
+  window.cwAuth.emby.init = ensureHydrate;
+  window.cwAuth.emby.rehydrate = () => { try { hydrateFromConfig(true); } catch {} };
+
   window.embyAuto = embyAuto;
   window.embyLoadLibraries = embyLoadLibraries;
   window.mergeEmbyIntoCfg = mergeEmbyIntoCfg;

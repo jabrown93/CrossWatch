@@ -11,6 +11,7 @@ from functools import lru_cache
 from fastapi import APIRouter, Body
 from fastapi.responses import JSONResponse
 
+from api.provider_guard import usage_conflict_response
 from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import list_instance_ids, provider_key, normalize_instance_id
 
@@ -20,6 +21,7 @@ _CFG_KEY_ALIAS = {
     "tmdb": "tmdb_sync",
     "tmdb_sync": "tmdb_sync",
 }
+_MAX_GENERATED_PROFILES = 9
 
 
 def _cfg_key(provider: str) -> str:
@@ -65,26 +67,19 @@ def _canonical_profile_id(provider: str, instance_id: Any) -> str | None:
         num = int(m.group(1))
     except Exception:
         return ""
+    if num < 1 or num > _MAX_GENERATED_PROFILES:
+        return ""
     return f"{prov}-P{num:02d}"
 
 
 def _next_profile_id(provider: str, insts: dict[str, Any]) -> str:
     prov = _prov_prefix(provider)
-    best = 0
-    for k in (insts or {}).keys():
-        m = re.fullmatch(rf"{re.escape(prov)}-P(\d{{2,}})", str(k).strip().upper())
-        if not m:
-            continue
-        try:
-            best = max(best, int(m.group(1)))
-        except Exception:
-            pass
-    n = best + 1 if best else 1
-    cand = f"{prov}-P{n:02d}"
-    while cand in insts:
-        n += 1
+    existing = {str(k).strip().upper() for k in (insts or {}).keys()}
+    for n in range(1, _MAX_GENERATED_PROFILES + 1):
         cand = f"{prov}-P{n:02d}"
-    return cand
+        if cand not in existing:
+            return cand
+    return ""
 
 
 def _create_instance(insts: dict[str, Any], inst: str, payload: dict[str, Any]) -> None:
@@ -109,6 +104,15 @@ def _provider_block(cfg: dict[str, Any], provider: str) -> dict[str, Any]:
     blk: dict[str, Any] = {}
     cfg[k] = blk
     return blk
+
+
+def _invalidate_provider_cache(provider: str) -> None:
+    try:
+        from api.probesAPI import invalidate_provider_caches
+
+        invalidate_provider_caches(_cfg_key(provider))
+    except Exception:
+        pass
 
 
 def _strip_instances(d: dict[str, Any]) -> dict[str, Any]:
@@ -163,11 +167,15 @@ def api_provider_instances_create_next(provider: str, payload: dict[str, Any] = 
         blk["instances"] = insts
 
     inst = _next_profile_id(provider, insts)
+    if not inst:
+        return {"ok": False, "error": "profile_limit_reached"}
+
     if inst in insts and isinstance(insts.get(inst), dict):
         return {"ok": True, "id": inst}
 
     _create_instance(insts, inst, payload or {})
     save_config(cfg)
+    _invalidate_provider_cache(provider)
     return {"ok": True, "id": inst}
 
 
@@ -193,11 +201,12 @@ def api_provider_instances_create(provider: str, instance_id: str, payload: dict
     _create_instance(insts, inst, payload or {})
 
     save_config(cfg)
+    _invalidate_provider_cache(provider)
     return {"ok": True, "id": inst}
 
 
 @router.delete("/provider-instances/{provider}/{instance_id}")
-def api_provider_instances_delete(provider: str, instance_id: str) -> dict[str, Any]:
+def api_provider_instances_delete(provider: str, instance_id: str) -> Any:
     inst = normalize_instance_id(instance_id)
     if inst == "default":
         return {"ok": False, "error": "cannot_delete_default"}
@@ -208,6 +217,11 @@ def api_provider_instances_delete(provider: str, instance_id: str) -> dict[str, 
     if not isinstance(insts, dict) or inst not in insts:
         return {"ok": False, "error": "not_found"}
 
+    conflict = usage_conflict_response(cfg, provider_key(provider), inst)
+    if conflict is not None:
+        return conflict
+
     insts.pop(inst, None)
     save_config(cfg)
+    _invalidate_provider_cache(provider)
     return {"ok": True}

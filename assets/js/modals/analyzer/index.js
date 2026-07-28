@@ -2,19 +2,38 @@
 /* Modal for analyzing sync issues and provider feature coverage. */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
-const fjson = async (u, o) => {
-  const r = await fetch(u, o);
-  if (!r.ok) throw new Error(r.status);
-  return r.json();
+const fjson = async (u, o = {}) => {
+  const controller = new AbortController();
+  const external = o.signal;
+  const abort = () => controller.abort(external?.reason);
+  if (external?.aborted) abort();
+  else external?.addEventListener?.("abort", abort, { once: true });
+  const timeoutMs = Number(o.timeoutMs) > 0 ? Number(o.timeoutMs) : 120000;
+  const timer = setTimeout(() => controller.abort("Analyzer request timed out"), timeoutMs);
+  try {
+    const r = await fetch(u, { ...o, signal: controller.signal });
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
+  } finally {
+    clearTimeout(timer);
+    external?.removeEventListener?.("abort", abort);
+  }
 };
 const Q = (s, r = document) => r.querySelector(s);
 const QA = (s, r = document) => Array.from(r.querySelectorAll(s));
 const esc = s =>
   (window.CSS?.escape ? CSS.escape(s) : String(s).replace(/[^\w-]/g, "\\$&"));
+const escHtml = s =>
+  String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 const tagOf = (p, f, k) => `${p}::${f}::${k}`;
 const chips = ids =>
   Object.entries(ids || {})
-    .map(([k, v]) => `<span class="chip mono">${k}:${v}</span>`)
+    .map(([k, v]) => `<span class="chip mono">${escHtml(k)}:${escHtml(v)}</span>`)
     .join("");
 
 const displayTitle = r => {
@@ -50,8 +69,8 @@ const renderCounts = c => {
       const label = meta.label?.(key) || key;
       const logo = meta.logLogoPath?.(key) || meta.logoPath?.(key) || "";
       const count = fmtCountNumber(total);
-      return `<span class="prov-stat" title="${label} ${count}">
-        <span class="prov-stat-brand">${logo ? `<img src="${logo}" alt="${label} logo" loading="lazy">` : `<span class="prov-stat-text">${label}</span>`}</span>
+      return `<span class="prov-stat" title="${escHtml(label)} ${escHtml(count)}">
+        <span class="prov-stat-brand">${logo ? `<img src="${escHtml(logo)}" alt="${escHtml(label)} logo" loading="lazy">` : `<span class="prov-stat-text">${escHtml(label)}</span>`}</span>
         <span class="prov-stat-count">${count}</span>
       </span>`;
     })
@@ -116,19 +135,21 @@ function css() {
   .an-modal .cx-mark .material-symbols-rounded{font-variation-settings:"FILL" 0,"wght" 500,"GRAD" 0,"opsz" 24;font-size:18px;line-height:1;color:#f3f6ff}
   .an-modal .cx-title{display:inline-flex;align-items:center;gap:10px;font-weight:900;font-size:18px;letter-spacing:.08em;text-transform:uppercase;color:#f3f6ff;text-shadow:0 0 18px rgba(104,122,255,.16)}
   .an-modal .an-actions{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
-  .an-modal .an-intro{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 14px 12px;border-bottom:1px solid rgba(255,255,255,.06);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.006))}
+  .an-modal .an-intro{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;min-height:52px;padding:7px 12px;border-bottom:1px solid rgba(255,255,255,.06);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.006))}
   .an-modal .an-intro-copy{min-width:0}
   .an-modal .an-intro-title{font-size:14px;font-weight:800;letter-spacing:.01em;color:#f4f7ff}
   .an-modal .an-intro-sub{margin-top:4px;font-size:12px;line-height:1.45;color:rgba(205,215,235,.74)}
   .an-modal .an-intro-meta{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
   .an-modal .an-intro-meta .mini{display:inline-flex;align-items:center;min-height:28px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.035);font-size:11px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:rgba(230,237,250,.84)}
+  .an-modal .an-intro-meta button.mini{cursor:pointer;font-family:inherit}
+  .an-modal .an-intro-meta button.mini:disabled{cursor:default;opacity:.45}
   .an-modal .pill,.an-modal .close-btn{appearance:none;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.02));color:#edf3ff;border-radius:14px;padding:8px 12px;font-size:12px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap;flex:0 0 auto;box-shadow:0 10px 24px rgba(0,0,0,.16),inset 0 1px 0 rgba(255,255,255,.04);transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease,background .14s ease}
   .an-modal .pill:hover,.an-modal .close-btn:hover{transform:translateY(-1px);border-color:rgba(123,112,255,.4);box-shadow:0 14px 30px rgba(0,0,0,.24),0 0 0 1px rgba(123,112,255,.14) inset}
   .an-modal .pill:active,.an-modal .close-btn:active{transform:none}
   .an-modal .pill.ghost,.an-modal .close-btn{background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.012))}
   .an-modal #an-run{background:linear-gradient(135deg,rgba(112,92,255,.92),rgba(72,144,255,.88));border-color:rgba(143,165,255,.38);box-shadow:0 16px 34px rgba(45,96,255,.26),0 0 18px rgba(116,97,255,.18)}
   .an-modal .pill[disabled],.an-modal .close-btn[disabled]{opacity:.55;pointer-events:none}
-  .an-modal #an-toggle-ids{min-width:112px}
+  .an-modal #an-toggle-ids{width:40px;padding-inline:0}
   .an-modal .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.045);box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
   .an-modal input[type=search]{flex:1 1 320px;min-width:240px;max-width:440px;width:auto;height:38px;background:rgba(6,10,19,.82);border:1px solid rgba(255,255,255,.1);color:#e6eeff;border-radius:14px;padding:0 13px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.02),0 8px 24px rgba(0,0,0,.12)}
   .an-modal input[type=search]:focus{outline:none;border-color:rgba(120,136,255,.52);box-shadow:0 0 0 3px rgba(115,97,255,.14),inset 0 0 0 1px rgba(255,255,255,.02)}
@@ -136,6 +157,7 @@ function css() {
   .an-modal .an-pair-chip{font-size:11px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02));color:#dbe6ff;font-weight:800;letter-spacing:.06em;text-transform:uppercase;box-shadow:0 10px 22px rgba(0,0,0,.16);transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease,background .14s ease;opacity:.92}
   .an-modal .an-pair-chip:hover{transform:translateY(-1px);border-color:rgba(139,92,246,.4);box-shadow:0 14px 28px rgba(0,0,0,.22),0 0 0 1px rgba(139,92,246,.12) inset}
   .an-modal .an-pair-chip.on{background:linear-gradient(180deg,rgba(107,92,255,.28),rgba(58,130,246,.12));border-color:rgba(118,110,255,.5);box-shadow:0 16px 30px rgba(0,0,0,.24),0 0 18px rgba(110,94,255,.14)}
+  .an-modal .an-pair-prof{flex:0 0 auto;font-size:9px;font-weight:800;letter-spacing:.03em;line-height:1;padding:2px 5px;margin-left:-2px;border-radius:999px;background:color-mix(in srgb,var(--an-accent,#7b5cff) 22%,transparent);border:1px solid color-mix(in srgb,var(--an-accent,#7b5cff) 42%,transparent);color:var(--an-text,#dbe3ff)}
   .an-modal .an-pair-chip span.dir{display:inline-flex;align-items:center;justify-content:center;opacity:.82}
   .an-modal .an-pair-chip span.dir .material-symbols-rounded{font-size:15px;line-height:1;font-variation-settings:"FILL" 0,"wght" 500,"GRAD" 0,"opsz" 20}
   .an-modal .an-wrap{flex:1;min-height:0;display:grid;grid-template-rows:minmax(230px,1fr) 10px minmax(180px,.8fr);overflow:hidden;padding:10px 14px 0;gap:0}
@@ -161,6 +183,10 @@ function css() {
   .an-modal .row .prov{font-weight:800;letter-spacing:.05em;color:#dce7ff;text-transform:uppercase}
   .an-modal .row .feat{opacity:.82;text-transform:capitalize}
   .an-modal .row .counts{font-size:12px;opacity:.8}
+  .an-modal .head .cell{position:relative}
+  .an-modal .col-resize{position:absolute;top:0;right:-5px;width:11px;height:100%;cursor:col-resize;z-index:4;touch-action:none}
+  .an-modal .col-resize::after{content:"";position:absolute;top:22%;bottom:22%;left:5px;width:2px;border-radius:2px;background:rgba(255,255,255,.16)}
+  .an-modal .col-resize:hover::after,.an-modal .col-resize.dragging::after{background:var(--an-accent,#7b6bff);box-shadow:0 0 8px rgba(123,107,255,.5)}
   .an-modal .sort{cursor:pointer;user-select:none;font-weight:800;letter-spacing:.05em;text-transform:uppercase;font-size:11px;color:#adbbdb}
   .an-modal .sort span.label{margin-right:4px}
   .an-modal .sort span.dir{opacity:.72;font-size:10px}
@@ -202,6 +228,9 @@ function css() {
   .wait-ring{width:64px;height:64px;border-radius:50%;position:relative;filter:drop-shadow(0 0 12px rgba(122,107,255,.55))}
   .wait-ring::before{content:"";position:absolute;inset:0;border-radius:50%;padding:4px;background:conic-gradient(#7a6bff,#23d5ff,#7a6bff);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:wait-spin 1.1s linear infinite}
   .wait-text{font-weight:800;color:#dbe8ff;text-shadow:0 0 12px rgba(122,107,255,.28)}
+  .wait-retry{cursor:pointer;font-family:inherit;font-size:12px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#dbe8ff;padding:7px 16px;border-radius:999px;border:1px solid rgba(122,107,255,.45);background:rgba(122,107,255,.14)}
+  .wait-retry:hover{background:rgba(122,107,255,.26)}
+  .wait-retry.hidden{display:none}
   @keyframes wait-spin{to{transform:rotate(360deg)}}
   html[data-cw-theme="flat-dark"] .an-modal,
   html[data-cw-theme="flat-dark"] .an-modal .cx-head,
@@ -295,58 +324,118 @@ function css() {
   document.head.appendChild(el);
 }
 
+function injectAnalyzerCSS() {
+  const existing = document.getElementById("cw-analyzer-redesign-css");
+  if (existing?.tagName === "LINK") return Promise.resolve();
+  existing?.remove();
+  const link = document.createElement("link");
+  const cssUrl = new URL("./styles.css", import.meta.url);
+  const version = new URL(import.meta.url).searchParams.get("v") || window.__CW_VERSION__;
+  if (version) cssUrl.searchParams.set("v", version);
+  link.id = "cw-analyzer-redesign-css";
+  link.rel = "stylesheet";
+  link.href = cssUrl.href;
+  return new Promise(resolve => {
+    link.addEventListener("load", resolve, { once: true });
+    link.addEventListener("error", resolve, { once: true });
+    document.head.appendChild(link);
+  });
+}
+
 function gridTemplateFrom(widths) {
   return widths.map(w => `${w}px`).join(" ");
 }
 
+let activeCleanup = null;
+
 export default {
   async mount(root) {
+    activeCleanup?.();
     css();
+    await injectAnalyzerCSS();
     root.classList.add("modal-root","an-modal");
     const shell = root.closest(".cx-modal-shell");
     if (shell) {
       shell.classList.add("analyzer-modal-shell");
-      shell.style.setProperty("--cxModalMaxW", "960px");
-      shell.style.setProperty("--cxModalMaxH", "86vh");
+      shell.style.setProperty("--cxModalW", "1180px");
+      shell.style.setProperty("--cxModalMaxW", "1180px");
+      shell.style.setProperty("--cxModalMaxH", "700px");
     }
     root.innerHTML = `
-      <div class="cx-head">
-        <div class="cx-left">
-          <div class="cx-mark"><span class="material-symbols-rounded" aria-hidden="true">troubleshoot</span></div>
-          <div class="cx-title">Analyzer</div>
-          <button class="pill ghost" id="an-toggle-ids">IDs: hidden</button>
-          <button class="pill ghost" id="an-scope">Scope: issues</button>
-          <input id="an-search" type="search" placeholder="title, year, provider, feature...">
+      <div class="an-app">
+        <div class="cx-head">
+          <div class="cx-head-left">
+            <div class="an-head-text">
+              <div class="cx-title">Sync Analyzer</div>
+              <div class="an-head-sub">Understand what is aligned, what needs attention, and why.</div>
+            </div>
+          </div>
+          <div class="an-actions">
+            <button class="pill" id="an-run" type="button"><span class="material-symbols-rounded" aria-hidden="true">refresh</span><span>Analyze</span></button>
+            <button class="close-btn" id="an-close" type="button"><span class="material-symbols-rounded" aria-hidden="true">close</span><span>Close</span></button>
+          </div>
         </div>
-        <div class="an-actions">
-          <button class="pill" id="an-run" type="button">Analyze</button>
-          <button class="close-btn" id="an-close">Close</button>
+
+        <div class="an-layout">
+          <aside class="an-sidebar">
+            <div class="an-side-label">View</div>
+            <nav class="an-view-nav" aria-label="Analyzer view">
+              <button class="an-view-btn active" id="an-scope-issues" type="button" data-scope="issues" aria-pressed="true">
+                <span class="material-symbols-rounded" aria-hidden="true">problem</span>
+                <span><strong>Needs attention</strong><small>Missing, blocked and risky items</small></span>
+              </button>
+              <button class="an-view-btn" id="an-scope-all" type="button" data-scope="all" aria-pressed="false">
+                <span class="material-symbols-rounded" aria-hidden="true">dataset</span>
+                <span><strong>All scoped items</strong><small>Browse healthy and affected data</small></span>
+              </button>
+            </nav>
+
+            <div class="an-side-label an-pair-label">Sync pairs</div>
+            <p class="an-side-hint">Choose the routes you want to compare.</p>
+            <div class="an-pairs" id="an-pairs"></div>
+
+            <div class="an-side-status">
+              <div class="an-status-title">Analysis status</div>
+              <div class="count-stack">
+                <button type="button" id="an-issues-count" class="an-status-row active" aria-pressed="true" title="Items currently missing at one or more destinations."><i class="an-status-dot issue-dot"></i><b>Current mismatches</b><em>0</em></button>
+                <button type="button" id="an-pending-count" class="an-status-row" aria-pressed="false" title="Items attempted last sync that remain unresolved and are pending a retry."><i class="an-status-dot pending-dot"></i><b>Pending retries</b><em>0</em></button>
+                <button type="button" id="an-system-count" class="an-status-row" aria-pressed="false" title="Background state and integrity diagnostics."><i class="an-status-dot system-dot"></i><b>System</b><em>0</em></button>
+                <button type="button" id="an-blocked-count" class="an-status-row" aria-pressed="false" title="Items held back by a manual block list or an active blackbox."><i class="an-status-dot blocked-dot"></i><b>Blocked</b><em>0</em></button>
+              </div>
+            </div>
+          </aside>
+
+          <main class="an-main">
+            <section class="an-intro">
+              <div class="an-intro-copy">
+                <div class="an-intro-title">Items that need your attention</div>
+              </div>
+              <div class="an-intro-meta" id="an-summary-meta">
+              </div>
+            </section>
+
+            <section class="an-workspace">
+              <div class="an-workspace-head">
+                <div class="an-workspace-copy">
+                  <span class="material-symbols-rounded" aria-hidden="true">fact_check</span>
+                  <span><strong id="an-results-title">Issue results</strong><small>Select a row to see the reason and available details.</small></span>
+                </div>
+                <div class="an-tools">
+                  <label class="an-search-wrap">
+                    <span class="material-symbols-rounded" aria-hidden="true">search</span>
+                    <input id="an-search" type="search" placeholder="Search title, provider or feature">
+                  </label>
+                  <button class="pill ghost" id="an-toggle-ids" type="button" title="Show IDs" aria-label="Show IDs" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">key</span></button>
+                </div>
+              </div>
+              <div class="an-wrap" id="an-wrap">
+                <div class="an-grid" id="an-grid"></div>
+                <div class="an-split" id="an-split" title="Drag to resize the result and detail panes"></div>
+                <div class="an-issues" id="an-issues"></div>
+              </div>
+            </section>
+          </main>
         </div>
-      </div>
-      <div class="an-intro">
-        <div class="an-intro-copy">
-          <div class="an-intro-title">Find missing, blocked, and out-of-scope deltas</div>
-          <div class="an-intro-sub" id="an-summary-copy">Analyzer compares the selected source and destination pairs so you can see why a title is not lining up between providers.</div>
-        </div>
-        <div class="an-intro-meta" id="an-summary-meta">
-          <span class="mini">Scoped 0</span>
-          <span class="mini">Visible 0</span>
-          <span class="mini">Issues 0</span>
-        </div>
-      </div>
-      <div class="an-pairs" id="an-pairs"></div>
-      <div class="an-wrap" id="an-wrap">
-        <div class="an-grid" id="an-grid"></div>
-        <div class="an-split" id="an-split" title="drag to resize"></div>
-        <div class="an-issues" id="an-issues"></div>
-      </div>
-      <div class="an-footer">
-        <div class="count-stack">
-          <span class="mono" id="an-issues-count" title="Issues are sync delta problems in the selected pairs, like missing peers or blocked items.">Issues: 0</span>
-          <span class="mono" id="an-system-count" title="System findings are analyzer diagnostics about state files, providers, metadata, or other background integrity checks.">System: 0</span>
-          <span class="mono" id="an-blocked-count">Blocked: 0</span>
-        </div>
-        <div class="stats empty" id="an-stats"></div>
       </div>
     `;
 
@@ -357,29 +446,41 @@ export default {
       <div class="wait-card" role="status" aria-live="assertive">
         <div class="wait-ring"></div>
         <div class="wait-text" id="an-wait-text">Loading...</div>
+        <button class="wait-retry hidden" id="an-wait-retry" type="button">Retry</button>
       </div>`;
     root.appendChild(wait);
 
     let waitSlowTimer = null;
+    let waitRetryTimer = null;
     let waitShownAt = 0;
     const setWaitText = t => {
       const el = Q("#an-wait-text", root);
       if (el) el.textContent = t;
+    };
+    const setWaitRetryVisible = v => {
+      const b = Q("#an-wait-retry", root);
+      if (b) b.classList.toggle("hidden", !v);
     };
     function showWait(text) {
       waitShownAt = performance.now();
       const el = Q("#an-wait", root);
       if (el) el.classList.remove("hidden");
       setWaitText(text || "Working...");
+      setWaitRetryVisible(false);
       clearTimeout(waitSlowTimer);
+      clearTimeout(waitRetryTimer);
       waitSlowTimer = setTimeout(
         () => setWaitText(`${text} (still working...)`),
         3000
       );
+      waitRetryTimer = setTimeout(() => setWaitRetryVisible(true), 8000);
     }
     function hideWait() {
       clearTimeout(waitSlowTimer);
+      clearTimeout(waitRetryTimer);
       waitSlowTimer = null;
+      waitRetryTimer = null;
+      setWaitRetryVisible(false);
       const minVisible = 250;
       const elapsed = performance.now() - waitShownAt;
       const doHide = () => Q("#an-wait", root).classList.add("hidden");
@@ -391,23 +492,35 @@ export default {
     const grid = Q("#an-grid", root);
     const issues = Q("#an-issues", root);
     const pairBar = Q("#an-pairs", root);
-    const stats = Q("#an-stats", root);
-    const summaryCopy = Q("#an-summary-copy", root);
     const summaryMeta = Q("#an-summary-meta", root);
     const issuesCount = Q("#an-issues-count", root);
+    const pendingCount = Q("#an-pending-count", root);
     const systemCount = Q("#an-system-count", root);
     const blockedCount = Q("#an-blocked-count", root);
     const search = Q("#an-search", root);
     const btnRun = Q("#an-run", root);
     const btnToggleIDs = Q("#an-toggle-ids", root);
     const btnClose = Q("#an-close", root);
-    const btnScope = Q("#an-scope", root);
+    const btnScopeIssues = Q("#an-scope-issues", root);
+    const btnScopeAll = Q("#an-scope-all", root);
+    const introTitle = Q(".an-intro-title", root);
+    const resultsTitle = Q("#an-results-title", root);
     const split = Q("#an-split", root);
+
+    const setStatusCount = (el, label, value, detail = "") => {
+      if (!el) return;
+      const labelEl = Q("b", el);
+      const valueEl = Q("em", el);
+      if (labelEl) labelEl.textContent = label;
+      if (valueEl) valueEl.textContent = String(value);
+      if (detail) el.title = detail;
+    };
 
     let COLS = JSON.parse(localStorage.getItem("an.cols") || "null");
     if (!Array.isArray(COLS) || COLS.length !== 4) COLS = [110, 110, 360, 90];
     let ITEMS = [];
     let VIEW = [];
+    let VIEW_RENDER = [];
     let SORT_KEY = "title";
     let SORT_DIR = "asc";
     let SHOW_IDS = false;
@@ -415,6 +528,7 @@ export default {
     let PAIRS = [];
     let PAIR_FILTER = new Set();
     let PAIR_STATS = [];
+    let PAIR_ISSUE_COUNTS = {};
     let PAIR_EXCLUSIONS = [];
     let PAIR_SCOPE_KEYS = new Set();
     let UNSYNCED = new Set();
@@ -427,15 +541,40 @@ export default {
     let LIMIT_INFO = {};
     let LIMIT_AFFECTED = new Map();
     let BLOCKS_BY_PF = new Map();
+    let BLOCKED_FINDINGS = [];
+    let CORE_EXTRA = [];
+    let BLOCKED_MANUAL = [];
+    let PAIR_ACTIVITY = {};
+    let PROFILE_LABELS = {};
+    let DETAIL_LOADED = new Set();
+    let DETAIL_VIEW = "issues";
+    let ATTENTION = { rows: [], counts: { current_mismatch: 0, pending_retry: 0, blocked: 0, total: 0 } };
+    let ISSUE_ITEMS = [];
+    let ISSUE_OFFSET = 0;
+    let ALL_TOTAL = 0;
+    let ALL_OFFSET = 0;
+    let ANALYSIS_TIMINGS = {};
+    let requestController = new AbortController();
+    let analyzePromise = null;
+    const PAGE_SIZE = 250;
+    const cleanup = () => {
+      requestController.abort();
+      clearTimeout(waitSlowTimer);
+      if (activeCleanup === cleanup) activeCleanup = null;
+    };
+    activeCleanup = cleanup;
     const setSummary = () => {
-      const scoped = ITEMS.filter(inPairScope);
-      if (summaryCopy) {
-        summaryCopy.textContent = SCOPE === "issues"
-          ? "Showing only items with detected delta issues for the selected pairs."
-          : "Showing all scoped items for the selected pairs, including healthy matches.";
-      }
+      if (introTitle) introTitle.textContent = SCOPE === "issues" ? "Items that need your attention" : "All items in the selected routes";
+      if (resultsTitle) resultsTitle.textContent = SCOPE === "issues" ? "Issue results" : "Scoped item browser";
       if (summaryMeta) {
-        summaryMeta.innerHTML = `<span class="mini" title="Scoped items are rows included by the selected pair filter.">Scoped ${scoped.length}</span><span class="mini" title="Visible items are the rows currently shown in the top table after search and scope filters.">Visible ${VIEW.length}</span><span class="mini" title="Issues are sync delta problems in the selected pairs, such as missing peers.">Issues ${UNSYNCED.size}</span><span class="mini" title="System findings are analyzer diagnostics about files, metadata, providers, or state health.">System ${EXTRA_FINDINGS.length}</span>`;
+        const total = SCOPE === "all" ? ALL_TOTAL : ISSUE_ITEMS.length;
+        const offset = SCOPE === "all" ? ALL_OFFSET : ISSUE_OFFSET;
+        const page = total
+          ? `<button class="mini" id="an-page-prev" type="button" ${offset <= 0 ? "disabled" : ""}>Previous</button><span class="mini">${offset + 1}-${Math.min(offset + ITEMS.length, total)} of ${total}</span><button class="mini" id="an-page-next" type="button" ${offset + ITEMS.length >= total ? "disabled" : ""}>Next</button>`
+          : "";
+        summaryMeta.innerHTML = page;
+        Q("#an-page-prev", summaryMeta)?.addEventListener("click", () => SCOPE === "all" ? loadAllPage(Math.max(0, ALL_OFFSET - PAGE_SIZE)) : showIssuePage(Math.max(0, ISSUE_OFFSET - PAGE_SIZE)));
+        Q("#an-page-next", summaryMeta)?.addEventListener("click", () => SCOPE === "all" ? loadAllPage(ALL_OFFSET + PAGE_SIZE) : showIssuePage(ISSUE_OFFSET + PAGE_SIZE));
       }
     };
 
@@ -544,23 +683,28 @@ export default {
     function renderHeader() {
       const dirMark = k =>
         SORT_KEY === k ? (SORT_DIR === "asc" ? "^" : "v") : "";
+      const cols = [
+        ["provider", "Provider"],
+        ["feature", "Feature"],
+        ["title", "Title"],
+        ["type", "Type"]
+      ];
+      const cells = cols
+        .map(
+          ([k, label], i) =>
+            `<div class="cell sort" data-k="${k}"><span class="label">${label}</span><span class="dir">${dirMark(
+              k
+            )}</span>${
+              i < cols.length - 1
+                ? `<span class="col-resize" data-ci="${i}" title="Drag to resize"></span>`
+                : ""
+            }</div>`
+        )
+        .join("");
       return `
         <div class="row head" style="grid-template-columns:${gridTemplateFrom(
           COLS
-        )}">
-          <div class="cell sort" data-k="provider"><span class="label">Provider</span><span class="dir">${dirMark(
-            "provider"
-          )}</span></div>
-          <div class="cell sort" data-k="feature"><span class="label">Feature</span><span class="dir">${dirMark(
-            "feature"
-          )}</span></div>
-          <div class="cell sort" data-k="title"><span class="label">Title</span><span class="dir">${dirMark(
-            "title"
-          )}</span></div>
-          <div class="cell sort" data-k="type"><span class="label">Type</span><span class="dir">${dirMark(
-            "type"
-          )}</span></div>
-        </div>`;
+        )}">${cells}</div>`;
     }
 
 
@@ -575,37 +719,6 @@ export default {
       if (!set) return false;
       return set.has(_normKey(key));
     }
-    async function refreshBlocked() {
-      const pairs = new Map();
-      for (const r of ITEMS || []) {
-        const k = _pfKey(r.provider, r.feature);
-        if (!pairs.has(k)) pairs.set(k, { provider: r.provider, feature: r.feature });
-      }
-      if (!pairs.size) {
-        BLOCKS_BY_PF = new Map();
-        return;
-      }
-      const next = new Map();
-      await Promise.all(
-        Array.from(pairs.values()).map(async ({ provider, feature }) => {
-          try {
-            const u = `/api/editor?source=state&kind=${encodeURIComponent(
-              String(feature || "")
-            )}&provider=${encodeURIComponent(String(provider || ""))}`;
-            const res = await fjson(u, { cache: "no-store" });
-            const blocks = Array.isArray(res && res.manual_blocks)
-              ? res.manual_blocks
-              : [];
-            const set = new Set(blocks.map(_normKey).filter(Boolean));
-            next.set(_pfKey(provider, feature), set);
-          } catch {
-            next.set(_pfKey(provider, feature), new Set());
-          }
-        })
-      );
-      BLOCKS_BY_PF = next;
-    }
-
     function renderBody(rows) {
       return rows
         .map(r => {
@@ -613,9 +726,9 @@ export default {
           const blk = isBlocked(r.provider, r.feature, r.key);
           const uns = UNSYNCED.has(tag);
           const label = displayTitle(r);
-          return `<div class="row${SELECTED === tag ? " sel" : ""}" data-tag="${tag}">
-            <div class="prov">${r.provider}</div>
-            <div class="feat">${r.feature}</div>
+          return `<div class="row${SELECTED === tag ? " sel" : ""}">
+            <div class="prov">${escHtml(r.provider)}</div>
+            <div class="feat">${escHtml(r.feature)}</div>
             <div class="title-stack">
               <div class="title">${
                 blk
@@ -634,10 +747,10 @@ export default {
                       return `<span class="unsync-dot" title="${escHtml(tip)}"></span>`;
                     })()
                   : ""
-              }${label}</div>
+              }${escHtml(label)}</div>
               <div class="ids mono">${chips(r.ids)}</div>
             </div>
-            <div>${r.type || ""}</div>
+            <div>${escHtml(r.type || "")}</div>
           </div>`;
         })
         .join("");
@@ -663,7 +776,8 @@ export default {
     }
 
     function draw() {
-      grid.innerHTML = renderHeader() + renderBody(sortRows(VIEW.slice()));
+      VIEW_RENDER = sortRows(VIEW.slice());
+      grid.innerHTML = renderHeader() + renderBody(VIEW_RENDER);
       setCols();
       setSummary();
     }
@@ -697,17 +811,59 @@ export default {
         return;
       }
       const row = e.target.closest(".row:not(.head)");
-      if (row) select(row.getAttribute("data-tag"));
+      if (row) {
+        const idx = QA(".row:not(.head)", grid).indexOf(row);
+        const item = idx >= 0 ? VIEW_RENDER[idx] : null;
+        if (!item) return;
+        DETAIL_VIEW = "issues";
+        updateStatusActive();
+        select(tagOf(item.provider, item.feature, item.key));
+      }
     });
 
-    function escHtml(s) {
-      return String(s)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
+    grid.addEventListener("pointerdown", e => {
+      const rez = e.target.closest(".col-resize");
+      if (!rez) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const ci = Number(rez.getAttribute("data-ci"));
+      if (!Number.isInteger(ci) || ci < 0 || ci >= COLS.length) return;
+      const startX = e.clientX;
+      const startW = COLS[ci] || 60;
+      const MINW = 60;
+      let moved = false;
+      rez.classList.add("dragging");
+      try { rez.setPointerCapture(e.pointerId); } catch {}
+      const mv = ev => {
+        const dx = ev.clientX - startX;
+        if (Math.abs(dx) > 2) moved = true;
+        COLS[ci] = Math.max(MINW, Math.round(startW + dx));
+        setCols();
+      };
+      const up = () => {
+        rez.removeEventListener("pointermove", mv);
+        rez.removeEventListener("pointerup", up);
+        rez.removeEventListener("pointercancel", up);
+        rez.classList.remove("dragging");
+        if (moved) {
+          try { localStorage.setItem("an.cols", JSON.stringify(COLS)); } catch {}
+        }
+        const suppress = ev => {
+          ev.stopPropagation();
+          grid.removeEventListener("click", suppress, true);
+        };
+        grid.addEventListener("click", suppress, true);
+        setTimeout(() => grid.removeEventListener("click", suppress, true), 0);
+      };
+      rez.addEventListener("pointermove", mv);
+      rez.addEventListener("pointerup", up);
+      rez.addEventListener("pointercancel", up);
+    });
+
+    issuesCount?.addEventListener("click", () => setDetailView("issues"));
+    pendingCount?.addEventListener("click", () => setDetailView("pending"));
+    systemCount?.addEventListener("click", () => setDetailView("system"));
+    blockedCount?.addEventListener("click", () => setDetailView("blocked"));
 
     function dedupeInfoFindings(list, typeName) {
       if (!Array.isArray(list) || !list.length) return [];
@@ -801,7 +957,7 @@ export default {
       const ids = it.ids || {};
       const inputs = ID_FIELDS.map(name => {
         const val = ids[name] || "";
-        return `<label><span>${name}</span><input type="text" name="${name}" data-idfield="${name}" value="${String(
+        return `<label><span>${escHtml(name)}</span><input type="text" name="${escHtml(name)}" data-idfield="${escHtml(name)}" value="${escHtml(
           val
         )}"></label>`;
       }).join("");
@@ -1070,7 +1226,198 @@ export default {
     async function select(tag) {
       SELECTED = tag;
       draw();
+      if (DETAIL_VIEW === "issues") {
+        renderIssueDetail(tag);
+        if (UNSYNCED.has(tag) && !DETAIL_LOADED.has(tag)) {
+          await loadItemDetail(tag);
+          if (SELECTED === tag && DETAIL_VIEW === "issues") {
+            draw();
+            renderIssueDetail(tag);
+          }
+        }
+      }
+    }
 
+    function hintMessage(h) {
+      if (!h || typeof h !== "object") return "";
+      if (h.message) return String(h.message).trim();
+      const parts = [];
+      if (h.provider) parts.push(String(h.provider).toUpperCase());
+      if (Array.isArray(h.reasons) && h.reasons.length) parts.push(h.reasons.map(String).join(", "));
+      else if (h.reason) parts.push(String(h.reason));
+      else if (h.kind) parts.push(String(h.kind));
+      return parts.join(": ").trim();
+    }
+
+    async function loadItemDetail(tag) {
+      const [provider, feature, key] = tag.split("::");
+      let d;
+      try {
+        const base = withPairs("/api/analyzer/detail");
+        const sep = base.includes("?") ? "&" : "?";
+        d = await fjson(
+          `${base}${sep}provider=${encodeURIComponent(provider)}&feature=${encodeURIComponent(feature)}&key=${encodeURIComponent(key)}`,
+          { signal: requestController.signal }
+        );
+      } catch {
+        return;
+      }
+      DETAIL_LOADED.add(tag);
+      const details = Array.isArray(d.target_show_info) ? d.target_show_info : [];
+      const msgs = details.map(x => String((x && x.message) || "").trim()).filter(Boolean);
+      const hintMsgs = (Array.isArray(d.hints) ? d.hints : []).map(hintMessage).filter(Boolean);
+      const merged = [];
+      for (const r of [...hintMsgs, ...(UNSYNCED_REASON.get(tag) || []), ...msgs]) {
+        if (r && !merged.includes(r)) merged.push(r);
+      }
+      if (merged.length) UNSYNCED_REASON.set(tag, merged);
+    }
+
+    async function loadSystemFindings() {
+      let sys;
+      try {
+        sys = await fjson(withPairs("/api/analyzer/system"), { signal: requestController.signal });
+      } catch {
+        return;
+      }
+      if (requestController.signal.aborted) return;
+      const list = Array.isArray(sys && sys.problems) ? sys.problems : [];
+      EXTRA_FINDINGS = CORE_EXTRA.concat(list.filter(p => p && p.type !== "cw_state_unresolved_backlog"));
+      BLOCKED_FINDINGS = BLOCKED_MANUAL.concat(list.filter(p => p && p.type === "cw_state_blackbox_active"));
+      setStatusCount(systemCount, "System", systemFindings().length);
+      const blockedTotal = BLOCKED_FINDINGS.reduce((acc, p) => {
+        if (p.type === "cw_state_blackbox_active") {
+          const c = Number(p.count);
+          const n = Number.isFinite(c) && c > 0 ? c : (Array.isArray(p.affected_items) ? p.affected_items.length : 0) || 1;
+          return acc + n;
+        }
+        return acc + 1;
+      }, 0);
+      setStatusCount(blockedCount, "Blocked", blockedTotal);
+      setStatusCount(issuesCount, "Current mismatches", UNSYNCED.size, "Items currently missing at a destination");
+      setStatusCount(pendingCount, "Pending retries", pendingRows().length, "Items attempted last sync that remain unresolved");
+      setSummary();
+      renderActiveDetail();
+    }
+
+    function updateStatusActive() {
+      const map = [[issuesCount, "issues"], [pendingCount, "pending"], [systemCount, "system"], [blockedCount, "blocked"]];
+      for (const [el, v] of map) {
+        if (!el) continue;
+        const on = v === DETAIL_VIEW;
+        el.classList.toggle("active", on);
+        el.setAttribute("aria-pressed", on ? "true" : "false");
+      }
+    }
+
+    function systemFindings() {
+      return (EXTRA_FINDINGS || []).filter(p => p && p.type !== "cw_state_blackbox_active");
+    }
+
+    function renderUnresolvedSection() {
+      const rows = pendingRows();
+      if (!rows.length) return "";
+      const blocks = rows.map(r => {
+        const { base, states } = attentionRowLabel(r);
+        const prov = String(r.provider || "").toUpperCase();
+        const feat = String(r.feature || "");
+        const reason = String(r.reason || "").trim();
+        const badges = states.map(s => `<span class="badge mono">${escHtml(s)}</span>`).join(" ");
+        const meta = [prov, feat].filter(Boolean).join(" · ");
+        return `<div class="issue"><div class="h">${escHtml(base)} ${badges}</div><div style="opacity:.85">${escHtml(meta)}${reason ? " — " + escHtml(reason) : ""}</div></div>`;
+      }).join("");
+      return `<div class="issue"><div class="h">Pending retries</div><div style="opacity:.85">Items attempted during the last sync that could not be matched or written at the destination. They stay here until a later sync confirms them or they are cleared.</div></div>` + blocks;
+    }
+
+    function renderIssuesEmpty() {
+      const notes = renderScopeExclusions();
+      const unresolved = renderUnresolvedSection();
+      const extras = renderGenericFindingBlocks(EXTRA_FINDINGS);
+      if (unresolved || (NORMALIZATION && NORMALIZATION.length) || extras) {
+        issues.innerHTML = renderNormalizationPanel(NORMALIZATION) + unresolved + extras + notes;
+      } else {
+        const ok = `<div class="issue"><div class="h">No issues detected</div><div>The selected source and destination pairs are currently aligned for this scope.</div></div>`;
+        issues.innerHTML = notes + ok;
+      }
+      issues.scrollTop = 0;
+    }
+
+    function renderSystemDetail() {
+      const findings = systemFindings();
+      const blocks = renderGenericFindingBlocks(findings);
+      if (!blocks && !(NORMALIZATION && NORMALIZATION.length)) {
+        issues.innerHTML =
+          `<div class="issue"><div class="h">No system findings</div><div>No background state or integrity diagnostics for the selected routes.</div></div>`;
+        issues.scrollTop = 0;
+        return;
+      }
+      const header = findings.length
+        ? `<div class="issue"><div class="h">System findings</div><div style="opacity:.85">Background diagnostics for the current state. They don't always mean the selected pair is unsynced, but they can explain risky or inconsistent state.</div></div>`
+        : "";
+      issues.innerHTML = renderNormalizationPanel(NORMALIZATION) + header + blocks;
+      issues.scrollTop = 0;
+    }
+
+    function renderBlockedDetail() {
+      const blocks = renderGenericFindingBlocks(BLOCKED_FINDINGS);
+      if (!blocks) {
+        issues.innerHTML =
+          `<div class="issue"><div class="h">No blocked items</div><div>Nothing is currently held back by a manual block list or an active blackbox for the selected routes.</div></div>`;
+        issues.scrollTop = 0;
+        return;
+      }
+      issues.innerHTML =
+        `<div class="issue"><div class="h">Blocked items</div><div style="opacity:.85">Items intentionally held back by a manual block list or an active blackbox. They are not synced by design.</div></div>` + blocks;
+      issues.scrollTop = 0;
+    }
+
+    function pendingRows() {
+      return (ATTENTION && Array.isArray(ATTENTION.rows) ? ATTENTION.rows : []).filter(r => r && r.unresolved);
+    }
+
+    function attentionRowLabel(r) {
+      const series = String(r.series_title || "").trim();
+      const title = String(r.title || "").trim();
+      const season = r.season;
+      const episode = r.episode;
+      const type = String(r.type || "").toLowerCase();
+      let base = title || series || String((r.keys || [])[0] || r.key || "");
+      if (type === "episode" && season != null && episode != null) {
+        base = `${series || title || base} - S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
+      }
+      const states = [];
+      if (r.current_mismatch) states.push("current mismatch");
+      if (r.unresolved) states.push("pending retry");
+      if (r.blocked) states.push("blocked");
+      return { base, states };
+    }
+
+    function renderPendingDetail() {
+      const section = renderUnresolvedSection();
+      issues.innerHTML = section ||
+        `<div class="issue"><div class="h">No pending retries</div><div>Nothing was left unresolved after the last sync for the selected routes.</div></div>`;
+      issues.scrollTop = 0;
+    }
+
+    function renderActiveDetail() {
+      if (DETAIL_VIEW === "pending") { renderPendingDetail(); return; }
+      if (DETAIL_VIEW === "system") { renderSystemDetail(); return; }
+      if (DETAIL_VIEW === "blocked") { renderBlockedDetail(); return; }
+      if (SELECTED && ITEMS.some(r => tagOf(r.provider, r.feature, r.key) === SELECTED)) {
+        renderIssueDetail(SELECTED);
+      } else {
+        renderIssuesEmpty();
+      }
+    }
+
+    function setDetailView(view) {
+      DETAIL_VIEW = (view === "pending" || view === "system" || view === "blocked") ? view : "issues";
+      updateStatusActive();
+      renderActiveDetail();
+      if (issues) issues.scrollTop = 0;
+    }
+
+    function renderIssueDetail(tag) {
       const [provider, feature, key] = tag.split("::");
       const it = ITEMS.find(r => tagOf(r.provider, r.feature, r.key) === tag);
       if (!it) {
@@ -1088,10 +1435,19 @@ export default {
         ? `Missing at ${missingTargets.join(" & ")}`
         : "Missing at other provider";
 
-      const reasons = UNSYNCED_REASON.get(tag) || [];
+      const allReasons = UNSYNCED_REASON.get(tag) || [];
+      // Drop any reason fully contained in a longer.
+      const reasons = allReasons.filter(
+        (r, i) =>
+          !allReasons.some(
+            (o, j) => j !== i && o.length > r.length && o.includes(r)
+          )
+      );
       const reasonBadge =
         unsynced && reasons.length
-          ? ` <span class="badge mono">${escHtml(reasons[0])}</span>`
+          ? reasons
+              .map(r => ` <span class="badge mono">${escHtml(r)}</span>`)
+              .join("")
           : "";
 
       const blockedBadge = blocked
@@ -1099,12 +1455,12 @@ export default {
         : "";
 
       const status = unsynced
-        ? `<span class="badge">${missingLabel}</span>${reasonBadge}${blockedBadge}`
+        ? `<span class="badge">${escHtml(missingLabel)}</span>${reasonBadge}${blockedBadge}`
         : `<span class="badge">No analyzer issues</span>${blockedBadge}`;
 
       const manual = manualIdsBlock(it);
       const header = `<div class="issue">
-        <div class="h">${heading}</div>
+        <div class="h">${escHtml(heading)}</div>
         <div>${status}</div>
         ${manual}
       </div>`;
@@ -1131,11 +1487,13 @@ export default {
       );
       const limitBlock = renderLimitPanel(tag);
       const scopeBlock = renderScopeExclusions();
+      const unresolvedSection = renderUnresolvedSection();
       issues.innerHTML =
         limitBlock +
         header +
         normalizationBlock +
         scopeBlock +
+        unresolvedSection +
         localSystemSection +
         allSystemSection;
       issues.scrollTop = 0;
@@ -1225,7 +1583,63 @@ function renderScopeExclusions() {
   </div>`;
 }
 
-function renderPairs() {
+function profileLabel(provider, instance) {
+      const inst = String(instance || "").trim();
+      if (!inst || inst.toLowerCase() === "default") return "";
+      const prov = String(provider || "").toUpperCase();
+      return (PROFILE_LABELS[prov] && PROFILE_LABELS[prov][inst]) || inst;
+    }
+
+    function lastRunPairId(list) {
+      let best = null;
+      let bestNs = -1;
+      for (const p of list) {
+        const id = String(p.id || "");
+        const ns = Number((PAIR_ACTIVITY && PAIR_ACTIVITY[id]) || 0);
+        if (ns > bestNs) {
+          bestNs = ns;
+          best = id;
+        }
+      }
+      return bestNs > 0 ? best : null;
+    }
+
+    async function loadPairActivity() {
+      try {
+        const j = await fjson("/api/analyzer/pair-activity", { cache: "no-store", timeoutMs: 30000, signal: requestController.signal });
+        const out = {};
+        for (const p of (j && Array.isArray(j.pairs) ? j.pairs : [])) {
+          if (p && p.id) out[String(p.id)] = Number(p.last_run_ns || 0);
+        }
+        PAIR_ACTIVITY = out;
+      } catch {
+        PAIR_ACTIVITY = {};
+      }
+    }
+
+    async function loadProfileLabels() {
+      try {
+        const j = await fjson("/api/provider-instances", { cache: "no-store", timeoutMs: 30000, signal: requestController.signal });
+        const map = j && typeof j === "object" ? j : {};
+        const out = {};
+        for (const [prov, raw] of Object.entries(map)) {
+          const ids = [];
+          for (const x of (Array.isArray(raw) ? raw : [])) {
+            const id = typeof x === "string" ? x : (x && x.id ? String(x.id) : "");
+            const norm = String(id || "").trim();
+            if (norm && norm.toLowerCase() !== "default") ids.push(norm);
+          }
+          const labels = {};
+          ids.forEach((id, i) => { labels[id] = `P${String(i + 1).padStart(2, "0")}`; });
+          out[String(prov || "").toUpperCase()] = labels;
+        }
+        PROFILE_LABELS = out;
+      } catch {
+        PROFILE_LABELS = {};
+      }
+    }
+
+    function renderPairs() {
       if (!pairBar) return;
       const list = (PAIRS || []).filter(p => p && p.enabled);
       if (!PAIR_FILTER.size && list.length) {
@@ -1234,11 +1648,18 @@ function renderPairs() {
           if (raw) {
             const ids = JSON.parse(raw);
             if (Array.isArray(ids))
-              ids.forEach(id => PAIR_FILTER.add(String(id)));
+              ids.forEach(id => {
+                if (list.some(p => String(p.id) === String(id))) PAIR_FILTER.add(String(id));
+              });
           }
         } catch {}
         if (!PAIR_FILTER.size) {
-          for (const p of list) PAIR_FILTER.add(String(p.id));
+          if (list.length === 1) {
+            PAIR_FILTER.add(String(list[0].id));
+          } else {
+            const lastId = lastRunPairId(list);
+            PAIR_FILTER.add(String(lastId || list[0].id));
+          }
         }
       }
       if (!list.length) {
@@ -1272,8 +1693,6 @@ function renderPairs() {
             synced: 0,
             unsynced: 0
           };
-          const total = stAB.total + stBA.total;
-          const unsynced = stAB.unsynced + stBA.unsynced;
           const on =
             !PAIR_FILTER.size || PAIR_FILTER.has(String(p.id));
           const mode = String(p.mode || "one-way").toLowerCase();
@@ -1284,13 +1703,16 @@ function renderPairs() {
             mode === "mirror"
               ? "swap_horiz"
               : "arrow_forward";
-          const badge = total
-            ? `<span class="mono">${unsynced || 0}/${total}</span>`
-            : "";
+          const issueN = PAIR_ISSUE_COUNTS[String(p.id)] || 0;
+          const badge = `<span class="an-pair-count${issueN ? " has" : ""}" title="${issueN} issue${issueN === 1 ? "" : "s"} for this pair">${issueN}</span>`;
           const cls = `an-pair-chip${on ? " on" : ""}`;
+          const srcProf = profileLabel(src, p.source_instance);
+          const dstProf = profileLabel(dst, p.target_instance);
+          const prof = (label, name) =>
+            label ? `<span class="an-pair-prof" title="${escHtml(name)} profile ${escHtml(label)}">${escHtml(label)}</span>` : "";
           return `<button type="button" class="${cls}" data-id="${esc(
             String(p.id || "")
-          )}"><span class="mono">${src}</span><span class="dir"><span class="material-symbols-rounded" aria-hidden="true">${dir}</span></span><span class="mono">${dst}</span>${badge}</button>`;
+          )}" aria-pressed="${on ? "true" : "false"}"><span class="mono">${src}</span>${prof(srcProf, src)}<span class="dir"><span class="material-symbols-rounded" aria-hidden="true">${dir}</span></span><span class="mono">${dst}</span>${prof(dstProf, dst)}${badge}</button>`;
         })
         .join("");
       pairBar.innerHTML = html;
@@ -1327,9 +1749,9 @@ function renderPairs() {
       });
     }
 
-    async function getActivePairMap() {
+    async function getActivePairMap(signal) {
       try {
-        const arr = await fjson("/api/pairs", { cache: "no-store" });
+        const arr = await fjson("/api/pairs", { cache: "no-store", timeoutMs: 30000, signal });
         const map = new Map();
         const on = feat =>
           feat && (typeof feat.enable === "boolean" ? feat.enable : !!feat);
@@ -1364,7 +1786,7 @@ function renderPairs() {
           const srcLabel = p.source_label || src;
           const dstLabel = p.target_label || dst;
           const F = p.features || {};
-          for (const feat of ["history", "watchlist", "ratings"]) {
+          for (const feat of ["history", "watchlist", "ratings", "progress"]) {
             if (!on(F[feat])) continue;
             add(src, feat, dst);
             add(src, feat, dstLabel);
@@ -1384,17 +1806,56 @@ function renderPairs() {
       }
     }
 
+    async function loadAllPage(offset = 0) {
+      showWait("Loading item page...");
+      try {
+        const sep = withPairs("/api/analyzer/state").includes("?") ? "&" : "?";
+        const data = await fjson(
+          `${withPairs("/api/analyzer/state")}${sep}offset=${Math.max(0, offset)}&limit=${PAGE_SIZE}`,
+          { signal: requestController.signal }
+        );
+        ITEMS = Array.isArray(data.items) ? data.items : [];
+        ALL_TOTAL = Number(data.total || 0);
+        ALL_OFFSET = Number(data.offset || 0);
+        filter(search.value || "");
+      } catch (error) {
+        if (!requestController.signal.aborted) {
+          issues.innerHTML = `<div class="issue"><div class="h">Could not load this page</div><div>${escHtml(error?.message || error)}</div></div>`;
+        }
+      } finally {
+        hideWait();
+      }
+    }
+
+    function showIssuePage(offset = 0) {
+      ISSUE_OFFSET = Math.max(0, Math.min(Number(offset || 0), Math.max(0, ISSUE_ITEMS.length - 1)));
+      ITEMS = ISSUE_ITEMS.slice(ISSUE_OFFSET, ISSUE_OFFSET + PAGE_SIZE);
+      filter(search.value || "");
+    }
+
     async function load() {
       restoreSplit();
       dragY();
       showWait("Loading pairs...");
-      await getActivePairMap();
+      await Promise.all([loadPairActivity(), loadProfileLabels()]);
+      await getActivePairMap(requestController.signal);
+      if (requestController.signal.aborted) {
+        hideWait();
+        return;
+      }
       setWaitText("Reading scoped state...");
       let s;
       try {
-        s = await fjson(withPairs("/api/analyzer/state"));
+        const stateUrl = withPairs("/api/analyzer/state");
+        s = await fjson(`${stateUrl}${stateUrl.includes("?") ? "&" : "?"}offset=0&limit=0`, {
+          signal: requestController.signal
+        });
       } catch {
-        s = { counts: {}, items: [] };
+        if (requestController.signal.aborted) {
+          hideWait();
+          return;
+        }
+        s = { counts: {}, items: [], total: 0 };
         issues.innerHTML = `
           <div class="issue">
             <div class="h">No scoped state yet</div>
@@ -1402,14 +1863,12 @@ function renderPairs() {
           </div>`;
       }
       ITEMS = s.items || [];
+      ALL_TOTAL = Number(s.total || 0);
       VIEW = ITEMS.slice();
-      const countsText = renderCounts(s.counts);
-      stats.innerHTML = countsText;
-      if (!countsText) stats.classList.add("empty");
-      else stats.classList.remove("empty");
-      issuesCount.textContent = "Issues: 0";
-      if (systemCount) systemCount.textContent = "System: 0";
-      if (blockedCount) blockedCount.textContent = "Blocked: 0";
+      setStatusCount(issuesCount, "Current mismatches", 0);
+      setStatusCount(pendingCount, "Pending retries", 0);
+      setStatusCount(systemCount, "System", 0);
+      setStatusCount(blockedCount, "Blocked", 0);
       draw();
       setWaitText("Analyzing...");
       try {
@@ -1420,21 +1879,49 @@ function renderPairs() {
     }
 
     async function analyze(silent = false) {
+      if (analyzePromise) return analyzePromise;
+      analyzePromise = analyzeRun(silent).finally(() => {
+        analyzePromise = null;
+      });
+      return analyzePromise;
+    }
+
+    async function analyzeRun(silent = false) {
       if (!silent) showWait("Analyzing...");
-      const pairMap = await getActivePairMap();
-      const [meta, status] = await Promise.all([
-        fjson(withPairs("/api/analyzer/problems")).catch(() => ({ problems: [] })),
-        fjson("/api/status").catch(() => null),
-        refreshBlocked().catch(() => null)
-      ]);
+      const pairMap = await getActivePairMap(requestController.signal);
+      if (requestController.signal.aborted) return;
+      let meta;
+      let status;
+      try {
+        [meta, status] = await Promise.all([
+          fjson(withPairs("/api/analyzer/problems"), { signal: requestController.signal }),
+          fjson("/api/status", { signal: requestController.signal }).catch(() => null)
+        ]);
+      } catch (error) {
+        if (requestController.signal.aborted) return;
+        issues.innerHTML = `<div class="issue"><div class="h">Analyzer failed</div><div>${escHtml(error?.message || error)}</div></div>`;
+        if (!silent) hideWait();
+        return;
+      }
 
       PAIR_STATS = meta.pair_stats || [];
       PAIR_EXCLUSIONS = meta.pair_exclusions || [];
       SUMMARY = meta.summary || {};
+      ATTENTION = (meta.attention && typeof meta.attention === "object")
+        ? { rows: Array.isArray(meta.attention.rows) ? meta.attention.rows : [], counts: meta.attention.counts || {} }
+        : { rows: [], counts: {} };
+      ANALYSIS_TIMINGS = meta.timings_ms || {};
       PAIR_SCOPE_KEYS = buildPairScopeKeys(pairMap);
       renderPairs();
 
       const all = meta.problems || [];
+      BLOCKS_BY_PF = new Map();
+      for (const finding of all) {
+        if (!finding || finding.type !== "blocked_manual" || !finding.key) continue;
+        const pf = _pfKey(finding.provider, finding.feature);
+        if (!BLOCKS_BY_PF.has(pf)) BLOCKS_BY_PF.set(pf, new Set());
+        BLOCKS_BY_PF.get(pf).add(_normKey(finding.key));
+      }
       const normalization = all.filter(
         p => p && p.type === "history_show_normalization"
       );
@@ -1444,8 +1931,15 @@ function renderPairs() {
           p &&
           p.type !== "missing_peer" &&
           p.type !== "blocked_manual" &&
-          p.type !== "history_show_normalization"
+          p.type !== "history_show_normalization" &&
+          p.type !== "cw_state_unresolved_backlog"
       );
+      BLOCKED_FINDINGS = all.filter(
+        p => p && (p.type === "blocked_manual" || p.type === "cw_state_blackbox_active")
+      );
+      CORE_EXTRA = EXTRA_FINDINGS.slice();
+      BLOCKED_MANUAL = BLOCKED_FINDINGS.slice();
+      DETAIL_LOADED = new Set();
 
       LIMIT_INFO = {};
       LIMIT_AFFECTED = new Map();
@@ -1516,9 +2010,44 @@ function renderPairs() {
         keep.push(p);
       }
 
+      PAIR_ISSUE_COUNTS = {};
+      const onFeat = f => f && (typeof f.enable === "boolean" ? f.enable : !!f);
+      for (const pr of (PAIRS || [])) {
+        const src = String(pr.source || "").toUpperCase();
+        const dst = String(pr.target || "").toUpperCase();
+        const srcL = String(pr.source_label || src).toUpperCase();
+        const dstL = String(pr.target_label || dst).toUpperCase();
+        const two = _isTwoWayMode(pr.mode);
+        const F = pr.features || {};
+        let n = 0;
+        for (const it of keep) {
+          if (!onFeat(F[String(it.feature || "").toLowerCase()])) continue;
+          const ip = String(it.provider || "").toUpperCase();
+          const tgts = (it.targets || []).map(t => String(t || "").toUpperCase());
+          const fwd = (ip === src || ip === srcL) && (tgts.includes(dst) || tgts.includes(dstL));
+          const rev = two && (ip === dst || ip === dstL) && (tgts.includes(src) || tgts.includes(srcL));
+          if (fwd || rev) n++;
+        }
+        PAIR_ISSUE_COUNTS[String(pr.id)] = n;
+      }
+      renderPairs();
+
       UNSYNCED = new Set(
         keep.map(p => tagOf(p.provider, p.feature, p.key))
       );
+      ISSUE_ITEMS = keep.map(p => ({
+        provider: p.provider,
+        feature: p.feature,
+        key: p.key,
+        title: p.title || p.item_title || "",
+        year: p.year,
+        type: p.item_type || p.type_name || "",
+        series_title: p.series_title || "",
+        season: p.season,
+        episode: p.episode,
+        ids: p.ids || {}
+      }));
+      if (SCOPE === "issues") showIssuePage(0);
 
       UNSYNCED_META = new Map(
         keep.map(p => [
@@ -1544,7 +2073,20 @@ function renderPairs() {
         const msgs = details
           .map(d => String((d && d.message) || "").trim())
           .filter(Boolean);
-        const reasons = msgs.slice();
+        const hintMsgs = (Array.isArray(p.hints) ? p.hints : [])
+          .map(h => {
+            if (!h || typeof h !== "object") return "";
+            if (h.message) return String(h.message).trim();
+            const parts = [];
+            if (h.provider) parts.push(String(h.provider).toUpperCase());
+            if (Array.isArray(h.reasons) && h.reasons.length) parts.push(h.reasons.map(String).join(", "));
+            else if (h.reason) parts.push(String(h.reason));
+            else if (h.kind) parts.push(String(h.kind));
+            return parts.join(": ").trim();
+          })
+          .filter(Boolean);
+        // Provider specific hints will be shown first
+        const reasons = [...hintMsgs, ...msgs];
         try {
           const featLower = String(p.feature || "").toLowerCase();
           const targets = (p.targets || []).map(t => String(t || "").toUpperCase());
@@ -1587,76 +2129,104 @@ function renderPairs() {
         }
       } catch {}
 
-      const parts = [`Issues: ${keep.length}`];
+      const parts = [`Current mismatches: ${keep.length}`];
       if (per.history) parts.push(`H:${per.history}`);
       if (per.watchlist) parts.push(`W:${per.watchlist}`);
       if (per.ratings) parts.push(`R:${per.ratings}`);
-      issuesCount.textContent = parts.join(" | ");
-      if (systemCount) systemCount.textContent = `System: ${EXTRA_FINDINGS.length}`;
-      if (blockedCount) {
-        const scoped = ITEMS.filter(inPairScope);
-        const n = scoped.reduce(
-          (acc, r) => acc + (isBlocked(r.provider, r.feature, r.key) ? 1 : 0),
-          0
-        );
-        blockedCount.textContent = `Blocked: ${n}`;
-      }
-
-      filter(search.value || "");
-
-      if (!keep.length) {
-        const notes = renderScopeExclusions();
-        const extras = renderGenericFindingBlocks(EXTRA_FINDINGS);
-        if ((NORMALIZATION && NORMALIZATION.length) || extras) {
-          issues.innerHTML = renderNormalizationPanel(NORMALIZATION) + extras + notes;
-        } else {
-          const ok = `<div class="issue"><div class="h">No issues detected</div><div>The selected source and destination pairs are currently aligned for this scope.</div></div>`;
-          issues.innerHTML = notes + ok;
+      if (per.progress) parts.push(`P:${per.progress}`);
+      setStatusCount(issuesCount, "Current mismatches", keep.length, parts.slice(1).join(" · ") || "Items currently missing at a destination");
+      setStatusCount(pendingCount, "Pending retries", pendingRows().length, "Items attempted last sync that remain unresolved");
+      setStatusCount(systemCount, "System", systemFindings().length);
+      const blockedTotal = BLOCKED_FINDINGS.reduce((acc, p) => {
+        if (p.type === "cw_state_blackbox_active") {
+          const c = Number(p.count);
+          const n = Number.isFinite(c) && c > 0
+            ? c
+            : (Array.isArray(p.affected_items) ? p.affected_items.length : 0) || 1;
+          return acc + n;
         }
-        if (!silent) hideWait();
-        return;
-      }
+        return acc + 1;
+      }, 0);
+      setStatusCount(blockedCount, "Blocked", blockedTotal);
 
-      const first = keep[0];
-      const tag = tagOf(first.provider, first.feature, first.key);
-      await select(tag);
-      SELECTED = tag;
+      if (keep.length) {
+        const first = keep[0];
+        SELECTED = tagOf(first.provider, first.feature, first.key);
+      } else if (SELECTED && !ITEMS.some(r => tagOf(r.provider, r.feature, r.key) === SELECTED)) {
+        SELECTED = null;
+      }
+      filter(search.value || "");
+      setDetailView(DETAIL_VIEW);
       if (!silent) hideWait();
+
+      if (SELECTED && UNSYNCED.has(SELECTED) && DETAIL_VIEW === "issues") {
+        loadItemDetail(SELECTED).then(() => {
+          if (SELECTED && DETAIL_VIEW === "issues" && !requestController.signal.aborted) {
+            draw();
+            renderIssueDetail(SELECTED);
+          }
+        });
+      }
+      loadSystemFindings();
     }
 
     btnRun.addEventListener("click", async e => {
       e.preventDefault();
       e.stopPropagation();
       if (btnRun.disabled) return;
-      const prev = btnRun.textContent;
+      const label = Q("span:last-child", btnRun);
+      const prev = label?.textContent || "Analyze";
       btnRun.disabled = true;
-      btnRun.textContent = "Analyzing...";
+      btnRun.classList.add("busy");
+      if (label) label.textContent = "Analyzing";
       try {
         await analyze(false);
       } finally {
         btnRun.disabled = false;
-        btnRun.textContent = prev;
+        btnRun.classList.remove("busy");
+        if (label) label.textContent = prev;
       }
     });
 
     btnToggleIDs.onclick = () => {
       SHOW_IDS = !SHOW_IDS;
-      btnToggleIDs.textContent = `IDs: ${
-        SHOW_IDS ? "shown" : "hidden"
-      }`;
+      const label = SHOW_IDS ? "Hide IDs" : "Show IDs";
+      btnToggleIDs.title = label;
+      btnToggleIDs.setAttribute("aria-label", label);
+      btnToggleIDs.setAttribute("aria-pressed", String(SHOW_IDS));
       grid.classList.toggle("show-ids", SHOW_IDS);
     };
-    btnScope.onclick = () => {
-      SCOPE = SCOPE === "issues" ? "all" : "issues";
-      btnScope.textContent = `Scope: ${SCOPE}`;
-      filter(search.value || "");
+    const selectScope = async nextScope => {
+      if (nextScope === SCOPE) return;
+      SCOPE = nextScope;
+      btnScopeIssues?.classList.toggle("active", SCOPE === "issues");
+      btnScopeAll?.classList.toggle("active", SCOPE === "all");
+      btnScopeIssues?.setAttribute("aria-pressed", String(SCOPE === "issues"));
+      btnScopeAll?.setAttribute("aria-pressed", String(SCOPE === "all"));
+      if (SCOPE === "all") await loadAllPage(0);
+      else {
+        showIssuePage(0);
+        ALL_OFFSET = 0;
+      }
     };
+    btnScopeIssues.onclick = () => selectScope("issues");
+    btnScopeAll.onclick = () => selectScope("all");
     search.addEventListener("input", e => filter(e.target.value));
     btnClose.addEventListener("click", () => {
+      cleanup();
       if (window.cxCloseModal) window.cxCloseModal();
+    });
+
+    Q("#an-wait-retry", root)?.addEventListener("click", () => {
+      try { requestController.abort("retry"); } catch {}
+      requestController = new AbortController();
+      analyzePromise = null;
+      load();
     });
 
     await load();
   },
-  unmount() {}
+  unmount() {
+    activeCleanup?.();
+  }
 };

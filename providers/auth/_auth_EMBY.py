@@ -321,7 +321,7 @@ def html() -> str:
               <label for="emby_user_id" style="margin-top:10px">User_ID</label>
               <div class="inp-row">
                 <input id="emby_user_id" name="emby_user_id" class="grow" placeholder="e.g. 6f7a0b3b-... (GUID)">
-                <button id="emby_pick_user" class="btn" type="button" data-cw-emby="pick-user">Pick user</button>
+                <button id="emby_pick_user" class="cw-userpick-icon material-symbols-rounded" type="button" data-cw-emby="pick-user" title="Pick user" aria-label="Pick user">person_search</button>
               </div>
               <div class="sub">Uses your signed-in account. Admin accounts show all users; otherwise you'll only see yourself.</div>
 
@@ -334,23 +334,10 @@ def html() -> str:
 
           <div class="cw-subpanel" data-sub="whitelist">
             <div style="max-width:980px">
-              <div class="inline" style="gap:12px;margin-top:0;margin-bottom:12px">
-                <button id="btn-emby-load-libraries" class="btn" type="button" title="Load Emby libraries">Load libraries</button>
-                <span class="sub" style="margin-left:auto">Refresh after changing Server URL.</span>
-              </div>
-
-              <div class="lm-head">
-                <div class="title">Whitelist Libraries</div>
-                <input id="emby_lib_filter" class="lm-filter" placeholder="Filter...">
-                <div class="lm-col"><span class="sub">Select all:</span></div>
-                <div class="lm-col"><button id="emby_hist_all" type="button" class="lm-dot hist" title="Toggle all History" aria-pressed="false"></button><span class="sub">History</span></div>
-                <div class="lm-col"><button id="emby_rate_all" type="button" class="lm-dot rate" title="Toggle all Ratings" aria-pressed="false"></button><span class="sub">Ratings</span></div>
-                <div class="lm-col"><button id="emby_scr_all" type="button" class="lm-dot scr" title="Toggle all Scrobble" aria-pressed="false"></button><span class="sub">Scrobble</span></div>
-              </div>
-              <div id="emby_lib_matrix" class="lm-rows"></div>
-              <div class="sub" style="margin-top:6px">Empty = all libraries.</div>
+              <div id="emby_lib_matrix"></div>
               <select id="emby_lib_history" class="lm-hidden" multiple></select>
               <select id="emby_lib_ratings" class="lm-hidden" multiple></select>
+              <select id="emby_lib_progress" class="lm-hidden" multiple></select>
               <select id="emby_lib_scrobble" class="lm-hidden" multiple></select>
             </div>
           </div>

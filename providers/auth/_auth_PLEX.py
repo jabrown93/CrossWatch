@@ -234,35 +234,12 @@ def html() -> str:
 
     /* user picker */
     #sec-plex .userpick{position:relative;display:inline-block}
-    #sec-plex .userpop{color:#e9eefb}
-    #sec-plex .userrow strong{color:#fff}
-    #sec-plex .userpop{
-      position:fixed;left:0;top:0;width:320px !important;max-width:92vw;max-height:340px;overflow:hidden;
-      background:#0b0d12;border:1px solid var(--border);border-radius:12px;padding:8px;z-index:9999;box-shadow:0 12px 30px rgba(0,0,0,.55)
-    }
-    #sec-plex .userpop.hidden{display:none}
-    #sec-plex .userpop .pophead{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-    #sec-plex .userpop .pophead input{flex:1;min-width:0}
-    #sec-plex .userpop .userlist{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow:auto}
-    #sec-plex .userrow{display:block;text-align:left;padding:10px 12px;border-radius:10px;background:#0a0d14;border:1px solid rgba(255,255,255,.06);cursor:pointer}
-    #sec-plex .userrow:hover{background:#0f1320;border-color:#b066ff;box-shadow:0 0 0 2px rgba(176,102,255,.15)}
-    #sec-plex .userrow .row1{display:flex;align-items:center;gap:10px;margin-bottom:2px}
-    #sec-plex .tag{font-size:.75em;opacity:.9;padding:2px 8px;border-radius:999px;border:1px solid var(--border)}
-    #sec-plex .tag.owner{color:#b066ff;border-color:#b066ff;box-shadow:0 0 6px rgba(176,102,255,.55)}
-    #sec-plex .tag.friend{color:#00d1ff;border-color:#00d1ff;box-shadow:0 0 6px rgba(0,209,255,.55)}
-    #sec-plex .tag.managed{color:#35ff8f;border-color:#35ff8f;box-shadow:0 0 6px rgba(53,255,143,.55)}
     #sec-plex .fieldline{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
 
     /* SSL toggle */
     #sec-plex .sslopt{display:flex;align-items:center;gap:8px;white-space:nowrap}
     #sec-plex .sslopt input[type="checkbox"]{width:18px;height:18px;accent-color:#00d1ff;cursor:pointer}
     #sec-plex .sslopt .lbl{opacity:.9}
-
-    /* neon scrollbar (user list) */
-    #sec-plex .userpop .userlist{scrollbar-width:thin;scrollbar-color:#00d1ff #0b0d12}
-    #sec-plex .userpop .userlist::-webkit-scrollbar{width:10px}
-    #sec-plex .userpop .userlist::-webkit-scrollbar-track{background:#0b0d12;border-radius:10px}
-    #sec-plex .userpop .userlist::-webkit-scrollbar-thumb{border-radius:10px;border:2px solid #0b0d12;background:linear-gradient(180deg,#00d1ff 0%,#b066ff 100%);box-shadow:0 0 8px rgba(0,209,255,.55),0 0 8px rgba(176,102,255,.55)}
 
     /* pin row */
     #sec-plex .pinrow{ margin-top:8px; display:flex; gap:12px; align-items:center; }
@@ -284,26 +261,34 @@ def html() -> str:
     #sec-plex #plex_msg_detail.warn{ color:#f7b955; }
     #sec-plex #plex_msg_detail.hidden{ display:none; }
     
-    /* Connect PLEX  */
-    #sec-plex .pinrow .btn:first-child{
+    #sec-plex .hidden{display:none !important}
+    #sec-plex .btn.plex-connect{
       background: linear-gradient(135deg,#00e084,#2ea859);
       border-color: rgba(0,224,132,.45);
       box-shadow: 0 0 14px rgba(0,224,132,.35);
       color: #fff;
     }
-    #sec-plex .pinrow .btn:first-child:hover{
+    #sec-plex .btn.plex-connect:hover{
       filter: brightness(1.06);
       box-shadow: 0 0 18px rgba(0,224,132,.5);
     }
-
-    /* Link code (PIN)  */
-    #sec-plex #plex_pin { max-width: none; }
-    #sec-plex .inline input#plex_pin{
-      flex: 1 1 0; min-width: 0; width: auto; font: inherit;
-      font-variant-numeric: normal; letter-spacing: normal; text-transform: none;
-      line-height: normal; height: auto; padding: 10px 12px;
-      background: #0b0d12; border: 1px solid var(--border); border-radius: 12px; box-shadow: none;
+    #sec-plex .plx-qc{margin-top:12px;padding:14px;border-radius:12px;border:1px solid rgba(0,224,132,.35);background:rgba(0,224,132,.06)}
+    #sec-plex .plx-qc-codewrap{display:flex;align-items:center;justify-content:center;gap:12px}
+    #sec-plex .plx-qc-code{
+      font-size:2em;font-weight:700;letter-spacing:.24em;padding:6px 0 6px .24em;color:#8ff0c2;
+      text-align:center;text-transform:uppercase;font-variant-numeric:tabular-nums;
     }
+    #sec-plex .plx-qc-copy{
+      appearance:none;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+      width:34px;height:34px;border-radius:9px;flex:0 0 auto;
+      border:1px solid rgba(0,224,132,.35);background:rgba(0,224,132,.08);color:#8ff0c2;
+      transition:background .15s ease, border-color .15s ease, color .15s ease, transform .12s ease;
+    }
+    #sec-plex .plx-qc-copy:hover{background:rgba(0,224,132,.16);border-color:rgba(0,224,132,.6)}
+    #sec-plex .plx-qc-copy:active{transform:scale(.94)}
+    #sec-plex .plx-qc-copy.copied{background:rgba(0,224,132,.24);border-color:rgba(0,224,132,.75)}
+    #sec-plex .plx-qc-copy svg{width:16px;height:16px;display:block}
+    #sec-plex .plx-qc-meta{display:flex;justify-content:space-between;gap:12px;margin-top:6px}
 
   </style>
 
@@ -329,21 +314,29 @@ def html() -> str:
 
         <div class="cw-subpanels">
           <div class="cw-subpanel active" data-sub="auth">
-            <div>
-              <label for="plex_pin">Link code (PIN)</label>
-              <div class="inline">
-                <input id="plex_pin" name="plex_pin" placeholder="" readonly>
-                <button id="btn-copy-plex-pin" type="button" class="btn copy">Copy</button>
-              </div>
-            </div>
-
-            <div class="inline pinrow">
-              <button id="btn-connect-plex" class="btn" type="button">Connect PLEX</button>
+            <input id="plex_pin" name="plex_pin" type="hidden">
+            <div class="sub">&nbsp;</div>
+            <div class="inline" style="margin-top:10px">
+              <button id="btn-connect-plex" class="btn plex-connect" type="button">Connect Plex</button>
+              <button id="btn-plex-cancel" class="btn danger hidden" type="button">Cancel</button>
+              <button id="btn-plex-restart" class="btn hidden" type="button">Restart</button>
               <button id="btn-delete-plex" class="btn danger" type="button">Delete</button>
-              <div class="hint">Opens plex.tv/link to complete sign-in.</div>
-              <div class="plexmsg">
+              <div class="plexmsg" style="margin-left:auto">
                 <div id="plex_msg" class="msg ok hidden">PIN</div>
                 <div id="plex_msg_detail" class="hidden"></div>
+              </div>
+            </div>
+            <div id="plex_qc_state" class="plx-qc hidden">
+              <div class="plx-qc-codewrap">
+                <div class="plx-qc-code" id="plex_qc_code">----</div>
+                <button type="button" id="plex_qc_copy" class="plx-qc-copy" title="Copy code" aria-label="Copy code">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                </button>
+              </div>
+              <div class="sub" id="plex_qc_help">Opening plex.tv/link &mdash; enter this code there and approve CrossWatch.</div>
+              <div class="plx-qc-meta">
+                <span class="sub" id="plex_qc_status">Waiting for authorization&hellip;</span>
+                <span class="sub" id="plex_qc_timer"></span>
               </div>
             </div>
           </div>
@@ -359,25 +352,12 @@ def html() -> str:
                   <span class="lbl">Verify SSL</span>
                 </label>
               </div>
-              <div class="fieldline" style="margin-top:6px">
-                <select id="plex_server_url_select" class="hidden" style="width:100%" title="Discovered server URLs"></select>
-              </div>
-              <div id="plex_server_url_select_hint" class="sub hidden" style="margin-top:4px">Pick a discovered URL to fill Server URL.</div>
-
-              <div class="sub">Leave blank to discover.</div>
+              <div class="sub">Type a URL, or pick a discovered server from the list. Leave blank to discover.</div>
 
               <label for="plex_username" style="margin-top:10px">Username</label>
               <div class="fieldline userpick">
                 <input id="plex_username" name="plex_username" placeholder="Plex Home profile">
-                <button class="btn" id="plex_user_pick_btn" title="Choose from server users">Pick</button>
-                <div id="plex_user_pop" class="userpop hidden">
-                  <div class="pophead">
-                    <input id="plex_user_filter" placeholder="Filter users...">
-                    <button type="button" class="btn" id="plex_user_close">Close</button>
-                  </div>
-                  <div id="plex_user_list" class="userlist"></div>
-                  <div class="sub" style="margin-top:6px">Click a user to fill Username and Account_ID.</div>
-                </div>
+                <button class="cw-userpick-icon material-symbols-rounded" id="plex_user_pick_btn" type="button" title="Choose from server users" aria-label="Choose from server users">person_search</button>
               </div>
 
               <label for="plex_account_id" style="margin-top:10px">Account_ID</label>
@@ -396,22 +376,10 @@ def html() -> str:
 
           <div class="cw-subpanel" data-sub="whitelist">
             <div style="max-width:980px">
-              <div class="plex-btnrow" style="margin-top:0;margin-bottom:12px">
-                <button id="btn-plex-load-libraries" class="btn" type="button" title="Load Plex libraries">Load libraries</button>
-                <span class="sub" style="align-self:center">Refresh after changing Server URL / token.</span>
-              </div>
-
-              <div class="lm-head">
-                <div class="title">Whitelist Libraries</div>
-                <input id="plex_lib_filter" class="lm-filter" placeholder="Filter...">
-                <div class="lm-col"><button id="plex_hist_all" type="button" class="lm-dot hist" title="Toggle all History"></button><span class="sub">History</span></div>
-                <div class="lm-col"><button id="plex_rate_all" type="button" class="lm-dot rate" title="Toggle all Ratings"></button><span class="sub">Ratings</span></div>
-                <div class="lm-col"><button id="plex_scr_all" type="button" class="lm-dot scr" title="Toggle all Scrobble"></button><span class="sub">Scrobble</span></div>
-              </div>
-              <div id="plex_lib_matrix" class="lm-rows"></div>
-              <div class="sub" style="margin-top:6px">Empty = all libraries.</div>
+              <div id="plex_lib_matrix"></div>
               <select id="plex_lib_history" class="lm-hidden" multiple></select>
               <select id="plex_lib_ratings" class="lm-hidden" multiple></select>
+              <select id="plex_lib_progress" class="lm-hidden" multiple></select>
               <select id="plex_lib_scrobble" class="lm-hidden" multiple></select>
             </div>
           </div>

@@ -12,12 +12,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Query, Request, HTTPException
+from fastapi import APIRouter, Query, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 from urllib.parse import parse_qs
 
 from cw_platform.config_base import load_config, save_config
-from cw_platform.provider_instances import build_provider_config_view, normalize_instance_id
+from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id
+from cw_platform.provider_usage import webhook_source_enabled
+from providers.webhooks.config import apply_webhook_settings, media_source_connected, webhook_sinks
 from providers.scrobble.routes import build_route_cfg_by_id, normalize_route_options, normalize_routes
 from providers.scrobble.scrobble import mask_account as _mask_account
 from providers.scrobble.sources import scrobble_sources
@@ -70,8 +72,17 @@ except Exception:
 
 router = APIRouter(tags=["scrobbler"])
 
+
+class WebhookAuthError(Exception):
+    def __init__(self, provider: str = "", reason: str = "invalid_webhook_token") -> None:
+        self.provider = str(provider or "").strip().lower()
+        self.reason = str(reason or "invalid_webhook_token").strip() or "invalid_webhook_token"
+        super().__init__(self.reason)
+
+
 # Webhook URL token helpers
-_WEBHOOK_KEYS = ("plextrakt", "jellyfintrakt", "embytrakt", "plexwatcher")
+_LEGACY_MEDIA_WEBHOOK_KEYS = ("plextrakt", "jellyfintrakt", "embytrakt")
+_WEBHOOK_KEYS = (*_LEGACY_MEDIA_WEBHOOK_KEYS, "plexwatcher")
 
 def _gen_webhook_id() -> str:
     return secrets.token_urlsafe(24).rstrip("=")
@@ -79,8 +90,11 @@ def _gen_webhook_id() -> str:
 def _ensure_webhook_ids(cfg: dict[str, Any]) -> dict[str, str]:
     sec = cfg.setdefault("security", {})
     ids = sec.setdefault("webhook_ids", {})
+    # Once a user removes the legacy media webhook endpoints, don't recreate them.
+    legacy_removed = bool(sec.get("legacy_webhooks_removed"))
+    ensure_keys = ("plexwatcher",) if legacy_removed else _WEBHOOK_KEYS
     changed = False
-    for k in _WEBHOOK_KEYS:
+    for k in ensure_keys:
         v = str(ids.get(k) or "").strip()
         if not v:
             ids[k] = _gen_webhook_id()
@@ -109,12 +123,23 @@ def _ensure_route_ratings_webhook_ids(cfg: dict[str, Any], regenerate: bool = Fa
         route_id = str(raw.get("id") or f"R{idx + 1}").strip() or f"R{idx + 1}"
         options = normalize_route_options(raw.get("options"))
         ratings = dict(options.get("ratings") or {})
-        if regenerate or not str(ratings.get("webhook_id") or "").strip():
-            ratings["webhook_id"] = _gen_webhook_id()
-            changed = True
-        if regenerate or not str(ratings.get("webhook_token") or "").strip():
-            ratings["webhook_token"] = _gen_webhook_id()
-            changed = True
+        mode = str(ratings.get("mode") or "off").strip().lower() or "off"
+        has_targets = bool(list(ratings.get("targets") or []))
+        if mode == "custom" and has_targets:
+            if regenerate or not str(ratings.get("webhook_id") or "").strip():
+                ratings["webhook_id"] = _gen_webhook_id()
+                changed = True
+            if regenerate or not str(ratings.get("webhook_token") or "").strip():
+                ratings["webhook_token"] = _gen_webhook_id()
+                changed = True
+        else:
+            if mode == "custom" and not has_targets:
+                ratings["mode"] = "off"
+                changed = True
+            if str(ratings.get("webhook_id") or "").strip() or str(ratings.get("webhook_token") or "").strip():
+                changed = True
+            ratings["webhook_id"] = ""
+            ratings["webhook_token"] = ""
         options["ratings"] = ratings
         raw["options"] = options
         out.append(
@@ -124,13 +149,62 @@ def _ensure_route_ratings_webhook_ids(cfg: dict[str, Any], regenerate: bool = Fa
                 "provider_instance": str(raw.get("provider_instance") or "default").strip() or "default",
                 "sink": str(raw.get("sink") or "").strip().lower(),
                 "sink_instance": str(raw.get("sink_instance") or "default").strip() or "default",
-                "mode": str(ratings.get("mode") or "inherit").strip().lower() or "inherit",
+                "mode": str(ratings.get("mode") or "off").strip().lower() or "off",
                 "targets": list(ratings.get("targets") or []),
                 "webhook_id": str(ratings.get("webhook_id") or "").strip(),
                 "webhook_token": str(ratings.get("webhook_token") or "").strip(),
             }
         )
 
+    if changed:
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
+    return out
+
+
+def _profile_webhook_key(provider: str, instance: str) -> str:
+    return f"profile:{str(provider or '').strip().lower()}:{normalize_instance_id(instance)}"
+
+
+def _source_has_webhook(cfg: dict[str, Any], provider: str, instance: str) -> bool:
+    try:
+        from providers.webhooks.config import webhook_sinks
+
+        return bool(webhook_sinks(cfg, provider, instance))
+    except Exception:
+        return False
+
+
+def _ensure_media_profile_webhook_ids(cfg: dict[str, Any], regenerate: bool = False) -> list[dict[str, Any]]:
+    sec = cfg.setdefault("security", {})
+    ids = sec.setdefault("webhook_ids", {})
+    changed = False
+    out: list[dict[str, Any]] = []
+    for provider in ("plex", "jellyfin", "emby"):
+        try:
+            instances = list_instance_ids(cfg, provider)
+        except Exception:
+            instances = ["default"]
+        for raw_inst in instances:
+            inst = normalize_instance_id(raw_inst)
+            key = _profile_webhook_key(provider, inst)
+            if not (media_source_connected(cfg, provider, inst) and _source_has_webhook(cfg, provider, inst)):
+                if str(ids.get(key) or "").strip():
+                    del ids[key]
+                    changed = True
+                continue
+            if regenerate or not str(ids.get(key) or "").strip():
+                ids[key] = _gen_webhook_id()
+                changed = True
+            out.append(
+                {
+                    "provider": provider,
+                    "instance": inst,
+                    "webhook_token": str(ids.get(key) or "").strip(),
+                }
+            )
     if changed:
         try:
             save_config(cfg)
@@ -182,14 +256,68 @@ def _extract_url_params(request: Request) -> dict[str, str]:
     return out
 
 
-def _require_webhook_token(request: Request, which: str) -> None:
+def _webhook_profile_gate(cfg: dict[str, Any], provider: str, instance: str) -> dict[str, Any] | None:
+    if not media_source_connected(cfg, provider, instance):
+        return {"ok": True, "ignored": True, "error": "provider_not_connected"}
+    if not webhook_source_enabled(cfg, provider, instance):
+        return {"ok": True, "ignored": True, "error": "profile_disabled"}
+    if not webhook_sinks(cfg, provider, instance):
+        return {"ok": True, "ignored": True, "error": "no_destinations"}
+    return None
+
+
+def _resolve_media_webhook_request(request: Request, provider: str, legacy_key: str) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None]:
     cfg = load_config() or {}
+    provider_lc = str(provider or "").strip().lower()
+    if not scrobble_sources(cfg).get("webhook"):
+        return None, "default", {"ok": True, "ignored": True, "error": "webhook_disabled"}
+
+    params = _extract_url_params(request)
+    if "profile" in params:
+        secret = str(params.get("profile") or "").strip()
+        # A profile token that matches nothing is a failed authentication, not a
+        # routing miss: answering 200/ignored would let it be brute-forced without
+        # ever surfacing in the logs. Matched-but-gated profiles still return
+        # ignored below, since those are legitimate senders.
+        if not secret:
+            raise WebhookAuthError(provider_lc, "invalid_profile")
+        for hook in _ensure_media_profile_webhook_ids(cfg):
+            if str(hook.get("provider") or "").strip().lower() != provider_lc:
+                continue
+            expected = str(hook.get("webhook_token") or "").strip()
+            if not expected or not hmac.compare_digest(expected, secret):
+                continue
+            inst = normalize_instance_id(hook.get("instance"))
+            blocked = _webhook_profile_gate(cfg, provider_lc, inst)
+            if blocked:
+                return None, inst, blocked
+            return apply_webhook_settings(build_provider_config_view(cfg, provider_lc, inst), provider_lc, inst), inst, None
+        raise WebhookAuthError(provider_lc, "invalid_profile")
+
     ids = _ensure_webhook_ids(cfg)
-    expected = str(ids.get(which) or "").strip()
+    expected = str(ids.get(legacy_key) or "").strip()
     got = _extract_url_token(request)
-    # Fail closed
     if not expected or not got or not hmac.compare_digest(expected, got):
-        raise HTTPException(status_code=401, detail="invalid_webhook_token")
+        raise WebhookAuthError(provider_lc, "invalid_webhook_token")
+    blocked = _webhook_profile_gate(cfg, provider_lc, "default")
+    if blocked:
+        return None, "default", blocked
+    return apply_webhook_settings(cfg, provider_lc, "default"), "default", None
+
+
+_WEBHOOK_IGNORE_REASONS: dict[str, tuple[str, str]] = {
+    "profile_disabled": ("profile is disabled for webhooks", "INFO"),
+    "webhook_disabled": ("webhook source is disabled", "INFO"),
+    "provider_not_connected": ("provider is not connected", "WARN"),
+    "no_destinations": ("no destinations selected", "WARN"),
+    "invalid_profile": ("invalid profile route", "WARN"),
+}
+
+
+def _webhook_ignore_log(prefix: str, target_error: dict[str, Any] | None) -> tuple[str, str]:
+    key = str((target_error or {}).get("error") or "").strip()
+    text, level = _WEBHOOK_IGNORE_REASONS.get(key, (key or "unknown reason", "WARN"))
+    return f"{prefix}: ignored ({text})", level
 
 
 def _resolve_plexwatcher_target(request: Request) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
@@ -227,7 +355,7 @@ def _resolve_plexwatcher_target(request: Request) -> tuple[str, dict[str, Any], 
             if isinstance(route_cfg, dict):
                 return "route", route_cfg, hook
 
-    raise HTTPException(status_code=401, detail="invalid_webhook_token")
+    raise WebhookAuthError("plex", "invalid_webhook_token")
 
 
 def _event_trigger_route_label(route: dict[str, Any]) -> str:
@@ -300,17 +428,63 @@ async def api_webhook_urls() -> JSONResponse:
     cfg = load_config() or {}
     ids = _ensure_webhook_ids(cfg)
     route_hooks = _ensure_route_ratings_webhook_ids(cfg)
-    return JSONResponse({"ok": True, "ids": ids, "route_hooks": route_hooks}, status_code=200)
+    profile_hooks = _ensure_media_profile_webhook_ids(cfg)
+    return JSONResponse({"ok": True, "ids": ids, "route_hooks": route_hooks, "profile_hooks": profile_hooks}, status_code=200)
 
 
 @router.post("/api/webhooks/regenerate")
-async def api_webhook_regenerate() -> JSONResponse:
+async def api_webhook_regenerate(payload: dict[str, Any] | None = Body(default=None)) -> JSONResponse:
     cfg = load_config() or {}
     sec = cfg.setdefault("security", {})
     ids = sec.setdefault("webhook_ids", {})
-    for k in _WEBHOOK_KEYS:
-        ids[k] = _gen_webhook_id()
-    route_hooks = _ensure_route_ratings_webhook_ids(cfg, regenerate=True)
+    body = payload if isinstance(payload, dict) else {}
+    key = str(body.get("key") or "").strip()
+    provider = str(body.get("provider") or "").strip().lower()
+    instance = str(body.get("instance") or "").strip()
+    route_id = str(body.get("route_id") or body.get("route") or "").strip()
+
+    if route_id:
+        sc = cfg.setdefault("scrobble", {})
+        watch = sc.setdefault("watch", {})
+        routes = watch.get("routes")
+        if not isinstance(routes, list):
+            return JSONResponse({"ok": False, "error": "routes_not_configured"}, status_code=400)
+        found = False
+        for idx, raw in enumerate(routes):
+            if not isinstance(raw, dict):
+                continue
+            rid = str(raw.get("id") or f"R{idx + 1}").strip() or f"R{idx + 1}"
+            if rid != route_id:
+                continue
+            options = normalize_route_options(raw.get("options"))
+            ratings = dict(options.get("ratings") or {})
+            ratings["webhook_id"] = _gen_webhook_id()
+            ratings["webhook_token"] = _gen_webhook_id()
+            options["ratings"] = ratings
+            raw["options"] = options
+            found = True
+            break
+        if not found:
+            return JSONResponse({"ok": False, "error": "route_not_found"}, status_code=404)
+        route_hooks = _ensure_route_ratings_webhook_ids(cfg)
+        profile_hooks = _ensure_media_profile_webhook_ids(cfg)
+    elif key:
+        if key not in _WEBHOOK_KEYS:
+            return JSONResponse({"ok": False, "error": "invalid_key"}, status_code=400)
+        ids[key] = _gen_webhook_id()
+        route_hooks = _ensure_route_ratings_webhook_ids(cfg)
+        profile_hooks = _ensure_media_profile_webhook_ids(cfg)
+    elif provider:
+        if provider not in {"plex", "jellyfin", "emby"}:
+            return JSONResponse({"ok": False, "error": "invalid_provider"}, status_code=400)
+        ids[_profile_webhook_key(provider, instance or "default")] = _gen_webhook_id()
+        route_hooks = _ensure_route_ratings_webhook_ids(cfg)
+        profile_hooks = _ensure_media_profile_webhook_ids(cfg)
+    else:
+        for k in _WEBHOOK_KEYS:
+            ids[k] = _gen_webhook_id()
+        route_hooks = _ensure_route_ratings_webhook_ids(cfg, regenerate=True)
+        profile_hooks = _ensure_media_profile_webhook_ids(cfg, regenerate=True)
     try:
         save_config(cfg)
     except Exception:
@@ -320,6 +494,7 @@ async def api_webhook_regenerate() -> JSONResponse:
             "ok": True,
             "ids": {k: str(ids.get(k) or '').strip() for k in _WEBHOOK_KEYS},
             "route_hooks": route_hooks,
+            "profile_hooks": profile_hooks,
         },
         status_code=200,
     )
@@ -506,6 +681,11 @@ def _emit_activity_webhook_event(provider: str, payload: dict[str, Any], result:
         return
     if result.get("error") or result.get("ignored") or result.get("debounced") or result.get("suppressed") or result.get("dedup"):
         return
+    if result.get("route_dispatch") or result.get("activity_recorded"):
+        return
+    for value in result.values():
+        if isinstance(value, dict) and (value.get("route_dispatch") or value.get("activity_recorded")):
+            return
     action = str(result.get("action") or "").strip().lower()
     if action not in {"/scrobble/stop", "stop"}:
         return
@@ -549,10 +729,6 @@ def _emit_activity_webhook_event(provider: str, payload: dict[str, Any], result:
 
 def _plex_token(cfg: dict[str, Any]) -> str:
     return ((cfg.get("plex") or {}).get("account_token") or "").strip()
-
-
-def _plex_client_id(cfg: dict[str, Any]) -> str:
-    return (cfg.get("plex") or {}).get("client_id") or "crosswatch"
 
 
 def _account(cfg: dict[str, Any]) -> Any:
@@ -1063,20 +1239,12 @@ def debug_watch_status(request: Request) -> dict[str, Any]:
     return out
 
 @router.post("/api/watch/start")
-def debug_watch_start(
-    request: Request,
-    provider: str | None = Query(None),
-    sink: str | None = Query(None),
-) -> dict[str, Any]:
+def debug_watch_start(request: Request) -> dict[str, Any]:
     if callable(_reset_currently_watching):
         try:
             _reset_currently_watching()
         except Exception:
             pass
-
-    if provider is not None or sink is not None:
-        # Watcher startup is route-driven now; query overrides are ignored for backward compatibility.
-        pass
 
     if not (HAVE_WATCH_MANAGER and callable(_wm_start_from_config)):
         raise HTTPException(status_code=500, detail="WatchManager unavailable")
@@ -1124,21 +1292,20 @@ def debug_watch_refresh(request: Request) -> dict[str, Any]:
     out["reloaded"] = True
     return out
 
+@router.post("/webhook/jellyfin")
 @router.post("/webhook/jellyfintrakt")
 async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
-    _require_webhook_token(request, "jellyfintrakt")
-
     from crosswatch import _UIHostLogger
 
     try:
-        from providers.webhooks.jellyfintrakt import process_webhook as jf_process_webhook
+        from providers.webhooks.jellyfin import process_webhook as jf_process_webhook
     except Exception:
         try:
             from crosswatch import process_webhook_jellyfin as jf_process_webhook
         except Exception:
             from jellyfintrakt import process_webhook as jf_process_webhook  # type: ignore[import]
 
-    logger = _UIHostLogger("TRAKT", "SCROBBLE")
+    logger = _UIHostLogger("WEBHOOK", "SCROBBLE")
 
     def log(msg: str, level: str = "INFO") -> None:
         lvl_raw = str(level or "INFO")
@@ -1169,6 +1336,11 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
             print(f"[SCROBBLE] {lvl_up} {msg}")
         except Exception:
             pass
+
+    target_cfg, provider_instance, target_error = _resolve_media_webhook_request(request, "jellyfin", "jellyfintrakt")
+    if target_error:
+        log(*_webhook_ignore_log("jf-webhook", target_error))
+        return JSONResponse(target_error, status_code=200)
 
     raw = await request.body()
     ct = (request.headers.get("content-type") or "").lower()
@@ -1249,6 +1421,8 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
             headers=dict(request.headers),
             raw=raw,
             logger=log,
+            cfg=target_cfg,
+            provider_instance=provider_instance,
         )
     except Exception as e:
         log(f"jf-webhook: process_webhook raised: {e}", "ERROR")
@@ -1277,21 +1451,20 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
     )
 
 
+@router.post("/webhook/emby")
 @router.post("/webhook/embytrakt")
 async def webhook_embytrakt(request: Request) -> JSONResponse:
-    _require_webhook_token(request, "embytrakt")
-
     from crosswatch import _UIHostLogger
 
     try:
-        from providers.webhooks.embytrakt import process_webhook as emby_process_webhook
+        from providers.webhooks.emby import process_webhook as emby_process_webhook
     except Exception:
         try:
             from crosswatch import process_webhook_emby as emby_process_webhook  # type: ignore[attr-defined]
         except Exception:
             from embytrakt import process_webhook as emby_process_webhook  # type: ignore[import]
 
-    logger = _UIHostLogger("TRAKT", "SCROBBLE")
+    logger = _UIHostLogger("WEBHOOK", "SCROBBLE")
 
     def log(msg: str, level: str = "INFO") -> None:
         lvl_raw = str(level or "INFO")
@@ -1322,6 +1495,11 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
             print(f"[SCROBBLE] {lvl_up} {msg}")
         except Exception:
             pass
+
+    target_cfg, provider_instance, target_error = _resolve_media_webhook_request(request, "emby", "embytrakt")
+    if target_error:
+        log(*_webhook_ignore_log("emby-webhook", target_error))
+        return JSONResponse(target_error, status_code=200)
 
     raw = await request.body()
     ct = (request.headers.get("content-type") or "").lower()
@@ -1402,6 +1580,8 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
             headers=dict(request.headers),
             raw=raw,
             logger=log,
+            cfg=target_cfg,
+            provider_instance=provider_instance,
         )
     except Exception as e:
         log(f"emby-webhook: process_webhook raised: {e}", "ERROR")
@@ -1430,18 +1610,17 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
     )
 
 
+@router.post("/webhook/plex")
 @router.post("/webhook/plextrakt")
 async def webhook_trakt(request: Request) -> JSONResponse:
-    _require_webhook_token(request, "plextrakt")
-
     from crosswatch import _UIHostLogger
 
     try:
-        from providers.scrobble.trakt.webhook import process_webhook  # type: ignore[import]
+        from providers.webhooks.plex import process_webhook
     except Exception:
         from crosswatch import process_webhook
 
-    logger = _UIHostLogger("TRAKT", "SCROBBLE")
+    logger = _UIHostLogger("WEBHOOK", "SCROBBLE")
 
     def log(msg: str, level: str = "INFO") -> None:
         lvl_raw = str(level or "INFO")
@@ -1472,6 +1651,11 @@ async def webhook_trakt(request: Request) -> JSONResponse:
             print(f"[SCROBBLE] {lvl_up} {msg}")
         except Exception:
             pass
+
+    target_cfg, provider_instance, target_error = _resolve_media_webhook_request(request, "plex", "plextrakt")
+    if target_error:
+        log(*_webhook_ignore_log("plex-webhook", target_error))
+        return JSONResponse(target_error, status_code=200)
 
     raw = await request.body()
     ct = (request.headers.get("content-type") or "").lower()
@@ -1527,6 +1711,8 @@ async def webhook_trakt(request: Request) -> JSONResponse:
             headers=dict(request.headers),
             raw=raw,
             logger=log,
+            cfg=target_cfg,
+            provider_instance=provider_instance,
         )
     except Exception as e:
         log(f"webhook: process_webhook raised: {e}", "ERROR")

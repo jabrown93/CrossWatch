@@ -31,8 +31,14 @@ try:
     from .trakt import _ratings as feat_ratings
 except Exception:
     feat_ratings = None
-
-feat_playlists = None
+try:
+    from .trakt import _progress as feat_progress
+except Exception:
+    feat_progress = None
+try:
+    from .trakt import _playlists as feat_playlists
+except Exception:
+    feat_playlists = None
 
 from ._mod_common import (
     build_session,
@@ -50,7 +56,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.1"
+__VERSION__ = "1.4"
 __all__ = ["get_manifest", "TRAKTModule", "OPS"]
 
 os.environ.setdefault("CW_TRAKT_UA", f"CrossWatch TRAKT/{__VERSION__}")
@@ -65,6 +71,16 @@ class TRAKTAuthError(TRAKTError):
 
 
 _PROVIDER = "TRAKT"
+
+_PLAYLIST_CAPABILITIES: dict[str, Any] = {
+    "read": True,
+    "create": True,
+    "add": True,
+    "remove": True,
+    "reorder": True,
+    "smart": False,
+    "media_types": ["movies", "shows", "seasons", "episodes"],
+}
 
 
 def _dbg(feature: str, event: str, **fields: Any) -> None:
@@ -88,8 +104,8 @@ if feat_history:
     _FEATURES["history"] = feat_history
 if feat_ratings:
     _FEATURES["ratings"] = feat_ratings
-if feat_playlists:
-    _FEATURES["playlists"] = feat_playlists
+if feat_progress:
+    _FEATURES["progress"] = feat_progress
 
 
 def _features_flags() -> dict[str, bool]:
@@ -97,7 +113,8 @@ def _features_flags() -> dict[str, bool]:
         "watchlist": "watchlist" in _FEATURES,
         "ratings": "ratings" in _FEATURES,
         "history": "history" in _FEATURES,
-        "playlists": "playlists" in _FEATURES,
+        "progress": "progress" in _FEATURES,
+        "playlists": feat_playlists is not None,
     }
 
 
@@ -120,6 +137,12 @@ def get_manifest() -> Mapping[str, Any]:
                 "unrate": True,
                 "from_date": True,
             },
+            "progress": {
+                "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+                "upsert": True,
+                "remove": True,
+            },
+            "playlists": _PLAYLIST_CAPABILITIES,
         },
     }
 
@@ -340,6 +363,7 @@ class TRAKTModule:
             self.client = self.client.connect()
         self.raw_cfg = cfg
         self.config = cfg
+        self.instance_id = "default"
         self.progress_factory = (
             lambda feature, total=None, throttle_ms=300: make_snapshot_progress(
                 ctx,
@@ -356,7 +380,8 @@ class TRAKTModule:
             "watchlist": True,
             "ratings": True,
             "history": True,
-            "playlists": False,
+            "progress": True,
+            "playlists": True,
         }
         present = _features_flags()
         return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
@@ -455,7 +480,8 @@ class TRAKTModule:
             "watchlist": (core_ok and wl_ok) if (need_wl and "watchlist" in _FEATURES) else False,
             "ratings": (core_ok if (enabled.get("ratings") and "ratings" in _FEATURES) else False),
             "history": (core_ok if (enabled.get("history") and "history" in _FEATURES) else False),
-            "playlists": (core_ok if (enabled.get("playlists") and "playlists" in _FEATURES) else False),
+            "progress": (core_ok if (enabled.get("progress") and "progress" in _FEATURES) else False),
+            "playlists": (core_ok if enabled.get("playlists") else False),
         }
 
         checks: list[bool] = []
@@ -532,6 +558,23 @@ class TRAKTModule:
         mod = _FEATURES.get(feature)
         return mod.build_index(self, **kwargs) if mod else {}
 
+    def prepare_source_snapshot(self, feature: str, items: Any) -> int:
+        if str(feature or "").lower() != "history" or feature not in _FEATURES:
+            return 0
+        mod = _FEATURES.get(feature)
+        hook = getattr(mod, "prepare_source_snapshot", None)
+        if not callable(hook):
+            return 0
+        seq = list(items.values()) if isinstance(items, Mapping) else list(items or [])
+        if not seq:
+            return 0
+        try:
+            produced = hook(seq)
+            return produced if isinstance(produced, int) else 0
+        except Exception as e:
+            _warn(feature, "prepare_source_snapshot_failed", error=str(e))
+            return 0
+
     def add(
         self,
         feature: str,
@@ -554,6 +597,18 @@ class TRAKTModule:
         try:
             skipped_keys: list[str] = []
             res = mod.add(self, lst)
+
+            if isinstance(res, dict) and isinstance(res.get("confirmed_keys"), list):
+                exact = [str(x) for x in (res.get("confirmed_keys") or []) if x]
+                out: dict[str, Any] = dict(res)
+                out["ok"] = bool(res.get("ok", True))
+                out["count"] = len(exact)
+                out["unresolved"] = res.get("unresolved") or []
+                out["confirmed_keys"] = exact
+                sk = out.get("skipped_keys")
+                if isinstance(sk, list) and sk:
+                    out["skipped"] = len(sk)
+                return out
 
             if isinstance(res, tuple):
                 if len(res) == 2:
@@ -578,7 +633,7 @@ class TRAKTModule:
                     sk = set(skipped_keys)
                     confirmed_keys = [k for k in confirmed_keys if k not in sk]
 
-            out: dict[str, Any] = {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+            out = {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
             if skipped_keys:
                 out["skipped_keys"] = skipped_keys
                 out["skipped"] = len(skipped_keys)
@@ -606,7 +661,13 @@ class TRAKTModule:
             _warn(feature, "write_skipped", op="remove", reason="module_missing")
             return {"ok": True, "count": 0, "unresolved": []}
         try:
-            cnt, unresolved = mod.remove(self, lst)
+            raw = mod.remove(self, lst)
+            if isinstance(raw, Mapping):
+                out = dict(raw)
+                out.setdefault("ok", True)
+                out.setdefault("confirmed_keys", [])
+                return out
+            cnt, unresolved = raw
             confirmed_keys = _confirmed_keys(self.key_of, lst, unresolved)
             return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
         except Exception as e:
@@ -634,6 +695,12 @@ class _TraktOPS:
                 "unrate": True,
                 "from_date": True,
             },
+            "progress": {
+                "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+                "upsert": True,
+                "remove": True,
+            },
+            "playlists": _PLAYLIST_CAPABILITIES,
         }
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
@@ -663,6 +730,40 @@ class _TraktOPS:
     ) -> Mapping[str, dict[str, Any]]:
         return self._adapter(cfg).build_index(feature)
 
+    def prepare_source_snapshot(
+        self,
+        cfg: Mapping[str, Any],
+        *,
+        feature: str,
+        items: Any,
+    ) -> int:
+        return TRAKTModule(cfg, connect=False).prepare_source_snapshot(feature, items)
+
+    def destination_comparison_view(
+        self,
+        cfg: Mapping[str, Any],
+        *,
+        feature: str,
+        index: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if str(feature or "").lower() != "history":
+            return index
+        mod = _FEATURES.get(feature)
+        hook = getattr(mod, "destination_comparison_view", None)
+        if not callable(hook):
+            return index
+        try:
+            adapter = None
+            try:
+                adapter = self._adapter(cfg)
+            except Exception as e:
+                _warn(feature, "destination_comparison_adapter_failed", error=str(e))
+            out = hook(index, adapter)
+            return out if isinstance(out, Mapping) else index
+        except Exception as e:
+            _warn(feature, "destination_comparison_failed", error=str(e))
+            return index
+
     def add(
         self,
         cfg: Mapping[str, Any],
@@ -688,5 +789,81 @@ class _TraktOPS:
 
     def dropped_show_tokens(self, cfg: Mapping[str, Any]) -> set[str]:
         return self._adapter(cfg).dropped_show_tokens()
+
+    def _pl(self) -> Any:
+        if feat_playlists is None:
+            raise TRAKTError("Trakt playlists feature is unavailable")
+        return feat_playlists
+
+    def _playlist_adapter(self, cfg: Mapping[str, Any], instance: str | None):
+        from cw_platform.provider_instances import normalize_instance_id
+
+        ad = self._adapter(cfg)
+        try:
+            ad.instance_id = normalize_instance_id(instance)
+        except Exception:
+            ad.instance_id = "default"
+        return ad
+
+    def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None):
+        if feat_playlists is None:
+            return []
+        return list(self._pl().list_resources(self._playlist_adapter(cfg, instance)))
+
+    def get_playlist_snapshot(self, cfg: Mapping[str, Any], playlist_id: str, *, instance: str | None = None):
+        return self._pl().get_snapshot(self._playlist_adapter(cfg, instance), playlist_id)
+
+    def create_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        name: str,
+        *,
+        media_type: str | None = None,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().create(self._playlist_adapter(cfg, instance), name, media_type=media_type, dry_run=dry_run)
+
+    def add_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().add(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def remove_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().remove(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def reorder_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        ordered_keys: Iterable[str],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        keys = list(ordered_keys or [])
+        if dry_run:
+            return {"ok": True, "count": 0, "dry_run": True}
+        return self._pl().reorder(self._playlist_adapter(cfg, instance), playlist_id, keys)
 
 OPS = _TraktOPS()

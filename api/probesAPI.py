@@ -11,6 +11,7 @@ import secrets
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Mapping
@@ -22,6 +23,7 @@ from fastapi.responses import JSONResponse
 from cw_platform.config_base import load_config as _load_config
 
 from cw_platform.provider_instances import get_provider_block, list_instance_ids, normalize_instance_id, provider_key
+from providers.sync.simkl._common import simkl_api_params, simkl_user_agent
 
 
 def _provider_auth():
@@ -58,6 +60,8 @@ PROVIDERS: tuple[str, ...] = (
     "mdblist",
     "publicmetadb",
     "tautulli",
+    "nuvio",
+    "kodi",
 )
 
 # Caches
@@ -76,6 +80,23 @@ _CACHE_LOCK = threading.Lock()
 _BUST_SEEN: set[str] = set()
 
 _HTTP_TL = threading.local()
+
+
+def invalidate_provider_caches(provider_id: str) -> None:
+    p = str(provider_id or "").strip().lower()
+    if not p:
+        return
+    with _CACHE_LOCK:
+        if p in PROBE_CACHE:
+            PROBE_CACHE[p] = (0.0, False)
+        pref = f"{p}|"
+        for key in [key for key in PROBE_DETAIL_CACHE.keys() if str(key).startswith(pref)]:
+            PROBE_DETAIL_CACHE.pop(key, None)
+        for key in [key for key in _USERINFO_CACHE.keys() if str(key).startswith(pref)]:
+            _USERINFO_CACHE.pop(key, None)
+        _BUST_SEEN.discard(p)
+    STATUS_CACHE["ts"] = 0.0
+    STATUS_CACHE["data"] = None
 
 
 def _set_http_error(msg: str) -> None:
@@ -108,6 +129,8 @@ PROBE_CFG_KEY: dict[str, str] = {
     "MDBLIST": "mdblist",
     "PUBLICMETADB": "publicmetadb",
     "TAUTULLI": "tautulli",
+    "NUVIO": "nuvio",
+    "KODI": "kodi",
 }
 
 _FALLBACK_KEYS: dict[str, tuple[str, ...]] = {
@@ -218,6 +241,20 @@ def _probe_key(provider_id: str, cfg: Mapping[str, Any]) -> str:
         exp = str(m.get("expires_at") or "0")
         return f"mdblist|device:{_secret_cache_tag(tok)}|exp:{exp}" if tok else "mdblist|unconfigured"
 
+    if p == "publicmetadb":
+        m = cfg.get("publicmetadb") or {}
+        key = str((m.get("api_key") or m.get("key") or "")).strip()
+        return f"publicmetadb|api:{_secret_cache_tag(key)}" if key else "publicmetadb|unconfigured"
+
+    if p == "nuvio":
+        n = cfg.get("nuvio") or {}
+        if not _provider_auth().is_configured("nuvio", n):
+            return "nuvio|unconfigured"
+        base = _norm_url(n.get("base_url") or "https://api.nuvio.tv")
+        tok = str((n.get("access_token") or "")).strip()
+        profile = str((n.get("profile_id") or "")).strip()
+        return f"nuvio|base:{_secret_cache_tag(base)}|tok:{_secret_cache_tag(tok)}|profile:{profile}"
+
     if p == "tautulli":
         t = cfg.get("tautulli") or {}
         base = _norm_url(t.get("server_url"))
@@ -229,6 +266,14 @@ def _probe_key(provider_id: str, cfg: Mapping[str, Any]) -> str:
         server = _norm_url(jf.get("server"))
         tok = str((jf.get("access_token") or jf.get("token") or "")).strip()
         return f"jellyfin|srv:{_secret_cache_tag(server)}|tok:{_secret_cache_tag(tok)}" if (server and tok) else "jellyfin|unconfigured"
+
+    if p == "kodi":
+        kodi = cfg.get("kodi") or {}
+        server = _norm_url(kodi.get("server"))
+        user = str((kodi.get("username") or "")).strip()
+        pw = str((kodi.get("password") or "")).strip()
+        verified = "1" if kodi.get("connection_verified") is True else "0"
+        return f"kodi|srv:{_secret_cache_tag(server)}|user:{_secret_cache_tag(user)}|pw:{_secret_cache_tag(pw)}|verified:{verified}" if server else "kodi|unconfigured"
 
     if p == "emby":
         em = cfg.get("emby") or {}
@@ -369,6 +414,22 @@ def _hdr_int(headers: Mapping[str, str], key: str) -> int | None:
         return None
 
 
+def _simkl_settings_post(client_id: str, token: str, timeout: int = HTTP_TIMEOUT) -> tuple[int, bytes]:
+    cid = str(client_id or "").strip()
+    tok = str(token or "").strip()
+    url = "https://api.simkl.com/users/settings"
+    if cid:
+        url = f"{url}?{urllib.parse.urlencode(simkl_api_params(cid))}"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": simkl_user_agent(),
+        "Authorization": f"Bearer {tok}",
+        "simkl-api-key": cid,
+    }
+    return _http_post(url, headers=headers, data=b"{}", timeout=timeout)
+
+
 def _load_trakt_last_limit_error(
     path: str = "/config/.cw_state/trakt_last_limit_error.json",
 ) -> dict[str, Any]:
@@ -476,7 +537,7 @@ def _probe_simkl_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tu
 
     s: Mapping[str, Any] = (cfg.get("simkl") or {}) if isinstance(cfg.get("simkl"), Mapping) else {}
     cid = str((s.get("client_id") or "")).strip()
-    tok = str((s.get("access_token") or "")).strip()
+    tok = str((s.get("access_token") or s.get("token") or "")).strip()
     if not cid:
         with _CACHE_LOCK:
             PROBE_DETAIL_CACHE[key] = (now, False, "SIMKL: missing client_id")
@@ -486,9 +547,7 @@ def _probe_simkl_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tu
             PROBE_DETAIL_CACHE[key] = (now, False, "SIMKL: missing access token")
         return False, "SIMKL: missing access token"
 
-    url = "https://api.simkl.com/users/settings"
-    headers = {**UA, "Authorization": f"Bearer {tok}", "simkl-api-key": cid}
-    code, _ = _http_get(url, headers=headers, timeout=HTTP_TIMEOUT)
+    code, _ = _simkl_settings_post(cid, tok, timeout=HTTP_TIMEOUT)
 
     ok = code == 200
     rsn = "" if ok else _reason_http(code, "SIMKL")
@@ -731,6 +790,62 @@ def _probe_publicmetadb_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL
         PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
     return ok, rsn
 
+def _probe_nuvio_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("nuvio", cfg)
+    bust_ts = _consume_bust("nuvio")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    from providers.auth._auth_NUVIO import (
+        NuvioAuthError,
+        NuvioClient,
+        NuvioInvalidResponse,
+        NuvioServiceUnavailable,
+        NuvioTokenRefreshError,
+    )
+
+    n: Mapping[str, Any] = (cfg.get("nuvio") or {}) if isinstance(cfg.get("nuvio"), Mapping) else {}
+    status = _provider_auth().status_for_block("nuvio", n)
+    if not status.get("authenticated"):
+        rsn = "Nuvio: missing authentication"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+    pid = status.get("profile_id")
+    if pid is None:
+        rsn = "Nuvio: missing profile"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    try:
+        hint = cfg.get("_cw_probe") if isinstance(cfg.get("_cw_probe"), Mapping) else {}
+        inst = normalize_instance_id((hint or {}).get("instance"))
+        profiles = NuvioClient(cfg, instance_id=inst).pull_profiles(cfg, refresh=True)
+        ok = any(int(p.get("profile_id") or 0) == pid for p in profiles if isinstance(p, Mapping))
+        rsn = "" if ok else "Nuvio: profile unavailable"
+    except NuvioTokenRefreshError:
+        ok = False
+        rsn = "Nuvio: token refresh failed"
+    except NuvioAuthError:
+        ok = False
+        rsn = "Nuvio: authentication failed"
+    except NuvioInvalidResponse:
+        ok = bool(status.get("connected"))
+        rsn = "Nuvio: invalid response"
+    except NuvioServiceUnavailable:
+        ok = bool(status.get("connected"))
+        rsn = "Nuvio: service unavailable"
+    except Exception:
+        ok = bool(status.get("connected"))
+        rsn = "Nuvio: service unavailable"
+
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
+    return ok, rsn
+
 def _probe_tautulli_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
     key = _probe_key("tautulli", cfg)
     bust_ts = _consume_bust("tautulli")
@@ -778,6 +893,7 @@ def _probe_jellyfin_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) ->
     jf = (cfg.get("jellyfin") or cfg.get("JELLYFIN") or {}) or {}
     server = (jf.get("server") or "").strip()
     token = (jf.get("access_token") or jf.get("token") or "").strip()
+    device_id = (jf.get("device_id") or "crosswatch").strip() or "crosswatch"
 
     if not server:
         rsn = "Jellyfin: missing server URL"
@@ -790,11 +906,10 @@ def _probe_jellyfin_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) ->
             PROBE_DETAIL_CACHE[key] = (now, False, rsn)
         return False, rsn
 
-    url = f"{server.rstrip('/')}/System/Info/Public"
-    code, _ = _http_get(url, headers={**UA}, timeout=HTTP_TIMEOUT)
-    if code == 404:
-        url2 = f"{server.rstrip('/')}/System/Info"
-        code, _ = _http_get(url2, headers={**UA, "X-Emby-Token": token}, timeout=HTTP_TIMEOUT)
+    from providers.sync.jellyfin._auth_http import auth_headers
+
+    url = f"{server.rstrip('/')}/Users/Me"
+    code, _ = _http_get(url, headers={**UA, **auth_headers(token, device_id)}, timeout=HTTP_TIMEOUT)
 
     ok = code == 200
     rsn = "" if ok else _reason_http(code, "Jellyfin")
@@ -832,6 +947,33 @@ def _probe_emby_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tup
     with _CACHE_LOCK:
         PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
     return ok, rsn
+
+
+def _probe_kodi_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("kodi", cfg)
+    bust_ts = _consume_bust("kodi")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    kodi = (cfg.get("kodi") or cfg.get("KODI") or {}) or {}
+    server = str(kodi.get("server") or "").strip()
+    verified = kodi.get("connection_verified") is True
+    if not server:
+        rsn = "Kodi: missing server URL"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+    if not verified:
+        rsn = "Kodi: connection not verified"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, True, "")
+    return True, ""
 
 def plex_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> dict[str, Any]:
     key = _probe_key("plex", cfg)
@@ -941,6 +1083,47 @@ def mdblist_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> d
             "user_id": j.get("user_id"),
             "limits": limits,
         }
+
+    with _CACHE_LOCK:
+        _USERINFO_CACHE[key] = (now, out)
+    return out
+
+def simkl_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> dict[str, Any]:
+    key = _probe_key("simkl", cfg)
+    bust_ts = _consume_bust("simkl")
+    now = time.time()
+    cached = _USERINFO_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts) and isinstance(cached[1], dict):
+        return cached[1]
+
+    sk = (cfg.get("simkl") or cfg.get("SIMKL") or {}) or {}
+    cid = str((sk.get("client_id") or "")).strip()
+    tok = str((sk.get("access_token") or sk.get("token") or "")).strip()
+    if not cid or not tok:
+        with _CACHE_LOCK:
+            _USERINFO_CACHE[key] = (now, {})
+        return {}
+
+    code, body = _simkl_settings_post(cid, tok, timeout=HTTP_TIMEOUT)
+
+    out: dict[str, Any] = {}
+    if code == 200:
+        j = _json_loads(body) or {}
+        account = j.get("account") if isinstance(j, dict) else {}
+        user = j.get("user") if isinstance(j, dict) else {}
+        if isinstance(account, Mapping):
+            account_type = str(account.get("type") or "").strip().lower()
+            if account_type:
+                out["account_type"] = account_type
+                out["plan_type"] = account_type
+                out["vip"] = account_type in ("pro", "vip")
+                out["vip_type"] = account_type if account_type in ("pro", "vip") else None
+            if account.get("id") is not None:
+                out["account_id"] = account.get("id")
+        if isinstance(user, Mapping):
+            username = str(user.get("name") or "").strip()
+            if username:
+                out["username"] = username
 
     with _CACHE_LOCK:
         _USERINFO_CACHE[key] = (now, out)
@@ -1153,11 +1336,17 @@ def _prov_configured(cfg: dict[str, Any], name: str, instance_id: Any = "default
     if ck == "emby":
         return bool(str(blk.get("server") or "").strip() and str(blk.get("access_token") or blk.get("token") or blk.get("api_key") or "").strip())
 
+    if ck == "kodi":
+        return bool(str(blk.get("server") or "").strip() and blk.get("connection_verified") is True)
+
     if ck == "mdblist":
         return _provider_auth().is_configured("mdblist", blk)
 
     if ck == "publicmetadb":
         return bool(str(blk.get("api_key") or blk.get("key") or "").strip())
+
+    if ck == "nuvio":
+        return _provider_auth().is_configured("nuvio", blk)
 
     if ck == "tmdb_sync":
         return bool(str(blk.get("api_key") or "").strip() and str(blk.get("session_id") or "").strip())
@@ -1227,13 +1416,16 @@ DETAIL_PROBES: dict[str, Callable[..., tuple[bool, str]]] = {
     "ANILIST": _probe_anilist_detail,
     "JELLYFIN": _probe_jellyfin_detail,
     "EMBY": _probe_emby_detail,
+    "KODI": _probe_kodi_detail,
     "TMDB": _probe_tmdb_detail,
     "MDBLIST": _probe_mdblist_detail,
     "PUBLICMETADB": _probe_publicmetadb_detail,
     "TAUTULLI": _probe_tautulli_detail,
+    "NUVIO": _probe_nuvio_detail,
 }
 USERINFO_FNS: dict[str, Callable[..., dict[str, Any]]] = {
     "PLEX": plex_user_info,
+    "SIMKL": simkl_user_info,
     "TRAKT": trakt_user_info,
     "ANILIST": anilist_user_info,
     "EMBY": emby_user_info,
@@ -1360,6 +1552,12 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     normalize_instance_id(inst)
                     for inst in list_instance_ids(cfg, ck)
                 }
+                if prov == "NUVIO":
+                    insts = {
+                        inst
+                        for inst in insts
+                        if _prov_configured(cfg, prov, inst)
+                    }
                 if insts:
                     configured_instances[prov] = insts
 
@@ -1462,15 +1660,19 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
             trakt_ok, trakt_reason, cfg_trakt = _provider_tuple("TRAKT")
             jelly_ok, jelly_reason, cfg_jelly = _provider_tuple("JELLYFIN")
             emby_ok, emby_reason, cfg_emby = _provider_tuple("EMBY")
+            kodi_ok, kodi_reason, cfg_kodi = _provider_tuple("KODI")
             tmdb_ok, tmdb_reason, cfg_tmdb = _provider_tuple("TMDB")
             mdbl_ok, mdbl_reason, cfg_mdbl = _provider_tuple("MDBLIST")
             publicmetadb_ok, publicmetadb_reason, cfg_publicmetadb = _provider_tuple("PUBLICMETADB")
+            nuvio_ok, nuvio_reason, cfg_nuvio = _provider_tuple("NUVIO")
             taut_ok, taut_reason, cfg_taut = _provider_tuple("TAUTULLI")
             anilist_ok, anilist_reason, cfg_anilist = _provider_tuple("ANILIST")
 
             userinfo_jobs: dict[str, tuple[Callable[..., dict[str, Any]], dict[str, Any]]] = {}
             if plex_ok:
                 userinfo_jobs["PLEX"] = (plex_user_info, cfg_plex)
+            if simkl_ok:
+                userinfo_jobs["SIMKL"] = (simkl_user_info, cfg_simkl)
             if trakt_ok:
                 userinfo_jobs["TRAKT"] = (trakt_user_info, cfg_trakt)
             if anilist_ok:
@@ -1495,6 +1697,7 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                             userinfo[prov] = {}
 
             info_plex = userinfo.get("PLEX", {})
+            info_simkl = userinfo.get("SIMKL", {})
             info_trakt = userinfo.get("TRAKT", {})
             info_anilist = userinfo.get("ANILIST", {})
             info_emby = userinfo.get("EMBY", {})
@@ -1574,6 +1777,18 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 providers_out["SIMKL"] = {
                     "connected": simkl_ok,
                     **({} if simkl_ok else {"reason": simkl_reason}),
+                    **(
+                        {}
+                        if not info_simkl
+                        else {
+                            "vip": bool(info_simkl.get("vip")),
+                            "vip_type": info_simkl.get("vip_type"),
+                            "account_type": info_simkl.get("account_type"),
+                            "plan_type": info_simkl.get("plan_type"),
+                            **({"account_id": info_simkl.get("account_id")} if info_simkl.get("account_id") is not None else {}),
+                            **({"username": info_simkl.get("username")} if info_simkl.get("username") else {}),
+                        }
+                    ),
                     "instances": inst_map,
                     "instances_summary": inst_sum,
                     "rep_instance": inst_sum.get("rep"),
@@ -1611,6 +1826,18 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     "connected": emby_ok,
                     **({} if emby_ok else {"reason": emby_reason}),
                     **({} if not info_emby else {"premiere": bool(info_emby.get("premiere"))}),
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
+            if "KODI" in active_providers:
+                inst_map, inst_sum = _instances_payload("KODI")
+                k_block = (cfg_kodi.get("kodi") or {}) if isinstance(cfg_kodi.get("kodi"), Mapping) else {}
+                providers_out["KODI"] = {
+                    "connected": kodi_ok,
+                    **({} if kodi_ok else {"reason": kodi_reason}),
+                    **({"kodi_version": k_block.get("kodi_version")} if k_block.get("kodi_version") else {}),
+                    **({"jsonrpc_version": k_block.get("jsonrpc_version")} if k_block.get("jsonrpc_version") else {}),
                     "instances": inst_map,
                     "instances_summary": inst_sum,
                     "rep_instance": inst_sum.get("rep"),
@@ -1664,6 +1891,22 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     "instances_summary": inst_sum,
                     "rep_instance": inst_sum.get("rep"),
                 }
+            if "NUVIO" in active_providers:
+                inst_map, inst_sum = _instances_payload("NUVIO")
+                n_block = (cfg_nuvio.get("nuvio") or {}) if isinstance(cfg_nuvio.get("nuvio"), Mapping) else {}
+                n_profile_name = str(n_block.get("profile_name") or "").strip()
+                n_profile_id = str(n_block.get("profile_id") or "").strip()
+                providers_out["NUVIO"] = {
+                    "connected": nuvio_ok,
+                    **({} if nuvio_ok else {"reason": nuvio_reason}),
+                    **({"profile_name": n_profile_name} if n_profile_name else {}),
+                    **({"profile_id": n_profile_id} if n_profile_id else {}),
+                    **({"nuvio_profile_name": n_profile_name} if n_profile_name else {}),
+                    **({"nuvio_profile_id": n_profile_id} if n_profile_id else {}),
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
 
 
 
@@ -1711,9 +1954,11 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 "anilist_connected": anilist_ok,
                 "jellyfin_connected": jelly_ok,
                 "emby_connected": emby_ok,
+                "kodi_connected": kodi_ok,
                 "tmdb_connected": tmdb_ok,
                 "mdblist_connected": mdbl_ok,
                 "publicmetadb_connected": publicmetadb_ok,
+                "nuvio_connected": nuvio_ok,
                 "tautulli_connected": taut_ok,
                 "debug": debug,
                 "can_run": bool(any_pair_ready),

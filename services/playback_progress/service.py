@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -17,8 +18,9 @@ from cw_platform.id_map import canonical_key, minimal as id_minimal
 from cw_platform.provider_instances import build_provider_config_view, get_instance_block, get_provider_block, list_instance_ids, normalize_instance_id
 
 from .adapters.base import PlaybackProgressAdapter, configured_label
-from .adapters.media_servers import EmbyPlaybackAdapter, JellyfinPlaybackAdapter, PlexPlaybackAdapter
+from .adapters.media_servers import EmbyPlaybackAdapter, JellyfinPlaybackAdapter, KodiPlaybackAdapter, PlexPlaybackAdapter
 from .adapters.mdblist import MDBListPlaybackAdapter
+from .adapters.nuvio import NuvioPlaybackAdapter
 from .adapters.publicmetadb import PublicMetaDBPlaybackAdapter
 from .adapters.simkl import SimklPlaybackAdapter
 from .adapters.trakt import TraktPlaybackAdapter
@@ -30,11 +32,12 @@ CACHE_TTL_SECONDS = 60.0
 MAX_WORKERS = 6
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 12.0
 GROUP_PROGRESS_TOLERANCE = 2.0
-PHASE1_PROVIDERS = ("trakt", "simkl", "mdblist", "publicmetadb", "plex", "emby", "jellyfin")
+PHASE1_PROVIDERS = ("trakt", "simkl", "mdblist", "publicmetadb", "plex", "emby", "jellyfin", "nuvio", "kodi")
 SORT_VALUES = {"last_updated", "progress_high", "progress_low", "remaining_time", "rating_high", "title", "provider"}
-LIVE_MEDIA_PROVIDERS = {"plex", "emby", "jellyfin"}
+LIVE_MEDIA_PROVIDERS = {"plex", "emby", "jellyfin", "kodi"}
 LIVE_ACTIVE_STATES = {"playing", "paused", "buffering"}
 LIVE_MAX_AGE_SECONDS = 10 * 60
+CANONICAL_TMDB_RE = re.compile(r"^tmdb:(\d+)(?:#|$)", re.I)
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -378,6 +381,83 @@ def _with_remaining_fallback(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _artwork_identity_key(item: Mapping[str, Any]) -> str:
+    media_type = _group_text(item.get("media_type") or item.get("type"))
+    if media_type == "movie":
+        return f"movie:{_group_text(item.get('title'))}:{_group_number(item.get('year'))}"
+    if media_type in {"episode", "anime_episode"}:
+        series = _group_text(item.get("series_title") or item.get("title"))
+        return f"episode:{series}:{_group_number(item.get('season'))}:{_group_number(item.get('episode'))}"
+    return ""
+
+
+def _show_ids_for_artwork(item: Mapping[str, Any]) -> dict[str, Any]:
+    meta = _as_mapping(item.get("provider_metadata"))
+    show_ids = dict(_as_mapping(meta.get("show_ids")))
+    ids = _as_mapping(item.get("ids"))
+    for target, keys in {
+        "tmdb": ("tmdb_show", "show_tmdb", "series_tmdb"),
+        "imdb": ("imdb_show", "show_imdb", "series_imdb"),
+        "tvdb": ("tvdb_show", "show_tvdb", "series_tvdb"),
+    }.items():
+        if not _blank_scalar(show_ids.get(target)):
+            continue
+        for key in keys:
+            value = ids.get(key) or item.get(key)
+            if not _blank_scalar(value):
+                show_ids[target] = value
+                break
+    if _group_text(item.get("media_type") or item.get("type")) in {"episode", "anime_episode"}:
+        match = CANONICAL_TMDB_RE.match(str(item.get("canonical_key") or "").strip())
+        if match and _blank_scalar(show_ids.get("tmdb")):
+            show_ids["tmdb"] = match.group(1)
+    return clean_mapping(show_ids)
+
+
+def _share_artwork_metadata(items: list[dict[str, Any]]) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        key = _artwork_identity_key(item)
+        if key:
+            grouped.setdefault(key, []).append(item)
+
+    for records in grouped.values():
+        if len(records) < 2:
+            continue
+        shared_show_ids: dict[str, Any] = {}
+        poster = ""
+        backdrop = ""
+        for record in records:
+            for key, value in _show_ids_for_artwork(record).items():
+                if not _blank_scalar(value):
+                    shared_show_ids.setdefault(key, value)
+            if _blank_scalar(poster) and not _blank_scalar(record.get("poster_url")):
+                poster = str(record.get("poster_url") or "")
+            if _blank_scalar(backdrop) and not _blank_scalar(record.get("backdrop_url")):
+                backdrop = str(record.get("backdrop_url") or "")
+        for record in records:
+            if _blank_scalar(record.get("poster_url")) and poster:
+                record["poster_url"] = poster
+            if _blank_scalar(record.get("backdrop_url")) and backdrop:
+                record["backdrop_url"] = backdrop
+            if not shared_show_ids:
+                continue
+            meta = dict(_as_mapping(record.get("provider_metadata")))
+            existing_show_ids = dict(_as_mapping(meta.get("show_ids")))
+            merged_show_ids = clean_mapping({**shared_show_ids, **existing_show_ids})
+            if merged_show_ids:
+                meta["show_ids"] = merged_show_ids
+                record["provider_metadata"] = clean_mapping(meta)
+            ids = dict(_as_mapping(record.get("ids")))
+            if not _blank_scalar(shared_show_ids.get("tmdb")):
+                ids.setdefault("tmdb_show", shared_show_ids.get("tmdb"))
+            if not _blank_scalar(shared_show_ids.get("imdb")):
+                ids.setdefault("imdb_show", shared_show_ids.get("imdb"))
+            if not _blank_scalar(shared_show_ids.get("tvdb")):
+                ids.setdefault("tvdb_show", shared_show_ids.get("tvdb"))
+            record["ids"] = clean_mapping(ids)
+
+
 def _combine_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(records, key=_record_order_key)
     primary = dict(ordered[0])
@@ -517,6 +597,8 @@ def _validated_progress_percent(value: Any) -> tuple[float | None, str]:
 def _instance_label(cfg: Mapping[str, Any], provider: str, instance_id: str) -> str:
     block = get_provider_block(cfg, provider, instance_id)
     label = configured_label(block, "Default" if instance_id == "default" else instance_id)
+    if str(provider or "").strip().lower() == "nuvio":
+        label = str(block.get("profile_name") or "").strip() or label
     provider_label = {
         "trakt": "Trakt",
         "simkl": "SIMKL",
@@ -525,6 +607,8 @@ def _instance_label(cfg: Mapping[str, Any], provider: str, instance_id: str) -> 
         "plex": "Plex",
         "emby": "Emby",
         "jellyfin": "Jellyfin",
+        "nuvio": "Nuvio",
+        "kodi": "Kodi",
     }.get(provider, provider)
     if label.lower() == "default":
         return f"{provider_label} Default"
@@ -574,6 +658,8 @@ def _profile_has_explicit_identity(cfg: Mapping[str, Any], provider: str, instan
         ),
         "emby": ("access_token", "user_id"),
         "jellyfin": ("access_token", "user_id"),
+        "nuvio": ("access_token", "refresh_token", "profile_id"),
+        "kodi": ("server", "server_url", "connection_verified", "username"),
     }.get(str(provider or "").strip().lower(), ())
     return any(str(_path_value(raw, path) or "").strip() for path in identity_paths)
 
@@ -602,6 +688,35 @@ def _provider_timeout_seconds(cfg: Mapping[str, Any]) -> float:
     return max(3.0, min(raw, 60.0))
 
 
+def _capability_error(cap: PlaybackCapabilities) -> dict[str, Any]:
+    reason = str(cap.reason or "").strip()
+    error_code = "unsupported" if cap.configured else "not_configured"
+    message = reason or "Provider does not support playback listing."
+    if cap.configured and "unavailable" in message.lower():
+        error_code = "provider_unavailable"
+    return {
+        "ok": False,
+        "provider": cap.provider,
+        "provider_label": cap.provider_label,
+        "instance_id": cap.instance_id,
+        "instance_label": cap.instance_label,
+        "operation": "list_progress",
+        "error_code": error_code,
+        "message": message,
+        "retryable": False,
+        "remote_status": None,
+    }
+
+
+def _enrich_list_error(error: dict[str, Any], cap: PlaybackCapabilities | None) -> dict[str, Any]:
+    if cap is None:
+        return error
+    out = dict(error)
+    out.setdefault("provider_label", cap.provider_label)
+    out.setdefault("instance_label", cap.instance_label)
+    return out
+
+
 class PlaybackProgressService:
     def __init__(self) -> None:
         self.adapters: dict[str, PlaybackProgressAdapter] = {
@@ -612,9 +727,15 @@ class PlaybackProgressService:
             "plex": PlexPlaybackAdapter(),
             "emby": EmbyPlaybackAdapter(),
             "jellyfin": JellyfinPlaybackAdapter(),
+            "nuvio": NuvioPlaybackAdapter(),
+            "kodi": KodiPlaybackAdapter(),
         }
         self._cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = threading.RLock()
+
+    def _adapter(self, provider: str) -> PlaybackProgressAdapter | None:
+        provider_key = str(provider or "").strip().lower()
+        return self.adapters.get(provider_key)
 
     def provider_instances(self, cfg: Mapping[str, Any] | None = None) -> list[dict[str, str]]:
         config = cfg or load_config()
@@ -638,7 +759,7 @@ class PlaybackProgressService:
         out: list[PlaybackCapabilities] = []
         for spec in self.provider_instances(config):
             provider = spec["provider"]
-            adapter = self.adapters.get(provider)
+            adapter = self._adapter(provider)
             if not adapter:
                 continue
             config_view = build_provider_config_view(config, provider, spec["instance_id"])
@@ -699,7 +820,9 @@ class PlaybackProgressService:
     ) -> PlaybackListResult:
         provider = spec["provider"]
         instance_id = spec["instance_id"]
-        adapter = self.adapters[provider]
+        adapter = self._adapter(provider)
+        if adapter is None:
+            return PlaybackListResult(False, provider, instance_id, error_code="unknown_provider", message="Provider module unavailable.")
         config_view = build_provider_config_view(cfg, provider, instance_id)
         cap = adapter.capabilities(config_view, instance_id=instance_id, instance_label=spec["instance_label"])
         if not cap.read:
@@ -778,12 +901,15 @@ class PlaybackProgressService:
             and (not instance_filter or spec["instance_id"] == instance_filter)
         ]
         readable_specs: list[dict[str, str]] = []
+        skipped_errors: list[dict[str, Any]] = []
         capabilities = self.capabilities(cfg)
         cap_by_key = {(cap.provider, cap.instance_id): cap for cap in capabilities}
         for spec in specs:
             cap = cap_by_key.get((spec["provider"], spec["instance_id"]))
             if cap and cap.read and cap.included:
                 readable_specs.append(dict(spec))
+            elif cap and cap.included and cap.configured:
+                skipped_errors.append(_capability_error(cap))
 
         LOG.info(
             f"list requested providers={len(readable_specs)} force_refresh={bool(force_refresh)} "
@@ -820,8 +946,13 @@ class PlaybackProgressService:
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
-        errors = [r.to_error() for r in results if not r.ok]
+        errors = skipped_errors + [
+            _enrich_list_error(r.to_error(), cap_by_key.get((r.provider, r.instance_id)))
+            for r in results
+            if not r.ok
+        ]
         items = [_with_remaining_fallback(item.to_dict()) for result in results if result.ok for item in result.items]
+        _share_artwork_metadata(items)
         _overlay_live_streams(items)
         filtered = self._apply_filters(items, media_type=media_type, progress_min=progress_min, progress_max=progress_max, age=age, rating_min=rating_min, search=search)
         if not provider_filter:
@@ -981,7 +1112,7 @@ class PlaybackProgressService:
     def _adapter_for_action(self, cfg: Mapping[str, Any], provider: str, instance_id: str) -> tuple[PlaybackProgressAdapter | None, dict[str, Any], str]:
         provider_key = str(provider or "").strip().lower()
         inst = normalize_instance_id(instance_id)
-        adapter = self.adapters.get(provider_key)
+        adapter = self._adapter(provider_key)
         if not adapter:
             return None, {}, inst
         return adapter, build_provider_config_view(cfg, provider_key, inst), inst
@@ -1038,8 +1169,6 @@ class PlaybackProgressService:
         instance_id: str,
         instance_label: str,
     ) -> PlaybackActionResult:
-        if provider == "plex":
-            return PlaybackActionResult(True, provider, instance_id, "remove_progress", remote_id=str(record.get("remote_id") or ""), canonical_key=str(record.get("canonical_key") or ""), message="Cleanup skipped because Plex clears resume progress through mark-unwatched.")
         caps = adapter.capabilities(config_view, instance_id=instance_id, instance_label=instance_label)
         if not caps.remove_progress:
             return PlaybackActionResult(True, provider, instance_id, "remove_progress", remote_id=str(record.get("remote_id") or ""), canonical_key=str(record.get("canonical_key") or ""), message="Cleanup skipped because remove progress is unsupported.")

@@ -456,7 +456,7 @@ def test_credentials_accepts_and_consumes_valid_setup_token(monkeypatch, tmp_pat
     assert not token_path.exists()
 
 
-def test_logout_all_revokes_paired_mobile_devices(monkeypatch) -> None:
+def test_logout_all_purges_legacy_mobile_pairings(monkeypatch) -> None:
     from api import appAuthAPI as auth
 
     cfg = _auth_cfg()
@@ -475,10 +475,10 @@ def test_logout_all_revokes_paired_mobile_devices(monkeypatch) -> None:
     resp = auth.api_logout_all(req)
 
     assert resp.status_code == 200
-    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] > 0
+    assert "mobile_auth" not in cfg
 
 
-def test_credentials_password_change_revokes_mobile_devices(monkeypatch) -> None:
+def test_credentials_password_change_purges_legacy_mobile_pairings(monkeypatch) -> None:
     from api import appAuthAPI as auth
 
     cfg = _auth_cfg()
@@ -497,10 +497,10 @@ def test_credentials_password_change_revokes_mobile_devices(monkeypatch) -> None
     resp = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "newpassword1"})
 
     assert resp.status_code == 200
-    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] > 0
+    assert "mobile_auth" not in cfg
 
 
-def test_credentials_save_without_password_change_does_not_revoke_mobile_devices(monkeypatch) -> None:
+def test_credentials_save_without_password_change_keeps_legacy_mobile_pairings(monkeypatch) -> None:
     # A benign settings tweak (e.g. remember-session preference) hits this same
     # endpoint with enabled=True and no password. It must not revoke paired
     # mobile devices -- only an actual password rotation should.
@@ -531,7 +531,7 @@ def test_credentials_save_without_password_change_does_not_revoke_mobile_devices
     )
 
     assert resp.status_code == 200
-    assert cfg["mobile_auth"]["devices"][0]["revoked_at"] == 0
+    assert "mobile_auth" in cfg
 
 
 def test_disabling_auth_mints_a_fresh_setup_token(monkeypatch) -> None:

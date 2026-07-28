@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 import requests
 
+from cw_platform.metadata_cache import normalize_title
+
 try:
     from _logging import log as _real_log
 except ImportError:
@@ -119,7 +121,7 @@ class TmdbProvider:
         msg = event if not suffix else f"{event} {suffix}"
         log(msg, level="debug", module="META", extra=clean or None)
 
-    def _get(self, url: str, params: dict[str, Any] | None = None) -> Any:
+    def _get(self, url: str, params: dict[str, Any] | None = None, *, quiet_404: bool = False) -> Any:
         q = dict(params or {})
         q["api_key"] = self._apikey()
         ck = url + "?" + "&".join(sorted(f"{k}={v}" for k, v in q.items()))
@@ -167,13 +169,14 @@ class TmdbProvider:
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 retryable = (status == 429) or (status is None) or (500 <= int(status or 0) < 600)
                 if (not retryable) or (attempt >= max_retries):
-                    lvl = "INFO" if int(status or 0) == 404 else "WARNING"
-                    log(
-                        f"TMDb request failed ({status or 'n/a'}) at {url}",
-                        level=lvl,
-                        module="META",
-                        extra={"status": status, "url": url},
-                    )
+                    if not (quiet_404 and int(status or 0) == 404):
+                        lvl = "INFO" if int(status or 0) == 404 else "WARNING"
+                        log(
+                            f"TMDb request failed ({status or 'n/a'}) at {url}",
+                            level=lvl,
+                            module="META",
+                            extra={"status": status, "url": url},
+                        )
                     raise
                 time.sleep(self._retry_delay(attempt, base_s, max_s))
                 attempt += 1
@@ -198,6 +201,188 @@ class TmdbProvider:
     @staticmethod
     def _pick_first(arr: list[Any] | None) -> Any | None:
         return arr[0] if isinstance(arr, list) and arr else None
+
+    @staticmethod
+    def _entity_kind(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        return "movie" if text in {"movie", "movies", "film", "films"} else "tv"
+
+    @staticmethod
+    def _detail_titles(det: Mapping[str, Any], kind: str) -> list[str]:
+        keys = ("title", "original_title") if kind == "movie" else ("name", "original_name")
+        return [str(det.get(k) or "") for k in keys if det.get(k)]
+
+    def _detail_year(self, det: Mapping[str, Any], kind: str) -> int | None:
+        field = "release_date" if kind == "movie" else "first_air_date"
+        return self._safe_int_year(det.get(field))
+
+    @staticmethod
+    def _expected_titles(title: str | None, year: int | None) -> set[str]:
+        want = normalize_title(title)
+        if not want:
+            return set()
+        wants = {want}
+        if year is not None:
+            suffix = f" {int(year)}"
+            if want.endswith(suffix):
+                trimmed = want[: -len(suffix)].strip()
+                if trimmed:
+                    wants.add(trimmed)
+        return wants
+
+    def _matches_expected(
+        self,
+        det: Mapping[str, Any],
+        kind: str,
+        title: str | None,
+        year: int | None,
+    ) -> bool:
+        wants = self._expected_titles(title, year)
+        if not wants:
+            return False
+        if not any(normalize_title(t) in wants for t in self._detail_titles(det, kind)):
+            return False
+        if year is None:
+            return True
+        got = self._detail_year(det, kind)
+        if got is None:
+            return True
+        return abs(int(got) - int(year)) <= 1
+
+    def _try_details(self, kind: str, tmdb_id: str, lang: str) -> tuple[dict[str, Any] | None, bool]:
+        base = "https://api.themoviedb.org/3"
+        try:
+            data = self._get(f"{base}/{kind}/{tmdb_id}", {"language": lang}, quiet_404=True)
+            return (data if isinstance(data, dict) else None), True
+        except requests.exceptions.RequestException as e:
+            status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+            if status == 404:
+                return None, True
+            return None, False
+        except Exception:
+            return None, False
+
+    def _find_by_external(
+        self,
+        external_id: str,
+        source: str,
+        tmdb_id: str,
+    ) -> tuple[str | None, bool]:
+        base = "https://api.themoviedb.org/3"
+        try:
+            data = self._get(f"{base}/find/{external_id}", {"external_source": source}, quiet_404=True)
+        except requests.exceptions.RequestException as e:
+            status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+            if status != 404:
+                return None, False
+            return None, True
+        except Exception:
+            return None, False
+        if not isinstance(data, dict):
+            return None, True
+        for bucket, kind in (("movie_results", "movie"), ("tv_results", "tv")):
+            for row in data.get(bucket) or []:
+                if isinstance(row, dict) and str(row.get("id") or "") == str(tmdb_id):
+                    return kind, True
+        return None, True
+
+    def _search_confirms(
+        self,
+        kind: str,
+        tmdb_id: str,
+        title: str,
+        year: int | None,
+        lang: str,
+    ) -> tuple[bool, bool]:
+        base = "https://api.themoviedb.org/3"
+        params: dict[str, Any] = {"query": title, "language": lang, "include_adult": False}
+        if year is not None:
+            params["primary_release_year" if kind == "movie" else "first_air_date_year"] = year
+        try:
+            data = self._get(f"{base}/search/{kind}", params, quiet_404=True)
+        except requests.exceptions.RequestException as e:
+            status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+            if status != 404:
+                return False, False
+            return False, True
+        except Exception:
+            return False, False
+        if not isinstance(data, dict):
+            return False, True
+        for row in data.get("results") or []:
+            if not isinstance(row, dict) or str(row.get("id") or "") != str(tmdb_id):
+                continue
+            if self._matches_expected(row, kind, title, year):
+                return True, True
+        return False, True
+
+    def resolve_namespace(
+        self,
+        *,
+        tmdb_id: str | int,
+        requested_type: str,
+        title: str | None = None,
+        year: int | str | None = None,
+        imdb_id: str | None = None,
+        tvdb_id: str | int | None = None,
+        locale: str | None = None,
+    ) -> dict[str, Any] | None:
+        tid = str(tmdb_id or "").strip()
+        if not tid.isdecimal() or int(tid) <= 0:
+            return None
+
+        requested = self._entity_kind(requested_type)
+        alternate = "tv" if requested == "movie" else "movie"
+        lang = locale or "en-US"
+
+        want_title = str(title or "").strip()
+        try:
+            want_year: int | None = int(str(year)[:4]) if str(year or "").strip() else None
+        except Exception:
+            want_year = None
+
+        if not want_title:
+            return None
+
+        req_det, req_ok = self._try_details(requested, tid, lang)
+        if not req_ok:
+            return None
+        if req_det and self._matches_expected(req_det, requested, want_title, want_year):
+            return {"resolved_type": requested, "status": "resolved", "reason": "requested_title_year_match"}
+
+        alt_det, alt_ok = self._try_details(alternate, tid, lang)
+        if not alt_ok:
+            return None
+
+        alt_match = bool(alt_det) and self._matches_expected(alt_det or {}, alternate, want_title, want_year)
+
+        if alt_match:
+            return {"resolved_type": alternate, "status": "resolved", "reason": "alternate_title_year_match"}
+        if req_det and not alt_det:
+            return {"resolved_type": requested, "status": "resolved", "reason": "only_requested_namespace_exists"}
+        if alt_det and not req_det:
+            return {"resolved_type": alternate, "status": "resolved", "reason": "only_alternate_namespace_exists"}
+
+        external = str(imdb_id or "").strip() if requested == "movie" else str(tvdb_id or "").strip()
+        source = "imdb_id" if requested == "movie" else "tvdb_id"
+        if not external:
+            external = str(tvdb_id or "").strip() if requested == "movie" else str(imdb_id or "").strip()
+            source = "tvdb_id" if requested == "movie" else "imdb_id"
+        if external:
+            found, ok = self._find_by_external(external, source, tid)
+            if not ok:
+                return None
+            if found:
+                return {"resolved_type": found, "status": "resolved", "reason": f"external_id_{source}"}
+
+        for kind in (requested, alternate):
+            confirmed, ok = self._search_confirms(kind, tid, want_title, want_year, lang)
+            if not ok:
+                return None
+            if confirmed:
+                return {"resolved_type": kind, "status": "resolved", "reason": "search_title_year_match"}
+
+        return {"resolved_type": requested, "status": "unresolved", "reason": "inconclusive"}
 
     def _images(self, tmdb_id: str, kind: str, lang: str, need: Mapping[str, bool]) -> dict[str, list[dict[str, Any]]]:
         want_poster = bool(need.get("poster"))
@@ -376,7 +561,8 @@ class TmdbProvider:
             return {}
 
         tmdb_id = str(ids.get("tmdb") or ids.get("id") or "").strip()
-        imdb_id = (ids.get("imdb") or "").strip()
+        imdb_id = str(ids.get("imdb") or "").strip()
+        tvdb_id = str(ids.get("tvdb") or ids.get("tvdb_id") or "").strip()
         title = (ids.get("title") or "").strip()
         year_in = (ids.get("year") or "").strip()
 
@@ -402,6 +588,25 @@ class TmdbProvider:
                         ent_in = "tv"
             except Exception as e:
                 self._log_exc("TMDb find by IMDb failed", e)
+
+        if not tmdb_id and tvdb_id:
+            try:
+                found = self._get(f"{base}/find/{tvdb_id}", {"external_source": "tvdb_id"})
+                if ent_in == "movie":
+                    hit = self._pick_first(found.get("movie_results") or [])
+                else:
+                    hit = self._pick_first(found.get("tv_results") or [])
+                tmdb_id = str(hit.get("id")) if hit else ""
+                if not tmdb_id:
+                    m = self._pick_first(found.get("movie_results") or [])
+                    t = self._pick_first(found.get("tv_results") or [])
+                    tmdb_id = str((m or t or {}).get("id") or "") if (m or t) else ""
+                    if m and not t:
+                        ent_in = "movie"
+                    if t and not m:
+                        ent_in = "tv"
+            except Exception as e:
+                self._log_exc("TMDb find by TVDB failed", e)
 
         if not tmdb_id and title:
             try:
@@ -608,9 +813,8 @@ def html() -> str:
         <label for="tmdb_api_key">TMDb API key</label>
         <input id="tmdb_api_key" name="tmdb_api_key" placeholder="Your TMDb API key" oninput="this.dataset.dirty='1'; updateTmdbHint()">
         <div id="tmdb_hint" class="msg warn hidden">
-          TMDb is optional but recommended to enrich posters &amp; metadata in the preview.
-          Get an API key at
-          <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">TMDb API settings</a>.
+          TMDb is optional but highly recommended.
+          Get an API key at <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">TMDb API settings</a>
         </div>
         <div class="sub">This product uses the TMDb API but is not endorsed by TMDb.</div>
         <div class="sep"></div>

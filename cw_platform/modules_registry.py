@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib import import_module
 from typing import Any
 
 # Global module registry
@@ -14,9 +15,11 @@ MODULES: dict[str, dict[str, str]] = {
         "_auth_TRAKT":    "providers.auth._auth_TRAKT",
         "_auth_JELLYFIN": "providers.auth._auth_JELLYFIN",
         "_auth_EMBY":     "providers.auth._auth_EMBY",
+        "_auth_KODI":     "providers.auth._auth_KODI",
         "_auth_MDBLIST":  "providers.auth._auth_MDBLIST",
         "_auth_PUBLICMETADB": "providers.auth._auth_PUBLICMETADB",
         "_auth_TAUTULLI": "providers.auth._auth_TAUTULLI",
+        "_auth_NUVIO":    "providers.auth._auth_NUVIO",
         "_auth_ANILIST":  "providers.auth._auth_ANILIST",
         "_auth_TMDB":     "providers.auth._auth_TMDB",
     },
@@ -26,8 +29,10 @@ MODULES: dict[str, dict[str, str]] = {
         "_mod_TRAKT":      "providers.sync._mod_TRAKT",
         "_mod_JELLYFIN":   "providers.sync._mod_JELLYFIN",
         "_mod_EMBY":       "providers.sync._mod_EMBY",
+        "_mod_KODI":       "providers.sync._mod_KODI",
         "_mod_MDBLIST":    "providers.sync._mod_MDBLIST",
         "_mod_PUBLICMETADB": "providers.sync._mod_PUBLICMETADB",
+        "_mod_NUVIO":      "providers.sync._mod_NUVIO",
         "_mod_CROSSWATCH": "providers.sync._mod_CROSSWATCH",
         "_mod_TAUTULLI":   "providers.sync._mod_TAUTULLI",
         "_mod_ANILIST":    "providers.sync._mod_ANILIST",
@@ -41,21 +46,48 @@ def get_sync_module_path_by_name(name: str) -> str | None:
     return MODULES["SYNC"].get(key)
 
 
-def load_sync_ops(name: str) -> Any | None:
-    # Resolve via the orchestrator's dynamic provider discovery (pkgutil-scanned
-    # providers/sync/_mod_*.py) instead of importing the static MODULES["SYNC"]
-    # path by hand — keeps this the single source of truth for "what ops does
-    # provider X have" so the two registries can't silently drift apart.
-    from cw_platform.orchestrator._providers import load_sync_providers
+def sync_provider_names(*, upper: bool = True) -> list[str]:
+    names = [
+        str(key).replace("_mod_", "")
+        for key in (MODULES.get("SYNC") or {}).keys()
+        if str(key).startswith("_mod_")
+    ]
+    out: list[str] = []
+    for name in names:
+        value = name.upper() if upper else name.lower()
+        if value and value not in {"BASE", "base"} and value not in out:
+            out.append(value)
+    return out
 
-    return load_sync_providers().get((name or "").strip().upper())
+
+def load_sync_ops(name: str) -> Any | None:
+    # Resolve straight from MODULES["SYNC"]. Do not delegate to
+    # orchestrator._providers.load_sync_providers() — that function calls back
+    # into this one per provider, so delegating makes the two mutually recursive.
+    path = get_sync_module_path_by_name(name)
+    if not path:
+        return None
+    mod = import_module(path)
+    return getattr(mod, "OPS", None)
+
+
+def sync_provider_supports_feature(name: str, feature: str) -> bool:
+    provider = str(name or "").strip().lower()
+    feat = str(feature or "").strip().lower()
+    if not provider or not feat:
+        return False
+    ops = load_sync_ops(provider)
+    if not ops:
+        return False
+    features = ops.features() if callable(getattr(ops, "features", None)) else {}
+    if isinstance(features, Mapping) and features.get(feat) is not True:
+        return False
+    caps = ops.capabilities() if callable(getattr(ops, "capabilities", None)) else {}
+    cap = caps.get(feat) if isinstance(caps, Mapping) else None
+    return bool(cap) if isinstance(cap, Mapping) else bool(isinstance(features, Mapping) and features.get(feat))
 
 
 def state_read_features(ops: Any) -> dict[str, bool]:
-    """Return features that can provide a complete provider-state inventory.
-    Providers may still support writes for a feature that cannot be enumerated
-    completely. Captures and provider-state imports must only use the latter.
-    """
     fn = getattr(ops, "state_read_features", None)
     if not callable(fn):
         fn = getattr(ops, "features", None)

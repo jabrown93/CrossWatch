@@ -8,19 +8,22 @@ from typing import Any, Callable, Optional
 import copy
 
 import importlib
+import logging
 import re
 import secrets
 import threading
 import time
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 
 import requests
 from fastapi import Body, Request, HTTPException, Response, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
+from api.provider_guard import usage_conflict_response
 from cw_platform.config_base import DEFAULT_CFG, load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
 from cw_platform.url_validation import assert_server_url_safe, guarded_request
+from cw_platform.value_coercion import coerce_bool
 from providers.sync.emby._utils import (
     ensure_whitelist_defaults as emby_ensure_whitelist_defaults,
     fetch_libraries_from_cfg as emby_fetch_libraries_from_cfg,
@@ -31,6 +34,12 @@ from providers.sync.jellyfin._utils import (
     fetch_libraries_from_cfg as jf_fetch_libraries_from_cfg,
     inspect_and_persist as jf_inspect_and_persist,
 )
+from providers.sync.jellyfin._auth_http import JellyfinAuthError
+from providers.auth._auth_KODI import KodiAuthError
+from providers.sync.kodi._common import (
+    ensure_whitelist_defaults as kodi_ensure_whitelist_defaults,
+    fetch_libraries_from_cfg as kodi_fetch_libraries_from_cfg,
+)
 from providers.sync.plex._utils import (
     ensure_whitelist_defaults,
     fetch_libraries_from_cfg,
@@ -39,6 +48,18 @@ from providers.sync.plex._utils import (
 import providers.sync.plex._utils as plex_utils
 
 __all__ = ["register_auth"]
+
+_LOG = logging.getLogger("crosswatch.api.authentication")
+
+
+def _apply_media_overrides(cfg: Any, provider: str, inst: str, server: str | None, verify_ssl: bool | None) -> dict[str, Any]:
+    block = ensure_instance_block(cfg, provider, inst)
+    s = str(server or "").strip()
+    if s:
+        block["server_url" if provider == "plex" else "server"] = s
+    if verify_ssl is not None:
+        block["verify_ssl"] = coerce_bool(verify_ssl)
+    return block
 
 
 def _provider_auth():
@@ -49,10 +70,62 @@ def _provider_auth():
 # Helpers
 def _status_from_msg(msg: str) -> int:
     m = (msg or "").lower()
+    if "version too old" in m or "requires jellyfin" in m: return 400
     if any(x in m for x in ("401", "403", "invalid credential", "unauthor")): return 401
     if "timeout" in m: return 504
     if any(x in m for x in ("dns", "ssl", "connection", "refused", "unreachable", "getaddrinfo", "name or service")): return 502
     return 502
+
+def _public_jellyfin_runtime_error(exc: RuntimeError) -> str:
+    error_text = str(exc).lower()
+    if "version too old" in error_text:
+        return "Jellyfin version too old; CrossWatch requires Jellyfin 10.9 or newer."
+    if "unable to determine jellyfin server version" in error_text:
+        return "Unable to determine Jellyfin server version; CrossWatch requires Jellyfin 10.9 or newer."
+    return "Login failed"
+
+
+_JF_QC_REASON_STATUS: dict[str, int] = {
+    "missing_server": 400,
+    "version_too_old": 400,
+    "version_unknown": 400,
+    "disabled": 409,
+    "not_authorized": 401,
+    "unauthorized": 401,
+    "expired": 410,
+    "unreachable": 502,
+    "initiate_failed": 502,
+    "connect_failed": 502,
+}
+
+
+_JF_QC_PUBLIC_MESSAGES: dict[str, str] = {
+    "missing_server": "Enter a Jellyfin server URL.",
+    "version_too_old": "Jellyfin version too old. CrossWatch requires Jellyfin 10.9 or newer.",
+    "version_unknown": "Unable to determine the Jellyfin server version.",
+    "disabled": "Quick Connect is disabled on this Jellyfin server.",
+    "not_authorized": "Quick Connect has not been authorized.",
+    "unauthorized": "Jellyfin rejected the authentication request.",
+    "expired": "Quick Connect request expired.",
+    "unreachable": "The Jellyfin server could not be reached.",
+    "initiate_failed": "Could not start Quick Connect.",
+    "connect_failed": "Could not complete Quick Connect.",
+}
+
+
+def _jf_qc_error(exc: JellyfinAuthError) -> JSONResponse:
+    reason = str(getattr(exc, "reason", "error"))
+
+    if reason not in _JF_QC_PUBLIC_MESSAGES:
+        reason = "error"
+
+    status = _JF_QC_REASON_STATUS.get(reason, 502)
+    error = _JF_QC_PUBLIC_MESSAGES.get(reason, "Quick Connect failed")
+
+    return JSONResponse(
+        {"ok": False, "reason": reason, "error": error},
+        status_code=status,
+    )
 
 def _import_provider(modname: str, symbol: str = "PROVIDER"):
     try:
@@ -154,7 +227,7 @@ def _validate_tautulli_credentials(server_url: str, api_key: str, *, timeout: fl
             params={"apikey": key, "cmd": "get_server_info"},
             headers={"Accept": "application/json", "User-Agent": "CrossWatch/TautulliAuth"},
             timeout=timeout,
-            verify=bool(verify_ssl),
+            verify=coerce_bool(verify_ssl, True),
         )
     except ValueError:
         return False, "unsafe_redirect_target"
@@ -211,7 +284,23 @@ def _reset_provider_block(cfg: dict[str, Any], provider_key: str, inst: str) -> 
         blk["account_id"] = ""
     return True
 
-    
+
+_PLEX_LEGACY_FIELDS = ("account_token", "pms_token", "server_url", "client_id", "machine_id", "username", "account_id")
+
+
+def _plex_delete_falls_back_to_default(cfg: dict[str, Any], inst: str) -> bool:
+    if inst == "default":
+        return False
+    base = cfg.get("plex")
+    if not isinstance(base, dict):
+        return False
+    insts = base.get("instances")
+    if not isinstance(insts, dict) or inst not in insts or not isinstance(insts.get(inst), dict):
+        if not isinstance(insts, dict) or not insts:
+            return any(str(base.get(k) or "").strip() for k in _PLEX_LEGACY_FIELDS)
+    return False
+
+
 def _to_int(val: Any, default: int = 0) -> int:
     try:
         return int(val)
@@ -433,38 +522,38 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
     
     
     @app.post("/api/plex/token/delete", tags=["auth"])
-    def api_plex_token_delete(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_plex_token_delete(instance: str | None = Query(None)) -> Any:
         cfg = load_config() or {}
         if not isinstance(cfg, dict):
             cfg = dict(cfg)
         inst = normalize_instance_id(instance)
+        if _plex_delete_falls_back_to_default(cfg, inst):
+            inst = "default"
+
+        conflict = usage_conflict_response(cfg, "plex", inst)
+        if conflict is not None:
+            return conflict
+
         ok = _reset_provider_block(cfg, "plex", inst)
-        if not ok and inst != "default":
-            base = cfg.get("plex")
-            if isinstance(base, dict):
-                insts = base.get("instances")
-                if (not isinstance(insts, dict) or not insts) and any(str(base.get(k) or "").strip() for k in ("account_token","pms_token","server_url","client_id","machine_id","username","account_id")):
-                    ok = _reset_provider_block(cfg, "plex", "default")
-                    if ok:
-                        inst = "default"
         if not ok:
             return {"ok": False, "error": "not_found", "instance": inst}
         save_config(cfg)
         _probe_bust("plex")
         return {"ok": True, "instance": inst}
     @app.get("/api/plex/libraries", tags=["media providers"])
-    def plex_libraries(instance: str | None = Query(None)) -> dict[str, Any]:
+    def plex_libraries(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
+        _apply_media_overrides(cfg, "plex", inst, server, verify_ssl)
         ensure_whitelist_defaults(cfg, instance_id=inst)
         return {"libraries": fetch_libraries_from_cfg(cfg, instance_id=inst), "instance": inst}
 
     
     @app.get("/api/plex/pms/probe", tags=["media providers"])
-    def plex_pms_probe(timeout: float = 5.0, instance: str | None = Query(None)) -> dict[str, Any]:
+    def plex_pms_probe(timeout: float = 5.0, instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
-        plex = ensure_instance_block(cfg, "plex", inst)
+        plex = _apply_media_overrides(cfg, "plex", inst, server, verify_ssl)
         token = (plex.get("account_token") or "").strip()
         base = (plex.get("server_url") or "").strip().rstrip("/")
 
@@ -509,16 +598,18 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                     out["reachable"] = True
                     out["status"] = int(r2.status_code)
                     out["verify_ssl"] = False
-        except Exception as e:
-            out["error"] = str(e)
+        except Exception:
+            _LOG.exception("plex PMS probe failed")
+            out["error"] = "probe_failed"
         return out
 
 
     @app.get("/api/plex/pickusers", tags=["media providers"])
-    def plex_pickusers(instance: str | None = Query(None)) -> dict[str, Any]:
+    def plex_pickusers(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
-        plex = ensure_instance_block(cfg, "plex", inst)
+        override = bool(str(server or "").strip())
+        plex = _apply_media_overrides(cfg, "plex", inst, server, verify_ssl)
         token = (plex.get("account_token") or "").strip()
         base = (plex.get("server_url") or "").strip()
         if not token:
@@ -554,10 +645,11 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                     if url2 and not (plex.get("server_url") or "").strip():
                         plex["server_url"] = url2
                         base = url2
-                    try:
-                        save_config(cfg)
-                    except Exception:
-                        pass
+                    if not override:
+                        try:
+                            save_config(cfg)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             sess_tok = pms_token or token
@@ -722,8 +814,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
 
     @app.get("/api/plex/users", tags=["media providers"])
-    def plex_users(instance: str | None = Query(None)) -> dict[str, Any]:
-        return plex_pickusers(instance=instance)
+    def plex_users(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
+        return plex_pickusers(instance=instance, server=server, verify_ssl=verify_ssl)
 
     # JELLYFIN
     @app.post("/api/jellyfin/login", tags=["auth"])
@@ -745,7 +837,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         if "password" in payload:
             jf["password"] = str(payload.get("password") or "")
         if "verify_ssl" in payload:
-            jf["verify_ssl"] = bool(payload.get("verify_ssl"))
+            jf["verify_ssl"] = coerce_bool(payload.get("verify_ssl"))
 
         server = str(jf.get("server") or "").strip()
         username = str(jf.get("username") or "").strip()
@@ -772,6 +864,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                         "user_id": res.get("user_id") or jf2.get("user_id") or "",
                         "username": jf2.get("user") or jf2.get("username") or None,
                         "server": jf2.get("server") or None,
+                        "server_version": res.get("server_version") or jf2.get("server_version") or None,
                         "instance": inst,
                     },
                     200,
@@ -779,13 +872,21 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
             msg = res.get("error") or "Login failed"
             return JSONResponse({"ok": False, "error": msg}, _status_from_msg(msg))
-        except Exception:
+        except RuntimeError as exc:
+            msg = _public_jellyfin_runtime_error(exc)
+            _safe_log(log_fn, "JELLYFIN", f"[JELLYFIN:{inst}] Login failed error_type={type(exc).__name__}")
+            return JSONResponse({"ok": False, "error": msg}, _status_from_msg(msg))
+        except Exception as exc:
+            _safe_log(log_fn, "JELLYFIN", f"[JELLYFIN:{inst}] Login failed error_type={type(exc).__name__}")
             return JSONResponse({"ok": False, "error": "Login failed"}, 500)
 
     @app.post("/api/jellyfin/token/delete", tags=["auth"])
-    def api_jellyfin_token_delete(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_jellyfin_token_delete(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         cfg = load_config()
+        conflict = usage_conflict_response(cfg, "jellyfin", inst)
+        if conflict is not None:
+            return conflict
         jf = ensure_instance_block(cfg, "jellyfin", inst)
         jf["access_token"] = ""
         save_config(cfg)
@@ -799,8 +900,76 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {
             "connected": bool(jf.get("access_token") and jf.get("server")),
             "user": jf.get("user") or jf.get("username") or None,
+            "server_version": jf.get("server_version") or None,
             "instance": inst,
         }
+
+    @app.get("/api/jellyfin/quickconnect/available", tags=["auth"])
+    def api_jellyfin_qc_available(instance: str | None = Query(None)) -> JSONResponse:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        jf = ensure_instance_block(cfg, "jellyfin", inst)
+        server = str(jf.get("server") or "").strip()
+        if not server:
+            return JSONResponse({"ok": False, "supported": False, "enabled": False, "reason": "missing_server"}, 200)
+        prov = _import_provider("providers.auth._auth_JELLYFIN")
+        if not prov:
+            return JSONResponse({"ok": False, "error": "Provider missing"}, 500)
+        result = prov.quick_connect_available(server, verify_ssl=coerce_bool(jf.get("verify_ssl", False)))
+        return JSONResponse({**result, "instance": inst}, 200)
+
+    @app.post("/api/jellyfin/quickconnect/start", tags=["auth"])
+    def api_jellyfin_qc_start(payload: dict[str, Any] = Body(default={}), instance: str | None = Query(None)) -> JSONResponse:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        ensure_provider_block(cfg, "jellyfin")
+        jf = ensure_instance_block(cfg, "jellyfin", inst)
+        if isinstance(payload, dict):
+            server = (payload.get("server") or "").strip()
+            if server:
+                jf["server"] = server
+            if "verify_ssl" in payload:
+                jf["verify_ssl"] = coerce_bool(payload.get("verify_ssl"))
+        prov = _import_provider("providers.auth._auth_JELLYFIN")
+        if not prov:
+            return JSONResponse({"ok": False, "error": "Provider missing"}, 500)
+        try:
+            result = prov.quick_connect_start(cfg, instance_id=inst)
+            save_config(cfg)
+            return JSONResponse({**result, "instance": inst}, 200)
+        except JellyfinAuthError as exc:
+            _safe_log(log_fn, "JELLYFIN", f"[JELLYFIN:{inst}] Quick Connect start failed reason={getattr(exc, 'reason', 'error')}")
+            return _jf_qc_error(exc)
+        except Exception as exc:
+            _safe_log(log_fn, "JELLYFIN", f"[JELLYFIN:{inst}] Quick Connect start error type={type(exc).__name__}")
+            return JSONResponse({"ok": False, "error": "Quick Connect failed"}, 500)
+
+    @app.get("/api/jellyfin/quickconnect/poll", tags=["auth"])
+    def api_jellyfin_qc_poll(instance: str | None = Query(None)) -> JSONResponse:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        prov = _import_provider("providers.auth._auth_JELLYFIN")
+        if not prov:
+            return JSONResponse({"ok": False, "error": "Provider missing"}, 500)
+        try:
+            result = prov.quick_connect_poll(cfg, instance_id=inst)
+            if result.get("state") == "authorized":
+                save_config(cfg)
+            return JSONResponse({**result, "instance": inst}, 200)
+        except JellyfinAuthError as exc:
+            _safe_log(log_fn, "JELLYFIN", f"[JELLYFIN:{inst}] Quick Connect poll failed reason={getattr(exc, 'reason', 'error')}")
+            return _jf_qc_error(exc)
+        except Exception as exc:
+            _safe_log(log_fn, "JELLYFIN", f"[JELLYFIN:{inst}] Quick Connect poll error type={type(exc).__name__}")
+            return JSONResponse({"ok": False, "error": "Quick Connect failed"}, 500)
+
+    @app.post("/api/jellyfin/quickconnect/cancel", tags=["auth"])
+    def api_jellyfin_qc_cancel(instance: str | None = Query(None)) -> JSONResponse:
+        inst = normalize_instance_id(instance)
+        prov = _import_provider("providers.auth._auth_JELLYFIN")
+        if not prov:
+            return JSONResponse({"ok": False, "error": "Provider missing"}, 500)
+        return JSONResponse({**prov.quick_connect_cancel(instance_id=inst), "instance": inst}, 200)
 
     @app.get("/api/jellyfin/inspect", tags=["media providers"])
     def jf_inspect(instance: str | None = Query(None)):
@@ -810,9 +979,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return jf_inspect_and_persist(cfg, instance_id=inst)
 
     @app.get("/api/jellyfin/libraries", tags=["media providers"])
-    def jf_libraries(instance: str | None = Query(None)):
+    def jf_libraries(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)):
         cfg = load_config()
         inst = normalize_instance_id(instance)
+        _apply_media_overrides(cfg, "jellyfin", inst, server, verify_ssl)
         jf_ensure_whitelist_defaults(cfg, instance_id=inst)
         return {
             "libraries": jf_fetch_libraries_from_cfg(cfg, instance_id=inst),
@@ -820,10 +990,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         }
 
     @app.get("/api/jellyfin/users", tags=["media providers"], response_model=None)
-    def jf_users(instance: str | None = Query(None)) -> dict[str, Any]:
+    def jf_users(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
-        jf = ensure_instance_block(cfg, "jellyfin", inst)
+        jf = _apply_media_overrides(cfg, "jellyfin", inst, server, verify_ssl)
 
         server = _clean_media_base(jf.get("server"))
         access_token = str((jf.get("access_token") or "")).strip()
@@ -833,7 +1003,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             raise HTTPException(status_code=401, detail="Not connected to Jellyfin (missing server/token).")
 
         timeout = float(jf.get("timeout", 15) or 15)
-        verify = bool(jf.get("verify_ssl", False))
+        verify = coerce_bool(jf.get("verify_ssl", False))
         devid = str(jf.get("device_id") or "crosswatch").strip() or "crosswatch"
 
         base = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{devid}", Version="1.0"'
@@ -923,7 +1093,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             em["password"] = str(payload.get("password") or "")
 
         if "verify_ssl" in payload:
-            em["verify_ssl"] = bool(payload.get("verify_ssl"))
+            em["verify_ssl"] = coerce_bool(payload.get("verify_ssl"))
         if "timeout" in payload:
             em["timeout"] = _to_int(payload.get("timeout"), 15)
 
@@ -976,13 +1146,141 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         }
 
     @app.post("/api/emby/token/delete", tags=["auth"])
-    def api_emby_token_delete(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_emby_token_delete(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         cfg = load_config()
+        conflict = usage_conflict_response(cfg, "emby", inst)
+        if conflict is not None:
+            return conflict
         em = ensure_instance_block(cfg, "emby", inst)
         em["access_token"] = ""
         save_config(cfg)
         _probe_bust("emby")
+        return {"ok": True, "instance": inst}
+
+    # KODI
+    @app.post("/api/kodi/connect", tags=["auth"])
+    def api_kodi_connect(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> JSONResponse:
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "Malformed request"}, 400)
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        ensure_provider_block(cfg, "kodi")
+        kodi = ensure_instance_block(cfg, "kodi", inst)
+
+        server = str(payload.get("server") or "").strip()
+        username = str(payload.get("username") or "").strip()
+        if server:
+            kodi["server"] = server
+        kodi["username"] = username
+
+        if "password" in payload:
+            password = str(payload.get("password") or "")
+            if not _looks_masked_secret(password):
+                kodi["password"] = password
+
+        if "verify_ssl" in payload:
+            kodi["verify_ssl"] = coerce_bool(payload.get("verify_ssl"))
+        if "timeout" in payload:
+            kodi["timeout"] = _to_int(payload.get("timeout"), 12)
+
+        try:
+            prov = _import_provider("providers.auth._auth_KODI")
+            if not prov:
+                return JSONResponse({"ok": False, "error": "Provider missing"}, 500)
+
+            res = prov.start(cfg, redirect_uri="", instance_id=inst)
+            kodi_ensure_whitelist_defaults(cfg, instance_id=inst)
+            save_config(cfg)
+            _probe_bust("kodi")
+
+            kodi2 = ensure_instance_block(cfg, "kodi", inst)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "server": kodi2.get("server") or "",
+                    "username": kodi2.get("username") or "",
+                    "kodi_version": res.get("kodi_version") or kodi2.get("kodi_version") or "",
+                    "jsonrpc_version": res.get("jsonrpc_version") or kodi2.get("jsonrpc_version") or "",
+                    "auth_method": res.get("auth_method") or kodi2.get("auth_method") or "",
+                    "instance": inst,
+                },
+                200,
+            )
+        except KodiAuthError as exc:
+            reason = str(getattr(exc, "reason", "connect_failed"))
+            _safe_log(log_fn, "KODI", f"[KODI:{inst}] connect failed reason={reason}")
+            status_by_reason = {
+                "missing_server": 400,
+                "invalid_credentials": 401,
+                "unreachable": 502,
+                "not_kodi": 400,
+                "version_too_old": 400,
+                "jsonrpc_too_old": 400,
+                "invalid_response": 502,
+                "jsonrpc_error": 502,
+                "http_error": 502,
+            }
+            error_by_reason = {
+                "missing_server": "Enter a Kodi server URL",
+                "invalid_credentials": "Kodi rejected the credentials",
+                "unreachable": "Kodi server is unreachable",
+                "not_kodi": "That server is not Kodi",
+                "version_too_old": "Kodi 21.0 Omega or newer is required",
+                "jsonrpc_too_old": "Kodi JSON-RPC 13.5.0 or newer is required",
+                "invalid_response": "Kodi returned an unexpected response",
+                "jsonrpc_error": "Kodi JSON-RPC request failed",
+                "http_error": "Kodi JSON-RPC request failed",
+            }
+            return JSONResponse(
+                {"ok": False, "error": error_by_reason.get(reason, "Kodi connection failed"), "reason": reason, "instance": inst},
+                status_by_reason.get(reason, 500),
+            )
+        except Exception as exc:
+            _safe_log(log_fn, "KODI", f"[KODI:{inst}] connect failed error_type={type(exc).__name__}")
+            return JSONResponse({"ok": False, "error": "Kodi connection failed", "instance": inst}, 500)
+
+    @app.get("/api/kodi/status", tags=["auth"])
+    def api_kodi_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        kodi = ensure_instance_block(cfg, "kodi", inst)
+        return {
+            "connected": bool(kodi.get("server") and kodi.get("connection_verified") is True),
+            "server": kodi.get("server") or "",
+            "username": kodi.get("username") or "",
+            "has_password": bool(str(kodi.get("password") or "")),
+            "verify_ssl": coerce_bool(kodi.get("verify_ssl", False)),
+            "kodi_version": kodi.get("kodi_version") or "",
+            "jsonrpc_version": kodi.get("jsonrpc_version") or "",
+            "auth_method": kodi.get("auth_method") or "",
+            "instance": inst,
+        }
+
+    @app.get("/api/kodi/libraries", tags=["media providers"])
+    def api_kodi_libraries(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        _apply_media_overrides(cfg, "kodi", inst, server, verify_ssl)
+        kodi_ensure_whitelist_defaults(cfg, instance_id=inst)
+        return {"libraries": kodi_fetch_libraries_from_cfg(cfg, instance_id=inst), "instance": inst}
+
+    @app.post("/api/kodi/disconnect", tags=["auth"])
+    def api_kodi_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        conflict = usage_conflict_response(cfg, "kodi", inst)
+        if conflict is not None:
+            return conflict
+
+        prov = _import_provider("providers.auth._auth_KODI")
+        if not prov:
+            return JSONResponse({"ok": False, "error": "Provider missing", "instance": inst}, 500)
+        prov.disconnect(cfg, instance_id=inst)
+        save_config(cfg)
+        _probe_bust("kodi")
+        _safe_log(log_fn, "KODI", f"[KODI:{inst}] disconnected")
         return {"ok": True, "instance": inst}
 
     @app.get("/api/emby/inspect", tags=["media providers"])
@@ -1008,7 +1306,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                         f"{server}/Users/Me",
                         headers={"X-Emby-Token": token, "Accept": "application/json"},
                         timeout=float(em.get("timeout", 15) or 15),
-                        verify=bool(em.get("verify_ssl", False)),
+                        verify=coerce_bool(em.get("verify_ssl", False)),
                     )
                     if r.ok:
                         me = r.json() or {}
@@ -1022,9 +1320,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return out
 
     @app.get("/api/emby/libraries", tags=["media providers"])
-    def emby_libraries(instance: str | None = Query(None)) -> dict[str, Any]:
+    def emby_libraries(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
+        _apply_media_overrides(cfg, "emby", inst, server, verify_ssl)
         try:
             emby_ensure_whitelist_defaults(cfg, instance_id=inst)
         except TypeError:
@@ -1036,10 +1335,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {"libraries": libs, "instance": inst}
 
     @app.get("/api/emby/users", tags=["media providers"], response_model=None)
-    def emby_users(instance: str | None = Query(None)) -> dict[str, Any]:
+    def emby_users(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
-        em = ensure_instance_block(cfg, "emby", inst)
+        em = _apply_media_overrides(cfg, "emby", inst, server, verify_ssl)
 
         server = _clean_media_base(em.get("server"))
         access_token = str((em.get("access_token") or "")).strip()
@@ -1049,7 +1348,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             raise HTTPException(status_code=401, detail="Not connected to Emby (missing server/token).")
 
         timeout = float(em.get("timeout", 15) or 15)
-        verify = bool(em.get("verify_ssl", False))
+        verify = coerce_bool(em.get("verify_ssl", False))
         device_id = str(em.get("device_id") or "crosswatch").strip() or "crosswatch"
         stored_user_id = str(em.get("user_id") or "").strip()
         auth = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{device_id}", Version="1.0", Token="{token}"'
@@ -1521,10 +1820,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return out
 
     @app.post("/api/mdblist/disconnect", tags=["auth"])
-    def api_mdblist_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_mdblist_disconnect(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "mdblist", inst)
+            if conflict is not None:
+                return conflict
             m = ensure_instance_block(cfg, "mdblist", inst)
             m["api_key"] = ""
             _provider_auth().clear_oauth("mdblist", m)
@@ -1591,6 +1893,154 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "PUBLICMETADB", f"[PUBLICMETADB] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
+    # NUVIO
+    def _nuvio_client(cfg: dict[str, Any], inst: str):
+        from providers.auth._auth_NUVIO import NuvioClient
+
+        return NuvioClient(cfg, instance_id=inst)
+
+    def _nuvio_error(e: Exception) -> str:
+        name = e.__class__.__name__
+        if name == "NuvioTokenRefreshError":
+            return "token_refresh_failed"
+        if name == "NuvioAuthError":
+            return "authentication_failed"
+        if name == "NuvioProfileUnavailable":
+            return "profile_unavailable"
+        if name == "NuvioInvalidResponse":
+            code = str(e or "").strip()
+            allowed = {
+                "anonymous_session_not_object",
+                "exchange_not_object",
+                "invalid_expiry",
+                "invalid_json",
+                "invalid_poll_interval",
+                "invalid_profile_id",
+                "invalid_response",
+                "missing_access_token",
+                "missing_code_or_qr_content",
+                "missing_refresh_token",
+                "poll_session_not_list_object",
+                "profile_not_object",
+                "profiles_not_list",
+                "start_session_not_list_object",
+            }
+            return code if code in allowed else "invalid_response"
+        if name == "NuvioServiceUnavailable":
+            return "service_unavailable"
+        return "internal"
+
+    def _nuvio_public_error() -> str:
+        return "nuvio_request_failed"
+
+    @app.post("/api/nuvio/device/start", tags=["auth"])
+    def api_nuvio_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            redirect = str((payload or {}).get("redirect_base_url") or "https://nuvio.tv/tv-login").strip() or "https://nuvio.tv/tv-login"
+            res = _provider_auth().start_device_code("nuvio", cfg, instance_id=inst, redirect_base_url=redirect)
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] device login started instance={inst}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] device start failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "error": _nuvio_public_error(), "instance": inst}
+
+    @app.post("/api/nuvio/device/poll", tags=["auth"])
+    def api_nuvio_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code("nuvio", cfg, instance_id=inst)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] device poll failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "status": _nuvio_public_error(), "instance": inst}
+
+    @app.post("/api/nuvio/device/finish", tags=["auth"])
+    def api_nuvio_device_finish(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _nuvio_client(cfg, inst).exchange_tv_login_session(cfg)
+            _probe_bust("nuvio")
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] device login completed instance={inst}")
+            return {"ok": True, "status": "ok", "instance": inst, "expires_at": res.get("expires_at"), "profiles": res.get("profiles") or []}
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] device finish failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "status": _nuvio_public_error(), "instance": inst}
+
+    @app.get("/api/nuvio/status", tags=["auth"])
+    def api_nuvio_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth._auth_NUVIO import provider_block
+
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        out = _provider_auth().status_for_block("nuvio", provider_block(cfg, inst))
+        out["instance"] = inst
+        return out
+
+    @app.get("/api/nuvio/profiles", tags=["auth"])
+    def api_nuvio_profiles(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            profiles = _nuvio_client(cfg, inst).pull_profiles(cfg, refresh=True)
+            return {"ok": True, "instance": inst, "profiles": profiles}
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] profiles failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "error": _nuvio_public_error(), "instance": inst, "profiles": []}
+
+    @app.post("/api/nuvio/profile/select", tags=["auth"])
+    def api_nuvio_profile_select(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            selected = _nuvio_client(cfg, inst).select_profile(cfg, (payload or {}).get("profile_id"))
+            _probe_bust("nuvio")
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] profile selected instance={inst} profile_id={selected.get('profile_id')}")
+            return {
+                "ok": True,
+                "instance": inst,
+                "profile": selected,
+                "profile_id": selected.get("profile_id"),
+                "profile_name": selected.get("name") or "",
+            }
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] profile select failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "error": _nuvio_public_error(), "instance": inst}
+
+    @app.post("/api/nuvio/refresh", tags=["auth"])
+    def api_nuvio_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("nuvio", cfg, instance_id=inst)
+            if res.get("ok"):
+                _probe_bust("nuvio")
+            return {k: v for k, v in res.items() if k not in {"access_token", "refresh_token"}}
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] refresh failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "status": _nuvio_public_error(), "instance": inst}
+
+    @app.post("/api/nuvio/disconnect", tags=["auth"])
+    def api_nuvio_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "nuvio", inst)
+            if conflict is not None:
+                return conflict
+            block = ensure_instance_block(cfg, "nuvio", inst)
+            _provider_auth().clear_oauth("nuvio", block)
+            save_config(cfg)
+            _probe_bust("nuvio")
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] disconnected instance={inst}")
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] disconnect failed reason={_nuvio_error(e)} instance={inst}")
+            return {"ok": False, "error": _nuvio_public_error(), "instance": inst}
+
 
     # TAUTULLI
     @app.post("/api/tautulli/save", tags=["auth"])
@@ -1634,7 +2084,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         except ValueError as e:
             _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] rejected unsafe server_url instance={inst}: {e}")
             return {"ok": False, "error": str(e), "instance": inst}
-        ok, reason = _validate_tautulli_credentials(final_server, final_key, verify_ssl=bool(t.get("verify_ssl", True)))
+        ok, reason = _validate_tautulli_credentials(final_server, final_key, verify_ssl=coerce_bool(t.get("verify_ssl", True), True))
         if not ok:
             _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] validation failed reason={reason} instance={inst}")
             return {"ok": False, "error": reason, "instance": inst}
@@ -1663,7 +2113,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             server,
             key,
             timeout=float(t.get("timeout", 10) or 10),
-            verify_ssl=bool(t.get("verify_ssl", True)),
+            verify_ssl=coerce_bool(t.get("verify_ssl", True), True),
         )
         return {"connected": bool(ok), "instance": inst, **({} if ok else {"reason": reason})}
 
@@ -1722,8 +2172,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         device_code: str,
         *,
         instance_id: Any,
-        timeout_sec: int = 600,
-        interval: float = 2.0,
+        timeout_sec: int = 300,
+        interval: Optional[float] = None,
     ) -> Optional[str]:
         prov = _import_provider("providers.auth._auth_TRAKT")
         if not prov:
@@ -1731,23 +2181,66 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
         inst = normalize_instance_id(instance_id)
 
-        deadline = time.time() + max(0, int(timeout_sec))
-        sleep_s = max(0.5, float(interval))
+        base_interval = 5.0
+        pend_expires = 0
+        try:
+            pend0 = ensure_instance_block(load_config(), "trakt", inst).get("_pending_device") or {}
+            pv = float(pend0.get("interval") or 0)
+            if pv > 0:
+                base_interval = pv
+            pend_expires = int(pend0.get("expires_at") or 0)
+        except Exception:
+            pass
+        if interval:
+            base_interval = float(interval)
+        base_interval = max(5.0, base_interval)
+
+        now = time.time()
+        deadline = now + max(0, int(timeout_sec))
+        if pend_expires:
+            deadline = min(deadline, float(pend_expires))
+
+        sleep_s = base_interval
+        backoff = 0
 
         while time.time() < deadline:
+            time.sleep(min(sleep_s, max(0.0, deadline - time.time())))
+            if time.time() >= deadline:
+                break
+
             cfg = load_config()
             try:
                 res = prov.finish(cfg, device_code=device_code, instance_id=inst)  # type: ignore[attr-defined]
-                if isinstance(res, dict):
-                    status = (res.get("status") or "").lower()
-                    if res.get("ok"):
-                        save_config(cfg)
-                        return "ok"
-                    if status in ("expired_token", "no_device_code", "missing_client"):
-                        return None
             except Exception:
-                pass
-            time.sleep(sleep_s)
+                backoff += 1
+                sleep_s = min(60.0, base_interval * (2 ** backoff))
+                continue
+
+            if not isinstance(res, dict):
+                sleep_s = base_interval
+                continue
+
+            status = (res.get("status") or "").lower()
+            if res.get("ok"):
+                save_config(cfg)
+                return "ok"
+            if status in ("expired_token", "no_device_code", "missing_client", "not_found", "already_used", "access_denied"):
+                return None
+            if status == "slow_down":
+                base_interval = base_interval + 5.0
+                try:
+                    retry_after = float(res.get("retry_after") or 0)
+                except Exception:
+                    retry_after = 0.0
+                sleep_s = max(base_interval, retry_after)
+                continue
+            if status == "server_error":
+                backoff += 1
+                sleep_s = min(60.0, base_interval * (2 ** backoff))
+                continue
+
+            backoff = 0
+            sleep_s = base_interval
 
         return None
 
@@ -1786,7 +2279,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             device_code = str(info["device_code"])
 
             def waiter(_device_code: str, _inst: str) -> None:
-                token = trakt_wait_for_token(_device_code, instance_id=_inst, timeout_sec=600, interval=2.0)
+                token = trakt_wait_for_token(_device_code, instance_id=_inst, timeout_sec=300)
                 if token:
                     _safe_log(
                         log_fn,
@@ -1814,10 +2307,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return {"ok": False, "error": "internal"}
         
     @app.post("/api/trakt/token/delete", tags=["auth"])
-    def api_trakt_token_delete(instance: str = Query("default")) -> dict[str, Any]:
+    def api_trakt_token_delete(instance: str = Query("default")) -> Any:
         try:
             inst = normalize_instance_id(instance)
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "trakt", inst)
+            if conflict is not None:
+                return conflict
             tr = ensure_instance_block(cfg, "trakt", inst)
             tr["access_token"] = ""
             tr["refresh_token"] = ""
@@ -2031,15 +2527,70 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return PlainTextResponse("Error", 500)
 
     @app.post("/api/simkl/token/delete", tags=["auth"])
-    def api_simkl_token_delete(instance: str = Query("default")) -> dict[str, Any]:
+    def api_simkl_token_delete(instance: str = Query("default")) -> Any:
         cfg = load_config()
         inst = normalize_instance_id(instance)
+        conflict = usage_conflict_response(cfg, "simkl", inst)
+        if conflict is not None:
+            return conflict
         s = ensure_instance_block(cfg, "simkl", inst)
-        for k in ("access_token", "refresh_token", "token_expires_at", "scopes", "account"):
+        try:
+            from providers.auth._auth_SIMKL import app_pin_client_id as _simkl_pin_cid
+            if str(s.get("client_id") or "").strip() == _simkl_pin_cid():
+                s.pop("client_id", None)
+                s.pop("api_key", None)
+        except Exception:
+            pass
+        for k in ("access_token", "refresh_token", "token_expires_at", "scopes", "account", "_pending_pin", "auth_method"):
             s.pop(k, None)
         save_config(cfg)
         _probe_bust("simkl")
         return {"ok": True, "instance": inst}
+
+    @app.post("/api/simkl/pin/start", tags=["auth"])
+    def api_simkl_pin_start(instance: str = Query("default")) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        prov = _import_provider("providers.auth._auth_SIMKL")
+        if not prov:
+            return {"ok": False, "error": "provider_missing", "instance": inst}
+        try:
+            res = prov.pin_start(cfg, instance_id=inst)
+        except Exception as e:
+            _safe_log(log_fn, "SIMKL", f"[SIMKL:{inst}] PIN start error type={type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+        if res.get("ok"):
+            _probe_bust("simkl")
+        return {**res, "instance": inst}
+
+    @app.post("/api/simkl/pin/poll", tags=["auth"])
+    def api_simkl_pin_poll(instance: str = Query("default")) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        prov = _import_provider("providers.auth._auth_SIMKL")
+        if not prov:
+            return {"ok": False, "status": "provider_missing", "instance": inst}
+        try:
+            res = prov.pin_poll(cfg, instance_id=inst)
+        except Exception as e:
+            _safe_log(log_fn, "SIMKL", f"[SIMKL:{inst}] PIN poll error type={type(e).__name__}")
+            return {"ok": False, "status": "internal", "instance": inst}
+        if res.get("status") == "authorized":
+            _probe_bust("simkl")
+        return {**res, "instance": inst}
+
+    @app.post("/api/simkl/pin/cancel", tags=["auth"])
+    def api_simkl_pin_cancel(instance: str = Query("default")) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        prov = _import_provider("providers.auth._auth_SIMKL")
+        if not prov:
+            return {"ok": False, "instance": inst}
+        try:
+            res = prov.pin_cancel(cfg, instance_id=inst)
+        except Exception:
+            res = {"ok": True, "cancelled": False}
+        return {**res, "instance": inst}
 
 
 # ANILIST

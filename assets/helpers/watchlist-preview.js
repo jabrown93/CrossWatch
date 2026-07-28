@@ -15,9 +15,23 @@
   window._lastSyncEpoch = window._lastSyncEpoch || null;
   window.__wallRenderSignature = window.__wallRenderSignature || "";
   const WALL_PREVIEW_CACHE_KEY = "cw.wall.preview.v2";
-  const WALL_PREVIEW_LEGACY_CACHE_KEY = `cw.wall.preview.${window.APP_VERSION || "v1"}`;
+  const WALL_PREVIEW_MIGRATION_KEY = "cw.wallPreviewMigrated.v1";
   const WALL_PREVIEW_REFRESH_TTL_MS = 60 * 1000;
   const DEFAULT_INSTANCE = "default";
+
+  const migrateWallPreviewCache = () => {
+    try {
+      if (localStorage.getItem(WALL_PREVIEW_MIGRATION_KEY)) return;
+      const stale = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i) || "";
+        if (key.startsWith("cw.wall.preview.")) stale.push(key);
+      }
+      for (const key of stale) localStorage.removeItem(key);
+      localStorage.setItem(WALL_PREVIEW_MIGRATION_KEY, "1");
+    } catch {}
+  };
+  migrateWallPreviewCache();
 
   const json = async (url, opt) => {
     if (authSetupPending()) throw new Error("auth setup pending");
@@ -71,16 +85,8 @@
 
   const readWallCache = () => {
     try {
-      let raw = localStorage.getItem(WALL_PREVIEW_CACHE_KEY)
-        || localStorage.getItem(WALL_PREVIEW_LEGACY_CACHE_KEY);
-      if (!raw) {
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i) || "";
-          if (!key.startsWith("cw.wall.preview.") || key === WALL_PREVIEW_CACHE_KEY) continue;
-          raw = localStorage.getItem(key);
-          if (raw) break;
-        }
-      }
+      const raw = localStorage.getItem(WALL_PREVIEW_CACHE_KEY);
+      if (!raw) return null;
       const data = JSON.parse(raw);
       return Array.isArray(data?.items) ? data : null;
     } catch {
@@ -92,6 +98,10 @@
     try {
       localStorage.setItem(WALL_PREVIEW_CACHE_KEY, JSON.stringify({ items, last_sync_epoch: lastSyncEpoch || 0, total }));
     } catch {}
+  };
+
+  const clearWallCache = () => {
+    try { localStorage.removeItem(WALL_PREVIEW_CACHE_KEY); } catch {}
   };
 
   const hasRenderedWall = (row = document.getElementById("poster-row")) => !!(row?.childElementCount && !row.classList.contains("hidden"));
@@ -107,6 +117,19 @@
     try { return JSON.parse(localStorage.getItem("wl_first_seen") || "{}"); }
     catch { return {}; }
   };
+
+  function relWallTime(value) {
+    let ts = Number(value || 0);
+    if (!Number.isFinite(ts) || ts <= 0) return "";
+    if (ts > 100000000000) ts = Math.floor(ts / 1000);
+    if (typeof window.relTimeFromEpoch === "function") return window.relTimeFromEpoch(ts);
+    const delta = Math.max(1, Math.floor(Date.now() / 1000) - ts);
+    const units = [["y", 31536000], ["mo", 2592000], ["w", 604800], ["d", 86400], ["h", 3600], ["m", 60]];
+    for (const [name, seconds] of units) {
+      if (delta >= seconds) return `${Math.floor(delta / seconds)}${name} ago`;
+    }
+    return `${delta}s ago`;
+  }
 
   function updateEdges() {
     const row = document.getElementById("poster-row");
@@ -151,13 +174,93 @@
   function artUrl(item, size = "w342") {
     const tmdb = item?.tmdb;
     if (!tmdb) return null;
-    return `/art/tmdb/${isTV(item.type || item.entity || item.media_type) ? "tv" : "movie"}/${tmdb}?size=${encodeURIComponent(size)}`;
+    const kind = isTV(item.type || item.entity || item.media_type) ? "tv" : "movie";
+    return `/art/tmdb/${kind}/${tmdb}?size=${encodeURIComponent(size)}${artEvidenceOf(item)}`;
+  }
+
+  function asNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  function seasonNumber(item) {
+    return asNumber(item?.season_number ?? item?.episode?.season_number ?? item?.episode?.season ?? item?.season);
+  }
+
+  function episodeNumber(item) {
+    return asNumber(item?.episode_number ?? item?.episode?.episode_number ?? item?.episode?.number ?? item?.number ?? item?.episode);
+  }
+
+  function episodeLabel(item) {
+    const explicit = String(item?.episode_label || item?.episodeLabel || "").trim();
+    if (explicit) return explicit;
+    const season = seasonNumber(item);
+    const episode = episodeNumber(item);
+    return season && episode ? `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}` : "";
+  }
+
+  function episodeStillUrl(item, size = "w300") {
+    const tmdb = tmdbIdOf(item);
+    const season = seasonNumber(item);
+    const episode = episodeNumber(item);
+    if (!tmdb || !season || !episode || artTypeOf(item) !== "tv") return "";
+    return `/art/tmdb/tv/${encodeURIComponent(String(tmdb))}?kind=still&season=${encodeURIComponent(String(season))}&episode=${encodeURIComponent(String(episode))}&size=${encodeURIComponent(size)}${artEvidenceOf(item)}`;
+  }
+
+  function gridArtUrl(item, size = "w300") {
+    const still = episodeStillUrl(item, size);
+    if (still) return still;
+    const tmdb = tmdbIdOf(item);
+    if (!tmdb) return "";
+    return `/art/tmdb/${artTypeOf(item)}/${encodeURIComponent(String(tmdb))}?kind=backdrop&size=${encodeURIComponent(size)}&locale=${encodeURIComponent(window.__CW_LOCALE || navigator.language || "en-US")}${artEvidenceOf(item)}`;
+  }
+
+  function applyWidgetView(view = "") {
+    const widgetCard = document.getElementById("placeholder-card");
+    const mode = view || widgetCard?.dataset?.widgetView || "icon";
+    document.querySelectorAll("#poster-row .poster img").forEach((img) => {
+      const next = (mode === "media" || mode === "grid") ? img.dataset.gridSrc : img.dataset.coverSrc;
+      if (next && img.getAttribute("src") !== next) img.src = next;
+    });
+  }
+
+  function prewarmWallImages(limit = 12) {
+    const urls = [];
+    document.querySelectorAll("#poster-row .poster img").forEach((img) => {
+      urls.push(img.dataset.coverSrc || "", img.dataset.gridSrc || "");
+    });
+    const list = [...new Set(urls.filter(Boolean))].slice(0, limit);
+    if (!list.length) return;
+    if (navigator.connection?.saveData) return;
+    const run = () => {
+      let index = 0;
+      const next = () => {
+        const url = list[index++];
+        if (!url) return;
+        let settled = false;
+        const preload = new Image();
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          window.setTimeout(next, 160);
+        };
+        preload.onload = done;
+        preload.onerror = done;
+        preload.decoding = "async";
+        preload.src = url;
+        window.setTimeout(done, 3500);
+      };
+      next();
+    };
+    const start = () => {
+      if ("requestIdleCallback" in window) window.requestIdleCallback(run, { timeout: 4000 });
+      else window.setTimeout(run, 800);
+    };
+    window.setTimeout(start, 900);
   }
 
   const providerLogoPath = (name) => window.CW?.ProviderMeta?.logoPath?.(name) || "";
   const esc = (value) => String(value ?? "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[m]));
-  const previewMetaCache = new Map();
-  const previewMetaInflight = new Map();
   let activePreviewDrawerKey = "";
 
   function countLabel(total, noun) {
@@ -184,14 +287,24 @@
     return raw === "movie" ? "movie" : "show";
   }
 
-  function artTypeOf(item) {
+  function artTypeOf(item, meta = null) {
+    const resolved = String(meta?.resolved_type || "").toLowerCase();
+    if (resolved) return resolved === "movie" ? "movie" : "tv";
     return mediaTypeOf(item) === "movie" ? "movie" : "tv";
   }
 
-  function mediaLabelOf(item) {
+  function artEvidenceOf(item) {
+    const title = item?.title ? `&title=${encodeURIComponent(String(item.title))}` : "";
+    const year = item?.year ? `&year=${encodeURIComponent(String(item.year))}` : "";
+    return title + year;
+  }
+
+  function mediaLabelOf(item, meta = null) {
+    const resolved = String(meta?.resolved_type || "").toLowerCase();
+    if (resolved === "movie") return "Movie";
     const raw = String(item?.type || item?.entity || item?.media_type || "").toLowerCase();
     if (raw === "movie") return "Movie";
-    if (raw === "anime") return "Anime";
+    if (raw === "anime") return resolved === "show" ? "Show" : "Anime";
     return "Show";
   }
 
@@ -216,7 +329,7 @@
   function backdropUrl(item, meta = null) {
     const tmdb = tmdbIdOf(item, meta);
     if (!tmdb) return "";
-    return `/art/tmdb/${artTypeOf(item)}/${encodeURIComponent(String(tmdb))}?kind=backdrop&size=w1280&locale=${encodeURIComponent(window.__CW_LOCALE || navigator.language || "en-US")}`;
+    return `/art/tmdb/${artTypeOf(item, meta)}/${encodeURIComponent(String(tmdb))}?kind=backdrop&size=w1280&locale=${encodeURIComponent(window.__CW_LOCALE || navigator.language || "en-US")}${artEvidenceOf(item)}`;
   }
 
   function runtimeLabel(mins) {
@@ -232,28 +345,10 @@
     return /^\d{4}/.test(raw) ? raw.slice(0, 4) : "";
   }
 
-  function dateLabel(value) {
-    const raw = String(value || "");
-    if (!/^\d{4}-\d{2}-\d{2}/.test(raw)) return "";
-    const dt = new Date(`${raw.slice(0, 10)}T00:00:00Z`);
-    if (Number.isNaN(dt.getTime())) return "";
-    try {
-      return new Intl.DateTimeFormat(navigator.language || "en-US", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(dt);
-    } catch {
-      return raw.slice(0, 10);
-    }
-  }
-
-  function scoreValue(meta) {
-    const raw = Number(meta?.score ?? meta?.vote_average);
-    if (!Number.isFinite(raw) || raw <= 0) return null;
-    return raw <= 10 ? Math.round(raw * 10) : Math.round(raw);
-  }
-
   function tmdbUrl(item, meta = null) {
     const tmdb = tmdbIdOf(item, meta);
     if (!tmdb) return "";
-    return `https://www.themoviedb.org/${mediaTypeOf(item) === "movie" ? "movie" : "tv"}/${encodeURIComponent(String(tmdb))}`;
+    return `https://www.themoviedb.org/${artTypeOf(item, meta)}/${encodeURIComponent(String(tmdb))}`;
   }
 
   function imdbUrl(item, meta = null) {
@@ -264,333 +359,100 @@
   }
 
   async function getPreviewMeta(item) {
-    const cacheKey = previewMetaKey(item);
-    if (!cacheKey) return null;
-    if (previewMetaCache.has(cacheKey)) return previewMetaCache.get(cacheKey);
-    if (previewMetaInflight.has(cacheKey)) return previewMetaInflight.get(cacheKey);
-
-    const tmdb = tmdbIdOf(item);
-    const type = mediaTypeOf(item);
-    const req = (async () => {
-      try {
-        const res = await fetch("/api/metadata/bulk?overview=full", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            items: [{ type, tmdb }],
-            need: { overview: 1, runtime_minutes: 1, ids: 1, videos: 1, genres: 1, certification: 1, score: 1, release: 1, backdrop: 1 },
-            concurrency: 1,
-          }),
-        });
-        if (!res.ok) return null;
-        const data = await res.json();
-        const first = Object.values(data?.results || {})[0];
-        const meta = first?.ok ? (first.meta || null) : null;
-        if (meta) previewMetaCache.set(cacheKey, meta);
-        return meta;
-      } catch {
-        return null;
-      } finally {
-        previewMetaInflight.delete(cacheKey);
-      }
-    })();
-    previewMetaInflight.set(cacheKey, req);
-    return req;
+    if (!previewMetaKey(item)) return null;
+    return window.CW?.Meta?.get(item, "detail") || null;
   }
 
-  function ensurePreviewDrawerStyles() {
-    if (document.getElementById("cw-wall-preview-detail-style")) return;
+  function ensurePosterCursorStyle() {
+    if (document.getElementById("cw-wall-preview-cursor-style")) return;
     const style = document.createElement("style");
-    style.id = "cw-wall-preview-detail-style";
-    style.textContent = `
-      #cw-wall-preview-detail{
-        --wpd-bg:rgba(24,29,39,.94);
-        --wpd-bg-strong:rgba(11,14,21,.92);
-        --wpd-border:rgba(148,163,184,.22);
-        --wpd-border-strong:rgba(148,163,184,.30);
-        --wpd-text:#f4f7ff;
-        --wpd-muted:rgba(207,216,232,.72);
-        --wpd-chip:rgba(255,255,255,.07);
-        --wpd-shadow:0 24px 68px rgba(0,0,0,.48);
-        position:fixed;
-        left:50%;
-        bottom:max(18px,env(safe-area-inset-bottom));
-        width:min(860px,calc(100vw - 32px));
-        color:var(--wpd-text);
-        border:1px solid var(--wpd-border);
-        border-radius:24px;
-        background:var(--wpd-bg);
-        box-shadow:var(--wpd-shadow);
-        overflow:hidden;
-        isolation:isolate;
-        transform:translate(-50%,calc(100% + 28px)) scale(.985);
-        opacity:0;
-        pointer-events:none;
-        transition:transform .28s cubic-bezier(.2,.8,.2,1),opacity .22s ease,border-color .18s ease;
-        z-index:10025;
-      }
-      #cw-wall-preview-detail.show{
-        transform:translate(-50%,0) scale(1);
-        opacity:1;
-        pointer-events:auto;
-      }
-      html:not([data-tab="main"]) #cw-wall-preview-detail{display:none!important}
-      #cw-wall-preview-detail::before{
-        content:"";
-        position:absolute;
-        inset:0;
-        z-index:0;
-        pointer-events:none;
-        background:
-          linear-gradient(90deg,rgba(18,23,33,.98) 0%,rgba(18,23,33,.92) 48%,rgba(18,23,33,.80) 100%),
-          var(--wpd-backdrop,none);
-        background-size:100% 100%,cover;
-        background-position:center center,center center;
-        background-repeat:no-repeat,no-repeat;
-      }
-      #cw-wall-preview-detail .wpd-inner{
-        position:relative;
-        z-index:1;
-        display:grid;
-        grid-template-columns:118px minmax(0,1fr) 150px;
-        gap:16px;
-        align-items:stretch;
-        padding:16px;
-      }
-      #cw-wall-preview-detail .wpd-poster{
-        width:118px;
-        aspect-ratio:2/3;
-        border-radius:16px;
-        object-fit:cover;
-        border:1px solid var(--wpd-border);
-        background:var(--wpd-bg-strong);
-        box-shadow:0 18px 34px rgba(0,0,0,.28);
-      }
-      #cw-wall-preview-detail .wpd-main{min-width:0;display:flex;flex-direction:column}
-      #cw-wall-preview-detail .wpd-title-row{display:flex;gap:12px;align-items:flex-start}
-      #cw-wall-preview-detail .wpd-title{
-        flex:1;
-        min-width:0;
-        font-size:22px;
-        font-weight:850;
-        line-height:1.12;
-        letter-spacing:0;
-      }
-      #cw-wall-preview-detail .wpd-year{color:var(--wpd-muted);font-weight:760}
-      #cw-wall-preview-detail .wpd-close{
-        display:inline-flex;
-        align-items:center;
-        justify-content:center;
-        width:40px;
-        height:40px;
-        border-radius:999px;
-        border:1px solid var(--wpd-border);
-        background:var(--wpd-chip);
-        color:var(--wpd-text);
-        cursor:pointer;
-      }
-      #cw-wall-preview-detail .wpd-close:hover{border-color:var(--wpd-border-strong);background:rgba(255,255,255,.10)}
-      #cw-wall-preview-detail .wpd-close .material-symbol{font-size:22px}
-      #cw-wall-preview-detail .wpd-meta,
-      #cw-wall-preview-detail .wpd-sources{
-        display:flex;
-        align-items:center;
-        flex-wrap:wrap;
-        gap:7px;
-      }
-      #cw-wall-preview-detail .wpd-meta{margin-top:10px}
-      #cw-wall-preview-detail .wpd-sources{margin-top:auto;padding-top:12px}
-      #cw-wall-preview-detail .wpd-chip,
-      #cw-wall-preview-detail .wpd-source{
-        display:inline-flex;
-        align-items:center;
-        justify-content:center;
-        min-height:27px;
-        padding:0 10px;
-        border-radius:999px;
-        border:1px solid var(--wpd-border);
-        background:var(--wpd-chip);
-        color:var(--wpd-text);
-        font-size:11px;
-        font-weight:820;
-        letter-spacing:.04em;
-        text-transform:uppercase;
-      }
-      #cw-wall-preview-detail .wpd-source{width:34px;padding:0}
-      #cw-wall-preview-detail .wpd-source img{display:block;height:16px;max-width:23px;object-fit:contain}
-      #cw-wall-preview-detail .wpd-overview{
-        margin-top:12px;
-        color:var(--wpd-muted);
-        font-size:14px;
-        line-height:1.48;
-        max-height:4.5em;
-        overflow:hidden;
-        display:-webkit-box;
-        -webkit-line-clamp:3;
-        -webkit-box-orient:vertical;
-      }
-      #cw-wall-preview-detail .wpd-side{
-        display:flex;
-        flex-direction:column;
-        align-items:stretch;
-        justify-content:flex-start;
-        gap:9px;
-      }
-      #cw-wall-preview-detail .wpd-score{
-        --wpd-score:0deg;
-        --wpd-score-color:#49d391;
-        position:relative;
-        align-self:flex-end;
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        width:64px;
-        height:64px;
-        border-radius:50%;
-        background:conic-gradient(var(--wpd-score-color) var(--wpd-score),rgba(148,163,184,.18) 0);
-        font-size:18px;
-        font-weight:880;
-      }
-      #cw-wall-preview-detail .wpd-score::before{
-        content:"";
-        position:absolute;
-        inset:5px;
-        border-radius:50%;
-        background:var(--wpd-bg-strong);
-      }
-      #cw-wall-preview-detail .wpd-score span{position:relative}
-      #cw-wall-preview-detail .wpd-score-label{
-        align-self:flex-end;
-        margin-top:-3px;
-        color:var(--wpd-muted);
-        font-size:11px;
-        font-weight:720;
-      }
-      #cw-wall-preview-detail .wpd-link{
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        min-height:36px;
-        padding:0 12px;
-        border-radius:999px;
-        border:1px solid var(--wpd-border);
-        background:var(--wpd-chip);
-        color:var(--wpd-text);
-        text-decoration:none;
-        font-size:12px;
-        font-weight:820;
-      }
-      #cw-wall-preview-detail .wpd-link:hover{border-color:var(--wpd-border-strong);background:rgba(255,255,255,.10)}
-      #placeholder-card .poster{cursor:pointer}
-      html[data-cw-theme="flat-light"] #cw-wall-preview-detail{
-        --wpd-bg:rgba(255,255,255,.96);
-        --wpd-bg-strong:rgba(246,248,252,.96);
-        --wpd-border:rgba(15,23,42,.16);
-        --wpd-border-strong:rgba(15,23,42,.26);
-        --wpd-text:#172033;
-        --wpd-muted:rgba(51,65,85,.78);
-        --wpd-chip:rgba(241,245,249,.86);
-        --wpd-shadow:0 24px 60px rgba(15,23,42,.18);
-      }
-      html[data-cw-theme="flat-light"] #cw-wall-preview-detail::before{
-        background:
-          linear-gradient(90deg,rgba(255,255,255,.98) 0%,rgba(255,255,255,.93) 50%,rgba(255,255,255,.78) 100%),
-          var(--wpd-backdrop,none);
-      }
-      @media (max-width:720px){
-        #cw-wall-preview-detail{width:calc(100vw - 18px);bottom:max(10px,env(safe-area-inset-bottom));border-radius:20px}
-        #cw-wall-preview-detail .wpd-inner{grid-template-columns:78px minmax(0,1fr);gap:12px;padding:12px}
-        #cw-wall-preview-detail .wpd-poster{width:78px;border-radius:12px}
-        #cw-wall-preview-detail .wpd-title{font-size:17px}
-        #cw-wall-preview-detail .wpd-side{grid-column:1 / -1;flex-direction:row;align-items:center;flex-wrap:wrap}
-        #cw-wall-preview-detail .wpd-score{width:48px;height:48px;font-size:14px;align-self:center}
-        #cw-wall-preview-detail .wpd-score-label{display:none}
-        #cw-wall-preview-detail .wpd-overview{-webkit-line-clamp:2;font-size:13px}
-        #cw-wall-preview-detail .wpd-link{flex:1;min-width:120px}
-      }
-    `;
+    style.id = "cw-wall-preview-cursor-style";
+    style.textContent = "#placeholder-card .poster{cursor:pointer}";
     document.head.appendChild(style);
   }
 
-  function ensurePreviewDrawer() {
-    ensurePreviewDrawerStyles();
-    let drawer = document.getElementById("cw-wall-preview-detail");
-    if (drawer) return drawer;
+  let previewCard = null;
+  let previewItem = null;
+  let previewMeta = null;
 
-    drawer = document.createElement("aside");
-    drawer.id = "cw-wall-preview-detail";
-    drawer.setAttribute("aria-live", "polite");
-    drawer.setAttribute("aria-label", "Watchlist preview details");
-    document.body.appendChild(drawer);
+  function ensurePreviewCard() {
+    if (previewCard) return previewCard;
+    ensurePosterCursorStyle();
+    previewCard = window.CW.PlayingCard.mount({
+      id: "cw-wall-preview-detail",
+      variant: "watchlist",
+      tabScope: "main",
+      label: "Watchlist preview details",
+      width: "min(860px,calc(100vw - 32px))",
+      onClose: closePreviewDrawer,
+      onTrailer: () => { void window.CW?.Trailer?.openFor(previewItem, previewMeta); },
+    });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") closePreviewDrawer();
+      if (event.key !== "Escape") return;
+      if (document.getElementById("cw-trailer")?.classList.contains("show")) return;
+      closePreviewDrawer();
     }, true);
-    return drawer;
+    return previewCard;
   }
 
   function closePreviewDrawer() {
     activePreviewDrawerKey = "";
-    document.getElementById("cw-wall-preview-detail")?.classList.remove("show");
+    previewCard?.hide();
   }
 
-  function sourceMarkup(item) {
-    return sourceRowsForItem(item).slice(0, 6).map(({ provider, instance }) => {
-      const name = provider;
-      const src = providerLogoPath(name);
-      const label = providerInstanceLabel(name, instance);
-      return src
-        ? `<span class="wpd-source"><img src="${esc(src)}" alt="${esc(label)} logo"></span>`
-        : `<span class="wpd-source" aria-label="${esc(label)}">${esc(providerShortLabel(name).slice(0, 2))}</span>`;
-    }).join("");
+  function sourcesFor(item) {
+    return sourceRowsForItem(item).slice(0, 6).map(({ provider, instance }) => ({
+      label: providerInstanceLabel(provider, instance),
+      short: providerShortLabel(provider),
+      logo: providerLogoPath(provider),
+    }));
+  }
+
+  function previewModel(item, meta, loading) {
+    const resolved = String(meta?.resolved_type || "").toLowerCase();
+    const isMovie = resolved ? resolved === "movie" : mediaTypeOf(item) === "movie";
+    const releaseIso = isMovie
+      ? (meta?.detail?.release_date || meta?.release?.date || item?.release_date || "")
+      : (meta?.detail?.first_air_date || meta?.release?.date || item?.first_air_date || "");
+    const year = String(item?.year || meta?.year || yearFromIso(releaseIso) || "").trim();
+    const chips = [
+      { text: mediaLabelOf(item, meta) },
+      { text: year },
+      { text: runtimeLabel(meta?.runtime_minutes) },
+      { text: meta?.certification || meta?.release?.cert || meta?.detail?.certification || "" },
+    ];
+    const rawScore = Number(meta?.score);
+    const rawRating = Number(meta?.vote_average ?? meta?.detail?.vote_average);
+    const ratingValue = Number.isFinite(rawRating)
+      ? rawRating
+      : Number.isFinite(rawScore) ? rawScore / 10 : null;
+
+    return {
+      title: item?.title || meta?.title || "Unknown title",
+      year: "",
+      isMovie,
+      chips,
+      overview: meta?.overview || meta?.detail?.overview || meta?.detail?.tagline
+        || (loading ? "Loading details..." : "No description available."),
+      poster: artUrl(item, "w342") || "/assets/img/placeholder_poster.svg",
+      posterHref: tmdbUrl(item, meta),
+      backdrop: backdropUrl(item, meta),
+      information: meta ? window.CW.PlayingCard.fmt.informationFor(meta, isMovie) : "loading",
+      rating: { value: ratingValue, votes: meta?.vote_count ?? meta?.detail?.vote_count },
+      sources: sourcesFor(item),
+      links: [
+        { href: tmdbUrl(item, meta), text: "TMDb" },
+        { href: imdbUrl(item, meta), text: "IMDb" },
+      ],
+    };
   }
 
   function renderPreviewDrawer(item, meta = null, loading = false) {
-    const drawer = ensurePreviewDrawer();
-    const poster = artUrl(item, "w342") || "/assets/img/placeholder_poster.svg";
-    const backdrop = backdropUrl(item, meta);
-    const releaseIso = mediaTypeOf(item) === "movie"
-      ? (meta?.detail?.release_date || meta?.release?.date || item?.release_date || "")
-      : (meta?.detail?.first_air_date || meta?.release?.date || item?.first_air_date || "");
-    const title = item?.title || meta?.title || "Unknown title";
-    const year = String(item?.year || meta?.year || yearFromIso(releaseIso) || "").trim();
-    const genres = (Array.isArray(meta?.genres) ? meta.genres : Array.isArray(meta?.detail?.genres) ? meta.detail.genres : Array.isArray(item?.genres) ? item.genres : []).slice(0, 3);
-    const chips = [
-      mediaLabelOf(item),
-      year,
-      runtimeLabel(meta?.runtime_minutes),
-      dateLabel(releaseIso),
-      meta?.certification || meta?.release?.cert || meta?.detail?.certification || "",
-      ...genres,
-    ].filter(Boolean);
-    const overview = meta?.overview || meta?.detail?.overview || meta?.detail?.tagline || (loading ? "Loading details..." : "No description available.");
-    const score = scoreValue(meta);
-    const scoreColor = score == null ? "#94a3b8" : score >= 70 ? "#49d391" : score >= 45 ? "#e4b85a" : "#e66b7a";
-    const tmdb = tmdbUrl(item, meta);
-    const imdb = imdbUrl(item, meta);
-    const sourcesTitle = sourceRouteTitle(item);
-
-    drawer.style.setProperty("--wpd-backdrop", backdrop ? `url("${backdrop}")` : "none");
-    drawer.innerHTML = `
-      <div class="wpd-inner">
-        <img class="wpd-poster" src="${poster}" alt="" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg'">
-        <div class="wpd-main">
-          <div class="wpd-title-row">
-            <div class="wpd-title">${esc(title)}${year ? ` <span class="wpd-year">${esc(year)}</span>` : ""}</div>
-            <button type="button" class="wpd-close" aria-label="Close details"><span class="material-symbol">close</span></button>
-          </div>
-          <div class="wpd-meta">${chips.map((chip) => `<span class="wpd-chip">${esc(chip)}</span>`).join("")}</div>
-          <div class="wpd-overview">${esc(overview)}</div>
-          <div class="wpd-sources" title="${esc(sourcesTitle)}" aria-label="${esc(sourcesTitle || "Providers")}">${sourceMarkup(item)}</div>
-        </div>
-        <div class="wpd-side">
-          ${score == null ? "" : `<div class="wpd-score" style="--wpd-score:${Math.max(0, Math.min(100, score)) * 3.6}deg;--wpd-score-color:${scoreColor}"><span>${score}%</span></div><div class="wpd-score-label">User Score</div>`}
-          ${tmdb ? `<a class="wpd-link" href="${tmdb}" target="_blank" rel="noopener">View on TMDb</a>` : ""}
-          ${imdb ? `<a class="wpd-link" href="${imdb}" target="_blank" rel="noopener">View on IMDb</a>` : ""}
-        </div>
-      </div>
-    `;
-    drawer.querySelector(".wpd-close")?.addEventListener("click", closePreviewDrawer, true);
-    drawer.classList.add("show");
+    const card = ensurePreviewCard();
+    previewItem = item;
+    previewMeta = meta;
+    card.render(previewModel(item, meta, loading));
+    card.show();
   }
 
   async function openPreviewDrawer(item) {
@@ -599,10 +461,10 @@
     activePreviewDrawerKey = activeKey;
     renderPreviewDrawer(item, null, true);
     const meta = await getPreviewMeta(item);
-    const drawer = document.getElementById("cw-wall-preview-detail");
-    if (!drawer?.classList.contains("show") || activePreviewDrawerKey !== activeKey) return;
+    if (!previewCard?.isVisible() || activePreviewDrawerKey !== activeKey) return;
     renderPreviewDrawer(item, meta || null, false);
   }
+
   const previewGate = async () => {
     const [wlEnabled, hasKey, uiAllowed] = await Promise.all([
       Promise.resolve(window.isWatchlistEnabledInPairs?.() ?? true).catch(() => false),
@@ -632,9 +494,12 @@
     row.replaceChildren();
     row.classList.add("hidden");
     row.closest(".wall-wrap")?.classList.add("is-empty");
-    msg.textContent = text;
+    msg.innerHTML = `
+      <strong>${esc(text && text !== "No items to show yet." ? text : "No watchlist items yet")}</strong>
+      <small>Synced watchlist titles will appear here.</small>`;
     msg.classList.add("is-empty");
     msg.classList.remove("hidden");
+    window.dispatchEvent(new CustomEvent("cw:watchlist-widget-state", { detail: { empty: true, count: 0 } }));
   };
 
   function pillFor(status) {
@@ -763,11 +628,10 @@
       itemMap.set(itemKey, item);
 
       link.className = "poster";
-      link.href = `https://www.themoviedb.org/${isTV(item.type) ? "tv" : "movie"}/${item.tmdb}`;
+      link.href = tmdbUrl(item, window.CW?.Meta?.peek(item)) || `https://www.themoviedb.org/${isTV(item.type) ? "tv" : "movie"}/${item.tmdb}`;
       link.target = "_blank";
       link.rel = "noopener";
       link.style.cursor = "pointer";
-      link.title = `Show details for ${item.title || "this item"}`;
       link.setAttribute("aria-label", `Show details for ${item.title || "this item"}`);
       link.dataset.type = item.type || "";
       link.dataset.tmdb = String(item.tmdb);
@@ -779,41 +643,64 @@
       img.loading = renderedCount < 4 ? "eager" : "lazy";
       if (renderedCount < 4) img.fetchPriority = "high";
       img.alt = `${item.title || ""} (${item.year || ""})`;
-      img.src = artUrl(item, "w342") || "/assets/img/placeholder_poster.svg";
+      const widgetCard = document.getElementById("placeholder-card");
+      const currentView = widgetCard?.dataset?.widgetView || "icon";
+      const horizontal = widgetCard?.dataset?.widgetSize === "large";
+      const coverSrc = artUrl(item, "w342") || "/assets/img/placeholder_poster.svg";
+      const gridSrc = gridArtUrl(item, horizontal ? "w780" : "w300") || coverSrc;
+      img.src = (currentView === "media" || currentView === "grid") ? gridSrc : coverSrc;
+      img.dataset.coverSrc = coverSrc;
+      img.dataset.gridSrc = gridSrc;
       img.onerror = function () { this.onerror = null; this.src = "/assets/img/placeholder_poster.svg"; };
       link.appendChild(img);
+
+      const timeLabel = relWallTime(getTs(item) || lastSyncEpoch);
+      if (timeLabel) {
+        const age = document.createElement("span");
+        age.className = "wl-age";
+        age.textContent = timeLabel;
+        link.appendChild(age);
+      }
+
+      const epLabel = episodeLabel(item);
+      if (epLabel) {
+        const ep = document.createElement("span");
+        ep.className = "cw-history-episode wl-episode";
+        ep.textContent = epLabel;
+        link.appendChild(ep);
+      }
 
       const overlay = document.createElement("div");
       const currentProviders = providersForItem(item).slice(0, 5);
       const routeTitle = sourceRouteTitle(item);
       const synced = String(source).toLowerCase() === "both";
-      overlay.className = "ovr";
+      overlay.className = `ovr wl-status ${synced ? "is-synced" : "is-provider"}`;
       if (routeTitle) {
-        overlay.title = routeTitle;
         overlay.setAttribute("aria-label", routeTitle);
       }
-      overlay.style.left = "8px";
-      overlay.style.right = synced ? "8px" : "auto";
-      overlay.style.justifyContent = synced ? "center" : "flex-start";
-      overlay.style.width = synced ? "calc(100% - 16px)" : "auto";
       overlay.innerHTML = synced
         ? `<div class="pill ${pill.cls}">${pill.text}</div>`
-        : currentProviders.map(providerIconMarkup).join("");
+        : currentProviders.length ? currentProviders.map(providerIconMarkup).join("") : `<div class="pill ${pill.cls}">${pill.text}</div>`;
       link.appendChild(overlay);
+
+      if (synced) {
+        const marker = document.createElement("span");
+        marker.className = "wl-bookmark material-symbols-rounded";
+        marker.setAttribute("aria-hidden", "true");
+        marker.textContent = "bookmark";
+        link.appendChild(marker);
+      }
 
       const cap = document.createElement("div");
       cap.className = "cap";
-      cap.textContent = `${item.title || ""}${item.year ? ` - ${item.year}` : ""}`;
+      const typeLabel = isTV(item.type || item.entity || item.media_type) ? (epLabel || "TV Series") : "Movie";
+      const compactMeta = [typeLabel, item.year || "", timeLabel ? `updated ${timeLabel}` : ""].filter(Boolean).join(" - ");
+      const horizontalMeta = [typeLabel, item.year || ""].filter(Boolean).join(" \u2022 ");
+      cap.innerHTML = `
+        <strong>${esc(item.title || "")}</strong>
+        <small class="wl-meta-compact">${esc(compactMeta)}</small>
+        <small class="wl-meta-horizontal">${esc(horizontalMeta)}</small>`;
       link.appendChild(cap);
-
-      const hover = document.createElement("div");
-      hover.className = "hover";
-      hover.innerHTML = `
-        <div class="titleline">${item.title || ""}</div>
-        <div class="meta">
-          <div class="chip time">${lastSyncEpoch ? `updated ${window.relTimeFromEpoch?.(lastSyncEpoch) || ""}` : ""}</div>
-        </div>`;
-      link.appendChild(hover);
 
       frag.appendChild(link);
       renderedCount++;
@@ -833,6 +720,9 @@
     msg.classList.add("hidden");
     window.__wallRenderSignature = wallSignature(wallItems, lastSyncEpoch);
     initWallInteractions();
+    applyWidgetView();
+    prewarmWallImages();
+    window.dispatchEvent(new CustomEvent("cw:watchlist-widget-state", { detail: { empty: false, count: renderedCount } }));
     return true;
   }
 
@@ -845,17 +735,13 @@
 
     const myReq = ++wallReqSeq;
     const refreshVersion = window.__cwWallPreviewDirtyVersion;
-    let renderedWall = hasRenderedWall(row);
+    const renderedWall = hasRenderedWall(row);
     if (!renderedWall) {
       msg.textContent = "Loading...";
       msg.classList.remove("is-empty");
       msg.classList.remove("hidden");
       row.closest(".wall-wrap")?.classList.remove("is-empty");
       row.classList.add("hidden");
-      const cached = readWallCache();
-      if (cached) {
-        renderedWall = renderWall(row, msg, cached.items, cached.last_sync_epoch || 0, { total: cached.total ?? null });
-      }
     }
 
     const limit = Number.isFinite(window.MAX_WALL_POSTERS) ? Math.max(1, Number(window.MAX_WALL_POSTERS)) : 20;
@@ -867,6 +753,7 @@
       if (myReq !== wallReqSeq) return false;
       if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
       if (!gate.allowed) {
+        clearWallCache();
         hidePreviewCard(card, row, msg);
         return false;
       }
@@ -877,13 +764,14 @@
       const data = wallResult.data;
       if (myReq !== wallReqSeq) return false;
       if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
-      if (data?.missing_tmdb_key) { hidePreviewCard(card, row, msg); return false; }
+      if (data?.missing_tmdb_key) { clearWallCache(); hidePreviewCard(card, row, msg); return false; }
       if (!data?.ok) { msg.textContent = data?.error || "No state data found."; return false; }
 
       let items = Array.isArray(data.items) ? data.items.slice() : [];
       if (!items.length) items = (data.items || []).filter((it) => String(it?.status || "").toLowerCase() === "both");
       window._lastSyncEpoch = data.last_sync_epoch || null;
       if (!items.length) {
+        clearWallCache();
         setWallEmpty(row, msg, "No items to show yet.");
         markPreviewClean(refreshVersion);
         return true;
@@ -893,6 +781,10 @@
       markPreviewClean(refreshVersion);
       return true;
     } catch {
+      const cached = readWallCache();
+      if (cached?.items?.length) {
+        return renderWall(row, msg, cached.items, cached.last_sync_epoch || 0, { total: cached.total ?? null });
+      }
       if (!renderedWall) {
         row.classList.add("hidden");
         msg.classList.remove("hidden");
@@ -1026,6 +918,8 @@
     scrollWall,
     initWallInteractions,
     artUrl,
+    applyWidgetView,
+    prewarmWallImages,
     loadWall,
     updateWatchlistPreview,
     hasTmdbKey,

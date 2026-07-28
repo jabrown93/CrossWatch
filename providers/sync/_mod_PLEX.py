@@ -3,12 +3,17 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
+
+from cw_platform.value_coercion import coerce_bool
 
 from ._log import log as cw_log
 
@@ -35,7 +40,7 @@ def _error(event: str, **fields: Any) -> None:
 def _log(msg: str) -> None:
     _dbg(msg)
 
-__VERSION__ = "1.1"
+__VERSION__ = "2.1"
 os.environ.setdefault("CW_PLEX_VERSION", __VERSION__)
 os.environ.setdefault("CW_PLEX_UA", f"CrossWatch/{__VERSION__} (Plex)")
 __all__ = ["get_manifest", "PLEXModule", "PLEXClient", "PLEXError", "PLEXAuthError", "PLEXNotFound", "OPS"]
@@ -61,6 +66,7 @@ from .plex._common import (
     set_client_id,
 )
 from .plex._utils import fetch_shared_server_token, resolve_user_scope
+from cw_platform.id_map import canonical_key as _canonical_key
 from ._mod_common import (
     build_session,
     request_with_retries,
@@ -102,7 +108,26 @@ except Exception as e:
     if os.environ.get("CW_DEBUG") or os.environ.get("CW_PLEX_DEBUG"):
         _warn("feature_import_failed", feature="progress", error=str(e))
 
-feat_playlists = None
+try:
+    from .plex import _playlists as feat_playlists
+except Exception as e:
+    feat_playlists = None
+    if os.environ.get("CW_DEBUG") or os.environ.get("CW_PLEX_DEBUG"):
+        _warn("feature_import_failed", feature="playlists", error=str(e))
+
+_PLAYLIST_CAPABILITIES: dict[str, Any] = {
+    "read": True,
+    "create": True,
+    "add": True,
+    "remove": True,
+    "reorder": True,
+    "smart": True,
+    "smart_writable": False,
+    "media_types": ["movie", "show", "episode"],
+    "endpoint_types": ["playlist", "collection"],
+    "ordered_endpoint_types": ["playlist"],
+    "unordered_endpoint_types": ["watchlist", "collection"],
+}
 
 
 class PLEXError(RuntimeError):
@@ -136,6 +161,126 @@ def _history_index_semantics(cfg: Mapping[str, Any]) -> str:
         return "present" if bool(hist.get("include_marked_watched", True)) else "delta"
     except Exception:
         return "present"
+
+
+def _src_key(it: Any) -> str:
+    try:
+        k = str(_canonical_key(it) or "").strip()
+    except Exception:
+        k = ""
+    if k and not k.startswith("unknown:"):
+        return k
+    try:
+        return str(plex_key_of(it) or "").strip()
+    except Exception:
+        return k
+
+
+def _key_of_attempt(it: Any) -> str:
+    if isinstance(it, dict) and it.get("key"):
+        return str(it.get("key"))
+    return _src_key(it)
+
+
+def _unresolved_key(u: Any) -> str:
+    if isinstance(u, str):
+        return u
+    if isinstance(u, dict):
+        if u.get("key"):
+            return str(u.get("key"))
+        inner = u.get("item")
+        if isinstance(inner, dict):
+            return _src_key(inner)
+        return _src_key(u)
+    return ""
+
+
+def _split_keys(lst: Iterable[Mapping[str, Any]], unresolved: Any) -> tuple[list[str], list[str], list[str]]:
+    attempted: list[str] = []
+    seen: set[str] = set()
+    for it in lst or []:
+        k = _key_of_attempt(it)
+        if k and k not in seen:
+            attempted.append(k)
+            seen.add(k)
+    ukeys: set[str] = set()
+    if isinstance(unresolved, list):
+        for u in unresolved:
+            k = _unresolved_key(u)
+            if k:
+                ukeys.add(k)
+    confirmed = [k for k in attempted if k not in ukeys and not str(k).startswith("unknown:")]
+    return attempted, sorted(ukeys), confirmed
+
+
+_PLEX_HISTORY_META_FIELDS = (
+    "accepted_keys",
+    "presence_confirmed_keys",
+    "live_confirmed_keys",
+    "accepted_not_seen_live_keys",
+    "date_confirmed_keys",
+    "date_mismatch_keys",
+    "reason_counts",
+)
+
+
+_ADAPTER_CACHE: dict[str, tuple[Any, float]] = {}
+_ADAPTER_LOCK = threading.Lock()
+_ADAPTER_MAX = 8
+_ADAPTER_TTL = 300.0
+_ADAPTER_CACHE_ENABLED = True  # in-code kill switch for the connected-adapter reuse
+
+
+def _adapter_identity(cfg: Mapping[str, Any]) -> str:
+    pl_raw = (cfg or {}).get("plex") if isinstance(cfg, Mapping) else None
+    pl: Mapping[str, Any] = pl_raw if isinstance(pl_raw, Mapping) else {}
+    pms_raw = pl.get("pms")
+    pms: Mapping[str, Any] = pms_raw if isinstance(pms_raw, Mapping) else {}
+
+    def _h(v: Any) -> str:
+        s = str(v or "")
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16] if s else ""
+
+    def _stable(v: Any) -> str:
+        try:
+            return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            return str(v or "")
+
+    behavior = {
+        "fallback_GUID": pl.get("fallback_GUID") if "fallback_GUID" in pl else pl.get("fallback_guid"),
+        "history": pl.get("history") if isinstance(pl.get("history"), Mapping) else {},
+        "progress": pl.get("progress") if isinstance(pl.get("progress"), Mapping) else {},
+        "ratings": pl.get("ratings") if isinstance(pl.get("ratings"), Mapping) else {},
+        "scrobble": pl.get("scrobble") if isinstance(pl.get("scrobble"), Mapping) else {},
+        "strict_id_matching": pl.get("strict_id_matching"),
+        "timeout": pl.get("timeout"),
+        "max_retries": pl.get("max_retries"),
+        "history_workers": pl.get("history_workers"),
+        "rating_workers": pl.get("rating_workers"),
+        "watchlist_allow_pms_fallback": pl.get("watchlist_allow_pms_fallback"),
+        "watchlist_page_size": pl.get("watchlist_page_size"),
+        "watchlist_query_limit": pl.get("watchlist_query_limit"),
+        "watchlist_title_query": pl.get("watchlist_title_query"),
+        "watchlist_use_metadata_match": pl.get("watchlist_use_metadata_match"),
+        "watchlist_guid_priority": pl.get("watchlist_guid_priority"),
+        "progress_clock_drift_seconds": pl.get("progress_clock_drift_seconds"),
+        "progress_replay_enabled": pl.get("progress_replay_enabled"),
+    }
+
+    parts = [
+        str(pl.get("baseurl") or pl.get("server_url") or pms.get("url") or pms.get("baseurl") or pms.get("server_url") or ""),
+        str(pl.get("machine_id") or ""),
+        str(pl.get("server_name") or pl.get("server") or ""),
+        str(pl.get("username") or ""),
+        str(pl.get("account_id") or ""),
+        str(pl.get("client_id") or ""),
+        _h(pl.get("account_token") or pl.get("token")),
+        _h(pl.get("pms_token") or pms.get("token") or pms.get("x_plex_token")),
+        _h(pl.get("home_pin")),
+        _h(_stable(behavior)),
+    ]
+    return "|".join(parts)
 
 
 def _plex_tv_client_id(cfg: Any) -> str:
@@ -253,7 +398,7 @@ def _plex_tv_resource_for_connection(
         return None, None
 
     try:
-        u = urlparse(str(baseurl).strip())
+        u = urlparse(str(baseurl).strip(), scheme="")
         want_host = (u.hostname or "").strip().lower()
         want_port = int(u.port or 32400)
         want_scheme = (u.scheme or "").strip().lower()
@@ -288,7 +433,7 @@ def _plex_tv_resource_for_connection(
             if not uri:
                 continue
             try:
-                cu = urlparse(uri)
+                cu = urlparse(uri, scheme="")
                 host = (cu.hostname or "").strip().lower()
                 port = int(cu.port or 32400)
                 scheme = (cu.scheme or "").strip().lower()
@@ -343,7 +488,7 @@ def get_manifest() -> Mapping[str, Any]:
         "version": __VERSION__,
         "type": "sync",
         "bidirectional": True,
-        "features": {"watchlist": True, "history": True, "ratings": True, "playlists": False, "progress": True},
+        "features": {"watchlist": True, "history": True, "ratings": True, "playlists": True, "progress": True},
         "requires": ["plexapi"],
         "capabilities": {
             "bidirectional": True,
@@ -357,6 +502,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "unrate": True,
                 "from_date": False,
             },
+            "playlists": _PLAYLIST_CAPABILITIES,
         },
     }
 @dataclass
@@ -407,19 +553,36 @@ class PLEXClient:
         self._user_scope_kind: str | None = None
         self._token_stack: list[tuple[str | None, str | None, str | None, int | None, int | None, bool, str | None]] = []
 
-    def connect(self) -> PLEXClient:
-        try:
-            if self.cfg.token:
-                self._account = MyPlexAccount(token=self.cfg.token)
-                _ = self._account.username
-            elif self.cfg.username and self.cfg.password:
-                self._account = MyPlexAccount(self.cfg.username, self.cfg.password)
-                _ = self._account.username
-            else:
-                raise PLEXAuthError("Missing Plex auth (account token or username/password)")
+    def _ensure_account(self) -> MyPlexAccount:
+        if self._account is not None:
+            return self._account
+        if self.cfg.token:
+            self._account = MyPlexAccount(token=self.cfg.token)
+        elif self.cfg.username and self.cfg.password:
+            self._account = MyPlexAccount(self.cfg.username, self.cfg.password)
+        else:
+            raise PLEXAuthError("Missing Plex account auth (account token or username/password)")
+        _ = self._account.username
+        return self._account
 
-            cloud_token = self.cfg.token or self._account.authenticationToken
+    def connect(self) -> PLEXClient:
+        started = time.perf_counter()
+        try:
             pms_token = (self.cfg.pms_token or "").strip() or None
+            direct_pms = bool(self.cfg.baseurl and pms_token)
+            account: MyPlexAccount | None = None
+            cloud_token: str | None = None
+            if direct_pms:
+                cloud_token = (self.cfg.token or "").strip() or None
+                if not cloud_token and self.cfg.username and self.cfg.password:
+                    account = self._ensure_account()
+                    cloud_token = str(account.authenticationToken or "").strip() or None
+            else:
+                account = self._ensure_account()
+                cloud_token = (self.cfg.token or "").strip() or str(account.authenticationToken or "").strip() or None
+            connection_token = pms_token or cloud_token
+            if not connection_token:
+                raise PLEXAuthError("Missing Plex auth (PMS token or account login)")
             self._pms_token = pms_token
             self.cloud_token = cloud_token
 
@@ -429,11 +592,11 @@ class PLEXClient:
             self.session.headers.setdefault("X-Plex-Platform", "CrossWatch")
             self.session.headers.setdefault("X-Plex-Version", __VERSION__)
             self.session.headers.setdefault("Accept", "application/xml")
-            self.session.headers["X-Plex-Token"] = pms_token or cloud_token
+            self.session.headers["X-Plex-Token"] = connection_token
 
             if self.cfg.baseurl:
                 try:
-                    self.server = PlexServer(self.cfg.baseurl, (pms_token or cloud_token), timeout=self.cfg.timeout)
+                    self.server = PlexServer(self.cfg.baseurl, connection_token, timeout=self.cfg.timeout)
                     self.server._session = self.session  # type: ignore[attr-defined]
                     self._pms_baseurl = str(getattr(self.server, "baseurl", None) or self.cfg.baseurl or "")
                     if self._pms_baseurl and (pms_token or cloud_token):
@@ -445,6 +608,8 @@ class PLEXClient:
 
                 # Shared users need a server-scoped resource token for PMS endpoints.
                 if not pms_token:
+                    if not cloud_token:
+                        raise PLEXAuthError("Missing Plex account token for PMS resource discovery")
                     try:
                         baseurl = str(self.cfg.baseurl or "").strip()
                         mid = (self.cfg.machine_id or "").strip() or None
@@ -470,10 +635,17 @@ class PLEXClient:
                         configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token))
 
                 self._post_connect_user_scope(str(pms_token or cloud_token))
+                _dbg(
+                    "connect_done",
+                    mode="direct_pms",
+                    cloud_auth_deferred=bool(direct_pms and account is None),
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                )
                 return self
 
             try:
-                res = self._pick_resource(self._account)
+                account = self._ensure_account()
+                res = self._pick_resource(account)
                 res_tok = str(getattr(res, "accessToken", None) or "").strip() or None
                 res_mid = str(getattr(res, "clientIdentifier", None) or "").strip() or None
                 self.server = res.connect(timeout=self.cfg.timeout)  # type: ignore[assignment]
@@ -492,6 +664,12 @@ class PLEXClient:
                 return self
 
             self._post_connect_user_scope(str(pms_token or cloud_token))
+            _dbg(
+                "connect_done",
+                mode="cloud_resource",
+                cloud_auth_deferred=False,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
             return self
 
         except Exception as e:
@@ -871,9 +1049,7 @@ class PLEXClient:
         self._user_scope_kind = prev_scope_kind
 
     def account(self) -> MyPlexAccount:
-        if not self._account:
-            raise PLEXAuthError("MyPlexAccount not available (need account token or login).")
-        return self._account
+        return self._ensure_account()
 
     def ping(self) -> bool:
         try:
@@ -913,7 +1089,6 @@ _FEATURES: dict[str, Any] = {
     "watchlist": feat_watchlist,
     "history": feat_history,
     "ratings": feat_ratings,
-    "playlists": feat_playlists,
     "progress": feat_progress,
 }
 
@@ -924,7 +1099,7 @@ def _features_flags() -> dict[str, bool]:
         "history": "history" in _FEATURES and _FEATURES["history"] is not None,
         "ratings": "ratings" in _FEATURES and _FEATURES["ratings"] is not None,
         "progress": "progress" in _FEATURES and _FEATURES["progress"] is not None,
-        "playlists": "playlists" in _FEATURES and _FEATURES["playlists"] is not None,
+        "playlists": feat_playlists is not None,
     }
 
 
@@ -932,8 +1107,8 @@ class PLEXModule:
     def __init__(self, cfg: Mapping[str, Any]):
         self.config = cfg
         plex_cfg = dict(cfg.get("plex") or {})
-        baseurl = plex_cfg.get("baseurl") or plex_cfg.get("server_url")
         pms = plex_cfg.get("pms") or {}
+        baseurl = plex_cfg.get("baseurl") or plex_cfg.get("server_url") or pms.get("url") or pms.get("baseurl") or pms.get("server_url")
         self.cfg = PLEXConfig(
             token=plex_cfg.get("account_token") or plex_cfg.get("token"),
             pms_token=plex_cfg.get("pms_token") or pms.get("token") or pms.get("x_plex_token"),
@@ -947,9 +1122,9 @@ class PLEXModule:
             password=plex_cfg.get("password"),
             timeout=float(plex_cfg.get("timeout", cfg.get("timeout", 10.0))),
             max_retries=int(plex_cfg.get("max_retries", cfg.get("max_retries", 3))),
-            watchlist_allow_pms_fallback=bool(plex_cfg.get("watchlist_allow_pms_fallback", True)),
+            watchlist_allow_pms_fallback=coerce_bool(plex_cfg.get("watchlist_allow_pms_fallback", True), True),
             watchlist_page_size=int(plex_cfg.get("watchlist_page_size", 100)),
-            strict_id_matching=bool(plex_cfg.get("strict_id_matching", False)),
+            strict_id_matching=coerce_bool(plex_cfg.get("strict_id_matching", False)),
         )
 
         configure_plex_context(baseurl=self.cfg.baseurl or "", token=(self.cfg.pms_token or self.cfg.token or ""))
@@ -964,6 +1139,7 @@ class PLEXModule:
                 pass
 
         self.client = PLEXClient(self.cfg).connect()
+        self.instance_id = "default"
         self.progress_factory = (
             lambda feature, total=None, throttle_ms=300: make_snapshot_progress(
                 ctx,
@@ -976,7 +1152,7 @@ class PLEXModule:
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
-        toggles = {"watchlist": True, "ratings": True, "history": True, "playlists": False, "progress": True}
+        toggles = {"watchlist": True, "ratings": True, "history": True, "playlists": True, "progress": True}
         present = _features_flags()
         return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
 
@@ -1180,34 +1356,22 @@ class PLEXModule:
             return {"ok": True, "count": 0, "unresolved": []}
         try:
             cnt, unresolved = mod.add(self, lst)
-            attempted_keys: list[str] = []
-            for it in lst:
-                k = None
-                if isinstance(it, dict):
-                    k = it.get("key")
-                if not k:
-                    try:
-                        k = plex_key_of(it)
-                    except Exception:
-                        k = None
-                if k:
-                    attempted_keys.append(str(k))
-            unresolved_keys: set[str] = set()
-            if isinstance(unresolved, list):
-                for u in unresolved:
-                    if isinstance(u, str):
-                        unresolved_keys.add(u)
-                    elif isinstance(u, dict):
-                        uk = u.get("key")
-                        if not uk:
-                            try:
-                                uk = plex_key_of(u)
-                            except Exception:
-                                uk = None
-                        if uk:
-                            unresolved_keys.add(str(uk))
-            confirmed_keys = [k for k in attempted_keys if k not in unresolved_keys and not str(k).startswith("unknown:")]
-            return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+            _attempted, unresolved_keys, confirmed_keys = _split_keys(lst, unresolved)
+            res: dict[str, Any] = {
+                "ok": True,
+                "count": int(cnt),
+                "unresolved": unresolved,
+                "confirmed_keys": confirmed_keys,
+                "unresolved_keys": unresolved_keys,
+                "results": list(getattr(self, "_progress_write_results", [])) if feature == "progress" else [],
+            }
+            if feature == "history":
+                hm = getattr(self, "_plex_history_write_meta", None)
+                if isinstance(hm, dict):
+                    for f in _PLEX_HISTORY_META_FIELDS:
+                        if f in hm:
+                            res[f] = hm[f]
+            return res
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1232,34 +1396,15 @@ class PLEXModule:
             return {"ok": True, "count": 0, "unresolved": []}
         try:
             cnt, unresolved = mod.remove(self, lst)
-            attempted_keys: list[str] = []
-            for it in lst:
-                k = None
-                if isinstance(it, dict):
-                    k = it.get("key")
-                if not k:
-                    try:
-                        k = plex_key_of(it)
-                    except Exception:
-                        k = None
-                if k:
-                    attempted_keys.append(str(k))
-            unresolved_keys: set[str] = set()
-            if isinstance(unresolved, list):
-                for u in unresolved:
-                    if isinstance(u, str):
-                        unresolved_keys.add(u)
-                    elif isinstance(u, dict):
-                        uk = u.get("key")
-                        if not uk:
-                            try:
-                                uk = plex_key_of(u)
-                            except Exception:
-                                uk = None
-                        if uk:
-                            unresolved_keys.add(str(uk))
-            confirmed_keys = [k for k in attempted_keys if k not in unresolved_keys and not str(k).startswith("unknown:")]
-            return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+            _attempted, unresolved_keys, confirmed_keys = _split_keys(lst, unresolved)
+            return {
+                "ok": True,
+                "count": int(cnt),
+                "unresolved": unresolved,
+                "confirmed_keys": confirmed_keys,
+                "unresolved_keys": unresolved_keys,
+                "results": list(getattr(self, "_progress_write_results", [])) if feature == "progress" else [],
+            }
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1287,12 +1432,21 @@ class _PlexOPS:
                 "unrate": True,
                 "from_date": False,
             },
+            "playlists": _PLAYLIST_CAPABILITIES,
         }
 
     def index_semantics(self, cfg: Mapping[str, Any], *, feature: str) -> str | None:
         if str(feature).lower() == "history":
             return _history_index_semantics(cfg)
         return None
+
+    def snapshot_refresh(self, cfg: Mapping[str, Any], *, feature: str) -> Mapping[str, dict[str, Any]] | None:
+        if str(feature or "").lower() != "history":
+            return None
+        try:
+            return self._adapter(cfg).build_index(feature, force=True)
+        except Exception:
+            return None
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
         c = cfg or {}
@@ -1309,7 +1463,28 @@ class _PlexOPS:
         return bool(account_token or flat_pms_token or (pms_url and pms_token))
 
     def _adapter(self, cfg: Mapping[str, Any]) -> PLEXModule:
-        return PLEXModule(cfg)
+        if not _ADAPTER_CACHE_ENABLED:
+            return PLEXModule(cfg)
+        key = _adapter_identity(cfg)
+        now = time.time()
+        with _ADAPTER_LOCK:
+            ent = _ADAPTER_CACHE.get(key)
+            if ent is not None and (now - ent[1]) < _ADAPTER_TTL:
+                return ent[0]
+        mod = PLEXModule(cfg)
+        try:
+            setattr(mod, "_cw_home_scope_sticky", True)
+        except Exception:
+            pass
+        with _ADAPTER_LOCK:
+            if len(_ADAPTER_CACHE) >= _ADAPTER_MAX:
+                try:
+                    oldest = min(_ADAPTER_CACHE.items(), key=lambda kv: kv[1][1])[0]
+                    _ADAPTER_CACHE.pop(oldest, None)
+                except Exception:
+                    _ADAPTER_CACHE.clear()
+            _ADAPTER_CACHE[key] = (mod, now)
+        return mod
 
     def build_index(self, cfg: Mapping[str, Any], *, feature: str) -> Mapping[str, dict[str, Any]]:
         return self._adapter(cfg).build_index(feature)
@@ -1336,6 +1511,89 @@ class _PlexOPS:
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
+
+    def _pl(self) -> Any:
+        if feat_playlists is None:
+            raise PLEXError("Plex playlists feature is unavailable")
+        return feat_playlists
+
+    def _playlist_adapter(self, cfg: Mapping[str, Any], instance: str | None):
+        from cw_platform.provider_instances import normalize_instance_id
+
+        ad = self._adapter(cfg)
+        try:
+            ad.instance_id = normalize_instance_id(instance)
+        except Exception:
+            ad.instance_id = "default"
+        return ad
+
+    def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None):
+        if feat_playlists is None:
+            return []
+        return list(self._pl().list_resources(self._playlist_adapter(cfg, instance)))
+
+    def get_playlist_snapshot(self, cfg: Mapping[str, Any], playlist_id: str, *, instance: str | None = None):
+        return self._pl().get_snapshot(self._playlist_adapter(cfg, instance), playlist_id)
+
+    def create_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        name: str,
+        *,
+        media_type: str | None = None,
+        items: Iterable[Mapping[str, Any]] | None = None,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().create(
+            self._playlist_adapter(cfg, instance),
+            name,
+            media_type=media_type,
+            items=list(items or []),
+            dry_run=dry_run,
+        )
+
+    def add_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().add(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def remove_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        return self._pl().remove(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def reorder_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        ordered_keys: Iterable[str],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        keys = list(ordered_keys or [])
+        if dry_run:
+            return {"ok": True, "count": 0, "dry_run": True}
+        return self._pl().reorder(self._playlist_adapter(cfg, instance), playlist_id, keys)
 
 
 OPS = _PlexOPS()

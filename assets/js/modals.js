@@ -21,6 +21,7 @@ const { ModalRegistry } = await import(_cwVer('./modals/core/registry.js'));
 ModalRegistry.register('pair-config', () => import(_cwVer('./modals/pair-config/index.js')));
 ModalRegistry.register('about',        () => import(_cwVer('./modals/about.js')));
 ModalRegistry.register('analyzer',     () => import(_cwVer('./modals/analyzer/index.js')));
+ModalRegistry.register('events',       () => import(_cwVer('./modals/events/index.js')));
 ModalRegistry.register('exporter',     () => import(_cwVer('./modals/exporter/index.js')));
 ModalRegistry.register('maintenance',  () => import(_cwVer('./modals/maintenance/index.js')));
 ModalRegistry.register('manual-watched', () => import(_cwVer('./modals/manual-watched/index.js')));
@@ -29,6 +30,10 @@ ModalRegistry.register('tls-cert',     () => import(_cwVer('./modals/tls/index.j
 ModalRegistry.register('setup-wizard', () => import(_cwVer('./modals/setup-wizard/index.js')));
 ModalRegistry.register('upgrade-warning', () => import(_cwVer('./modals/upgrade-warning/index.js')));
 ModalRegistry.register('capture-compare', () => import(_cwVer('./modals/capture-compare/index.js')));
+ModalRegistry.register('provider-cleanup', () => import(_cwVer('./modals/provider-cleanup/index.js')));
+ModalRegistry.register('scrobbler-webhook', () => import(_cwVer('./modals/scrobbler-webhook/index.js')));
+ModalRegistry.register('scrobbler-route', () => import(_cwVer('./modals/scrobbler-route/index.js')));
+ModalRegistry.register('editor-raw', () => import(_cwVer('./modals/editor-raw/index.js')));
 
 export const openModal = ModalRegistry.open;
 export const closeModal = ModalRegistry.close;
@@ -42,6 +47,7 @@ window.openAbout = (props = {}) => ModalRegistry.open('about', props);
 window.closeAbout = () => ModalRegistry.close();
 
 window.openAnalyzer = (props = {}) => ModalRegistry.open('analyzer', props);
+window.openEvents = (props = {}) => ModalRegistry.open('events', props);
 window.openExporter = (props = {}) => ModalRegistry.open('exporter', props);
 
 window.openMaintenanceModal = (props = {}) => ModalRegistry.open('maintenance', props);
@@ -63,3 +69,7 @@ window.cxOpenModalFor = async (pairOrId = null) => {
 
 window.openInsightSettingsModal = (props = {}) => ModalRegistry.open('insight-settings', props);
 window.openCaptureCompare = (props = {}) => ModalRegistry.open('capture-compare', props);
+window.openProviderCleanupModal = (props = {}) => ModalRegistry.open('provider-cleanup', props);
+window.openScrobblerWebhookModal = (props = {}) => ModalRegistry.open('scrobbler-webhook', props);
+window.openScrobblerRouteModal = (props = {}) => ModalRegistry.open('scrobbler-route', props);
+window.openEditorRawModal = (props = {}) => ModalRegistry.open('editor-raw', props);

@@ -96,8 +96,10 @@ def test_latest_ratings_widget_dedupes_and_sorts_provider_state() -> None:
     assert [item["title"] for item in payload["items"]] == ["Arrival", "Severance"]
     assert payload["items"][0]["rating"] == 9
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"PLEX", "TRAKT"}
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/10?size=w342"
-    assert payload["items"][1]["poster"] == "/art/tmdb/tv/20?size=w342"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/10?kind=backdrop&size=w300"
+    assert payload["items"][0]["cover"] == "/art/tmdb/movie/10?size=w342"
+    assert payload["items"][1]["poster"] == "/art/tmdb/tv/20?kind=backdrop&size=w300"
+    assert payload["items"][1]["cover"] == "/art/tmdb/tv/20?size=w342"
 
 
 def test_latest_ratings_widget_uses_tracker_items_without_runtime_state() -> None:
@@ -173,7 +175,8 @@ def test_dashboard_widgets_merge_flattened_provider_rows_across_providers(monkey
     assert {source["provider"] for source in history["items"][0]["sources"]} == set(FLATTENED_PROVIDERS)
     assert ratings["total"] == 1
     assert ratings["items"][0]["title"] == "Heat"
-    assert ratings["items"][0]["poster"] == "/art/tmdb/movie/949?size=w342"
+    assert ratings["items"][0]["poster"] == "/art/tmdb/movie/949?kind=backdrop&size=w300"
+    assert ratings["items"][0]["cover"] == "/art/tmdb/movie/949?size=w342"
     assert {source["provider"] for source in ratings["items"][0]["sources"]} == set(FLATTENED_PROVIDERS)
 
 
@@ -209,7 +212,8 @@ def test_latest_ratings_widget_handles_nested_provider_movie_rows(provider: str)
     assert payload["items"][0]["title"] == "Heat"
     assert payload["items"][0]["year"] == 1995
     assert payload["items"][0]["tmdb"] == 949
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?size=w342"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?kind=backdrop&size=w300"
+    assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?size=w342"
 
 
 def test_recent_history_widget_includes_latest_state_history(monkeypatch) -> None:
@@ -333,6 +337,138 @@ def test_recent_history_widget_merges_provider_local_episode_ids_and_inherits_ar
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"SIMKL", "TRAKT"}
 
 
+def _translated_anime_state() -> dict:
+    return {
+        "providers": {
+            "SIMKL": {
+                "instances": {
+                    "SIMKL-P01": {
+                        "history": {
+                            "baseline": {
+                                "items": {
+                                    "tmdb:12971#s01e291@1767229200": {
+                                        "type": "episode",
+                                        "series_title": "Dragon Ball Z",
+                                        "season": 1,
+                                        "episode": 291,
+                                        "show_ids": {"tmdb": 12971},
+                                        "watched_at": "2026-01-01T02:00:00Z",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "TRAKT": {
+                "instances": {
+                    "TRAKT-P01": {
+                        "history": {
+                            "baseline": {
+                                "items": {
+                                    "tmdb:12971#s09e01@1767229200": {
+                                        "type": "episode",
+                                        "series_title": "Dragon Ball Z",
+                                        "season": 9,
+                                        "episode": 1,
+                                        "show_ids": {"tmdb": 12971},
+                                        "watched_at": "2026-01-01T02:00:00Z",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+
+def test_recent_history_widget_merges_translated_episode_via_pair_alias(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {"ok": True, "total": 0, "items": []},
+    )
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "_history_alias_representatives",
+        lambda: {"tmdb:12971#s01e291": "tmdb:12971#s09e01", "tmdb:12971#s09e01": "tmdb:12971#s09e01"},
+    )
+
+    payload = dashboard_widgets.recent_history_widget(_translated_anime_state(), limit=5)
+
+    assert payload["total"] == 1
+    assert {source["provider"] for source in payload["items"][0]["sources"]} == {"SIMKL", "TRAKT"}
+
+
+def test_recent_history_widget_keeps_translated_episode_split_without_alias(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {"ok": True, "total": 0, "items": []},
+    )
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", dict)
+
+    payload = dashboard_widgets.recent_history_widget(_translated_anime_state(), limit=5)
+
+    assert payload["total"] == 2
+
+
+def _write_pair_alias(tmp_path, scope, items, name="trakt_history.pair_alias.p1.json"):
+    import json
+
+    (tmp_path / name).write_text(json.dumps({"scope": scope, "items": items}), encoding="utf-8")
+
+
+def _alias_sandbox(monkeypatch, tmp_path, pairs):
+    import cw_platform.config_base as config_base
+    import services.analyzer as analyzer
+
+    sandbox = tmp_path / ".cw_state"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(analyzer, "CWS_DIR", sandbox)
+    monkeypatch.setattr(config_base, "load_config", lambda: {"pairs": pairs})
+    return sandbox
+
+
+_ALIAS_PAIR = {
+    "id": "p1",
+    "enabled": True,
+    "source": "SIMKL",
+    "target": "TRAKT",
+    "source_instance": "SIMKL-P01",
+    "target_instance": "TRAKT-P01",
+    "mode": "one-way",
+    "features": {"history": {"enable": True}},
+}
+_ALIAS_SCOPE = "one-way:SIMKL#SIMKL-P01-TRAKT#TRAKT-P01:p1|SIMKL>TRAKT"
+
+
+def test_history_alias_representatives_reads_scoped_file(monkeypatch, tmp_path) -> None:
+    sandbox = _alias_sandbox(monkeypatch, tmp_path, [_ALIAS_PAIR])
+    _write_pair_alias(sandbox, _ALIAS_SCOPE, {
+        "tmdb:12971#s01e291@1767229200": {
+            "destination_key": "tmdb:12971#s09e01",
+            "destination_event_key": "tmdb:12971#s09e01@1767229200",
+        }
+    })
+
+    reps = dashboard_widgets._history_alias_representatives()
+
+    assert reps["tmdb:12971#s01e291"] == "tmdb:12971#s09e01"
+    assert reps["tmdb:12971#s09e01"] == "tmdb:12971#s09e01"
+
+
+def test_history_alias_representatives_rejects_foreign_scope(monkeypatch, tmp_path) -> None:
+    sandbox = _alias_sandbox(monkeypatch, tmp_path, [_ALIAS_PAIR])
+    _write_pair_alias(sandbox, "one-way:PLEX#PLEX-P01-TRAKT#TRAKT-P01:p9|PLEX>TRAKT", {
+        "tmdb:12971#s01e291@1767229200": {"destination_key": "tmdb:12971#s09e01"}
+    })
+
+    assert dashboard_widgets._history_alias_representatives() == {}
+
+
 def test_recent_history_widget_resolves_missing_art_from_metadata(monkeypatch) -> None:
     fake = FakeMetadataManager()
     monkeypatch.setattr(dashboard_widgets, "_METADATA_MANAGER", fake)
@@ -416,8 +552,69 @@ def test_latest_ratings_widget_merges_provider_local_movie_ids_and_inherits_art(
 
     assert payload["total"] == 1
     assert payload["items"][0]["title"] == "Heat"
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?size=w342"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?kind=backdrop&size=w300"
+    assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?size=w342"
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"SIMKL", "TRAKT"}
+
+
+def test_latest_ratings_widget_keeps_tracker_rated_at_over_destination_sync_time() -> None:
+    tracker_items = {
+        "movie|imdb:tt0113277": {
+            "type": "movie",
+            "title": "Heat",
+            "year": 1995,
+            "rating": 8,
+            "rated_at": "2020-01-01T00:00:00Z",
+            "sources_by_provider": {"TRAKT": ["main"]},
+        },
+        "movie|imdb:tt0468569": {
+            "type": "movie",
+            "title": "The Dark Knight",
+            "year": 2008,
+            "rating": 9,
+            "rated_at": "2026-01-05T00:00:00Z",
+            "sources_by_provider": {"TRAKT": ["main"]},
+        },
+    }
+    state = {
+        "providers": {
+            "TMDB": {
+                "ratings": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:rating:949": {
+                                "type": "movie",
+                                "title": "Heat",
+                                "year": 1995,
+                                "ids": {"tmdb": 949},
+                                "rating": 8,
+                                "rated_at": "2026-02-01T00:00:00Z",
+                            },
+                            "tmdb:rating:680": {
+                                "type": "movie",
+                                "title": "Pulp Fiction",
+                                "year": 1994,
+                                "ids": {"tmdb": 680},
+                                "rating": 7,
+                                "rated_at": "2026-01-10T00:00:00Z",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    payload = dashboard_widgets.latest_ratings_widget(state, limit=5, tracker_items=tracker_items)
+
+    titles = [item["title"] for item in payload["items"]]
+    assert titles == ["Pulp Fiction", "The Dark Knight", "Heat"]
+
+    heat = payload["items"][2]
+    assert heat["rated_at"] == "2020-01-01T00:00:00Z"
+    assert heat["tmdb"] == 949
+    assert {source["provider"] for source in heat["sources"]} == {"TRAKT", "TMDB"}
+    assert all(not key.startswith("_") for key in heat)
 
 
 def test_latest_ratings_widget_resolves_missing_art_from_metadata(monkeypatch) -> None:
@@ -449,7 +646,8 @@ def test_latest_ratings_widget_resolves_missing_art_from_metadata(monkeypatch) -
 
     assert payload["total"] == 1
     assert payload["items"][0]["tmdb"] == 949
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?size=w342"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?kind=backdrop&size=w300"
+    assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?size=w342"
     assert fake.calls[0]["entity"] == "movie"
 
 
@@ -685,3 +883,105 @@ def test_recent_scrobble_widget_uses_nested_history_sync_item_art(tmp_path, monk
         {"provider": "TRAKT", "instance": "default"},
         {"provider": "CROSSWATCH", "instance": "default"},
     ]
+
+
+def test_recent_progress_widget_uses_sync_state_not_live_provider_endpoints() -> None:
+    state = {
+        "providers": {
+            "PLEX": {
+                "progress": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:550": {
+                                "type": "movie",
+                                "title": "Fight Club",
+                                "year": 1999,
+                                "ids": {"tmdb": 550},
+                                "progress_percent": 42.2,
+                                "progress_at": "2026-01-02T02:00:00Z",
+                            },
+                            "tmdb:40": {
+                                "type": "movie",
+                                "title": "Arrival",
+                                "year": 2016,
+                                "ids": {"tmdb": 40},
+                                "progress_ms": 900000,
+                                "duration_ms": 1800000,
+                                "updated_at": "2026-01-01T02:00:00Z",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    payload = dashboard_widgets.recent_progress_widget(state, limit=5, tracker_items={})
+
+    assert payload["ok"] is True
+    assert payload["total"] == 2
+    assert payload["items"][0]["title"] == "Fight Club"
+    assert payload["items"][0]["progress"] == 42.2
+    assert payload["items"][1]["progress"] == 50.0
+    assert payload["items"][0]["sources"] == [{"provider": "PLEX", "instance": "default"}]
+
+
+def test_recent_playlists_widget_uses_playlist_activity(monkeypatch) -> None:
+    from services import playlists
+
+    monkeypatch.setattr(
+        playlists,
+        "activity",
+        lambda _cfg, limit=25: [
+            {"ts": 1767225600, "type": "Run", "status": "completed", "label": "MAP-01", "details": "+2/-0"}
+        ][:limit],
+    )
+    monkeypatch.setattr("cw_platform.config_base.load_config", lambda: {})
+
+    payload = dashboard_widgets.recent_playlists_widget(limit=3)
+
+    assert payload == {
+        "ok": True,
+        "items": [{"ts": 1767225600, "type": "Run", "status": "completed", "label": "MAP-01", "details": "+2/-0"}],
+        "total": 1,
+    }
+
+
+def test_dashboard_widgets_payload_only_builds_included_widgets(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda kind: calls.append(f"tracker:{kind}") or {})
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "recent_history_widget",
+        lambda *_args, **_kwargs: calls.append("history") or {"ok": True, "items": [], "total": 0},
+    )
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "recent_scrobble_widget",
+        lambda **_kwargs: calls.append("scrobble") or {"ok": True, "items": [], "total": 0},
+    )
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "latest_ratings_widget",
+        lambda *_args, **_kwargs: calls.append("ratings") or {"ok": True, "items": [], "total": 0},
+    )
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "recent_progress_widget",
+        lambda *_args, **_kwargs: calls.append("progress") or {"ok": True, "items": [], "total": 0},
+    )
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "recent_playlists_widget",
+        lambda **_kwargs: calls.append("playlists") or {"ok": True, "items": [], "total": 0},
+    )
+
+    payload = dashboard_widgets.dashboard_widgets_payload({}, include={"ratings", "playlists"})
+
+    assert payload == {
+        "ok": True,
+        "latest_ratings": {"ok": True, "items": [], "total": 0},
+        "recent_playlists": {"ok": True, "items": [], "total": 0},
+    }
+    assert calls == ["tracker:ratings", "ratings", "playlists"]

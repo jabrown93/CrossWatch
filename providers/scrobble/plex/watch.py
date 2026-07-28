@@ -34,6 +34,8 @@ from providers.scrobble.sources import source_enabled
 
 _CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
 _CFG_TTL_SEC = 2.0
+OFFLINE_INITIAL_RETRY_SECONDS = 30.0
+OFFLINE_MAX_RETRY_SECONDS = 300.0
 
 
 def _cfg(ttl: float = _CFG_TTL_SEC) -> dict[str, Any]:
@@ -367,10 +369,10 @@ class WatchService:
         self._psn_sessions: set[str] = set()
         self._allowed_sessions: set[str] = set()
         self._last_seen: dict[str, float] = {}
-        self._last_emit: dict[str, tuple[str, int]] = {}
+        self._last_emit: dict[str, tuple[str, float]] = {}
         self._attempt = 0
         self._no_sessions_access = False  # True when token cannot access /status/sessions (shared server)
-        self._max_seen: dict[str, int] = {}
+        self._max_seen: dict[str, float] = {}
         self._first_seen: dict[str, float] = {}
         self._last_pause_ts: dict[str, float] = {}
         self._filtered_ts: dict[str, float] = {}
@@ -383,6 +385,9 @@ class WatchService:
         self._last_seek_emit: dict[str, float] = {}
         self._sess_user_cache: dict[str, tuple[str, float]] = {}
         self._sess_identity_cache: dict[str, dict[str, Any]] = {}
+        self._offline = False
+        self._offline_failures = 0
+        self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         lvl = (str(level) or "INFO").upper()
@@ -390,15 +395,31 @@ class WatchService:
             return
         if BASE_LOG is not None:
             try:
-                BASE_LOG(msg, level=lvl, module="PLEX ")
+                BASE_LOG(msg, level=lvl, module="PLEX-WATCH")
                 return
             except Exception:
                 pass
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{ts}] [PLEX ] {lvl} {msg}")
+        print(f"[{ts}] [PLEX-WATCH] {lvl} {msg}")
 
     def _dbg(self, msg: str) -> None:
         self._log(msg, "DEBUG")
+
+    def _mark_offline(self, exc: Exception) -> None:
+        self._offline_failures += 1
+        if not self._offline:
+            self._offline = True
+            self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
+            self._log(f"Plex watcher offline: {exc}; retrying with backoff", "WARNING")
+            return
+        self._offline_retry = min(OFFLINE_MAX_RETRY_SECONDS, max(OFFLINE_INITIAL_RETRY_SECONDS, self._offline_retry * 2.0))
+
+    def _mark_online(self) -> None:
+        if self._offline:
+            self._log("Plex watcher reconnected", "INFO")
+        self._offline = False
+        self._offline_failures = 0
+        self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
 
     def _active_cfg(self) -> dict[str, Any]:
         try:
@@ -742,10 +763,20 @@ class WatchService:
         cache_key: str | None = None
         if sk:
             cache_key = f"{sk}|{_norm_user(ev.account or '')}|{str(ev.server_uuid or '').strip().lower()}"
-            if cache_key in self._allowed_sessions:
-                return True
 
         cfg = self._active_cfg()
+
+        # # A whitelist must be validated per event
+        libs = _as_set_str((((cfg.get("plex") or {}).get("scrobble") or {}).get("libraries")))
+        if libs:
+            sid = self._plex_section_id(ev)
+            if not sid or sid not in libs:
+                if cache_key:
+                    self._allowed_sessions.discard(cache_key)
+                return False
+
+        if cache_key and cache_key in self._allowed_sessions:
+            return True
 
         def _allow() -> bool:
             if cache_key:
@@ -756,13 +787,6 @@ class WatchService:
         if bool(filt.get("ignore_live_tv_dvr")) and _is_live_tv_dvr_event(ev):
             return False
 
-        libs = _as_set_str((((cfg.get("plex") or {}).get("scrobble") or {}).get("libraries")))
-        if libs:
-            sid = self._plex_section_id(ev)
-            if not sid:
-                return False
-            if sid not in libs:
-                return False
         return _allow()
 
     def _find_rating_key(self, raw: dict[str, Any]) -> int | None:
@@ -777,7 +801,7 @@ class WatchService:
             if isinstance(v, dict) and ("ratingKey" in v or "ratingkey" in v):
                 return _safe_int(v.get("ratingKey") or v.get("ratingkey"))
         return None
-    
+
     def _resolve_session_identity(self, session_key: str | None) -> dict[str, Any] | None:
         if not (self._plex and session_key):
             return None
@@ -1092,7 +1116,6 @@ class WatchService:
             # Ignore idle/incomplete Plex alerts with no user and no session.
             if not str(ev.account or "").strip() and not str(ev.session_key or "").strip():
                 return
-
             if not ev.account and ev.session_key:
                 prev_ev = self._last_event.get(str(ev.session_key))
                 prev_acc = str(getattr(prev_ev, "account", "") or "").strip() if prev_ev else ""
@@ -1114,7 +1137,6 @@ class WatchService:
 
             # Drop unresolved/no-user alerts before filter logging
             if not str(ev.account or "").strip():
-                self._dbg(f"drop alert without resolved user; inst={self._instance_id} sess={ev.session_key}")
                 return
 
             if not self._passes_filters(ev):
@@ -1176,7 +1198,7 @@ class WatchService:
 
             if ev.action == "stop" and best == want:
                 prev = self._last_emit.get(sk or "", (None, None))[1] if sk else None
-                if isinstance(prev, int):
+                if isinstance(prev, (int, float)):
                     best = prev
 
             if best != want:
@@ -1236,7 +1258,7 @@ class WatchService:
             )
             self._log(f"ids resolved: {_media_name(ev)} -> {_ids_desc(ev.ids)}", "DEBUG")
             try:
-                _cw_update("plex", ev, provider_instance=str(self._instance_id or "default"))
+                _cw_update("plex", ev, duration_ms=d, provider_instance=str(self._instance_id or "default"))
             except Exception:
                 pass
             if sk and ev.action == "start":
@@ -1264,20 +1286,23 @@ class WatchService:
                 self._plex = PlexServer(base, token)
                 self._listener = self._plex.startAlertListener(
                     callback=self._handle_alert,
-                    callbackError=lambda e: self._log(f"Watcher error: {e}", "ERROR"),
+                    callbackError=lambda e: self._mark_offline(e if isinstance(e, Exception) else RuntimeError(str(e))),
                 )
                 self._attempt = 0
+                self._mark_online()
                 self._log(f"Watcher connected; inst={self._instance_id}", lvl)
                 while not self._stop.is_set() and self._listener and self._listener.is_alive():
                     time.sleep(0.5)
             except Exception as e:
-                self._log(f"alert loop error: {e}", "ERROR")
+                self._mark_offline(e)
             if self._stop.is_set():
                 break
             self._attempt += 1
-            delay = min(30, (2 ** min(self._attempt, 5))) + (time.time() % 1.5)
-            self._log(f"reconnecting after {delay:.1f}s", "DEBUG")
-            time.sleep(delay)
+            if not self._offline:
+                self._mark_offline(RuntimeError("watcher disconnected"))
+            delay = self._offline_retry
+            self._dbg(f"reconnecting after {delay:.1f}s")
+            self._stop.wait(delay)
 
     def stop(self) -> None:
         self._stop.set()
@@ -1684,28 +1709,23 @@ def process_rating_webhook(
         return {"ok": True, "ignored": True}
 
     watch_cfg = (sc.get("watch") or {})
-    provider_name = str(watch_cfg.get("route_provider") or watch_cfg.get("provider") or "plex").lower().strip()
-    if provider_name != "plex":
-        return {"ok": True, "ignored": True}
+    if route_hook is not None:
+        provider_name = str(watch_cfg.get("route_provider") or "").lower().strip()
+        if provider_name != "plex":
+            return {"ok": True, "ignored": True}
 
-    route_opts_raw = watch_cfg.get("route_options")
-    route_opts: dict[str, Any] = route_opts_raw if isinstance(route_opts_raw, dict) else {}
-    ratings_opts_raw = route_opts.get("ratings")
-    ratings_opts: dict[str, Any] = ratings_opts_raw if isinstance(ratings_opts_raw, dict) else {}
-    ratings_mode = str(ratings_opts.get("mode") or "inherit").strip().lower() or "inherit"
-    route_sink = str(watch_cfg.get("route_sink") or "").strip().lower()
-    custom_targets = {
-        str(item or "").strip().lower()
-        for item in (ratings_opts.get("targets") or [])
-        if str(item or "").strip()
-    }
-    if ratings_mode == "custom" and route_sink in {"trakt", "simkl", "mdblist"}:
-        custom_targets = {route_sink} if route_sink in custom_targets or not custom_targets else {route_sink}
-
-    if ratings_mode == "off":
-        return {"ok": True, "ignored": True}
-
-    if ratings_mode == "custom":
+        route_opts_raw = watch_cfg.get("route_options")
+        route_opts: dict[str, Any] = route_opts_raw if isinstance(route_opts_raw, dict) else {}
+        ratings_opts_raw = route_opts.get("ratings")
+        ratings_opts: dict[str, Any] = ratings_opts_raw if isinstance(ratings_opts_raw, dict) else {}
+        ratings_mode = str(ratings_opts.get("mode") or "off").strip().lower() or "off"
+        if ratings_mode != "custom":
+            return {"ok": True, "ignored": True}
+        custom_targets = {
+            str(item or "").strip().lower()
+            for item in (ratings_opts.get("targets") or [])
+            if str(item or "").strip()
+        }
         enable_trakt = "trakt" in custom_targets
         enable_simkl = "simkl" in custom_targets
         enable_mdblist = "mdblist" in custom_targets

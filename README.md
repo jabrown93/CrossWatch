@@ -1,3 +1,6 @@
+<img width="1410" height="717" alt="CrossWatch" src="https://github.com/user-attachments/assets/bd977f1b-2cbc-425a-80f5-f6551ce145fd" />
+
+</center>
 
 > ## 🍴 This is a fork
 >
@@ -7,29 +10,24 @@
 >
 > **Differences from upstream:**
 >
-> - **Security hardening** — secrets are redacted from config output/logs, inbound media-server
->   webhooks (Plex/Emby/Jellyfin) are authenticated with a shared secret, and outbound requests
->   are guarded against SSRF via URL validation.
+> - **Security hardening** — secrets are redacted from config output/logs, outbound provider
+>   requests are guarded against SSRF (including on every redirect hop, which also covers
+>   Jellyfin Quick Connect), and an unrecognized webhook profile token is rejected with a
+>   logged 401 rather than a silent 200.
 > - **Bug fixes** — ID-mapping fixes (prefer IMDb over TMDb in match priority; map Jellyfin
->   `ProviderIds`) and a PublicMetaDB specials fix so `season 0` is no longer dropped from
->   progress/ratings.
+>   `ProviderIds`).
 > - **CI & automation** — a GitHub Actions test suite (pytest), automated Docker image and
->   GitHub Release publishing, and Renovate for dependency updates with SHA-pinned actions.
-> - **Resilience** — provider state directories are created lazily (never at import time), and
->   PublicMetaDB honors `CONFIG_BASE`, so source/non-Docker installs don't fail provider
->   discovery on a missing or read-only `/config`.
->
-> A few upstream tests fail on a pristine upstream checkout; they are tracked (deselected) in
-> CI so the suite stays green — see `.github/workflows/ci.yml`.
-
----
-
-<img width="1468" height="795" alt="overview (1)" src="https://github.com/user-attachments/assets/d4afb18c-b655-4aa7-ba2b-da10f3cef89a" />
+>   GitHub Release publishing, semantic-release versioning, and Renovate for dependency
+>   updates with SHA-pinned actions.
+> - **Hardened container** — the image is built on the shell-less, nonroot Docker Hardened
+>   Image Python runtime rather than `python:slim`.
+> - **No Android companion app** — dropped upstream in v0.10.3; this fork follows suit and
+>   purges any leftover paired-device tokens on the next credential rotation.
 
 <p align="center" style="font-size:14px;">
 <b>⭐ Star this repository to get updates</b><br>
 </p>
-<img width="1975" height="796" alt="ov" src="https://github.com/user-attachments/assets/bcf1d3c0-628c-49e2-8249-c3d853f8b115" />
+
 
 <p align="center">
   <a href="https://github.com/cenodude/CrossWatch/releases/latest">
@@ -61,35 +59,28 @@
     <img alt="Wiki" src="https://img.shields.io/badge/Wiki-wiki.crosswatch.app-B026FF?style=for-the-badge">
   </a>
 </p>
-<img
-  align="right"
-  src="https://github.com/user-attachments/assets/f219a392-839f-4ced-a263-1c745fbdf999"
-  alt="CrossWatch mobile"
-  width="170"
-  style="max-width:170px; height:auto; margin:0 0 12px 16px;"
-/>
 
-**CrossWatch/CW** is a synchronization engine that keeps your **Plex, Jellyfin, PublicMetaDB, Emby, SIMKL, Trakt, AniList, TMDb, MDBList and Tautulli** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
+
+**CrossWatch/CW** is a synchronization engine that keeps your **Plex, Jellyfin, PublicMetaDB, Emby, SIMKL, Trakt, AniList, TMDb, MDBList, Tautulli and Nuvio** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
 
 ### CW in a nutshell:
 * **One brain for all your media syncs** A single place to configure everything.
 * **Be your own Sync Hub** Create profiles for seperate media servers/users/trackers.
 * **Multi media-server** and **multi tracker** support with profiles.
 * **Synchronization**
-  * Watchlists, ratings and History
-  * Progress sync your progress status between Plex, Emby, Jellyfin and PublicMetaDB.
+  * Watchlists, ratings, History and Progress
   * Anime ID mapping (powered AniBridge) for better AniList matching across providers.
 * **Scrobble (tracks your activity)**
   * **Watcher** (Plex/Emby/Jellyfin to Trakt/SIMKL/MDBList)
     * Does not require any Plex Pass, Emby Premiere,etc.  
-  * **Webhooks** (Plex/Emby/Jellyfin to Trakt)
-  * **Watchlist Auto-Remove** Clears items from your Watchlist after a verified finish.
+  * **Webhooks** (Plex/Emby/Jellyfin to Trakt/SIMKL/MDBList)
 * **Tools**
   * Analyzer: Finds items that are **stuck** or inconsistent between providers.
   * Playback Progress Manager: View and edit unfinished playback sessions across providers.
   * Editor: Inspect and adjust your items and add or block items.
+  * Events Viewer: Search and inspect sync runs.
   * Captures: Rollback tool for provider watchlist, ratings, and history.
-  * Backup & Restore: Create, validate, import and restore configuration, application state, or full CrossWatch backups.
+  * Backup & Restore: Create, validate, import and restore configuration.
 
 And much more...such as:
 * Simple and advanced scheduling: From standard to more detailed pair schedules
@@ -98,10 +89,8 @@ And much more...such as:
 * Player card: Shows what you are currently watching in real time.
 * Fallback GUID: Revives old items from  your Plex library.
 
-
-
 ### Download
-[![Guide: Docker Setup](https://img.shields.io/badge/Guide-Docker%20Setup-0d6efd?style=for-the-badge)](https://wiki.crosswatch.app/getting-started/docker-setup)
+[![Guide: Installation](https://img.shields.io/badge/Guide-INSTALLATION-0d6efd?style=for-the-badge)](https://wiki.crosswatch.app/getting-started/installation)
 
 
 *   **Docker:**

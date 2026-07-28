@@ -502,20 +502,18 @@ def _clear_sessions(cfg: dict[str, Any]) -> None:
         _sync_legacy_session(a, [])
 
 
-def _revoke_mobile_devices(cfg: dict[str, Any]) -> None:
-    """Revoke every paired mobile device, so a device paired during a compromise
-    can't outlive the credential rotation meant to evict it. Called only from the
+def _purge_mobile_auth(cfg: dict[str, Any]) -> None:
+    """Drop the legacy mobile_auth block, so paired-device tokens left behind by
+    the removed companion app can't outlive the credential rotation meant to
+    evict them. The API that consumed them is gone, but the secrets stay in
+    config.json until something clears them. Called only from the
     security-sensitive session-clearing paths (password change, disable-auth,
     logout-all, apply-now) -- not from every credentials save, since that would
-    also fire on benign settings tweaks (e.g. remember-session preference).
-    Deferred import: api.mobileAPI imports this module at load time, so a
-    top-level import here would be circular."""
+    also fire on benign settings tweaks (e.g. remember-session preference)."""
     try:
-        from api.mobileAPI import revoke_all_devices
-
-        revoke_all_devices(cfg)
+        cfg.pop("mobile_auth", None)
     except Exception as exc:
-        log.error("Failed to revoke paired mobile devices during a session-clearing event", exc)
+        log.error("Failed to purge legacy mobile pairings during a session-clearing event", exc)
 
 
 def _clear_other_sessions(cfg: dict[str, Any], token: str | None) -> None:
@@ -1153,7 +1151,7 @@ def api_logout_all(request: Request) -> JSONResponse:
         if not _origin_allowed(request):
             return _origin_blocked_response()
     _clear_sessions(cfg)
-    _revoke_mobile_devices(cfg)
+    _purge_mobile_auth(cfg)
     save_config(cfg)
     resp = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
     _del_cookie(resp, request)
@@ -1185,7 +1183,7 @@ def api_apply_now(request: Request, payload: dict[str, Any] | None = Body(None))
         return _origin_blocked_response()
 
     _clear_sessions(cfg)
-    _revoke_mobile_devices(cfg)
+    _purge_mobile_auth(cfg)
     save_config(cfg)
 
     def _kill() -> None:
@@ -1247,7 +1245,7 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
         a["reset_required"] = False
         a["username"] = username or str(a.get("username") or "")
         _clear_sessions(cfg)
-        _revoke_mobile_devices(cfg)
+        _purge_mobile_auth(cfg)
         save_config(cfg)
         # Disabling auth makes setup_lock_required(cfg) true again (auth_required
         # flips to False), so this endpoint is now pre-auth-reachable once more.
@@ -1296,7 +1294,7 @@ def api_set_credentials(request: Request, payload: dict[str, Any] = Body(...)) -
     a["reset_required"] = False
     _clear_sessions(cfg)
     if password:
-        _revoke_mobile_devices(cfg)
+        _purge_mobile_auth(cfg)
     _clear_setup_autogen_flag(cfg)
     _mark_upgrade_pending_if_needed(cfg)
 

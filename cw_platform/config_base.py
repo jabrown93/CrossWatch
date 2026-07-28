@@ -176,6 +176,8 @@ def _is_sensitive_path(path: tuple[str, ...]) -> bool:
         "token_hash", "salt", "hash",
         "device_code",
         "_pending_request_token",
+        "_pending_tv_login",
+        "_pending_tv_caller",
         "request_token",
         "token",
         "password",
@@ -200,6 +202,30 @@ def _transform_secret_tree(obj: Any, *, decrypt: bool, path: tuple[str, ...] = (
 
     if isinstance(obj, str) and _is_sensitive_path(path):
         return _decrypt_secret(obj) if decrypt else _encrypt_secret(obj)
+
+    return obj
+
+
+def _encrypt_secret_tree_stable(obj: Any, prev: Any, path: tuple[str, ...] = ()) -> Any:
+    if isinstance(obj, dict):
+        prev_d = prev if isinstance(prev, dict) else {}
+        return {k: _encrypt_secret_tree_stable(v, prev_d.get(k), path + (str(k),)) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        prev_l = prev if isinstance(prev, list) else []
+        return [
+            _encrypt_secret_tree_stable(v, prev_l[i] if i < len(prev_l) else None, path + (str(i),))
+            for i, v in enumerate(obj)
+        ]
+
+    if isinstance(obj, str) and _is_sensitive_path(path):
+        if isinstance(prev, str) and prev.startswith(_ENC_PREFIX):
+            try:
+                if _decrypt_secret(prev) == obj:
+                    return prev
+            except Exception:
+                pass
+        return _encrypt_secret(obj)
 
     return obj
 
@@ -229,6 +255,9 @@ DEFAULT_CFG: dict[str, Any] = {
             "libraries": [],                            # Whitelist of library GUIDs; empty = all
             "include_marked_watched": True,             # Include items manually marked as watched in Plex
         },
+        "progress": {
+            "libraries": [],                            # Whitelist for resumable items; empty = all
+        },
         "ratings": {
             "libraries": [],                            # Whitelist of library GUIDs; empty = all
         },
@@ -251,8 +280,9 @@ DEFAULT_CFG: dict[str, Any] = {
     },
 
     "simkl": {
-        "access_token": "",                             # OAuth2 access token
-        "client_id": "",                                # From your Simkl app
+        "access_token": "",                             # OAuth2 / PIN access token
+        "auth_method": "",                              # "pin" | "oauth" (metadata; runtime uses access_token + client_id)
+        "client_id": "",                                # From your Simkl app (OAuth); baked app id when connected via PIN
         "client_secret": "",                            # From your Simkl app
         "date_from": "",                                # YYYY-MM-DD (optional start date for full sync)
         "watchlist_batch_size": 500,                    # Batch size for watchlist add/remove writes
@@ -315,7 +345,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "history_since": "1900-01-01T00:00:02Z"         # First-run baseline; watermark overrides after
     },
 
-    "publicmetadb": {
+        "publicmetadb": {
         "api_key": "",                                  # PublicMetaDB API key (pm-...)
         "base_url": "https://publicmetadb.com",         # External API base URL
         "timeout": 15.0,                                # HTTP timeout (seconds)
@@ -335,6 +365,15 @@ DEFAULT_CFG: dict[str, Any] = {
             "post_per_sec": 3,
             "get_per_sec": 20,
         },
+    },
+
+    "nuvio": {
+        "base_url": "https://api.nuvio.tv",
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "profile_id": "",
+        "profile_name": "",
     },
 
     "playback_progress": {
@@ -417,6 +456,8 @@ DEFAULT_CFG: dict[str, Any] = {
         "device_id": "crosswatch",                      # Client device id
         "username": "",                                 # Optional (login username)
         "user": "",                                     # Optional (display name; hydrated after auth)
+        "auth_method": "",                              # "quick_connect" | "password" (metadata; runtime uses access_token)
+        "server_version": "",                           # Detected during authentication; Jellyfin 10.9+ required
         "verify_ssl": True,                             # Verify TLS certificates
         "webhook_secret": "",                           # Shared secret for X-CW-Webhook-Secret verification
         "timeout": 15.0,                                # HTTP timeout (seconds)
@@ -447,6 +488,10 @@ DEFAULT_CFG: dict[str, Any] = {
                 "agent:themoviedb:en", "agent:themoviedb", "agent:imdb"
             ],
             "libraries": []                             # whitelist of library GUIDs (from /api/jellyfin/libraries.key); empty = all
+        },
+
+        "progress": {
+            "libraries": [],                            # whitelist for resumable items; empty = all
         },
 
         # Ratings settings
@@ -495,6 +540,10 @@ DEFAULT_CFG: dict[str, Any] = {
             "libraries": []                             # whitelist of library GUIDs (from /api/emby/libraries.key); empty = all
         },
 
+        "progress": {
+            "libraries": [],                            # whitelist for resumable items; empty = all
+        },
+
         # Ratings settings
         "ratings": {
             "ratings_query_limit": 2000,                # ratings query limit, default 2000
@@ -502,15 +551,27 @@ DEFAULT_CFG: dict[str, Any] = {
         },
     },
 
+    "kodi": {
+        "server": "",                                   # http(s)://host:port (required)
+        "username": "",                                 # Optional HTTP Basic Auth username
+        "password": "",                                 # Optional HTTP Basic Auth password
+        "verify_ssl": False,                            # Verify TLS certificates
+        "auth_method": "",                              # "basic" | "none" after connection verification
+        "kodi_version": "",                             # Detected during authentication; Kodi 21.0+ required
+        "jsonrpc_version": "",                          # Detected JSON-RPC version; 13.5.0+ required
+        "connection_verified": False,                   # True after JSON-RPC verification succeeds
+        "timeout": 12.0,                                # HTTP timeout (seconds)
+    },
+
     "crosswatch": {
-        "root_dir":         "/config/.cw_provider",    # Root folder for local provider state
-        "enabled":          True,                      # Enable/disable CrossWatch as sync provider
-        "retention_days":   30,                        # Snapshot retention in days; 0 = keep forever
-        "auto_snapshot":    True,                      # Take snapshot before mutating main JSONs
-        "max_snapshots":    64,                        # Max snapshots per feature; 0 = unlimited
-        "restore_watchlist": "latest",                 # "", "latest", or specific snapshot name/stem
-        "restore_history": "latest",                   # "", "latest", or specific snapshot name/stem
-        "restore_ratings": "latest"                    # "", "latest", or specific snapshot name/stem
+        "root_dir":         "/config/.cw_provider",     # Root folder for local provider state
+        "enabled":          True,                       # Enable/disable CrossWatch as sync provider
+        "retention_days":   30,                         # Snapshot retention in days; 0 = keep forever
+        "auto_snapshot":    True,                       # Take snapshot before mutating main JSONs
+        "max_snapshots":    64,                         # Max snapshots per feature; 0 = unlimited
+        "restore_watchlist": "latest",                  # "", "latest", or specific snapshot name/stem
+        "restore_history": "latest",                    # "", "latest", or specific snapshot name/stem
+        "restore_ratings": "latest"                     # "", "latest", or specific snapshot name/stem
     },
     
     # --- Meta Providers ------------------------------------------------------
@@ -543,8 +604,7 @@ DEFAULT_CFG: dict[str, Any] = {
         # Blackbox (including flapper protection)
         "blackbox": {
             "enabled": True,                            # Turn off to fully disable blackbox logic
-            "promote_after": 1,                         # Promote an item to blackbox after N consecutive unresolved/fail events
-            "unresolved_days": 0,                       # Minimum unresolved age (days) before it counts (0 = immediate)
+            "promote_after": 3,                         # Promote an item to blackbox after N consecutive failed writes
             "pair_scoped": True,                        # Track per source-target pair to avoid blocking the same title elsewhere
             "cooldown_days": 30,                        # Auto-prune/decay blackbox entries after this cooldown period
             "block_adds": True,                         # When blackboxed, block planned ADDs for that item
@@ -633,11 +693,11 @@ DEFAULT_CFG: dict[str, Any] = {
             }
         },
 
-        # Trakt sink rules (progress decisions) used by Trakt|SIMKL|MDblist
+        # Scrobble progress policy shared by Trakt, SIMKL, and MDBList
         "trakt": {
-            "progress_step": 25,                        # Send scrobble progress in % steps
-            "stop_pause_threshold": 80,                 # <80% STOP-send as PAUSE (your “watched” bar)
-            "force_stop_at": 95,                        # ≥95% always STOP
+            "progress_step": 25,                        # Coalesce start/progress updates in % steps
+            "watched_at": 90,                           # Watched threshold for local completion/statistics/watchlist removal
+            "force_stop_at": 95,                        # Defensive final-stop trust threshold
             "regress_tolerance_percent": 5,             # Small progress regress is tolerated
         }
     },
@@ -664,11 +724,12 @@ DEFAULT_CFG: dict[str, Any] = {
         "show_recent_history_widget": True,             # Show Recent History widget on Main tab
         "show_latest_ratings_widget": True,             # Show Latest Ratings widget on Main tab
         "show_recent_scrobble_widget": True,            # Show Recent Scrobble widget on Main tab
+        "show_recent_progress_widget": False,           # Show Recent Progress widget on Main tab
+        "show_recent_playlists_widget": False,          # Show Recent Playlists widget on Main tab
         "recent_activity_display": "count:3",           # "count:3|4|5" | "hours:24|48|72"
         "recent_activity_limit": 3,                     # Recent Scrobble rows on Main tab
         "recent_syncs_display": "count:3",              # "count:3|4|5" | "hours:24|48|72"
         "recent_syncs_limit": 3,                        # Recent Sync rows on Main tab
-        "show_AI": True,                                # Show ASK AI from GitBook
         "show_quick_add_desktop": True,                 # Show the Main-tab quick add drawer on desktop
         "show_quick_add_mobile": True,                  # Show the Main-tab quick add floating button on mobile
         "protocol": "http",                             # "http" | "https" (HTTPS uses a self-signed cert by default)
@@ -721,6 +782,7 @@ _SECRET_PATHS: list[tuple[str, ...]] = [
     ("simkl", "access_token"),
     ("simkl", "refresh_token"),
     ("simkl", "client_secret"),
+    ("simkl", "_pending_pin"),
     # AniList
     ("anilist", "access_token"),
     ("anilist", "client_secret"),
@@ -755,6 +817,13 @@ _SECRET_PATHS: list[tuple[str, ...]] = [
     ("emby", "access_token"),
     ("emby", "password"),
     ("emby", "webhook_secret"),
+    # Kodi
+    ("kodi", "password"),
+    # Nuvio
+    ("nuvio", "access_token"),
+    ("nuvio", "refresh_token"),
+    ("nuvio", "_pending_tv_login"),
+    ("nuvio", "_pending_tv_caller"),
     # App auth
     ("app_auth", "password", "hash"),
     ("app_auth", "password", "salt"),
@@ -1211,6 +1280,41 @@ def _normalize_publicmetadb(cfg: dict[str, Any]) -> None:
     _normalize_rate_limit(p, 3.0, 20.0, post_max=3.0, get_max=20.0)
 
 
+def _normalize_nuvio(cfg: dict[str, Any]) -> None:
+    n0 = cfg.get("nuvio")
+    if isinstance(n0, dict):
+        n = n0
+    else:
+        n = {}
+        cfg["nuvio"] = n
+
+    def _block(block: dict[str, Any]) -> None:
+        block["base_url"] = str(block.get("base_url") or "https://api.nuvio.tv").strip().rstrip("/") or "https://api.nuvio.tv"
+        block.pop("public_client_key", None)
+        block["access_token"] = str(block.get("access_token") or "").strip()
+        block["refresh_token"] = str(block.get("refresh_token") or "").strip()
+        try:
+            block["expires_at"] = int(block.get("expires_at") or 0)
+        except Exception:
+            block["expires_at"] = 0
+        pid = block.get("profile_id")
+        if pid in (None, ""):
+            block["profile_id"] = ""
+        else:
+            try:
+                block["profile_id"] = int(pid)
+            except Exception:
+                block["profile_id"] = ""
+        block["profile_name"] = str(block.get("profile_name") or "").strip()
+
+    _block(n)
+    insts = n.get("instances")
+    if isinstance(insts, dict):
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
 def _is_hhmm(v: str) -> bool:
     s = (v or "").strip()
     if len(s) != 5 or s[2] != ":":
@@ -1369,6 +1473,53 @@ def _normalize_anime_mapping(cfg: dict[str, Any]) -> None:
     am["features"] = _string_list(am.get("features"), ["watchlist", "ratings"])
 
 
+def _normalize_scrobble_webhook(cfg: dict[str, Any]) -> None:
+    # Drop legacy global webhook destinations
+    sc = cfg.get("scrobble")
+    if not isinstance(sc, dict):
+        return
+    wh = sc.get("webhook")
+    if not isinstance(wh, dict):
+        return
+
+    wh.pop("sinks", None)
+    wh.pop("sink_instances", None)
+
+    providers = wh.get("providers")
+    if isinstance(providers, dict):
+        for prov in list(providers.keys()):
+            node = providers.get(prov)
+            if not isinstance(node, dict):
+                continue
+            node.pop("sinks", None)
+            node.pop("sink_instances", None)
+            if not node:
+                del providers[prov]
+        if not providers:
+            wh.pop("providers", None)
+
+    # Empty per-profile sink overrides
+    profiles = wh.get("profiles")
+    if isinstance(profiles, dict):
+        for prov in list(profiles.keys()):
+            prov_node = profiles.get(prov)
+            if not isinstance(prov_node, dict):
+                continue
+            for inst in list(prov_node.keys()):
+                node = prov_node.get(inst)
+                if not isinstance(node, dict):
+                    continue
+                if isinstance(node.get("sinks"), list) and not node.get("sinks"):
+                    node.pop("sinks", None)
+                    node.pop("sink_instances", None)
+                if not node:
+                    del prov_node[inst]
+            if not prov_node:
+                del profiles[prov]
+        if not profiles:
+            wh.pop("profiles", None)
+
+
 def _normalize_ui(cfg: dict[str, Any]) -> None:
     ui = _ensure_dict(cfg, "ui")
 
@@ -1383,7 +1534,8 @@ def _normalize_ui(cfg: dict[str, Any]) -> None:
     ui["show_recent_history_widget"] = bool(ui.get("show_recent_history_widget", True))
     ui["show_latest_ratings_widget"] = bool(ui.get("show_latest_ratings_widget", True))
     ui["show_recent_scrobble_widget"] = bool(ui.get("show_recent_scrobble_widget", True))
-    ui["show_AI"] = bool(ui.get("show_AI", True))
+    ui["show_recent_progress_widget"] = bool(ui.get("show_recent_progress_widget", False))
+    ui["show_recent_playlists_widget"] = bool(ui.get("show_recent_playlists_widget", False))
     ui["show_quick_add_desktop"] = bool(ui.get("show_quick_add_desktop", True))
     ui["show_quick_add_mobile"] = bool(ui.get("show_quick_add_mobile", True))
 
@@ -1538,8 +1690,18 @@ def _ensure_webhook_ids(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         sec["webhook_ids"] = {}
         wh = sec["webhook_ids"]
 
+# temp flag to remove legacy webhooks from config if present
+    legacy_removed = bool(sec.get("legacy_webhooks_removed"))
+    required = ["plexwatcher"] if legacy_removed else ["plextrakt", "jellyfintrakt", "embytrakt", "plexwatcher"]
+
     changed = False
-    for k in ("plextrakt", "jellyfintrakt", "embytrakt", "plexwatcher"):
+    if legacy_removed:
+        for k in ("plextrakt", "jellyfintrakt", "embytrakt"):
+            if k in wh:
+                wh.pop(k, None)
+                changed = True
+
+    for k in required:
         v = wh.get(k)
         if not isinstance(v, str) or len(v.strip()) < 16:
             wh[k] = _new_webhook_id()
@@ -1564,9 +1726,11 @@ def load_config() -> dict[str, Any]:
     _normalize_simkl(cfg)
     _normalize_mdblist(cfg)
     _normalize_publicmetadb(cfg)
+    _normalize_nuvio(cfg)
     _normalize_anime_mapping(cfg)
     _normalize_scheduling(cfg)
     _normalize_app_auth(cfg)
+    _normalize_scrobble_webhook(cfg)
     pairs = cfg.get("pairs")
     if isinstance(pairs, list):
         for it in pairs:
@@ -1614,9 +1778,11 @@ def save_config(cfg: dict[str, Any]) -> None:
     _normalize_simkl(data)
     _normalize_mdblist(data)
     _normalize_publicmetadb(data)
+    _normalize_nuvio(data)
     _normalize_anime_mapping(data)
     _normalize_scheduling(data)
     _normalize_app_auth(data)
+    _normalize_scrobble_webhook(data)
     _normalize_ui(data)
     pairs = data.get("pairs")
     if isinstance(pairs, list):
@@ -1624,4 +1790,12 @@ def save_config(cfg: dict[str, Any]) -> None:
             if isinstance(it, dict):
                 it["features"] = _normalize_features_map(it.get("features"))  # type: ignore[arg-type]
 
-    _write_json_atomic(_cfg_file(), cast(dict[str, Any], _transform_secret_tree(data, decrypt=False)))
+    prev_raw: dict[str, Any] = {}
+    try:
+        p = _cfg_file()
+        if p.exists():
+            prev_raw = _read_json(p)
+    except Exception:
+        prev_raw = {}
+
+    _write_json_atomic(_cfg_file(), cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw)))
