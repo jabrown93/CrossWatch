@@ -47,14 +47,12 @@ def test_api_key_disabled_when_unset() -> None:
 
 
 def test_middleware_accepts_api_key(monkeypatch) -> None:
-    """Behavioral test: middleware gate accepts valid X-API-Key and rejects invalid/missing.
+    """Behavioral test: real app_auth_gate middleware accepts valid X-API-Key and rejects invalid/missing.
     Auth must be enabled with credentials + security.api_key configured."""
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse
-    from fastapi.testclient import TestClient
+    from starlette.testclient import TestClient
 
     from api import appAuthAPI as auth
-    import crosswatch as cw_module
+    import crosswatch
 
     # Config: auth enabled + credentials + api_key set
     cfg = {
@@ -73,57 +71,20 @@ def test_middleware_accepts_api_key(monkeypatch) -> None:
         },
     }
 
-    # Monkeypatch load_config to return our test config
-    monkeypatch.setattr(cw_module, "load_config", lambda: cfg)
+    # Monkeypatch the real load_config that app_auth_gate middleware calls
+    monkeypatch.setattr(crosswatch, "load_config", lambda: cfg)
 
-    # Build a minimal app with the auth gate middleware and a protected route
-    app = FastAPI()
+    # Use the real app and its real middleware
+    client = TestClient(crosswatch.app, raise_server_exceptions=False)
 
-    @app.middleware("http")
-    async def app_auth_gate(request: Request, call_next):
-        from urllib.parse import quote
-
-        try:
-            cfg = cw_module.load_config()
-        except Exception:
-            return JSONResponse({"ok": False, "error": "Service unavailable"}, status_code=503)
-
-        path = request.url.path or "/"
-
-        # Simplified gate: only check auth for /api/test
-        if not path.startswith("/api/"):
-            return await call_next(request)
-
-        if not cw_module.app_auth_required(cfg):
-            return await call_next(request)
-
-        # Check session cookie first
-        token = request.cookies.get(cw_module.APP_AUTH_COOKIE)
-        if cw_module.app_is_authenticated(cfg, token):
-            return await call_next(request)
-
-        # Check API key as fallback
-        if cw_module.app_api_key_authenticated(cfg, request):
-            return await call_next(request)
-
-        # Both auth methods failed
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
-
-    @app.get("/api/test")
-    def protected_route():
-        return {"ok": True}
-
-    client = TestClient(app)
-
-    # Test 1: no cookie + no API key → 401
-    resp = client.get("/api/test")
+    # Test 1: no cookie + no API key → 401 (gate blocks)
+    resp = client.get("/api/watchlist")
     assert resp.status_code == 401, f"Expected 401, got {resp.status_code}: {resp.text}"
 
-    # Test 2: no cookie + correct API key → NOT 401
-    resp = client.get("/api/test", headers={"X-API-Key": "test-key-123"})
+    # Test 2: no cookie + correct API key → NOT 401 (gate passes)
+    resp = client.get("/api/watchlist", headers={"X-API-Key": "test-key-123"})
     assert resp.status_code != 401, f"Expected non-401, got {resp.status_code}: {resp.text}"
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
 
-    # Test 3: no cookie + wrong API key → 401
-    resp = client.get("/api/test", headers={"X-API-Key": "wrong-key"})
+    # Test 3: no cookie + wrong API key → 401 (gate blocks)
+    resp = client.get("/api/watchlist", headers={"X-API-Key": "wrong-key"})
     assert resp.status_code == 401, f"Expected 401, got {resp.status_code}: {resp.text}"
