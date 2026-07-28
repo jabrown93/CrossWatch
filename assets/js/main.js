@@ -455,7 +455,11 @@
           more.style.marginLeft = "auto";
           more.addEventListener("click", (ev) => {
             ev.stopPropagation();
-            openSpotsModal(feat.label, { add: spotAdd, rem: spotRem, upd: spotUpd });
+            // Read the lane fresh: the render skip below can keep this
+            // listener alive across summaries whose visible rows are
+            // identical but whose full spotlight lists changed.
+            const cur = getLaneStats(summary || {}, feat.key);
+            openSpotsModal(feat.label, { add: cur.spotAdd, rem: cur.spotRem, upd: cur.spotUpd });
           });
           lastRow.appendChild(more);
         }
@@ -464,6 +468,11 @@
       lane.appendChild(body);
       wrap.appendChild(lane);
     }
+    // Polling re-renders identical payloads; skip the live-DOM swap (and its
+    // style/layout invalidation + repaint) when nothing visible changed.
+    const html = wrap.innerHTML;
+    if (html === renderLanes._lastHtml && elLanes.firstChild) return;
+    renderLanes._lastHtml = html;
     elLanes.replaceChildren(wrap);
   }
 
@@ -752,6 +761,7 @@
     if (authSetupPending()) return;
     summaryStream.onVisibility();
     openLogStream();
+    tick();
   });
 
   window.addEventListener("auth-changed", () => {
@@ -770,6 +780,15 @@
   });
 
   async function tick() {
+    if (document.hidden) {
+      // SSE closes on hide (summaryStream.onVisibility), which flips sseUp
+      // false and turned this loop into a fetch + full lanes rebuild every 6s
+      // for as long as the tab was backgrounded. Idle until visible again;
+      // the visibilitychange handler re-syncs immediately on return.
+      clearTimeout(tick._t);
+      tick._t = setTimeout(tick, 30000);
+      return;
+    }
     if (authSetupPending()) {
       try { esSummary?.close?.(); } catch {}
       esSummary = null;
