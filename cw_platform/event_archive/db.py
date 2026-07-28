@@ -23,8 +23,10 @@ _LOCAL = threading.local()
 # Registry so close_conn() can still drop every handle, not just the caller's.
 _CONNS: dict[int, sqlite3.Connection] = {}
 _GENERATION = 0
-# Set while the database files are being replaced; see suspended().
-_SUSPENDED = False
+# Count of active suspended() contexts; connections are barred while nonzero.
+# A boolean would let the first of two overlapping rebuilds lift the suspension
+# while the other is still unlinking the database files.
+_SUSPEND_DEPTH = 0
 
 _MEMORY_URI = "file:crosswatch_events_mem?mode=memory&cache=shared"
 
@@ -121,7 +123,7 @@ def get_conn() -> sqlite3.Connection | None:
     # while still looking current.
     for _ in range(3):
         with _LOCK:
-            if _SUSPENDED:
+            if _SUSPEND_DEPTH:
                 _LOCAL.conn = None
                 _LOCAL.path = None
                 return None
@@ -134,7 +136,7 @@ def get_conn() -> sqlite3.Connection | None:
             _LOCAL.path = None
             return None
         with _LOCK:
-            if not _SUSPENDED and _GENERATION == generation:
+            if not _SUSPEND_DEPTH and _GENERATION == generation:
                 _prune_dead_locked()
                 _CONNS[threading.get_ident()] = conn
                 _LOCAL.generation = generation
@@ -206,9 +208,9 @@ def suspended() -> Iterator[None]:
     "archive unavailable" and skip the write, which is the correct outcome
     while the archive is being replaced.
     """
-    global _SUSPENDED
+    global _SUSPEND_DEPTH
     with _LOCK:
-        _SUSPENDED = True
+        _SUSPEND_DEPTH += 1
         _invalidate_locked()
     _LOCAL.conn = None
     _LOCAL.path = None
@@ -219,4 +221,4 @@ def suspended() -> Iterator[None]:
             # Bump again so anything opened against the old files during the
             # block is treated as stale rather than current.
             _invalidate_locked()
-            _SUSPENDED = False
+            _SUSPEND_DEPTH -= 1

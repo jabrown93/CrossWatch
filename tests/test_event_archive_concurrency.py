@@ -231,6 +231,21 @@ def test_suspension_lifts_when_rebuild_fails(archive):
     assert ea_db.get_conn() is not None
 
 
+def test_overlapping_suspensions_bar_connections_until_all_exit(archive):
+    """Two /events-rebuild requests can overlap.
+
+    With a plain boolean the first context to exit lifts the suspension while
+    the second is still unlinking the database files, reopening the
+    deleted-inode window suspended() exists to close.
+    """
+    with ea_db.suspended():
+        with ea_db.suspended():
+            assert ea_db.get_conn() is None
+        # Inner context exited; the outer rebuild is still replacing files.
+        assert ea_db.get_conn() is None
+    assert ea_db.get_conn() is not None
+
+
 def test_dead_threads_do_not_leak_connections(archive):
     for _ in range(5):
         t = threading.Thread(target=ea_db.get_conn)
