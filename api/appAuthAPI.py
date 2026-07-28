@@ -452,13 +452,14 @@ def _login_error_payload(*, error: str, attempts: int, retry_after: int = 0) -> 
     }
 
 
-def _issue_session(cfg: dict[str, Any], request: Request) -> tuple[str, int]:
+def _issue_session(cfg: dict[str, Any], request: Request, *, ttl_sec: int | None = None) -> tuple[str, int]:
     token = secrets.token_urlsafe(32)
     a = cfg.setdefault("app_auth", {})
     if not isinstance(a, dict):
         a = {}
         cfg["app_auth"] = a
-    exp = _now() + _session_ttl_sec(a)
+    ttl = int(ttl_sec) if ttl_sec and int(ttl_sec) > 0 else _session_ttl_sec(a)
+    exp = _now() + ttl
 
     sessions = _prune_sessions(_iter_sessions(a))
     ip = getattr(getattr(request, "client", None), "host", "") or ""
@@ -1314,6 +1315,13 @@ def register_app_auth(app) -> None:
         from .authPlexAPI import register_auth_plex
 
         register_auth_plex(app)
+    except Exception:
+        pass
+
+    try:
+        from .authOIDCAPI import register_auth_oidc
+
+        register_auth_oidc(app)
     except Exception:
         pass
 
