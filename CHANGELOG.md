@@ -1,3 +1,10 @@
+## [1.1.5](https://github.com/jabrown93/CrossWatch/compare/v1.1.4...v1.1.5) (2026-07-28)
+
+
+### Bug Fixes
+
+* **event-archive:** isolate connections per thread and hash provider instances ([#65](https://github.com/jabrown93/CrossWatch/issues/65)) ([d657451](https://github.com/jabrown93/CrossWatch/commit/d6574515a4d438ff944bbfcd0d73df4f7572f0e9))
+
 ## [1.1.4](https://github.com/jabrown93/CrossWatch/compare/v1.1.3...v1.1.4) (2026-07-28)
 
 
