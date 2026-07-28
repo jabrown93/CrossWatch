@@ -2258,8 +2258,17 @@ _SSE_HEARTBEAT_SEC = 15.0
 _SSE_HEARTBEAT_COMMENT = ": keep-alive\n\n"
 
 
+def _sync_log_base_seq() -> int:
+    """Absolute sequence number of the first line currently in the SYNC buffer."""
+    import sys, importlib
+    m = sys.modules.get("crosswatch") or sys.modules.get("__main__")
+    if m is None or not hasattr(m, "LOG_BASE_SEQ"):
+        m = importlib.import_module("crosswatch")
+    return int(m.LOG_BASE_SEQ.get("SYNC", int(m.LOG_NEXT_SEQ.get("SYNC", 1))))
+
+
 @router.get("/run/summary/stream")
-async def api_run_summary_stream(request: Request) -> StreamingResponse:
+async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingResponse:
     import html, re
     TAG_RE = re.compile(r"<[^>]+>")
 
@@ -2313,9 +2322,25 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             return tuple(sorted((str(k).upper(), int(v or 0)) for k, v in counts.items()))
         except Exception:
             return ()
+    # Resume point: Last-Event-ID (browser auto-reconnect) wins over ?since=
+    # (explicit client reopen). 0 keeps the historic full-buffer replay for
+    # fresh page loads; anything else skips already-delivered lines so a
+    # flapping connection no longer re-parses and re-emits the whole 3000-line
+    # SYNC buffer on every reconnect.
+    resume_seq = 0
+    try:
+        resume_seq = max(0, int(request.headers.get("last-event-id") or 0))
+    except Exception:
+        resume_seq = 0
+    if not resume_seq:
+        try:
+            resume_seq = max(0, int(since or 0))
+        except Exception:
+            resume_seq = 0
+
     async def agen():
         last_key = None
-        last_idx = 0
+        last_seq = resume_seq
         last_hydrate_sig = None
         last_emit = time.monotonic()
         LOG_BUFFERS = _rt()[0]
@@ -2328,11 +2353,11 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             try:
                 buf = LOG_BUFFERS.get("SYNC") or []
                 buf_len = len(buf)
-                if last_idx > len(buf):
-                    last_idx = 0
-                if last_idx < len(buf):
-                    for line in buf[last_idx:]:
-                        raw = dehtml(line).strip()
+                base = _sync_log_base_seq()
+                start_idx = max(0, last_seq + 1 - base)
+                if start_idx < len(buf):
+                    for i in range(start_idx, len(buf)):
+                        raw = dehtml(buf[i]).strip()
                         if raw.startswith("{"):
                             try:
                                 obj = json.loads(raw)
@@ -2340,10 +2365,11 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
                             except Exception:
                                 continue
                             evt = (str(obj.get("event") or "log").strip() or "log")
+                            yield f"id: {base + i}\n"
                             yield f"event: {evt}\n"
                             yield f"data: {json.dumps(obj, separators=(',',':'))}\n\n"
                             emitted = True
-                    last_idx = len(buf)
+                    last_seq = base + len(buf) - 1
             except Exception:
                 pass
 
