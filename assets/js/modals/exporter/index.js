@@ -45,6 +45,11 @@ function enableColumnResize(table,key="cw.exporter.cols.v2"){
   }catch(err){console.warn("Column resize init failed:",err)}
 }
 
+// Document-level listener must outlive mount() but not the modal; kept here so
+// unmount() can remove it — otherwise each open leaks a handler pinning the
+// discarded modal subtree.
+let onDocClick=null;
+
 export default {
   async mount(root){
     injectCSS();
@@ -135,7 +140,9 @@ export default {
     const autoRefresh=debounce(()=>renderPreview(true),200), reset=cb=>()=>{state.selected.clear(); state.mode="all"; allChk.checked=true; cb?.(); savePrefs(); autoRefresh()};
     provBtn.addEventListener("click",e=>{e.stopPropagation(); provMenu.classList.contains("open")?closeProv():openProv()});
     provMenu.addEventListener("click",e=>{const btn=e.target.closest(".prov-opt"); if(!btn) return; provSel.value=btn.dataset.provider; closeProv(); reset(syncInstances)()});
-    document.addEventListener("click",e=>{if(!e.target.closest(".provider-field")) closeProv()});
+    if(onDocClick) document.removeEventListener("click",onDocClick);
+    onDocClick=e=>{if(!e.target.closest(".provider-field")) closeProv()};
+    document.addEventListener("click",onDocClick);
     instSel.addEventListener("change",reset());
     featSel.addEventListener("change",reset(()=>{syncFormats(); syncCapabilities(); syncWatchedDateOption()}));
     fmtSel.addEventListener("change",()=>{syncCapabilities(); syncWatchedDateOption(); savePrefs(); autoRefresh()});
@@ -150,5 +157,7 @@ export default {
     tbody.addEventListener("click",e=>{const tr=e.target.closest("tr[data-key]"); if(!tr||e.target.closest("input,button,select,.resizer")) return; const cb=$(".row-check",tr); if(cb){cb.checked=!cb.checked; cb.dispatchEvent(new Event("change",{bubbles:true}))}});
     await renderPreview(false);
   },
-  unmount(){}
+  unmount(){
+    if(onDocClick){document.removeEventListener("click",onDocClick); onDocClick=null;}
+  }
 };

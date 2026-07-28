@@ -1344,6 +1344,23 @@
     deleteBtn?.classList.toggle("hidden", !info.deleteSelector);
   }
 
+  // Single window listener resolving live panels from the DOM. A per-panel
+  // listener leaked: panels are destroyed by slot.innerHTML rebuilds, so each
+  // modal open added another unremovable closure pinning the detached panel.
+  let connectionModalResizeBound = false;
+  function bindConnectionModalResize() {
+    if (connectionModalResizeBound) return;
+    connectionModalResizeBound = true;
+    window.addEventListener("resize", () => {
+      document.querySelectorAll(".cw-connection-modal-panel").forEach((panel) => {
+        const overlay = panel.closest(".cw-connection-overlay");
+        if (!overlay || overlay.classList.contains("hidden")) return;
+        const info = connectionInfoForKey(panel.dataset.cwConnectionKey);
+        if (info) scheduleConnectionModalSize(panel, info);
+      });
+    }, { passive: true });
+  }
+
   function enhanceConnectionModal(section, overlay, key) {
     const info = connectionInfoForKey(key);
     const panel = connectionPanelFor(section, info);
@@ -1378,12 +1395,7 @@
       resetConnectionModalScroll(panel);
       updateConnectionModalSize(panel, info);
     });
-    if (!panel.__cwConnectionModalResizeBound) {
-      panel.__cwConnectionModalResizeBound = true;
-      window.addEventListener("resize", () => {
-        if (panel.isConnected && !overlay?.classList?.contains("hidden")) scheduleConnectionModalSize(panel, info);
-      }, { passive: true });
-    }
+    bindConnectionModalResize();
     if (!panel.__cwConnectionModalObserveBound) {
       panel.__cwConnectionModalObserveBound = true;
       const onPanelChange = () => {
