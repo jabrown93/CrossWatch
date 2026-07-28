@@ -226,3 +226,66 @@ def test_issuer_reachable_true_and_false() -> None:
     responses.reset()
     responses.add(responses.GET, DISCOVERY_URL, status=502)
     assert svc.issuer_reachable(_cfg()) is False
+
+
+@responses.activate
+def test_complete_flow_retries_jwks_on_key_rotation() -> None:
+    """Test that JWKS key rotation is handled: first fetch has unknown key, retry succeeds."""
+    svc = _svc()
+    _mock_discovery()
+    cfg = _cfg()
+    data = svc.start_flow(cfg, next_path="/", flow_nonce_hash=svc._sha256_hex("n"))
+    state = data["state"]
+    nonce = svc._PENDING_FLOWS[state]["nonce"]
+
+    # First JWKS response: key with different kid (not the one we need)
+    other_key = JsonWebKey.generate_key("RSA", 2048, is_private=True, options={"kid": "other-key"})
+    # Second JWKS response: correct key that signed the token
+    responses.add(responses.GET, JWKS_URL, json={"keys": [other_key.as_dict(is_private=False)]})
+    responses.add(responses.GET, JWKS_URL, json={"keys": [_KEY.as_dict(is_private=False)]})
+
+    _mock_token_endpoint(_id_token(nonce=nonce))
+
+    res = svc.complete_flow(cfg, state=state, code="authcode")
+    assert res["ok"] is True
+    assert res["identity"]["sub"] == "user-1"
+
+    # Verify JWKS was fetched twice (once with cache miss, once with force refresh)
+    jwks_calls = [c for c in responses.calls if c.request.url == JWKS_URL]
+    assert len(jwks_calls) == 2
+
+
+@responses.activate
+def test_complete_flow_does_not_retry_jwks_for_expired_token() -> None:
+    """Test that expired tokens fail WITHOUT triggering a JWKS force-refresh."""
+    svc = _svc()
+    _mock_discovery()
+    _mock_jwks()
+    cfg = _cfg()
+    data = svc.start_flow(cfg, next_path="/", flow_nonce_hash=svc._sha256_hex("n"))
+    state = data["state"]
+    nonce = svc._PENDING_FLOWS[state]["nonce"]
+
+    # Token that is already expired
+    now = int(time.time())
+    claims = {
+        "iss": ISSUER,
+        "aud": "cw-client",
+        "sub": "user-1",
+        "exp": now - 300,  # Expired 5 minutes ago
+        "iat": now - 600,
+        "nonce": nonce,
+        "preferred_username": "jared",
+        "email": "jared@example.com",
+        "groups": ["crosswatch"],
+    }
+    expired_token = jose_jwt.encode({"alg": "RS256", "kid": "test-key"}, claims, _KEY).decode("ascii")
+    _mock_token_endpoint(expired_token)
+
+    res = svc.complete_flow(cfg, state=state, code="authcode")
+    assert res["ok"] is False
+    assert res["code"] == "failed"
+
+    # Verify JWKS was fetched ONLY ONCE (no retry for validation errors)
+    jwks_calls = [c for c in responses.calls if c.request.url == JWKS_URL]
+    assert len(jwks_calls) == 1

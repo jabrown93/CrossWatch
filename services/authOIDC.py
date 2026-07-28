@@ -179,18 +179,19 @@ def _decode_id_token(id_token: str, *, doc: dict[str, Any], client_id: str) -> A
         "exp": {"essential": True},
     }
 
-    def _attempt(force: bool) -> Any:
+    def _decode_attempt(force: bool) -> Any:
         key_set = JsonWebKey.import_key_set(_jwks(str(doc.get("jwks_uri") or ""), force=force))
-        claims = jwt.decode(id_token, key_set, claims_options=options)
-        claims.validate(leeway=60)
-        return claims
+        return jwt.decode(id_token, key_set, claims_options=options)
 
     try:
-        return _attempt(False)
+        claims = _decode_attempt(False)
     except (JoseError, ValueError):
         # Retry once with a fresh JWKS fetch so signing-key rotation does not
         # strand logins for the cache TTL.
-        return _attempt(True)
+        claims = _decode_attempt(True)
+
+    claims.validate(leeway=60)
+    return claims
 
 
 def _extract_groups(claims: Any, groups_claim: str) -> list[str]:
