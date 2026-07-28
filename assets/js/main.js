@@ -455,7 +455,11 @@
           more.style.marginLeft = "auto";
           more.addEventListener("click", (ev) => {
             ev.stopPropagation();
-            openSpotsModal(feat.label, { add: spotAdd, rem: spotRem, upd: spotUpd });
+            // Read the lane fresh: the render skip below can keep this
+            // listener alive across summaries whose visible rows are
+            // identical but whose full spotlight lists changed.
+            const cur = getLaneStats(summary || {}, feat.key);
+            openSpotsModal(feat.label, { add: cur.spotAdd, rem: cur.spotRem, upd: cur.spotUpd });
           });
           lastRow.appendChild(more);
         }
