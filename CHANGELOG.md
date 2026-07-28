@@ -1,3 +1,11 @@
+## [1.1.6](https://github.com/jabrown93/CrossWatch/compare/v1.1.5...v1.1.6) (2026-07-28)
+
+
+### Bug Fixes
+
+* **sse:** generation-scoped resume cursor for summary stream ([#71](https://github.com/jabrown93/CrossWatch/issues/71)) ([be43a0f](https://github.com/jabrown93/CrossWatch/commit/be43a0febb2c9489204173a8c05112fec67397ee))
+* **ui:** stop unbounded event listener and interval accumulation ([#66](https://github.com/jabrown93/CrossWatch/issues/66)) ([90e3922](https://github.com/jabrown93/CrossWatch/commit/90e3922524b351e4741022c371f26aa72c26bb9a))
+
 ## [1.1.5](https://github.com/jabrown93/CrossWatch/compare/v1.1.4...v1.1.5) (2026-07-28)
 
 
