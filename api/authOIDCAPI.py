@@ -130,6 +130,10 @@ def api_oidc_callback(request: Request) -> Response:
         _del_flow_cookie(resp, request)
         return resp
 
+    # Re-load: the cfg from the top of this handler is seconds stale by now
+    # (discovery + token exchange + JWKS round-trips); writing it back would
+    # clobber any settings saved during that window.
+    cfg = load_config()
     token, exp = app_auth._issue_session(cfg, request, ttl_sec=authOIDC.session_ttl_sec(cfg))
     save_config(cfg)
     identity = res.get("identity") or {}

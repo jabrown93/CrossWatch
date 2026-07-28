@@ -8,7 +8,7 @@ import base64
 import hashlib
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from authlib.jose import JsonWebKey, JsonWebToken
@@ -105,6 +105,12 @@ def _discover(issuer: str) -> dict[str, Any]:
     for field in ("issuer", "authorization_endpoint", "token_endpoint", "jwks_uri"):
         if not str(doc.get(field) or "").strip():
             raise RuntimeError(f"OIDC discovery document is missing {field}")
+    # OIDC Discovery §4.3: the document's issuer MUST equal the URL it was
+    # fetched for, or ID tokens end up validated against whatever issuer the
+    # endpoint claims instead of the one the admin configured. Exact match --
+    # trailing slashes are significant (Authentik issuers end with one).
+    if str(doc.get("issuer") or "").strip() != key:
+        raise RuntimeError("OIDC discovery document issuer does not match the configured issuer")
     _DISCOVERY_CACHE[key] = {"at": _now(), "doc": doc}
     return doc
 
@@ -190,7 +196,12 @@ def start_flow(cfg: dict[str, Any], *, next_path: str, flow_nonce_hash: str) -> 
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    return {"ok": True, "state": state, "auth_url": f"{doc['authorization_endpoint']}?{urlencode(params)}"}
+    # Merge into any query the discovered endpoint already carries (RFC 6749
+    # §3.1 allows one); naive "?" concatenation would corrupt both queries.
+    authz = urlsplit(str(doc["authorization_endpoint"]))
+    query = urlencode(parse_qsl(authz.query, keep_blank_values=True) + list(params.items()))
+    auth_url = urlunsplit((authz.scheme, authz.netloc, authz.path, query, ""))
+    return {"ok": True, "state": state, "auth_url": auth_url}
 
 
 def _failed(error: str, *, code: str = "failed") -> dict[str, Any]:

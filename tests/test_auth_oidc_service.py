@@ -124,6 +124,47 @@ def test_start_flow_builds_pkce_authorize_url() -> None:
 
 
 @responses.activate
+def test_start_flow_rejects_discovery_issuer_mismatch() -> None:
+    """A discovery document claiming a different issuer must be refused, not
+    cached — otherwise ID tokens get validated against the wrong issuer."""
+    svc = _svc()
+    responses.add(
+        responses.GET,
+        DISCOVERY_URL,
+        json={
+            "issuer": "https://other-idp.test/",
+            "authorization_endpoint": AUTHZ_URL,
+            "token_endpoint": TOKEN_URL,
+            "jwks_uri": JWKS_URL,
+        },
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        svc.start_flow(_cfg(), next_path="/", flow_nonce_hash=svc._sha256_hex("n"))
+    assert not svc._DISCOVERY_CACHE
+
+
+@responses.activate
+def test_start_flow_preserves_existing_authorize_query() -> None:
+    svc = _svc()
+    responses.add(
+        responses.GET,
+        DISCOVERY_URL,
+        json={
+            "issuer": ISSUER,
+            "authorization_endpoint": AUTHZ_URL + "?tenant=abc",
+            "token_endpoint": TOKEN_URL,
+            "jwks_uri": JWKS_URL,
+        },
+    )
+    data = svc.start_flow(_cfg(), next_path="/", flow_nonce_hash=svc._sha256_hex("n"))
+    parts = urlsplit(data["auth_url"])
+    q = parse_qs(parts.query)
+    assert q["tenant"] == ["abc"]
+    assert q["response_type"] == ["code"]
+    assert q["state"] == [data["state"]]
+
+
+@responses.activate
 def test_complete_flow_happy_path() -> None:
     svc = _svc()
     _mock_discovery()

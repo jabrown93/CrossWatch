@@ -166,6 +166,41 @@ def test_oidc_callback_success_sets_session_cookie(monkeypatch) -> None:
     assert saved.get("cfg") is cfg
 
 
+def test_oidc_callback_saves_freshly_loaded_config(monkeypatch) -> None:
+    """The session must land in a config re-loaded after the slow IdP round
+    trips, not in the stale snapshot from the top of the handler."""
+    from api import authOIDCAPI as oidc_api
+
+    loads = [_auth_cfg(), _auth_cfg()]
+    monkeypatch.setattr(oidc_api, "load_config", lambda: loads.pop(0))
+    saved: dict = {}
+    monkeypatch.setattr(oidc_api, "save_config", lambda c: saved.setdefault("cfg", c))
+    stale = loads[0]
+    fresh = loads[1]
+    monkeypatch.setattr(
+        oidc_api.authOIDC,
+        "complete_flow",
+        lambda *_a, **_k: {
+            "ok": True,
+            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-nonce"),
+            "next": "/",
+            "identity": {"sub": "user-1", "username": "jared", "email": "j@x.com", "groups": ["crosswatch"]},
+        },
+    )
+
+    req = _request(
+        "/api/app-auth/oidc/callback",
+        query="code=abc&state=st",
+        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"},
+    )
+    resp = oidc_api.api_oidc_callback(req)
+
+    assert resp.status_code == 302
+    assert saved["cfg"] is fresh
+    assert len(fresh["app_auth"]["sessions"]) == 1
+    assert not stale["app_auth"]["sessions"]
+
+
 def test_oidc_callback_requires_matching_flow_cookie(monkeypatch) -> None:
     from api import authOIDCAPI as oidc_api
 
