@@ -1380,8 +1380,8 @@ def register_app_auth(app) -> None:
 
         # oidc_error present means we just bounced back from a failed SSO
         # attempt -- rendering the form instead of redirecting again breaks
-        # the redirect loop.
-        if oidc_available and not force_local and not oidc_error:
+        # the redirect loop. setup_lock_required prevents redirect during password-reset state.
+        if oidc_available and not force_local and not oidc_error and not setup_lock_required(cfg):
             try:
                 if authOIDC and authOIDC.issuer_reachable(cfg):
                     return RedirectResponse(
@@ -1420,6 +1420,10 @@ def register_app_auth(app) -> None:
         token = request.cookies.get(COOKIE_NAME)
         _drop_session(cfg, token)
         save_config(cfg)
-        resp = RedirectResponse(url="/login" if auth_required(cfg) else "/")
+        if auth_required(cfg):
+            url = "/login?local=1"
+        else:
+            url = "/"
+        resp = RedirectResponse(url=url)
         _del_cookie(resp, request)
         return resp

@@ -326,3 +326,52 @@ def test_login_sanitizes_malicious_next_paths(monkeypatch) -> None:
     resp = endpoint(_request("/login", query="next=https://evil.example"))
     assert resp.status_code == 302
     assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2F"
+
+
+def _logout_route(monkeypatch, cfg):
+    """Register routes on a throwaway FastAPI app and return the /logout endpoint."""
+    from fastapi import FastAPI
+
+    from api import appAuthAPI as auth
+
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_a, **_k: None)
+    app = FastAPI()
+    auth.register_app_auth(app)
+    for route in app.routes:
+        if getattr(route, "path", "") == "/logout" and "GET" in getattr(route, "methods", set()):
+            return route.endpoint
+    raise AssertionError("/logout route not registered")
+
+
+def test_logout_with_oidc_redirects_to_local_login(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    endpoint = _logout_route(monkeypatch, cfg)
+
+    # Seed a session in config so auth_required still returns True after logout
+    cfg["app_auth"]["sessions"].append({
+        "token_hash": "test-hash",
+        "expires_at": auth._now() + 3600,
+    })
+
+    token = "test-token"
+    resp = endpoint(_request("/logout", headers={"cookie": f"{auth.COOKIE_NAME}={token}"}))
+
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/login?local=1"
+
+
+def test_login_guards_oidc_redirect_during_reset(monkeypatch) -> None:
+    from services import authOIDC
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["reset_required"] = True
+    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
+    endpoint = _login_route(monkeypatch, cfg)
+
+    resp = endpoint(_request("/login"))
+    assert resp.status_code == 200
+    body = resp.body.decode("utf-8")
+    assert 'id="p"' in body
