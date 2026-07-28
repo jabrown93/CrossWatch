@@ -29,6 +29,7 @@ def _clear_caches():
     svc._PENDING_FLOWS.clear()
     svc._DISCOVERY_CACHE.clear()
     svc._JWKS_CACHE.clear()
+    svc._HEALTH_CACHE.clear()
     yield
 
 
@@ -222,10 +223,44 @@ def test_issuer_reachable_true_and_false() -> None:
     svc = _svc()
     _mock_discovery()
     assert svc.issuer_reachable(_cfg()) is True
-    svc._DISCOVERY_CACHE.clear()
+    svc._HEALTH_CACHE.clear()
     responses.reset()
     responses.add(responses.GET, DISCOVERY_URL, status=502)
     assert svc.issuer_reachable(_cfg()) is False
+
+
+@responses.activate
+def test_issuer_reachable_ignores_warm_metadata_cache() -> None:
+    """A cached discovery document must not mask an IdP outage on /login."""
+    svc = _svc()
+    _mock_discovery()
+    svc.start_flow(_cfg(), next_path="/", flow_nonce_hash=svc._sha256_hex("n"))
+    assert svc._DISCOVERY_CACHE  # metadata cache is warm
+    responses.reset()
+    responses.add(responses.GET, DISCOVERY_URL, status=502)
+    assert svc.issuer_reachable(_cfg()) is False
+
+
+@responses.activate
+def test_issuer_reachable_caches_probe_result() -> None:
+    svc = _svc()
+    _mock_discovery()
+    assert svc.issuer_reachable(_cfg()) is True
+    calls_after_first = len(responses.calls)
+    assert svc.issuer_reachable(_cfg()) is True
+    assert len(responses.calls) == calls_after_first
+
+
+@responses.activate
+def test_pending_flows_capped() -> None:
+    svc = _svc()
+    _mock_discovery()
+    cfg = _cfg()
+    first = svc.start_flow(cfg, next_path="/", flow_nonce_hash=svc._sha256_hex("n"))["state"]
+    for _ in range(svc.MAX_PENDING_FLOWS + 10):
+        svc.start_flow(cfg, next_path="/", flow_nonce_hash=svc._sha256_hex("n"))
+    assert len(svc._PENDING_FLOWS) <= svc.MAX_PENDING_FLOWS
+    assert first not in svc._PENDING_FLOWS  # oldest evicted first
 
 
 @responses.activate

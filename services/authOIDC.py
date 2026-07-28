@@ -21,13 +21,16 @@ except ImportError:
 
 DISCOVERY_TIMEOUT_SEC = 5
 DISCOVERY_TTL_SEC = 300
+HEALTH_TTL_SEC = 30
 TOKEN_TIMEOUT_SEC = 15
 PENDING_TTL_SEC = 10 * 60
+MAX_PENDING_FLOWS = 100
 SCOPES = "openid profile email"
 
 _PENDING_FLOWS: dict[str, dict[str, Any]] = {}
 _DISCOVERY_CACHE: dict[str, dict[str, Any]] = {}
 _JWKS_CACHE: dict[str, dict[str, Any]] = {}
+_HEALTH_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _log(msg: str, *, level: str = "INFO") -> None:
@@ -107,11 +110,27 @@ def _discover(issuer: str) -> dict[str, Any]:
 
 
 def issuer_reachable(cfg: dict[str, Any]) -> bool:
-    try:
-        _discover(str(_oidc_cfg(cfg).get("issuer") or ""))
-        return True
-    except Exception:
+    # Probes the network directly instead of going through _discover: a warm
+    # metadata cache must not report a dead IdP as reachable, or /login keeps
+    # auto-redirecting into the outage for the whole metadata TTL. Both
+    # outcomes are cached briefly so bursts of /login hits don't stack probes.
+    issuer = str(_oidc_cfg(cfg).get("issuer") or "").strip()
+    if not issuer:
         return False
+    cached = _HEALTH_CACHE.get(issuer)
+    if isinstance(cached, dict) and (_now() - int(cached.get("at") or 0)) < HEALTH_TTL_SEC:
+        return bool(cached.get("ok"))
+    ok = False
+    try:
+        resp = requests.get(
+            issuer.rstrip("/") + "/.well-known/openid-configuration",
+            timeout=DISCOVERY_TIMEOUT_SEC,
+        )
+        ok = bool(resp.ok)
+    except Exception:
+        ok = False
+    _HEALTH_CACHE[issuer] = {"at": _now(), "ok": ok}
+    return ok
 
 
 def _jwks(jwks_uri: str, *, force: bool = False) -> dict[str, Any]:
@@ -138,6 +157,13 @@ def _prune_pending() -> None:
 
 def start_flow(cfg: dict[str, Any], *, next_path: str, flow_nonce_hash: str) -> dict[str, Any]:
     _prune_pending()
+    # /oidc/login is reachable without a session, so without a cap a remote
+    # client could grow this map at request rate for the whole pending TTL.
+    # Evict oldest rather than reject so a burst can't lock out fresh logins.
+    if len(_PENDING_FLOWS) >= MAX_PENDING_FLOWS:
+        oldest = sorted(_PENDING_FLOWS, key=lambda k: int(_PENDING_FLOWS[k].get("expires_at") or 0))
+        for key in oldest[: len(_PENDING_FLOWS) - MAX_PENDING_FLOWS + 1]:
+            _PENDING_FLOWS.pop(key, None)
     o = _oidc_cfg(cfg)
     doc = _discover(str(o.get("issuer") or ""))
 
