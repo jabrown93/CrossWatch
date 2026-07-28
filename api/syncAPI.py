@@ -2362,9 +2362,14 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
                 if last_seq > newest:
                     last_seq = base - 1
                 start_idx = max(0, last_seq + 1 - base)
-                if start_idx < len(buf):
-                    for i in range(start_idx, len(buf)):
-                        raw = dehtml(buf[i]).strip()
+                # Snapshot the batch: buf is the live buffer and each yield is
+                # a suspension point, so appends (or head trims) during
+                # emission would otherwise let the cursor advance past records
+                # that were never iterated.
+                batch = buf[start_idx:]
+                if batch:
+                    for j, line in enumerate(batch):
+                        raw = dehtml(line).strip()
                         if raw.startswith("{"):
                             try:
                                 obj = json.loads(raw)
@@ -2372,11 +2377,11 @@ async def api_run_summary_stream(request: Request, since: int = 0) -> StreamingR
                             except Exception:
                                 continue
                             evt = (str(obj.get("event") or "log").strip() or "log")
-                            yield f"id: {base + i}\n"
+                            yield f"id: {base + start_idx + j}\n"
                             yield f"event: {evt}\n"
                             yield f"data: {json.dumps(obj, separators=(',',':'))}\n\n"
                             emitted = True
-                    last_seq = base + len(buf) - 1
+                    last_seq = base + start_idx + len(batch) - 1
                     # Cursor marker: the client advances its resume position
                     # from this event alone, so consumed batches count even
                     # when their event types have no UI listener.
