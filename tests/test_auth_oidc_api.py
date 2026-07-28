@@ -223,6 +223,57 @@ def test_oidc_callback_requires_matching_flow_cookie(monkeypatch) -> None:
     assert cfg["app_auth"]["sessions"] == []
 
 
+def test_oidc_callback_mismatch_keeps_newer_flow_cookie(monkeypatch) -> None:
+    """A stale callback losing the cookie race (two login tabs) must not
+    delete the cookie that the newer pending flow still needs."""
+    from api import authOIDCAPI as oidc_api
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        oidc_api.authOIDC,
+        "complete_flow",
+        lambda *_a, **_k: {
+            "ok": True,
+            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-a-nonce"),
+            "next": "/",
+            "identity": {"sub": "user-1", "username": "jared", "email": "", "groups": []},
+        },
+    )
+
+    req = _request(
+        "/api/app-auth/oidc/callback",
+        query="code=abc&state=st",
+        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-b-nonce"},
+    )
+    resp = oidc_api.api_oidc_callback(req)
+
+    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
+    assert oidc_api.FLOW_COOKIE_NAME not in _all_set_cookie_headers(resp)
+
+
+def test_oidc_callback_failure_keeps_flow_cookie(monkeypatch) -> None:
+    from api import authOIDCAPI as oidc_api
+
+    cfg = _auth_cfg()
+    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        oidc_api.authOIDC,
+        "complete_flow",
+        lambda *_a, **_k: {"ok": False, "error": "expired", "code": "failed"},
+    )
+
+    req = _request(
+        "/api/app-auth/oidc/callback",
+        query="code=abc&state=st",
+        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-b-nonce"},
+    )
+    resp = oidc_api.api_oidc_callback(req)
+
+    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
+    assert oidc_api.FLOW_COOKIE_NAME not in _all_set_cookie_headers(resp)
+
+
 def test_oidc_callback_denied_maps_to_denied_code(monkeypatch) -> None:
     from api import authOIDCAPI as oidc_api
 

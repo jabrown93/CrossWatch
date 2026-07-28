@@ -120,15 +120,14 @@ def api_oidc_callback(request: Request) -> Response:
         _log(f"OIDC sign-in failed: {exc}", level="ERROR")
         return _local_login_redirect("failed")
 
+    # Failure paths leave the flow cookie alone: with two flows in flight the
+    # shared cookie holds the newer flow's nonce, so deleting it here would
+    # break that still-pending login too. It expires on its own in 10 minutes.
     if not res.get("ok"):
-        resp = _local_login_redirect(str(res.get("code") or "failed"))
-        _del_flow_cookie(resp, request)
-        return resp
+        return _local_login_redirect(str(res.get("code") or "failed"))
 
     if not _flow_nonce_matches(request, res):
-        resp = _local_login_redirect("failed")
-        _del_flow_cookie(resp, request)
-        return resp
+        return _local_login_redirect("failed")
 
     # Re-load: the cfg from the top of this handler is seconds stale by now
     # (discovery + token exchange + JWKS round-trips); writing it back would
