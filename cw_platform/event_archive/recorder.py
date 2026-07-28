@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from ..provider_instances import normalize_instance_id
 from .db import get_conn
 
 _LOG = logging.getLogger("crosswatch.event_archive")
@@ -28,9 +29,17 @@ FIELDS = (
     "source_kind", "session_key", "source_file", "source_mtime", "detail",
 )
 
+# Instances belong here for the same reason the provider names do: with two
+# configured instances of one provider, the same item dispatched to each yields
+# an identical hash, and INSERT OR IGNORE (plus the events.event_hash UNIQUE
+# constraint) silently drops the second. Adding fields changes hashes, so rows
+# written before this are only deduplicated against each other -- harmless,
+# since dedup only needs to hold within a run.
 _HASH_FIELDS = (
     "source_file", "source_mtime", "event_type", "item_key",
-    "source_provider", "destination_provider", "origin_provider",
+    "source_provider", "source_instance",
+    "destination_provider", "destination_instance",
+    "origin_provider", "origin_instance",
     "feature", "pair_key", "operation", "reason_code",
     "old_value", "new_value", "run_id",
 )
@@ -50,8 +59,23 @@ def _s(v: Any) -> str:
     return str(v)
 
 
+_INSTANCE_FIELDS = frozenset({"source_instance", "destination_instance", "origin_instance"})
+
+
+def _instance_token(v: Any) -> str:
+    # Producers spell the default instance as None, "", or "default" depending on
+    # whether they went through normalize_instance_id(). Reuse that function so
+    # two ids hash alike exactly when they resolve to the same config block --
+    # it folds the default spellings but preserves case elsewhere, and
+    # get_provider_block() looks instances up by exact key.
+    return normalize_instance_id(v)
+
+
 def compute_event_hash(row: Mapping[str, Any], *, extra: Any = None) -> str:
-    parts = [_s(row.get(k)) for k in _HASH_FIELDS]
+    parts = [
+        _instance_token(row.get(k)) if k in _INSTANCE_FIELDS else _s(row.get(k))
+        for k in _HASH_FIELDS
+    ]
     if extra is not None:
         parts.append(_s(extra))
     return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()
