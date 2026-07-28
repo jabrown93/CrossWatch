@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .db import events_db_path, get_conn, close_conn
+from .db import events_db_path, get_conn, close_conn, suspended
 
 _LOG = logging.getLogger("crosswatch.event_archive")
 from .schema import SCHEMA_VERSION
@@ -177,17 +177,19 @@ def rebuild(
     reimport: bool = True,
 ) -> dict[str, Any]:
     path = events_db_path()
-    close_conn()
     removed: list[str] = []
-    for suffix in ("", "-wal", "-shm"):
-        fp = Path(str(path) + suffix)
-        try:
-            if fp.exists():
-                fp.unlink()
-                removed.append(fp.name)
-        except Exception:
-            _LOG.exception("events rebuild could not remove %s", fp.name)
-            return {"ok": False, "path": str(path), "error": "remove_failed", "file": fp.name}
+    # Held across the unlink so no thread can open a connection against a file
+    # that is about to disappear; a closed connection alone leaves that window.
+    with suspended():
+        for suffix in ("", "-wal", "-shm"):
+            fp = Path(str(path) + suffix)
+            try:
+                if fp.exists():
+                    fp.unlink()
+                    removed.append(fp.name)
+            except Exception:
+                _LOG.exception("events rebuild could not remove %s", fp.name)
+                return {"ok": False, "path": str(path), "error": "remove_failed", "file": fp.name}
     c = get_conn()
     if c is None:
         return {"ok": False, "available": False, "path": str(path), "removed": removed}

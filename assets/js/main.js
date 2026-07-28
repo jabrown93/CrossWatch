@@ -74,6 +74,16 @@
   let pairsRefreshTO = null;
   let spotsModal = null;
   let esSummary = null;
+  // Resume cursor for the summary stream, passed as ?since= on reopen so the
+  // server skips the full SYNC-buffer replay on every reconnect. Assigned (not
+  // maxed) from the dedicated cw:seq marker: after a backend restart the
+  // sequence space starts over, so a smaller id is newer, and the server
+  // treats an ahead-of-buffer cursor as stale either way.
+  let lastSummarySeq = 0;
+  const trackSummarySeq = (ev) => {
+    const n = Number(ev?.lastEventId);
+    if (Number.isFinite(n) && n > 0) lastSummarySeq = n;
+  };
   let esLogs = null;
   let runButtonWired = false;
   let hubLayoutHost = null;
@@ -699,6 +709,7 @@
       safe(esSummary?.close?.bind(esSummary));
       const url = new URL("/api/run/summary/stream", document.baseURI);
       url.searchParams.set("_ts", String(nowTs()));
+      if (lastSummarySeq > 0) url.searchParams.set("since", String(lastSummarySeq));
       esSummary = new EventSource(url.toString());
       window.esSum = esSummary;
       esSummary.onmessage = (ev) => {
@@ -723,6 +734,7 @@
       on(esSummary, ["run:error", "run:aborted"], () => {
         try { sync.error(); setRunButtonState(false); } catch {}
       });
+      on(esSummary, ["cw:seq"], trackSummarySeq);
       esSummary.onopen = () => safe(summaryStream.onOpen.bind(summaryStream));
       esSummary.onerror = () => summaryStream.onError();
     } catch {}
