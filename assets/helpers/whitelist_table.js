@@ -90,13 +90,14 @@
             </div>
           </div>
         </div>`;
-      const stampEl = host.querySelector(".cw-wl-stamp");
+      // render() re-runs on every column toggle/load; without this the old
+      // 30s interval (and the DOM closure it retains) stacks per render.
+      if (host.__cwWlTimer) clearInterval(host.__cwWlTimer);
       host.__cwWlTimer = setInterval(() => {
         const el = host.querySelector(".cw-wl-stamp");
         if (!el) { clearInterval(host.__cwWlTimer); host.__cwWlTimer = 0; return; }
         el.textContent = stampText();
       }, 30000);
-      void stampEl;
     }
 
     async function doLoad(force, flash) {

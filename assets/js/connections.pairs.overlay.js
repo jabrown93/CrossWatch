@@ -402,8 +402,16 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
   }
 
   function installTooltip(host) {
-    let tip = host.querySelector(".cx-tip");
-    if (!tip) { tip = document.createElement("div"); tip.className = "cx-tip"; host.appendChild(tip); }
+    // Wire once: host (#pairs_list) persists across renders, so re-adding
+    // listeners on every renderPairsOverlay() leaks them without bound.
+    if (host.__cxTipWired) return;
+    host.__cxTipWired = true;
+
+    const ensureTip = () => {
+      let tip = host.querySelector(".cx-tip");
+      if (!tip) { tip = document.createElement("div"); tip.className = "cx-tip"; host.appendChild(tip); }
+      return tip;
+    };
 
     let showTimer = 0;
 
@@ -412,6 +420,7 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
       const msg = el.getAttribute("data-tip") || el.getAttribute("aria-label") || el.getAttribute("title") || "";
       if (!msg) return;
       showTimer = setTimeout(() => {
+        const tip = ensureTip();
         tip.textContent = msg;
         tip.style.left = (ev.clientX + 10) + "px";
         tip.style.top = (ev.clientY + 10) + "px";
@@ -420,14 +429,15 @@ html[data-cw-theme="flat-light"] #pairs_list .icon-btn.power.off:hover{
     };
 
     const move = (ev) => {
-      if (!tip.classList.contains("on")) return;
+      const tip = host.querySelector(".cx-tip");
+      if (!tip || !tip.classList.contains("on")) return;
       tip.style.left = (ev.clientX + 10) + "px";
       tip.style.top = (ev.clientY + 10) + "px";
     };
 
     const hide = () => {
       clearTimeout(showTimer);
-      tip.classList.remove("on");
+      host.querySelector(".cx-tip")?.classList.remove("on");
     };
 
     host.addEventListener("pointerover", (e) => {
