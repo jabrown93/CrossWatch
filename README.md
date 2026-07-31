@@ -10,6 +10,8 @@
 >
 > **Differences from upstream:**
 >
+> - **Authentication** — OIDC/SSO login, static API-key auth via an `x-api-key` header for
+>   programmatic access, and a first-run setup-token gate. None of these exist upstream.
 > - **Security hardening** — secrets are redacted from config output/logs, outbound provider
 >   requests are guarded against SSRF (including on every redirect hop, which also covers
 >   Jellyfin Quick Connect), and an unrecognized webhook profile token is rejected with a

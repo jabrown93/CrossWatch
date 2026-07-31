@@ -24,6 +24,10 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # metadata-action's auto-generated title/description come from the GitHub
+      # repo metadata and are passed to build-push-action as --label, which wins
+      # over the Dockerfile's LABEL. Restate the fork disclaimer here so the dev
+      # image cannot end up implying upstream endorsement (License Section 11).
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         id: meta
         with:
@@ -31,6 +35,10 @@ jobs:
           tags: |
             type=raw,value=dev
             type=sha,prefix=dev-
+          labels: |
+            org.opencontainers.image.title=CrossWatch (unofficial fork)
+            org.opencontainers.image.description=Unofficial fork of cenodude/CrossWatch. One brain for all your media syncs, a single place to configure everything. Not endorsed by the upstream Copyright Holder.
+            org.opencontainers.image.licenses=LicenseRef-CrossWatch-Source-Available-1.0
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:

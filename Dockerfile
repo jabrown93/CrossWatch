@@ -43,7 +43,15 @@ RUN mkdir -p /config-skel
 # =====================================================================
 FROM dhi.io/python:3.14.6-alpine3.24
 
-LABEL org.opencontainers.image.description="One brain for all your media syncs A single place to configure everything."
+# Section 11 of the CrossWatch Source Available License forbids implying that a
+# modified version is endorsed by the Copyright Holder, so the description says
+# up front that this is an unofficial fork. The licenses label is the SPDX-style
+# hint scanners read; NOTICE (copied in with the app below) carries the
+# Section 6.3 statement of material modifications.
+LABEL org.opencontainers.image.title="CrossWatch (unofficial fork)" \
+      org.opencontainers.image.description="Unofficial fork of cenodude/CrossWatch. One brain for all your media syncs, a single place to configure everything. Not endorsed by the upstream Copyright Holder." \
+      org.opencontainers.image.source="https://github.com/jabrown93/CrossWatch" \
+      org.opencontainers.image.licenses="LicenseRef-CrossWatch-Source-Available-1.0"
 
 # Baked in by CI (jabrown93/.github/docker-release.yml passes
 # --build-arg APP_VERSION=v<version>); api/versionAPI.py reads this via
@@ -72,6 +80,9 @@ COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 
 # Application code (.dockerignore keeps .git/__pycache__/.venv/tests out).
+# LICENSE and NOTICE ride along deliberately: License Section 6 requires every
+# distributed copy to carry the copyright notice, the full license text, and a
+# clear notice of material modifications. Do not add either to .dockerignore.
 COPY . /app
 
 # Writable runtime dir owned by the nonroot runtime user. Named volumes
