@@ -14,6 +14,7 @@ from packaging.version import InvalidVersion, Version
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 from providers.scrobble.sources import source_enabled
+from cw_platform.config_env import env_locked_paths, env_overrides
 from _logging import log as BASE_LOG
 
 BACKUP_LOG = BASE_LOG.child("BACKUP")
@@ -396,7 +397,35 @@ def api_config() -> JSONResponse:
     if base is None or not hasattr(base, "redact_config"):
         return _nostore(JSONResponse({"ok": False, "error": "Config redaction unavailable"}, status_code=503))
     cfg = base.redact_config(cfg)  # type: ignore[attr-defined]
+    # Tells the UI which fields the environment owns so it can lock them.
+    cfg["_env_locked"] = env_locked_paths()
     return _nostore(JSONResponse(cfg))
+
+
+def _enforce_env_locks(
+    current: dict[str, Any],
+    cfg: dict[str, Any],
+) -> list[str]:
+    """Force env-owned paths back to their effective values; report what changed.
+
+    Runs after sensitive-value preservation so a masked secret the client echoed
+    back is not mistaken for an edit. A locked path is not a client error -- the
+    rest of the save proceeds and the caller is told which fields were dropped.
+    """
+    from cw_platform.config_base import _get_nested_value, _set_nested_value
+
+    ignored: list[str] = []
+    for path in env_overrides():
+        found_cfg, cfg_value = _get_nested_value(cfg, path)
+        if not found_cfg:
+            continue
+        found_cur, cur_value = _get_nested_value(current, path)
+        if found_cfg and found_cur and cfg_value == cur_value:
+            continue
+        ignored.append(".".join(path))
+        if found_cur:
+            _set_nested_value(cfg, path, cur_value)
+    return ignored
 
 def _finalize_config(env: dict[str, Any], cfg: dict[str, Any], *, ensure: bool = False) -> None:
     """Normalize scrobble mode/features.watch, prune+norm pairs, and clear setup-wizard markers.
@@ -542,6 +571,8 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
         pass
 
     cfg: dict[str, Any] = dict(merged or {})
+    cfg.pop("_env_locked", None)
+    env_locked_ignored = _enforce_env_locks(current, cfg)
 
     # SSRF guard — reject the save outright for a dangerous server URL
     # (bad scheme, path traversal, or a host that is/resolves to a cloud
@@ -593,6 +624,8 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
     _after_config_save(env, cfg)
 
     result: dict[str, Any] = {"ok": True}
+    if env_locked_ignored:
+        result["env_locked_ignored"] = env_locked_ignored
     if watch_runtime_changed:
         try:
             result.update(_apply_watch_runtime(request.app, cfg, watcher_was_running))

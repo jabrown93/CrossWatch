@@ -15,6 +15,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
 
+from .config_env import apply_env_overrides, env_overrides
+
 
 def _current_version_norm() -> str:
     try:
@@ -967,6 +969,20 @@ def _get_nested_value(src: dict[str, Any], path: str | Iterable[str]) -> tuple[b
     return True, cur
 
 
+def _delete_nested_value(dst: dict[str, Any], path: str | Iterable[str]) -> None:
+    parts = _path_parts(path)
+    if not parts:
+        return
+
+    cur: Any = dst
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or part not in cur:
+            return
+        cur = cur[part]
+    if isinstance(cur, dict):
+        cur.pop(parts[-1], None)
+
+
 def _set_nested_value(dst: dict[str, Any], path: str | Iterable[str], value: Any) -> None:
     parts = _path_parts(path)
     if not parts:
@@ -1659,7 +1675,13 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
     oidc["public_base_url"] = str(oidc.get("public_base_url", "") or "").strip().rstrip("/")
     oidc["groups_claim"] = str(oidc.get("groups_claim", "groups") or "").strip() or "groups"
     raw_groups = oidc.get("allowed_groups")
-    items = raw_groups if isinstance(raw_groups, list) else ([raw_groups] if raw_groups else [])
+    if isinstance(raw_groups, list):
+        items: list[Any] = raw_groups
+    elif raw_groups:
+        # A single env var can only carry a string, so accept a comma-separated list.
+        items = str(raw_groups).split(",")
+    else:
+        items = []
     oidc["allowed_groups"] = [s for s in (str(x or "").strip() for x in items) if s]
     try:
         hours = int(oidc.get("session_hours", 12) or 12)
@@ -1741,6 +1763,27 @@ def _ensure_webhook_ids(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 
     return cfg, changed
 
+_ENV_LOCKS_LOGGED = False
+
+
+def _log_env_locks(applied: list[tuple[str, ...]]) -> None:
+    """Announce env-owned paths once; load_config runs on nearly every request.
+
+    Paths only -- the values are frequently secrets.
+    """
+    global _ENV_LOCKS_LOGGED
+    if _ENV_LOCKS_LOGGED or not applied:
+        return
+    _ENV_LOCKS_LOGGED = True
+    names = ", ".join(sorted(".".join(p) for p in applied))
+    try:
+        from _logging import log as _real_log
+
+        _real_log(f"Config locked by environment: {names}", level="INFO", module="CONFIG")
+    except Exception:
+        print(f"[CONFIG] INFO: Config locked by environment: {names}")
+
+
 def load_config() -> dict[str, Any]:
     p = _cfg_file()
     first_run = not p.exists()
@@ -1752,6 +1795,8 @@ def load_config() -> dict[str, Any]:
             raise RuntimeError(f"Invalid config file: {p}") from e
 
     cfg = _deep_merge(DEFAULT_CFG, user_cfg)
+    # Before the normalizers, so env values get the same clamping as file values.
+    _log_env_locks(apply_env_overrides(cfg))
     cfg.setdefault("version", _current_version_norm())
     _normalize_tmdb_sync(cfg)
     _normalize_trakt(cfg)
@@ -1793,8 +1838,29 @@ def load_config() -> dict[str, Any]:
     return cfg
 
 
+def _revert_env_paths(payload: dict[str, Any], prev_raw: dict[str, Any]) -> None:
+    """Undo env-owned values so they never reach config.json.
+
+    Restores whatever the file held, or drops the key when the file never had
+    one; unsetting the variable then reveals the file value again, unchanged.
+
+    Runs on the encrypted write payload rather than on the caller's config:
+    that tree is freshly built by _encrypt_secret_tree_stable, so mutating it
+    cannot corrupt a config dict the caller still holds, and prev_raw's values
+    are already in on-disk form.
+    """
+    for path in env_overrides():
+        found, prev_value = _get_nested_value(prev_raw, path)
+        if found:
+            _set_nested_value(payload, path, prev_value)
+        else:
+            _delete_nested_value(payload, path)
+
+
 def save_config(cfg: dict[str, Any]) -> None:
     data: dict[str, Any] = dict(cfg or {})
+    # UI round-trips the GET /api/config response, which carries this marker.
+    data.pop("_env_locked", None)
     prev_version = str(data.get("version") or "").strip()
     try:
         ui0 = data.get("ui")
@@ -1830,4 +1896,6 @@ def save_config(cfg: dict[str, Any]) -> None:
     except Exception:
         prev_raw = {}
 
-    _write_json_atomic(_cfg_file(), cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw)))
+    payload = cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw))
+    _revert_env_paths(payload, prev_raw)
+    _write_json_atomic(_cfg_file(), payload)
