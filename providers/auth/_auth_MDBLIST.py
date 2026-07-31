@@ -265,7 +265,7 @@ def html() -> str:
                 <button id="mdblist_disconnect_api" class="btn danger">Delete</button>
               </div>
             </div>
-            <input id="mdblist_auth_method" name="mdblist_auth_method" type="hidden" value="device_code">
+            <input id="mdblist_auth_method" data-cfg-path="mdblist.auth_method" data-cfg-instance-root="mdblist" name="mdblist_auth_method" type="hidden" value="device_code">
 
             <div id="mdblist_device_panel" class="mdbl-pane" data-method="device_code">
               <input id="mdblist_device_code" type="hidden">
@@ -289,7 +289,7 @@ def html() -> str:
                 <div>
                   <label for="mdblist_key">API Key</label>
                   <div class="mdbl-api-field-row">
-                    <input id="mdblist_key" name="mdblist_key" type="password" placeholder="********" />
+                    <input id="mdblist_key" data-cfg-path="mdblist.api_key" data-cfg-instance-root="mdblist" name="mdblist_key" type="password" placeholder="********" />
                     <div id="mdblist_hint" class="msg warn">
                       Create API key at
                       <a href="https://mdblist.com/preferences/#api" target="_blank" rel="noopener">MDBList Preferences</a>.

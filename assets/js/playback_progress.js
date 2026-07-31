@@ -158,7 +158,7 @@ html[data-cw-theme=flat-dark] .pp-settings-dialog.cw-insight-set{background:#171
                         <span class="setting-name">Slow provider timeout</span>
                         <span class="setting-copy">Seconds</span>
                       </span>
-                      <input id="pp-settings-timeout" type="number" min="3" max="60" step="1">
+                      <input id="pp-settings-timeout" data-cfg-path="playback_progress.provider_timeout_seconds" type="number" min="3" max="60" step="1">
                     </label>
                   </div>
                 </div>

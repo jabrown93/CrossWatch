@@ -7,7 +7,7 @@ const _cwSecretIds = [
   "plex_home_pin", "simkl_client_id", "simkl_client_secret",
   "trakt_client_id", "trakt_client_secret", "anilist_client_id", "anilist_client_secret",
   "tmdb_api_key", "tmdb_sync_api_key", "tmdb_sync_session_id", "mdblist_key", "publicmetadb_key", "tautulli_key",
-  "kodi_password"
+  "kodi_password", "app_auth_oidc_client_secret", "security_api_key"
 ];
 
 function _cwEl(id) { return document.getElementById(id); }
@@ -34,12 +34,22 @@ async function _cwGetConfigFresh() {
   return _cwReadBody(resp);
 }
 
+/** Warn about fields the server refused because the environment owns them.
+ *  Without this the save reports success and the value reverts on reload. */
+function _cwWarnEnvLocked(result) {
+  const paths = result?.env_locked_ignored;
+  if (!Array.isArray(paths) || !paths.length) return result;
+  const names = paths.map((p) => window.CW?.EnvLock?.envVarFor?.(p) || p).join(", ");
+  try { window.CW?.DOM?.showToast?.(`Not saved, set by environment: ${names}`, false); } catch {}
+  return result;
+}
+
 async function _cwSaveConfig(cfg) {
   const api = _cwApi(), out = cfg || {};
-  if (typeof api?.Config?.save === "function") return api.Config.save(out);
+  if (typeof api?.Config?.save === "function") return _cwWarnEnvLocked(await api.Config.save(out));
   const resp = await _cwRequest("/api/config", { method: "POST", headers: _cwJSONHeaders, body: JSON.stringify(out) });
   if (!resp.ok) throw new Error(`POST /api/config ${resp.status}`);
-  return _cwReadBody(resp);
+  return _cwWarnEnvLocked(await _cwReadBody(resp));
 }
 
 function _cwSetConfigCache(cfg) {
@@ -524,6 +534,63 @@ async function saveSettings() {
       }
     } catch (e) {
       console.warn("saveSettings: trusted proxies merge failed", e);
+    }
+
+    try {
+      const prevOidc = serverCfg?.app_auth?.oidc || {};
+      const oidc = {};
+      let oidcChanged = false;
+      const setOidc = (key, next, prev) => {
+        if (next !== prev) { oidc[key] = next; oidcChanged = true; }
+      };
+
+      const enabledEl = _cwEl("app_auth_oidc_enabled");
+      if (enabledEl) setOidc("enabled", _cwTruthy(enabledEl.value), prevOidc.enabled === true);
+
+      [
+        ["app_auth_oidc_issuer", "issuer"],
+        ["app_auth_oidc_client_id", "client_id"],
+        ["app_auth_oidc_public_base_url", "public_base_url"],
+        ["app_auth_oidc_groups_claim", "groups_claim"],
+      ].forEach(([id, key]) => {
+        if (!_cwEl(id)) return;
+        setOidc(key, _getVal(id), _cwNorm(prevOidc[key]));
+      });
+
+      const groupsEl = _cwEl("app_auth_oidc_allowed_groups");
+      if (groupsEl) {
+        const next = String(groupsEl.value || "").split(",").map(_cwNorm).filter(Boolean);
+        const prev = Array.isArray(prevOidc.allowed_groups) ? prevOidc.allowed_groups.map(_cwNorm).filter(Boolean) : [];
+        if (!_cwSameList(next, prev)) { oidc.allowed_groups = next; oidcChanged = true; }
+      }
+
+      const hoursEl = _cwEl("app_auth_oidc_session_hours");
+      if (hoursEl) {
+        const prevHours = Number.isFinite(prevOidc.session_hours) ? Number(prevOidc.session_hours) : 12;
+        const parsed = parseInt(String(hoursEl.value || ""), 10);
+        // The server clamps too; this only avoids sending an obvious typo.
+        const next = Number.isFinite(parsed) ? Math.max(1, Math.min(168, parsed)) : prevHours;
+        setOidc("session_hours", next, prevHours);
+      }
+
+      const secret = _cwReadSecret("app_auth_oidc_client_secret", _cwNorm(prevOidc.client_secret));
+      if (secret.changed) {
+        _cwApplySecret(oidc, "client_secret", secret, "");
+        oidcChanged = true;
+      }
+      if (oidcChanged) {
+        ensureObj(ensureObj(cfg, "app_auth"), "oidc");
+        Object.assign(cfg.app_auth.oidc, oidc);
+        mark();
+      }
+
+      const apiKey = _cwReadSecret("security_api_key", _cwNorm(serverCfg?.security?.api_key));
+      if (apiKey.changed) {
+        _cwApplySecret(ensureObj(cfg, "security"), "api_key", apiKey, "");
+        mark();
+      }
+    } catch (e) {
+      console.warn("saveSettings: oidc merge failed", e);
     }
 
     const prevMode = serverCfg?.sync?.bidirectional?.mode || "two-way";

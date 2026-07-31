@@ -87,7 +87,7 @@ def register_ui_root(app: FastAPI) -> None:
 
 _HELPER_SCRIPTS = (
     "help-links.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "api.js", "core.js", "details-log.js",
-    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "providers-ui.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
+    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "providers-ui.js", "env-lock.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
     "restart_apply.js",
 )
 _APP_SCRIPTS = (
@@ -773,12 +773,12 @@ def _get_index_html_static() -> str:
               <div id="sched-provider-panel" class="cw-panel hidden"></div>
               <div id="sched-provider-raw" class="hidden">
                 <div class="grid2">
-                  <div><label for="schEnabled">Enable</label><select id="schEnabled" name="schEnabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></div>
-                  <div><label for="schMode">Frequency</label><select id="schMode" name="schMode"><option value="hourly">Every hour</option><option value="every_n_hours">Every N hours</option><option value="daily_time">Daily at...</option><option value="custom_interval">Custom</option></select></div>
-                  <div><label for="schN">Every N hours</label><input id="schN" name="schN" type="number" min="2" value="12"></div>
-                  <div><label for="schTime">Time</label><input id="schTime" name="schTime" type="time" value="03:30"></div>
-                  <div><label for="schCustomValue">Custom interval</label><input id="schCustomValue" name="schCustomValue" type="number" min="15" step="15" value="60"></div>
-                  <div><label for="schCustomUnit">Custom unit</label><select id="schCustomUnit" name="schCustomUnit"><option value="minutes">Minutes</option><option value="hours">Hours</option></select></div>
+                  <div><label for="schEnabled">Enable</label><select id="schEnabled" data-cfg-path="scheduling.enabled" name="schEnabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></div>
+                  <div><label for="schMode">Frequency</label><select id="schMode" data-cfg-path="scheduling.mode" name="schMode"><option value="hourly">Every hour</option><option value="every_n_hours">Every N hours</option><option value="daily_time">Daily at...</option><option value="custom_interval">Custom</option></select></div>
+                  <div><label for="schN">Every N hours</label><input id="schN" data-cfg-path="scheduling.every_n_hours" name="schN" type="number" min="2" value="12"></div>
+                  <div><label for="schTime">Time</label><input id="schTime" data-cfg-path="scheduling.daily_time" name="schTime" type="time" value="03:30"></div>
+                  <div><label for="schCustomValue">Custom interval</label><input id="schCustomValue" data-cfg-path="scheduling.custom_interval_minutes" name="schCustomValue" type="number" min="15" step="15" value="60"></div>
+                  <div><label for="schCustomUnit">Custom unit</label><select id="schCustomUnit" data-cfg-path="scheduling.custom_interval_minutes" name="schCustomUnit"><option value="minutes">Minutes</option><option value="hours">Hours</option></select></div>
                 </div>
                 <div id="sched_advanced_mount"></div>
               </div>
@@ -858,7 +858,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_watchlist_preview">Watchlist widget</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Watchlist widget: Shows or hides the dashboard Watchlist card on the Main screen." aria-label="Watchlist widget setting help">help</button>
                           </div>
-                          <select id="ui_show_watchlist_preview" name="ui_show_watchlist_preview">
+                          <select id="ui_show_watchlist_preview" data-cfg-path="ui.show_watchlist_preview" name="ui_show_watchlist_preview">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -869,7 +869,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_recent_history_widget">Recent history widget</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent history widget: Shows or hides the Main screen media history widget below Watchlist." aria-label="Recent history widget setting help">help</button>
                           </div>
-                          <select id="ui_show_recent_history_widget" name="ui_show_recent_history_widget">
+                          <select id="ui_show_recent_history_widget" data-cfg-path="ui.show_recent_history_widget" name="ui_show_recent_history_widget">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -880,7 +880,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_latest_ratings_widget">Latest ratings widget</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Latest ratings widget: Shows or hides the Main screen latest ratings poster widget below Watchlist." aria-label="Latest ratings widget setting help">help</button>
                           </div>
-                          <select id="ui_show_latest_ratings_widget" name="ui_show_latest_ratings_widget">
+                          <select id="ui_show_latest_ratings_widget" data-cfg-path="ui.show_latest_ratings_widget" name="ui_show_latest_ratings_widget">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -891,7 +891,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_recent_scrobble_widget">Recent Scrobble widget</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Scrobble widget: Shows or hides the Main screen recent scrobble widget below Watchlist." aria-label="Recent Scrobble widget setting help">help</button>
                           </div>
-                          <select id="ui_show_recent_scrobble_widget" name="ui_show_recent_scrobble_widget">
+                          <select id="ui_show_recent_scrobble_widget" data-cfg-path="ui.show_recent_scrobble_widget" name="ui_show_recent_scrobble_widget">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -902,7 +902,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_recent_progress_widget">Recent Progress widget</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Progress widget: Shows or hides the Main screen recent progress sync activity widget." aria-label="Recent Progress widget setting help">help</button>
                           </div>
-                          <select id="ui_show_recent_progress_widget" name="ui_show_recent_progress_widget">
+                          <select id="ui_show_recent_progress_widget" data-cfg-path="ui.show_recent_progress_widget" name="ui_show_recent_progress_widget">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -913,7 +913,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_recent_playlists_widget">Recent Playlists widget</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Playlists widget: Shows or hides the Main screen recent playlist sync activity widget." aria-label="Recent Playlists widget setting help">help</button>
                           </div>
-                          <select id="ui_show_recent_playlists_widget" name="ui_show_recent_playlists_widget">
+                          <select id="ui_show_recent_playlists_widget" data-cfg-path="ui.show_recent_playlists_widget" name="ui_show_recent_playlists_widget">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -935,7 +935,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_playingcard">Playing card</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Playing card: Shows or hides the currently playing card on the Main screen." aria-label="Playing card setting help">help</button>
                           </div>
-                          <select id="ui_show_playingcard" name="ui_show_playingcard">
+                          <select id="ui_show_playingcard" data-cfg-path="ui.show_playingcard" name="ui_show_playingcard">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -946,7 +946,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_recent_activity">Recent Scrobble list</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Scrobble list: Shows or hides the Main screen text list of locally recorded scrobbled movies and episodes." aria-label="Recent Scrobble list setting help">help</button>
                           </div>
-                          <select id="ui_show_recent_activity" name="ui_show_recent_activity">
+                          <select id="ui_show_recent_activity" data-cfg-path="ui.show_recent_activity" name="ui_show_recent_activity">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -957,7 +957,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_recent_activity_display">Recent Scrobble display</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent Scrobble display: Choose a fixed number of rows, or show items from the last 24, 48, or 72 hours with a maximum of 5 rows." aria-label="Recent Scrobble display setting help">help</button>
                           </div>
-                          <select id="ui_recent_activity_display" name="ui_recent_activity_display">
+                          <select id="ui_recent_activity_display" data-cfg-path="ui.recent_activity_display" name="ui_recent_activity_display">
                             <option value="count:3">Last 3 items</option>
                             <option value="count:4">Last 4 items</option>
                             <option value="count:5">Last 5 items</option>
@@ -972,7 +972,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_recent_syncs_display">Recent syncs display</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Recent syncs display: Choose a fixed number of rows, or show runs from the last 24, 48, or 72 hours with a maximum of 5 rows." aria-label="Recent syncs display setting help">help</button>
                           </div>
-                          <select id="ui_recent_syncs_display" name="ui_recent_syncs_display">
+                          <select id="ui_recent_syncs_display" data-cfg-path="ui.recent_syncs_display" name="ui_recent_syncs_display">
                             <option value="count:3">Last 3 items</option>
                             <option value="count:4">Last 4 items</option>
                             <option value="count:5">Last 5 items</option>
@@ -987,7 +987,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_quick_add_desktop">Desktop quick add</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Desktop quick add: Shows or hides the quick-add control on larger screens." aria-label="Desktop quick add setting help">help</button>
                           </div>
-                          <select id="ui_show_quick_add_desktop" name="ui_show_quick_add_desktop">
+                          <select id="ui_show_quick_add_desktop" data-cfg-path="ui.show_quick_add_desktop" name="ui_show_quick_add_desktop">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -998,7 +998,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_show_quick_add_mobile">Mobile quick add</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Mobile quick add: Shows or hides the compact quick-add control on mobile layouts." aria-label="Mobile quick add setting help">help</button>
                           </div>
-                          <select id="ui_show_quick_add_mobile" name="ui_show_quick_add_mobile">
+                          <select id="ui_show_quick_add_mobile" data-cfg-path="ui.show_quick_add_mobile" name="ui_show_quick_add_mobile">
                             <option value="true">Show</option>
                             <option value="false">Hide</option>
                           </select>
@@ -1020,7 +1020,7 @@ def _get_index_html_static() -> str:
                             <label for="ui_theme">Theme</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Theme: Choose Flat dark, Flat light Experimental, or Original to use the classic CrossWatch styling." aria-label="Theme setting help">help</button>
                           </div>
-                          <select id="ui_theme" name="ui_theme">
+                          <select id="ui_theme" data-cfg-path="ui.theme" name="ui_theme">
                             <option value="flat-dark">Flat dark</option>
                             <option value="flat-light">Flat light (Experimental)</option>
                             <option value="original">Original</option>
@@ -1032,7 +1032,7 @@ def _get_index_html_static() -> str:
                             <button type="button" class="cw-field-help material-symbols-rounded" title="UI protocol: HTTP is simplest. HTTPS serves CrossWatch with a self-signed certificate for encrypted browser traffic." aria-label="UI protocol setting help">help</button>
                           </div>
                           <div class="cw-settings-inline-action">
-                            <select id="ui_protocol" name="ui_protocol">
+                            <select id="ui_protocol" data-cfg-path="ui.protocol" name="ui_protocol">
                               <option value="http">HTTP</option>
                               <option value="https">HTTPS (self-signed)</option>
                             </select>
@@ -1064,14 +1064,14 @@ def _get_index_html_static() -> str:
                             <label for="app_auth_username">Username</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Username: The local CrossWatch username used on the login screen." aria-label="Username setting help">help</button>
                           </div>
-                          <input id="app_auth_username" name="app_auth_username" type="text" autocomplete="username" placeholder="admin">
+                          <input id="app_auth_username" data-cfg-path="app_auth.username" name="app_auth_username" type="text" autocomplete="username" placeholder="admin">
                         </div>
                         <div class="cw-auth-password-field">
                           <div class="cw-field-label-row">
                             <label for="app_auth_password">New password</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="New password: Enter a new local CrossWatch password. Leave it blank to keep the current password." aria-label="New password setting help">help</button>
                           </div>
-                          <input id="app_auth_password" name="app_auth_password" type="password" autocomplete="new-password" placeholder="(leave blank to keep)">
+                          <input id="app_auth_password" data-cfg-path="app_auth.password.hash" name="app_auth_password" type="password" autocomplete="new-password" placeholder="(leave blank to keep)">
                           <div class="sub" style="margin-top:0.35rem">Leave blank to keep the current password.</div>
                         </div>
                         <div class="cw-auth-confirm-field">
@@ -1079,7 +1079,7 @@ def _get_index_html_static() -> str:
                             <label for="app_auth_password2">Confirm password</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Confirm password: Repeat the new password exactly so CrossWatch can verify it before saving." aria-label="Confirm password setting help">help</button>
                           </div>
-                          <input id="app_auth_password2" name="app_auth_password2" type="password" autocomplete="new-password" placeholder="(repeat)">
+                          <input id="app_auth_password2" data-cfg-path="app_auth.password.hash" name="app_auth_password2" type="password" autocomplete="new-password" placeholder="(repeat)">
                           <div class="sub" style="margin-top:0.35rem">Repeat the new password exactly before saving.</div>
                         </div>
                         <div class="cw-auth-session-row">
@@ -1088,7 +1088,7 @@ def _get_index_html_static() -> str:
                               <label for="app_auth_remember_enabled">Session caching</label>
                               <button type="button" class="cw-field-help material-symbols-rounded" title="Session caching: Keeps you signed in across browser restarts. Browser session only signs out when the browser session ends." aria-label="Session caching setting help">help</button>
                             </div>
-                            <select id="app_auth_remember_enabled" name="app_auth_remember_enabled">
+                            <select id="app_auth_remember_enabled" data-cfg-path="app_auth.remember_session_enabled" name="app_auth_remember_enabled">
                               <option value="true">Enabled</option>
                               <option value="false">Browser session only</option>
                             </select>
@@ -1099,7 +1099,7 @@ def _get_index_html_static() -> str:
                               <label for="app_auth_remember_days">Session timeout</label>
                               <button type="button" class="cw-field-help material-symbols-rounded" title="Session timeout: Number of days a remembered login remains valid when session caching is enabled." aria-label="Session timeout setting help">help</button>
                             </div>
-                            <input id="app_auth_remember_days" name="app_auth_remember_days" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" autocomplete="off" placeholder="30">
+                            <input id="app_auth_remember_days" data-cfg-path="app_auth.remember_session_days" name="app_auth_remember_days" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" autocomplete="off" placeholder="30">
                             <div id="app_auth_remember_days_error" class="cw-field-inline-error hidden" role="alert"></div>
                             <div class="sub" style="margin-top:0.35rem">Used only when session caching is enabled. Maximum 365 days.</div>
                           </div>
@@ -1114,6 +1114,88 @@ def _get_index_html_static() -> str:
                             <button class="btn primary" type="button" id="btn-app-auth-plex-link" onclick="cwAppAuthPlexLink?.()">Link Plex account</button>
                             <button class="btn" type="button" id="btn-app-auth-plex-unlink" onclick="cwAppAuthPlexUnlink?.()">Unlink</button>
                           </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="cw-settings-block cw-app-card" id="app_auth_oidc_fields">
+                      <div class="cw-app-card-head">
+                        <span class="material-symbols-rounded cw-app-card-icon" aria-hidden="true">key</span>
+                        <div>
+                          <div class="cw-settings-block-title">Single sign-on (OIDC)</div>
+                          <div class="sub">Adds an identity provider such as Authentik to the login screen. The local password stays available as break-glass access.</div>
+                        </div>
+                      </div>
+                      <div class="cw-settings-2col">
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_enabled">Enable OIDC</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Enable OIDC: Offers single sign-on on the login screen once the issuer, client, and public base URL are set." aria-label="Enable OIDC help">help</button>
+                          </div>
+                          <select id="app_auth_oidc_enabled" data-cfg-path="app_auth.oidc.enabled" name="app_auth_oidc_enabled">
+                            <option value="false">Disabled</option>
+                            <option value="true">Enabled</option>
+                          </select>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_issuer">Issuer URL</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Issuer URL: The provider's issuer, used to fetch its discovery document. Must match the issuer in that document exactly, trailing slash included." aria-label="Issuer URL help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_issuer" data-cfg-path="app_auth.oidc.issuer" name="app_auth_oidc_issuer" type="text" placeholder="https://auth.example.com/application/o/crosswatch/">
+                          <div class="sub" style="margin-top:0.35rem">A trailing slash is significant. Copy it exactly as the provider shows it.</div>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_client_id">Client ID</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Client ID: The application identifier issued by the provider." aria-label="Client ID help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_client_id" data-cfg-path="app_auth.oidc.client_id" name="app_auth_oidc_client_id" type="text" autocomplete="off">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_client_secret">Client secret</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Client secret: The application secret issued by the provider. Leave it untouched to keep the stored value." aria-label="Client secret help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_client_secret" data-cfg-path="app_auth.oidc.client_secret" name="app_auth_oidc_client_secret" type="password" autocomplete="new-password">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_public_base_url">Public base URL</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Public base URL: The external address of this CrossWatch instance. The redirect URI registered with the provider is this URL plus /api/app-auth/oidc/callback." aria-label="Public base URL help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_public_base_url" data-cfg-path="app_auth.oidc.public_base_url" name="app_auth_oidc_public_base_url" type="text" placeholder="https://crosswatch.example.com">
+                          <div class="sub" style="margin-top:0.35rem">Register <code>&lt;this URL&gt;/api/app-auth/oidc/callback</code> as the redirect URI.</div>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_groups_claim">Groups claim</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Groups claim: The ID token claim that carries the user's group memberships." aria-label="Groups claim help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_groups_claim" data-cfg-path="app_auth.oidc.groups_claim" name="app_auth_oidc_groups_claim" type="text" placeholder="groups">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_allowed_groups">Allowed groups</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Allowed groups: Only accounts in one of these groups may sign in. Leaving it empty denies every OIDC login." aria-label="Allowed groups help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_allowed_groups" data-cfg-path="app_auth.oidc.allowed_groups" name="app_auth_oidc_allowed_groups" type="text" placeholder="crosswatch-admins, crosswatch-users">
+                          <div class="sub" style="margin-top:0.35rem">Comma-separated. Leaving this empty denies every OIDC login.</div>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_session_hours">Session length (hours)</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Session length: How long a session minted by an OIDC login stays valid, between 1 and 168 hours." aria-label="Session length help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_session_hours" data-cfg-path="app_auth.oidc.session_hours" name="app_auth_oidc_session_hours" type="number" min="1" max="168" step="1" placeholder="12">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="security_api_key">API key</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="API key: A static key accepted in the X-API-Key header for machine access. Leave it blank to disable machine access." aria-label="API key help">help</button>
+                          </div>
+                          <input id="security_api_key" data-cfg-path="security.api_key" name="security_api_key" type="password" autocomplete="new-password">
+                          <div class="sub" style="margin-top:0.35rem">Sent as <code>X-API-Key</code>. Blank disables key access.</div>
                         </div>
                       </div>
                     </div>
@@ -1153,7 +1235,7 @@ def _get_index_html_static() -> str:
                             <label for="trusted_proxies">Trusted reverse proxies (optional)</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Trusted reverse proxies: Enter proxy IPs or CIDR ranges so CrossWatch can read the real client IP for login rate limiting." aria-label="Trusted reverse proxies setting help">help</button>
                           </div>
-                          <input id="trusted_proxies" name="trusted_proxies" type="text" placeholder="127.0.0.1;192.168.2.1;192.168.2.0/16">
+                          <input id="trusted_proxies" data-cfg-path="security.trusted_proxies" name="trusted_proxies" type="text" placeholder="127.0.0.1;192.168.2.1;192.168.2.0/16">
                           <div class="sub" style="margin-top:0.35rem">
                             Only needed when behind a reverse proxy and you want accurate IP-based login rate limiting.
                             Enter proxy IPs or CIDR ranges separated by <code>;</code>
@@ -1181,7 +1263,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_enabled">Enabled</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Enabled: Turns the local tracker snapshot system on or off." aria-label="Local Tracker enabled setting help">help</button>
                           </div>
-                          <select id="cw_enabled" name="cw_enabled">
+                          <select id="cw_enabled" data-cfg-path="crosswatch.enabled" name="cw_enabled">
                             <option value="true">Enabled</option>
                             <option value="false">Disabled</option>
                           </select>
@@ -1192,7 +1274,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_retention_days">Retention (days)</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Retention days: How long snapshot files are kept before cleanup. Set 0 to keep snapshots forever." aria-label="Retention days setting help">help</button>
                           </div>
-                          <input id="cw_retention_days" name="cw_retention_days" type="number" min="0" step="1" placeholder="30">
+                          <input id="cw_retention_days" data-cfg-path="crosswatch.retention_days" name="cw_retention_days" type="number" min="0" step="1" placeholder="30">
                           <div class="sub" style="margin-top:0.35rem">0 = keep snapshots forever.</div>
                         </div>
 
@@ -1201,7 +1283,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_auto_snapshot">Auto snapshot</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Auto snapshot: Saves a tracker snapshot before CrossWatch writes provider changes, giving you a local restore point." aria-label="Auto snapshot setting help">help</button>
                           </div>
-                          <select id="cw_auto_snapshot" name="cw_auto_snapshot">
+                          <select id="cw_auto_snapshot" data-cfg-path="crosswatch.auto_snapshot" name="cw_auto_snapshot">
                             <option value="true">On (before writes)</option>
                             <option value="false">Off</option>
                           </select>
@@ -1212,7 +1294,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_max_snapshots">Max snapshots per feature</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Max snapshots per feature: Limits how many Watchlist, Ratings, and History snapshots are kept. Set 0 for unlimited." aria-label="Max snapshots per feature setting help">help</button>
                           </div>
-                          <input id="cw_max_snapshots" name="cw_max_snapshots" type="number" min="0" step="1" placeholder="64">
+                          <input id="cw_max_snapshots" data-cfg-path="crosswatch.max_snapshots" name="cw_max_snapshots" type="number" min="0" step="1" placeholder="64">
                           <div class="sub" style="margin-top:0.35rem">0 = unlimited.</div>
                         </div>
                       </div>
@@ -1232,7 +1314,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_restore_watchlist">Watchlist snapshot</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Watchlist snapshot: Select which local watchlist snapshot should be used for restore or tracker-backed reads." aria-label="Watchlist snapshot setting help">help</button>
                           </div>
-                          <select id="cw_restore_watchlist" name="cw_restore_watchlist"></select>
+                          <select id="cw_restore_watchlist" data-cfg-path="crosswatch.restore_watchlist" name="cw_restore_watchlist"></select>
                         </div>
 
                         <div>
@@ -1240,7 +1322,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_restore_history">History snapshot</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="History snapshot: Select which local history snapshot should be used for restore or tracker-backed reads." aria-label="History snapshot setting help">help</button>
                           </div>
-                          <select id="cw_restore_history" name="cw_restore_history"></select>
+                          <select id="cw_restore_history" data-cfg-path="crosswatch.restore_history" name="cw_restore_history"></select>
                         </div>
 
                         <div>
@@ -1248,7 +1330,7 @@ def _get_index_html_static() -> str:
                             <label for="cw_restore_ratings">Ratings snapshot</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Ratings snapshot: Select which local ratings snapshot should be used for restore or tracker-backed reads." aria-label="Ratings snapshot setting help">help</button>
                           </div>
-                          <select id="cw_restore_ratings" name="cw_restore_ratings"></select>
+                          <select id="cw_restore_ratings" data-cfg-path="crosswatch.restore_ratings" name="cw_restore_ratings"></select>
                         </div>
                       </div>
                       <div class="sub" style="margin-top:0.75rem">
@@ -1286,7 +1368,7 @@ def _get_index_html_static() -> str:
                   </div>
                   <div class="cw-maint-debug-field">
                     <label for="debug">Level</label>
-                    <select id="debug" name="debug">
+                    <select id="debug" data-cfg-path="runtime.debug" name="debug">
                       <option value="off">off</option>
                       <option value="on">on</option>
                       <option value="mods">on - including MOD debug - best option for debug</option>

@@ -2589,3 +2589,8 @@ html[data-cw-theme=flat-light] .cw-page-hero :is(.pp-hero-summary,.wl-hero-summa
 html[data-cw-theme=flat-light] .cw-page-hero :is(.pp-hero-summary,.wl-hero-summary,.ss-hero-summary,.cw-editor-hero-summary)>*{border-color:rgba(78,96,180,.18)!important;color:#172033!important;-webkit-text-fill-color:currentColor!important}
 html[data-cw-theme=flat-light] .cw-page-hero :is(.pp-hero-summary,.wl-hero-summary,.ss-hero-summary,.cw-editor-hero-summary)>:is(button,.pp-btn,.wl-refresh-btn,.ss-hero-refresh,.cw-editor-refresh):hover{background:rgba(17,24,39,.045)!important;background-image:none!important}
 @media(max-width:760px){.cw-page-hero{grid-template-columns:1fr;min-height:0;padding:22px!important}.cw-page-hero::after{right:12px;font-size:112px;opacity:.72}.cw-page-hero-title{font-size:28px!important}.cw-page-hero-actions{justify-content:flex-start!important}}
+
+/* Fields owned by an environment variable: disabled, with the owning var named. */
+.cw-env-locked{opacity:.55;cursor:not-allowed;filter:saturate(.7)}
+.cw-env-chip{display:inline-block;margin:4px 0 0 8px;padding:3px 7px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.02em;background:#0b0b16aa;border:1px solid #ffffff2b;color:#cfd6ff;cursor:help;vertical-align:middle}
+html[data-cw-theme=flat-light] .cw-env-chip{background:rgba(17,24,39,.06);border-color:rgba(78,96,180,.28);color:#3b4668}
