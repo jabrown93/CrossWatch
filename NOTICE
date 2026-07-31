@@ -1,0 +1,34 @@
+CrossWatch
+Copyright (c) Cenodude
+https://github.com/cenodude/CrossWatch
+
+Licensed under the CrossWatch Source Available License, Version 1.0.
+The complete license text ships alongside this file as LICENSE.
+
+MODIFICATIONS
+=============
+
+This is an UNOFFICIAL, MODIFIED distribution maintained by Jared Brown at
+https://github.com/jabrown93/CrossWatch. It is not approved, sponsored,
+maintained, or endorsed by the Copyright Holder.
+
+Material changes relative to upstream cenodude/CrossWatch:
+
+- Security hardening: secrets redacted from config output and logs; outbound
+  provider requests guarded against SSRF on every redirect hop (which also
+  covers Jellyfin Quick Connect); unrecognized webhook profile tokens rejected
+  with a logged 401 instead of a silent 200.
+- Bug fixes: ID-mapping corrections (IMDb preferred over TMDb in match
+  priority; Jellyfin `ProviderIds` mapped).
+- CI and automation: pytest suite in GitHub Actions, automated container image
+  and GitHub Release publishing, semantic-release versioning, Renovate with
+  SHA-pinned actions.
+- Container: built on the shell-less, nonroot Docker Hardened Image Python
+  runtime rather than `python:slim`; the dynamic PUID/PGID bash entrypoint has
+  been removed.
+- Android companion app removed (dropped upstream in v0.10.3); leftover paired
+  device tokens are purged on the next credential rotation.
+
+The container images published at ghcr.io/jabrown93/crosswatch are distributed
+free of charge under Sections 3 and 5 of the License. No fee of any kind is
+charged for access to or use of the Software.
