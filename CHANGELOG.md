@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/jabrown93/CrossWatch/compare/v1.2.0...v1.2.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **license:** ship modification notice and fork labels in the image ([#73](https://github.com/jabrown93/CrossWatch/issues/73)) ([a09b062](https://github.com/jabrown93/CrossWatch/commit/a09b06291955c4ed825d6501c1ff858091ac3d1f))
+
 # [1.2.0](https://github.com/jabrown93/CrossWatch/compare/v1.1.6...v1.2.0) (2026-07-28)
 
 
