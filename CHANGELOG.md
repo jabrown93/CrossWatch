@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/jabrown93/CrossWatch/compare/v1.2.1...v1.3.0) (2026-07-31)
+
+
+### Features
+
+* **config:** accept environment variables for OIDC and any config path ([#74](https://github.com/jabrown93/CrossWatch/issues/74)) ([72a4428](https://github.com/jabrown93/CrossWatch/commit/72a4428c884f9c8eebf1d7e100f467a8aefa2a11))
+
 ## [1.2.1](https://github.com/jabrown93/CrossWatch/compare/v1.2.0...v1.2.1) (2026-07-31)
 
 
