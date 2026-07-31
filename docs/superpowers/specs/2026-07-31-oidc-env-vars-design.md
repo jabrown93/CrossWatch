@@ -297,6 +297,15 @@ empty value is a deny rather than a default.
   listed in `tests/data/env_lock_exclusions.txt`. Fails when a new config field ships without an
   annotation or an explicit exclusion.
 
+**`tests/test_env_lock_js.py`** — runs `env-lock.js` under node against a stub DOM: locked
+fields disable and get the right variable name, unlocked fields are untouched, and a provider
+path resolves under the selected instance. A wrong resolution here fails open, so it needs
+direct coverage rather than inference from the markup.
+
+**`tests/test_oidc_settings_ui.py`** — every OIDC field renders, is annotated, is collected on
+save, and is hydrated on load; secrets are password inputs; the empty-allowed-groups denial is
+stated in the UI.
+
 **`tests/test_oidc_config.py`** — extended for the comma-split `allowed_groups` case.
 
 Existing suite must stay green; note the 6 pre-existing failures on `main` are unrelated.
