@@ -1477,6 +1477,40 @@ async function loadConfig() {
     const aaP2 = document.getElementById("app_auth_password2");
     if (aaP2) aaP2.value = "";
 
+    {
+      const oidc = aa.oidc || {};
+      const setText = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.value = value;
+      };
+      _setSelectValue("app_auth_oidc_enabled", oidc.enabled === true ? "true" : "false");
+      setText("app_auth_oidc_issuer", typeof oidc.issuer === "string" ? oidc.issuer : "");
+      setText("app_auth_oidc_client_id", typeof oidc.client_id === "string" ? oidc.client_id : "");
+      setText("app_auth_oidc_public_base_url", typeof oidc.public_base_url === "string" ? oidc.public_base_url : "");
+      setText("app_auth_oidc_groups_claim", typeof oidc.groups_claim === "string" ? oidc.groups_claim : "");
+      setText(
+        "app_auth_oidc_allowed_groups",
+        Array.isArray(oidc.allowed_groups) ? oidc.allowed_groups.join(", ") : ""
+      );
+      setText(
+        "app_auth_oidc_session_hours",
+        String(Number.isFinite(oidc.session_hours) ? oidc.session_hours : 12)
+      );
+
+      // Secrets arrive redacted; keep them masked so an untouched field is
+      // never written back as the redaction placeholder.
+      const shared = window.CW?.AuthShared;
+      [
+        ["app_auth_oidc_client_secret", oidc.client_secret],
+        ["security_api_key", cfg.security?.api_key],
+      ].forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        shared?.maskSecret?.(el, !!String(value || "").trim());
+        shared?.wireSecretInput?.(el);
+      });
+    }
+
     // Trusted reverse proxies (optional)
     const tpEl = _cwTrustedProxiesEl();
     if (tpEl) {

@@ -1118,6 +1118,88 @@ def _get_index_html_static() -> str:
                       </div>
                     </div>
 
+                    <div class="cw-settings-block cw-app-card" id="app_auth_oidc_fields">
+                      <div class="cw-app-card-head">
+                        <span class="material-symbols-rounded cw-app-card-icon" aria-hidden="true">key</span>
+                        <div>
+                          <div class="cw-settings-block-title">Single sign-on (OIDC)</div>
+                          <div class="sub">Adds an identity provider such as Authentik to the login screen. The local password stays available as break-glass access.</div>
+                        </div>
+                      </div>
+                      <div class="cw-settings-2col">
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_enabled">Enable OIDC</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Enable OIDC: Offers single sign-on on the login screen once the issuer, client, and public base URL are set." aria-label="Enable OIDC help">help</button>
+                          </div>
+                          <select id="app_auth_oidc_enabled" data-cfg-path="app_auth.oidc.enabled" name="app_auth_oidc_enabled">
+                            <option value="false">Disabled</option>
+                            <option value="true">Enabled</option>
+                          </select>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_issuer">Issuer URL</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Issuer URL: The provider's issuer, used to fetch its discovery document. Must match the issuer in that document exactly, trailing slash included." aria-label="Issuer URL help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_issuer" data-cfg-path="app_auth.oidc.issuer" name="app_auth_oidc_issuer" type="text" placeholder="https://auth.example.com/application/o/crosswatch/">
+                          <div class="sub" style="margin-top:0.35rem">A trailing slash is significant. Copy it exactly as the provider shows it.</div>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_client_id">Client ID</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Client ID: The application identifier issued by the provider." aria-label="Client ID help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_client_id" data-cfg-path="app_auth.oidc.client_id" name="app_auth_oidc_client_id" type="text" autocomplete="off">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_client_secret">Client secret</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Client secret: The application secret issued by the provider. Leave it untouched to keep the stored value." aria-label="Client secret help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_client_secret" data-cfg-path="app_auth.oidc.client_secret" name="app_auth_oidc_client_secret" type="password" autocomplete="new-password">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_public_base_url">Public base URL</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Public base URL: The external address of this CrossWatch instance. The redirect URI registered with the provider is this URL plus /api/app-auth/oidc/callback." aria-label="Public base URL help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_public_base_url" data-cfg-path="app_auth.oidc.public_base_url" name="app_auth_oidc_public_base_url" type="text" placeholder="https://crosswatch.example.com">
+                          <div class="sub" style="margin-top:0.35rem">Register <code>&lt;this URL&gt;/api/app-auth/oidc/callback</code> as the redirect URI.</div>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_groups_claim">Groups claim</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Groups claim: The ID token claim that carries the user's group memberships." aria-label="Groups claim help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_groups_claim" data-cfg-path="app_auth.oidc.groups_claim" name="app_auth_oidc_groups_claim" type="text" placeholder="groups">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_allowed_groups">Allowed groups</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Allowed groups: Only accounts in one of these groups may sign in. Leaving it empty denies every OIDC login." aria-label="Allowed groups help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_allowed_groups" data-cfg-path="app_auth.oidc.allowed_groups" name="app_auth_oidc_allowed_groups" type="text" placeholder="crosswatch-admins, crosswatch-users">
+                          <div class="sub" style="margin-top:0.35rem">Comma-separated. Leaving this empty denies every OIDC login.</div>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="app_auth_oidc_session_hours">Session length (hours)</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Session length: How long a session minted by an OIDC login stays valid, between 1 and 168 hours." aria-label="Session length help">help</button>
+                          </div>
+                          <input id="app_auth_oidc_session_hours" data-cfg-path="app_auth.oidc.session_hours" name="app_auth_oidc_session_hours" type="number" min="1" max="168" step="1" placeholder="12">
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row">
+                            <label for="security_api_key">API key</label>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="API key: A static key accepted in the X-API-Key header for machine access. Leave it blank to disable machine access." aria-label="API key help">help</button>
+                          </div>
+                          <input id="security_api_key" data-cfg-path="security.api_key" name="security_api_key" type="password" autocomplete="new-password">
+                          <div class="sub" style="margin-top:0.35rem">Sent as <code>X-API-Key</code>. Blank disables key access.</div>
+                        </div>
+                      </div>
+                    </div>
+
                     <div class="cw-settings-block cw-app-card">
                       <div class="cw-app-card-head">
                         <span class="material-symbols-rounded cw-app-card-icon" aria-hidden="true">admin_panel_settings</span>

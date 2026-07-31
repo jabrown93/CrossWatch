@@ -137,6 +137,54 @@ volumes:
 > The container exposes the web UI at:\
 > http://localhost:8787
 
+### Configuration from the environment
+
+Any setting can be supplied as an environment variable instead of being typed into the UI.
+Environment values win over `config.json` and are **never written to it**, so a secret from a
+Docker secret or Kubernetes Secret stays out of the config volume. Unset the variable and the
+field reverts to whatever the file held.
+
+Fields owned by the environment are shown disabled in the UI, labelled with the variable that
+owns them; a save that tried to change one reports which fields it discarded.
+
+Single sign-on and machine access have short names:
+
+| Variable | Setting |
+| --- | --- |
+| `CW_OIDC_ENABLED` | Offer OIDC login (`true` / `false`) |
+| `CW_OIDC_ISSUER` | Issuer URL — trailing slash is significant |
+| `CW_OIDC_CLIENT_ID` | Client ID |
+| `CW_OIDC_CLIENT_SECRET` | Client secret |
+| `CW_OIDC_PUBLIC_BASE_URL` | External base URL of this instance |
+| `CW_OIDC_GROUPS_CLAIM` | ID token claim holding group membership (default `groups`) |
+| `CW_OIDC_ALLOWED_GROUPS` | Groups allowed to sign in — **empty denies every OIDC login** |
+| `CW_OIDC_SESSION_HOURS` | Lifetime of an OIDC session, 1–168 |
+| `CW_API_KEY` | Static key accepted in the `X-API-Key` header |
+
+Every other setting uses `CW_CFG__` followed by the config path, with `__` between each part:
+
+```yaml
+environment:
+  CW_OIDC_ENABLED: "true"
+  CW_OIDC_ISSUER: "https://auth.example.com/application/o/crosswatch/"
+  CW_OIDC_CLIENT_ID: "crosswatch"
+  CW_OIDC_CLIENT_SECRET: "${CROSSWATCH_OIDC_SECRET}"
+  CW_OIDC_PUBLIC_BASE_URL: "https://crosswatch.example.com"
+  CW_OIDC_ALLOWED_GROUPS: "crosswatch-admins,crosswatch-users"
+  # Any other path:
+  CW_CFG__plex__server_url: "http://plex:32400"
+  CW_CFG__runtime__debug: "true"
+```
+
+Values are read as JSON when they parse as JSON and as plain text otherwise, so `true` is a
+boolean, `12` a number, and `["a","b"]` a list, while a URL is just a string. `CW_OIDC_ALLOWED_GROUPS`
+also accepts a comma-separated list. Setting a variable to an empty string sets the field to
+empty — to hand a field back to `config.json`, remove the variable.
+
+Two limits follow from the `__` path form: list entries cannot be addressed, so sync pairs and
+scrobbler routes are not configurable this way, and keys beginning with an underscore are out of
+reach. Values are read at startup, so changes need a restart.
+
 ## Sponsors
 
 <div align="center">

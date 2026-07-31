@@ -118,8 +118,11 @@ A module-level flag guards the log, since `load_config()` runs on nearly every r
 
 ### 3. Write path — `config_base.save_config`
 
-After the `_normalize_*` calls and before `_encrypt_secret_tree_stable`, every env-managed path
-is reverted in the write payload:
+Every env-managed path is reverted in the write payload, on the tree returned by
+`_encrypt_secret_tree_stable` rather than on `data`. `save_config` only shallow-copies its
+argument, so reverting on `data` reaches into nested dicts the caller still holds — and
+`load_config` calls `save_config` on first run, which would delete the value it had just applied.
+The encrypted tree is freshly built, and `prev_raw`'s values are already in on-disk form:
 
 - If the path exists in `prev_raw` (the on-disk JSON, already read by `save_config`), restore
   that value verbatim.
@@ -127,10 +130,6 @@ is reverted in the write payload:
 
 A new `_delete_nested_value(dst, path)` helper is needed; it prunes only the leaf, leaving
 parent dicts in place.
-
-Restoring an encrypted `enc:v1:` string verbatim is safe: `_encrypt_secret_tree_stable` will try
-`_decrypt_secret(prev) == obj`, fail the comparison, and call `_encrypt_secret(obj)` — which
-short-circuits on the `_ENC_PREFIX` and returns the string unchanged. No double encryption.
 
 Net effect: `config.json` is byte-identical at env-managed paths across saves, and unsetting the
 env var reverts the field to whatever the file said all along.

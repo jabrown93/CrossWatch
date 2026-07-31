@@ -1,0 +1,33 @@
+# Form elements in the env-lock scan set that are deliberately not config-bound.
+# A new field must either carry data-cfg-path or be listed here with a reason,
+# so an unlockable setting cannot ship by accident.
+#
+# Format: <file>:<element id>
+
+# Sync pair pickers, not settings.
+ui_frontend.py:source-provider
+ui_frontend.py:target-provider
+
+# Filter and search controls over already-loaded data.
+assets/js/playback_progress.js:pp-search
+assets/js/playback_progress.js:pp-provider
+assets/js/playback_progress.js:pp-type
+assets/js/playback_progress.js:pp-progress
+assets/js/playback_progress.js:pp-progress-range
+assets/js/playback_progress.js:pp-progress-value
+assets/js/playback_progress.js:pp-age
+assets/js/playback_progress.js:pp-rating
+assets/js/playback_progress.js:pp-sort
+# Hidden per-row carrier for provider/instance attributes.
+assets/js/playback_progress.js:(no id)
+
+# Login credentials posted to a connect endpoint; never stored in config.
+providers/auth/_auth_EMBY.py:emby_pass
+providers/auth/_auth_JELLYFIN.py:jfy_pass
+
+# Transient codes for device/PIN authorization flows.
+providers/auth/_auth_PLEX.py:plex_pin
+providers/auth/_auth_SIMKL.py:simkl_pin_code
+providers/auth/_auth_TRAKT.py:trakt_pin
+providers/auth/_auth_MDBLIST.py:mdblist_device_code
+providers/auth/_auth_NUVIO.py:nuvio_code_input
