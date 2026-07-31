@@ -455,7 +455,7 @@ def html() -> str:
                 <span id="simkl-countdown" style="min-width:60px;"></span>
               </div>
             </div>
-            <input id="simkl_auth_method" name="simkl_auth_method" type="hidden" value="pin">
+            <input id="simkl_auth_method" data-cfg-path="simkl.auth_method" data-cfg-instance-root="simkl" name="simkl_auth_method" type="hidden" value="pin">
 
             <div id="simkl_pin_panel" class="smk-pane" data-method="pin">
               <input id="simkl_pin_code" type="hidden">
@@ -478,11 +478,11 @@ def html() -> str:
               <div class="grid2">
                 <div>
                   <label for="simkl_client_id">Client ID</label>
-                  <input id="simkl_client_id" name="simkl_client_id" placeholder="Your SIMKL client id">
+                  <input id="simkl_client_id" data-cfg-path="simkl.client_id" data-cfg-instance-root="simkl" name="simkl_client_id" placeholder="Your SIMKL client id">
                 </div>
                 <div>
                   <label for="simkl_client_secret">Client Secret</label>
-                  <input id="simkl_client_secret" name="simkl_client_secret" placeholder="Your SIMKL client secret" type="password">
+                  <input id="simkl_client_secret" data-cfg-path="simkl.client_secret" data-cfg-instance-root="simkl" name="simkl_client_secret" placeholder="Your SIMKL client secret" type="password">
                 </div>
               </div>
 

@@ -224,17 +224,17 @@ def html() -> str:
             <div class="grid2">
               <div>
                 <label for="tautulli_server">Server URL</label>
-                <input id="tautulli_server" name="tautulli_server" type="text" placeholder="http://localhost:8181" />
+                <input id="tautulli_server" data-cfg-path="tautulli.server_url" data-cfg-instance-root="tautulli" name="tautulli_server" type="text" placeholder="http://localhost:8181" />
               </div>
               <div>
                 <label for="tautulli_key">API Key</label>
-                <input id="tautulli_key" name="tautulli_key" type="password" placeholder="********" />
+                <input id="tautulli_key" data-cfg-path="tautulli.api_key" data-cfg-instance-root="tautulli" name="tautulli_key" type="password" placeholder="********" />
               </div>
             </div>
 
             <div style="margin-top:10px;max-width:240px">
               <label for="tautulli_user_id">User ID (optional)<span class="cw-help" title="If this is empty, CrossWatch imports history for all Tautulli users. Normally you only want one user ID.">?</span></label>
-              <input id="tautulli_user_id" name="tautulli_user_id" type="text" placeholder="1" />
+              <input id="tautulli_user_id" data-cfg-path="tautulli.history.user_id" data-cfg-instance-root="tautulli" name="tautulli_user_id" type="text" placeholder="1" />
             </div>
 
             <div id="tautulli_hint" class="msg warn" style="margin-top:10px">

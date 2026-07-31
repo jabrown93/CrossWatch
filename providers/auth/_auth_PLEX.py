@@ -345,10 +345,10 @@ def html() -> str:
             <div style="max-width:820px">
               <label for="plex_server_url">Server URL</label>
               <div class="fieldline">
-                <input id="plex_server_url" name="plex_server_url" placeholder="http://host:32400" list="plex_server_suggestions">
+                <input id="plex_server_url" data-cfg-path="plex.server_url" data-cfg-instance-root="plex" name="plex_server_url" placeholder="http://host:32400" list="plex_server_suggestions">
                 <datalist id="plex_server_suggestions"></datalist>
                 <label class="sslopt" title="Verify server TLS certificate">
-                  <input type="checkbox" id="plex_verify_ssl">
+                  <input type="checkbox" id="plex_verify_ssl" data-cfg-path="plex.verify_ssl" data-cfg-instance-root="plex">
                   <span class="lbl">Verify SSL</span>
                 </label>
               </div>
@@ -356,15 +356,15 @@ def html() -> str:
 
               <label for="plex_username" style="margin-top:10px">Username</label>
               <div class="fieldline userpick">
-                <input id="plex_username" name="plex_username" placeholder="Plex Home profile">
+                <input id="plex_username" data-cfg-path="plex.username" data-cfg-instance-root="plex" name="plex_username" placeholder="Plex Home profile">
                 <button class="cw-userpick-icon material-symbols-rounded" id="plex_user_pick_btn" type="button" title="Choose from server users" aria-label="Choose from server users">person_search</button>
               </div>
 
               <label for="plex_account_id" style="margin-top:10px">Account_ID</label>
-              <input id="plex_account_id" name="plex_account_id" type="number" min="1" placeholder="e.g. 1">
+              <input id="plex_account_id" data-cfg-path="plex.account_id" data-cfg-instance-root="plex" name="plex_account_id" type="number" min="1" placeholder="e.g. 1">
 
               <label for="plex_home_pin" style="margin-top:10px">Home PIN (optional)</label>
-              <input id="plex_home_pin" name="plex_home_pin" type="password" inputmode="numeric" autocomplete="new-password" placeholder="4 digits">
+              <input id="plex_home_pin" data-cfg-path="plex.home_pin" data-cfg-instance-root="plex" name="plex_home_pin" type="password" inputmode="numeric" autocomplete="new-password" placeholder="4 digits">
               <div class="sub">Only needed if the selected Plex Home user is PIN-protected.</div>
 
               <div class="plex-btnrow">
@@ -377,10 +377,10 @@ def html() -> str:
           <div class="cw-subpanel" data-sub="whitelist">
             <div style="max-width:980px">
               <div id="plex_lib_matrix"></div>
-              <select id="plex_lib_history" class="lm-hidden" multiple></select>
-              <select id="plex_lib_ratings" class="lm-hidden" multiple></select>
-              <select id="plex_lib_progress" class="lm-hidden" multiple></select>
-              <select id="plex_lib_scrobble" class="lm-hidden" multiple></select>
+              <select id="plex_lib_history" data-cfg-path="plex.history.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
+              <select id="plex_lib_ratings" data-cfg-path="plex.ratings.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
+              <select id="plex_lib_progress" data-cfg-path="plex.progress.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
+              <select id="plex_lib_scrobble" data-cfg-path="plex.scrobble.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
             </div>
           </div>
         </div>

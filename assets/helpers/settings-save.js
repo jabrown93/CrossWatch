@@ -34,12 +34,22 @@ async function _cwGetConfigFresh() {
   return _cwReadBody(resp);
 }
 
+/** Warn about fields the server refused because the environment owns them.
+ *  Without this the save reports success and the value reverts on reload. */
+function _cwWarnEnvLocked(result) {
+  const paths = result?.env_locked_ignored;
+  if (!Array.isArray(paths) || !paths.length) return result;
+  const names = paths.map((p) => window.CW?.EnvLock?.envVarFor?.(p) || p).join(", ");
+  try { window.CW?.DOM?.showToast?.(`Not saved, set by environment: ${names}`, false); } catch {}
+  return result;
+}
+
 async function _cwSaveConfig(cfg) {
   const api = _cwApi(), out = cfg || {};
-  if (typeof api?.Config?.save === "function") return api.Config.save(out);
+  if (typeof api?.Config?.save === "function") return _cwWarnEnvLocked(await api.Config.save(out));
   const resp = await _cwRequest("/api/config", { method: "POST", headers: _cwJSONHeaders, body: JSON.stringify(out) });
   if (!resp.ok) throw new Error(`POST /api/config ${resp.status}`);
-  return _cwReadBody(resp);
+  return _cwWarnEnvLocked(await _cwReadBody(resp));
 }
 
 function _cwSetConfigCache(cfg) {

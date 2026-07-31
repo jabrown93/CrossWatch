@@ -271,7 +271,7 @@ export default {
             <div class="grid2">
               <div class="field">
                 <label for="tls-mode">Mode</label>
-                <select id="tls-mode">
+                <select id="tls-mode" data-cfg-path="ui.tls.self_signed">
                   <option value="self">Self-signed (generated)</option>
                   <option value="custom">Custom cert/key paths</option>
                 </select>
@@ -280,33 +280,33 @@ export default {
 
               <div class="field">
                 <label for="tls-hostname">Hostname (CN)</label>
-                <input id="tls-hostname" type="text" value="localhost" />
+                <input id="tls-hostname" data-cfg-path="ui.tls.hostname" type="text" value="localhost" />
                 <div class="hint">Used for the self-signed certificate CN and included in SAN.</div>
               </div>
 
               <div class="field">
                 <label for="tls-days">Valid days</label>
-                <input id="tls-days" type="number" min="1" max="3650" value="825" />
+                <input id="tls-days" data-cfg-path="ui.tls.valid_days" type="number" min="1" max="3650" value="825" />
               </div>
 
               <div class="field">
                 <label for="tls-altdns">Additional DNS names (comma separated)</label>
-                <input id="tls-altdns" type="text" placeholder="mybox.local, crosswatch.local" />
+                <input id="tls-altdns" data-cfg-path="ui.tls.alt_dns" type="text" placeholder="mybox.local, crosswatch.local" />
               </div>
 
               <div class="field">
                 <label for="tls-altips">Additional IPs (comma separated)</label>
-                <input id="tls-altips" type="text" placeholder="192.168.1.10" />
+                <input id="tls-altips" data-cfg-path="ui.tls.alt_ips" type="text" placeholder="192.168.1.10" />
               </div>
 
               <div class="field">
                 <label for="tls-certfile">Cert file path</label>
-                <input id="tls-certfile" type="text" placeholder="/config/tls/crosswatch.crt" />
+                <input id="tls-certfile" data-cfg-path="ui.tls.cert_file" type="text" placeholder="/config/tls/crosswatch.crt" />
               </div>
 
               <div class="field">
                 <label for="tls-keyfile">Key file path</label>
-                <input id="tls-keyfile" type="text" placeholder="/config/tls/crosswatch.key" />
+                <input id="tls-keyfile" data-cfg-path="ui.tls.key_file" type="text" placeholder="/config/tls/crosswatch.key" />
               </div>
             </div>
 

@@ -404,8 +404,8 @@ def html() -> str:
               <div style="grid-column:1 / -1">
                 <label for="jfy_server">Server URL</label>
                 <div class="inp-row">
-                  <input id="jfy_server" name="jfy_server" class="grow" placeholder="http://host:8096/">
-                  <label class="verify"><input id="jfy_verify_ssl" type="checkbox"> Verify SSL</label>
+                  <input id="jfy_server" data-cfg-path="jellyfin.server" data-cfg-instance-root="jellyfin" name="jfy_server" class="grow" placeholder="http://host:8096/">
+                  <label class="verify"><input id="jfy_verify_ssl" data-cfg-path="jellyfin.verify_ssl" data-cfg-instance-root="jellyfin" type="checkbox"> Verify SSL</label>
                 </div>
               </div>
             </div>
@@ -440,7 +440,7 @@ def html() -> str:
               <div class="grid2" style="margin-top:4px">
                 <div>
                   <label for="jfy_user">Username</label>
-                  <input id="jfy_user" name="jfy_user" placeholder="username" autocomplete="username">
+                  <input id="jfy_user" data-cfg-path="jellyfin.username" data-cfg-instance-root="jellyfin" name="jfy_user" placeholder="username" autocomplete="username">
                 </div>
                 <div>
                   <label for="jfy_pass">Password</label>
@@ -468,17 +468,17 @@ def html() -> str:
             <div style="max-width:820px">
               <label for="jfy_server_url">Server URL</label>
               <div class="inp-row">
-                <input id="jfy_server_url" name="jfy_server_url" class="grow" placeholder="http://host:8096/">
-                <label class="verify"><input id="jfy_verify_ssl_dup" type="checkbox"> Verify SSL</label>
+                <input id="jfy_server_url" data-cfg-path="jellyfin.server" data-cfg-instance-root="jellyfin" name="jfy_server_url" class="grow" placeholder="http://host:8096/">
+                <label class="verify"><input id="jfy_verify_ssl_dup" data-cfg-path="jellyfin.verify_ssl" data-cfg-instance-root="jellyfin" type="checkbox"> Verify SSL</label>
               </div>
               <div class="sub">Leave blank to discover.</div>
 
               <label for="jfy_username" style="margin-top:10px">Username</label>
-              <input id="jfy_username" name="jfy_username" placeholder="Display name">
+              <input id="jfy_username" data-cfg-path="jellyfin.username" data-cfg-instance-root="jellyfin" name="jfy_username" placeholder="Display name">
 
               <label for="jfy_user_id" style="margin-top:10px">User_ID</label>
               <div class="inp-row">
-                <input id="jfy_user_id" name="jfy_user_id" class="grow" placeholder="e.g. 6f7a0b3b-... (GUID)">
+                <input id="jfy_user_id" data-cfg-path="jellyfin.user_id" data-cfg-instance-root="jellyfin" name="jfy_user_id" class="grow" placeholder="e.g. 6f7a0b3b-... (GUID)">
                 <button id="jfy_pick_user" class="cw-userpick-icon material-symbols-rounded" type="button" title="Pick user" aria-label="Pick user">person_search</button>
               </div>
               <div class="sub">Uses your signed-in account. Admin accounts show all users; otherwise you'll only see yourself.</div>
@@ -493,10 +493,10 @@ def html() -> str:
           <div class="cw-subpanel" data-sub="whitelist">
             <div style="max-width:980px">
               <div id="jfy_lib_matrix"></div>
-              <select id="jfy_lib_history" name="jfy_lib_history" class="lm-hidden" multiple></select>
-              <select id="jfy_lib_ratings" name="jfy_lib_ratings" class="lm-hidden" multiple></select>
-              <select id="jfy_lib_progress" name="jfy_lib_progress" class="lm-hidden" multiple></select>
-              <select id="jfy_lib_scrobble" name="jfy_lib_scrobble" class="lm-hidden" multiple></select>
+              <select id="jfy_lib_history" data-cfg-path="jellyfin.history.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_history" class="lm-hidden" multiple></select>
+              <select id="jfy_lib_ratings" data-cfg-path="jellyfin.ratings.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_ratings" class="lm-hidden" multiple></select>
+              <select id="jfy_lib_progress" data-cfg-path="jellyfin.progress.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_progress" class="lm-hidden" multiple></select>
+              <select id="jfy_lib_scrobble" data-cfg-path="jellyfin.scrobble.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_scrobble" class="lm-hidden" multiple></select>
             </div>
           </div>
         </div>

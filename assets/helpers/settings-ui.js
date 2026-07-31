@@ -1326,6 +1326,7 @@ async function loadConfig() {
   if (!r.ok) throw new Error(`GET /api/config ${r.status}`);
   const cfg = await r.json();
   window._cfgCache = cfg;
+  try { window.CW?.EnvLock?.apply?.(cfg); } catch {}
 
   const _refreshSelectUi = (el) => {
     if (!el) return;

@@ -284,15 +284,15 @@ def html() -> str:
               <div style="grid-column:1 / -1">
                 <label for="emby_server">Server URL</label>
                 <div class="inp-row">
-                  <input id="emby_server" name="emby_server" class="grow" placeholder="http://host:8096/">
-                  <label class="verify"><input id="emby_verify_ssl" type="checkbox"> Verify SSL</label>
+                  <input id="emby_server" data-cfg-path="emby.server" data-cfg-instance-root="emby" name="emby_server" class="grow" placeholder="http://host:8096/">
+                  <label class="verify"><input id="emby_verify_ssl" data-cfg-path="emby.verify_ssl" data-cfg-instance-root="emby" type="checkbox"> Verify SSL</label>
                 </div>
               </div>
             </div>
             <div class="grid2" style="margin-top:8px">
               <div>
                 <label for="emby_user">Username</label>
-                <input id="emby_user" name="emby_user" placeholder="username">
+                <input id="emby_user" data-cfg-path="emby.username" data-cfg-instance-root="emby" name="emby_user" placeholder="username">
               </div>
               <div>
                 <label for="emby_pass">Password</label>
@@ -310,17 +310,17 @@ def html() -> str:
             <div style="max-width:820px">
               <label for="emby_server_url">Server URL</label>
               <div class="inp-row">
-                <input id="emby_server_url" name="emby_server_url" class="grow" placeholder="http://host:8096/">
-                <label class="verify"><input id="emby_verify_ssl_dup" type="checkbox"> Verify SSL</label>
+                <input id="emby_server_url" data-cfg-path="emby.server" data-cfg-instance-root="emby" name="emby_server_url" class="grow" placeholder="http://host:8096/">
+                <label class="verify"><input id="emby_verify_ssl_dup" data-cfg-path="emby.verify_ssl" data-cfg-instance-root="emby" type="checkbox"> Verify SSL</label>
               </div>
               <div class="sub">Leave blank to discover.</div>
 
               <label for="emby_username" style="margin-top:10px">Username</label>
-              <input id="emby_username" name="emby_username" placeholder="Display name">
+              <input id="emby_username" data-cfg-path="emby.username" data-cfg-instance-root="emby" name="emby_username" placeholder="Display name">
 
               <label for="emby_user_id" style="margin-top:10px">User_ID</label>
               <div class="inp-row">
-                <input id="emby_user_id" name="emby_user_id" class="grow" placeholder="e.g. 6f7a0b3b-... (GUID)">
+                <input id="emby_user_id" data-cfg-path="emby.user_id" data-cfg-instance-root="emby" name="emby_user_id" class="grow" placeholder="e.g. 6f7a0b3b-... (GUID)">
                 <button id="emby_pick_user" class="cw-userpick-icon material-symbols-rounded" type="button" data-cw-emby="pick-user" title="Pick user" aria-label="Pick user">person_search</button>
               </div>
               <div class="sub">Uses your signed-in account. Admin accounts show all users; otherwise you'll only see yourself.</div>
@@ -335,10 +335,10 @@ def html() -> str:
           <div class="cw-subpanel" data-sub="whitelist">
             <div style="max-width:980px">
               <div id="emby_lib_matrix"></div>
-              <select id="emby_lib_history" class="lm-hidden" multiple></select>
-              <select id="emby_lib_ratings" class="lm-hidden" multiple></select>
-              <select id="emby_lib_progress" class="lm-hidden" multiple></select>
-              <select id="emby_lib_scrobble" class="lm-hidden" multiple></select>
+              <select id="emby_lib_history" data-cfg-path="emby.history.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
+              <select id="emby_lib_ratings" data-cfg-path="emby.ratings.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
+              <select id="emby_lib_progress" data-cfg-path="emby.progress.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
+              <select id="emby_lib_scrobble" data-cfg-path="emby.scrobble.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
             </div>
           </div>
         </div>

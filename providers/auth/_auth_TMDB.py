@@ -186,7 +186,7 @@ def _tmdb_sync_html() -> str:
                 <div class="grid2">
                   <div>
                     <label for="tmdb_sync_api_key">API Key (v3)</label>
-                    <input id="tmdb_sync_api_key" name="tmdb_sync_api_key" type="password" autocomplete="new-password" placeholder="Enter TMDb API key" spellcheck="false" autocapitalize="off" />
+                    <input id="tmdb_sync_api_key" data-cfg-path="tmdb_sync.api_key" data-cfg-instance-root="tmdb_sync" name="tmdb_sync_api_key" type="password" autocomplete="new-password" placeholder="Enter TMDb API key" spellcheck="false" autocapitalize="off" />
                     <div id="tmdb_sync_hint" class="msg warn" style="margin-top:8px">
                       Create one at
                       <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">TMDb Preferences</a>
@@ -195,7 +195,7 @@ def _tmdb_sync_html() -> str:
             
                   <div>
                     <label for="tmdb_sync_session_id">Session ID (v3)</label>
-                    <input id="tmdb_sync_session_id" name="tmdb_sync_session_id" type="password" autocomplete="off" placeholder="Created after approval" readonly aria-readonly="true" tabindex="-1" />
+                    <input id="tmdb_sync_session_id" data-cfg-path="tmdb_sync.session_id" data-cfg-instance-root="tmdb_sync" name="tmdb_sync_session_id" type="password" autocomplete="off" placeholder="Created after approval" readonly aria-readonly="true" tabindex="-1" />
                     
                   </div>
                 </div>

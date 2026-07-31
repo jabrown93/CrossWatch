@@ -387,17 +387,17 @@ def html() -> str:
               <div style="grid-column:1 / -1">
                 <label for="kodi_server">Server URL</label>
                 <div class="inp-row">
-                  <input id="kodi_server" name="kodi_server" class="grow" placeholder="http://host:8080">
-                  <label class="verify"><input id="kodi_verify_ssl" type="checkbox"> Verify SSL</label>
+                  <input id="kodi_server" data-cfg-path="kodi.server" data-cfg-instance-root="kodi" name="kodi_server" class="grow" placeholder="http://host:8080">
+                  <label class="verify"><input id="kodi_verify_ssl" data-cfg-path="kodi.verify_ssl" data-cfg-instance-root="kodi" type="checkbox"> Verify SSL</label>
                 </div>
               </div>
               <div>
                 <label for="kodi_username">Username</label>
-                <input id="kodi_username" name="kodi_username" autocomplete="username" placeholder="optional">
+                <input id="kodi_username" data-cfg-path="kodi.username" data-cfg-instance-root="kodi" name="kodi_username" autocomplete="username" placeholder="optional">
               </div>
               <div>
                 <label for="kodi_password">Password</label>
-                <input id="kodi_password" name="kodi_password" type="password" autocomplete="current-password" placeholder="optional">
+                <input id="kodi_password" data-cfg-path="kodi.password" data-cfg-instance-root="kodi" name="kodi_password" type="password" autocomplete="current-password" placeholder="optional">
               </div>
             </div>
 
@@ -419,10 +419,10 @@ def html() -> str:
                 </div>
               </div>
             </div>
-            <select id="kodi_lib_history" class="lm-hidden" multiple></select>
-            <select id="kodi_lib_ratings" class="lm-hidden" multiple></select>
-            <select id="kodi_lib_progress" class="lm-hidden" multiple></select>
-            <select id="kodi_lib_scrobble" class="lm-hidden" multiple></select>
+            <select id="kodi_lib_history" data-cfg-path="kodi.history.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
+            <select id="kodi_lib_ratings" data-cfg-path="kodi.ratings.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
+            <select id="kodi_lib_progress" data-cfg-path="kodi.progress.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
+            <select id="kodi_lib_scrobble" data-cfg-path="kodi.scrobble.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
           </div>
         </div>
       </div>
