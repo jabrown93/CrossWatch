@@ -1,11 +1,11 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
 # =====================================================================
 # Builder: the DHI -dev variant has a shell, apk and build tools, and
 # runs as root, so we use it only to install dependencies. Nothing from
 # this stage ships except the venv and a few data files copied below.
 # =====================================================================
-FROM dhi.io/python:3.14.6-alpine3.24-dev AS builder
+FROM dhi.io/python:3.14.6-alpine3.24-dev@sha256:dadd6e6bcb814ac80aeac53a427c43d42a86be60e809b52b95fba737e888a983 AS builder
 
 USER root
 
@@ -41,7 +41,7 @@ RUN mkdir -p /config-skel
 # runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
 # -- no RUN. Dependencies and data are brought in from the builder.
 # =====================================================================
-FROM dhi.io/python:3.14.6-alpine3.24
+FROM dhi.io/python:3.14.6-alpine3.24@sha256:9b3f93eee9b045c116dd9fe2170fdd4c1977d8745f1469f042baa752e43d0ab4
 
 # Section 11 of the CrossWatch Source Available License forbids implying that a
 # modified version is endorsed by the Copyright Holder, so the description says
