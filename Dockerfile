@@ -41,7 +41,7 @@ RUN mkdir -p /config-skel
 # runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
 # -- no RUN. Dependencies and data are brought in from the builder.
 # =====================================================================
-FROM dhi.io/python:3.14.6-alpine3.24@sha256:9b3f93eee9b045c116dd9fe2170fdd4c1977d8745f1469f042baa752e43d0ab4
+FROM dhi.io/python:3.14.6-alpine3.24@sha256:be6d656ebb37cbe2d8bb7c70cfe39fb6a30bd592fccf235cb2b849d6ec2ded80
 
 # Section 11 of the CrossWatch Source Available License forbids implying that a
 # modified version is endorsed by the Copyright Holder, so the description says
