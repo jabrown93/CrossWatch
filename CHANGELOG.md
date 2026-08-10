@@ -1,3 +1,11 @@
+## [1.3.2](https://github.com/jabrown93/CrossWatch/compare/v1.3.1...v1.3.2) (2026-08-10)
+
+
+### Bug Fixes
+
+* **deps:** update dhi.io/python:3.14.6-alpine3.24 docker digest to be6d656 ([e193d34](https://github.com/jabrown93/CrossWatch/commit/e193d3406daf7789000837cd90afdc7af0fcca2c))
+* **deps:** update digest updates ([dfb12a3](https://github.com/jabrown93/CrossWatch/commit/dfb12a315d4968aaa80abaf8c0286351d246448a))
+
 ## [1.3.1](https://github.com/jabrown93/CrossWatch/compare/v1.3.0...v1.3.1) (2026-08-03)
 
 
