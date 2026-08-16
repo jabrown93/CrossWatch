@@ -5,7 +5,7 @@
 # runs as root, so we use it only to install dependencies. Nothing from
 # this stage ships except the venv and a few data files copied below.
 # =====================================================================
-FROM dhi.io/python:3.14.7-alpine3.24-dev@sha256:7f936ce613502edcd3f9a3c15d35d7e50ae4d36d985d44a1b590c7ad64cb9f32 AS builder
+FROM dhi.io/python:3.14.7-alpine3.24-dev@sha256:38fe0b5eb1b87c1b73303ea8570f3bf85b1be189ff7b4e6998ff991db43aad4e AS builder
 
 USER root
 
@@ -41,7 +41,7 @@ RUN mkdir -p /config-skel
 # runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
 # -- no RUN. Dependencies and data are brought in from the builder.
 # =====================================================================
-FROM dhi.io/python:3.14.7-alpine3.24@sha256:601190ebba99a616c04ba536aef22103a819eabfe407be6457009baee5fe3a64
+FROM dhi.io/python:3.14.7-alpine3.24@sha256:b395f3c5fae824a8a024dbc6f446f1e307bbf56e8aed7df5c9e284b5ce3ea963
 
 # Section 11 of the CrossWatch Source Available License forbids implying that a
 # modified version is endorsed by the Copyright Holder, so the description says
