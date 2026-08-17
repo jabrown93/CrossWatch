@@ -1,3 +1,13 @@
+## [1.3.3](https://github.com/jabrown93/CrossWatch/compare/v1.3.2...v1.3.3) (2026-08-17)
+
+
+### Bug Fixes
+
+* **deps:** update dhi.io/python docker tag ([4426dcb](https://github.com/jabrown93/CrossWatch/commit/4426dcb80e3af76f3bae3f8de1e97fe2062dc6ad))
+* **deps:** update digest updates ([fbbacac](https://github.com/jabrown93/CrossWatch/commit/fbbacac6ff18aea8dbd658ff3531af42c67d5d7f))
+* **deps:** update digest updates ([b3ee715](https://github.com/jabrown93/CrossWatch/commit/b3ee71573aaaf633db3d5985c67fd3f768610565))
+* **deps:** update digest updates ([554440e](https://github.com/jabrown93/CrossWatch/commit/554440e56920bcc5a599ac387055800f6dad8031))
+
 ## [1.3.2](https://github.com/jabrown93/CrossWatch/compare/v1.3.1...v1.3.2) (2026-08-10)
 
 
