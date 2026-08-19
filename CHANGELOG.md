@@ -1,3 +1,10 @@
+## [1.3.5](https://github.com/jabrown93/CrossWatch/compare/v1.3.4...v1.3.5) (2026-08-19)
+
+
+### Bug Fixes
+
+* **version:** point the update check at this fork's releases ([#85](https://github.com/jabrown93/CrossWatch/issues/85)) ([97f81dd](https://github.com/jabrown93/CrossWatch/commit/97f81dd186186352f1de76706e7dacab308ec2d8))
+
 ## [1.3.4](https://github.com/jabrown93/CrossWatch/compare/v1.3.3...v1.3.4) (2026-08-19)
 
 
