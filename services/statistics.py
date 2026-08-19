@@ -4,10 +4,8 @@
 from __future__ import annotations
 
 import difflib
-import json
 import os
 import re
-import tempfile
 import threading
 import time
 import unicodedata
@@ -15,13 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cw_platform.local_db import statistics as sqlite_statistics
+from cw_platform.local_db.legacy_files import STATISTICS_JSON, legacy_path
+
 try:
     from cw_platform.config_base import CONFIG as _CONFIG_DIR  # type: ignore
     CONFIG = Path(_CONFIG_DIR)
 except Exception:
     CONFIG = Path(os.getenv("CW_CONFIG_DIR", "/config")).resolve()
 
-STATS_PATH = CONFIG / "statistics.json"
 REPORT_DIR = Path("/config/sync_reports")
 
 _GUID_TMDB_RE = re.compile(r"tmdb://(?:movie|tv)/(\d+)", re.I)
@@ -44,187 +44,25 @@ def _canon_feature(name: Any) -> str:
     return s if s in ("watchlist", "ratings", "history", "progress", "playlists") else "watchlist"
 
 
-def _read_json(p: Path) -> dict[str, Any]:
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            d = json.load(f)
-            return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_json_atomic(p: Path, data: dict[str, Any]) -> None:
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    tmp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(p.parent),
-            prefix=p.name + ".",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            json.dump(data, tmp, ensure_ascii=False, indent=2)
-            tmp_name = tmp.name
-        os.replace(tmp_name, p)
-    except Exception:
-        try:
-            with p.open("w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-    finally:
-        if tmp_name:
-            try:
-                if Path(tmp_name).exists():
-                    os.unlink(tmp_name)
-            except Exception:
-                pass
-
-
-def _norm_title(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s or "")
-    s = "".join(ch for ch in s if not unicodedata.combining(ch)).casefold()
-    s = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", s)
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    toks = s.split()
-    if toks and toks[0] in {"the", "a", "an"}:
-        s = " ".join(toks[1:])
-    return s
-
-
-def _title_key(m: dict[str, Any]) -> str:
-    return _norm_title((m.get("title") or "").strip())
-
-
-def _similar(a: str, b: str) -> bool:
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    ta, tb = set(a.split()), set(b.split())
-    if ta and (len(ta & tb) / len(ta | tb)) >= 0.85:
-        return True
-    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.92
-
-
-def _titles_match_loose(rm: dict[str, Any], am: dict[str, Any]) -> bool:
-    ra, aa = _title_key(rm), _title_key(am)
-    if not ra or not aa:
-        return False
-    ry, ay = Stats._year_of(rm), Stats._year_of(am)
-    if isinstance(ry, int) and isinstance(ay, int) and ry != ay:
-        return False
-    return ra == aa or _similar(ra, aa)
-
-
-def _provset(m: dict[str, Any]) -> set[str]:
-    provs = {str(p).lower() for p in (m.get("providers") or [])}
-    if not provs:
-        s = str(m.get("src") or "").lower()
-        if s and s != "both":
-            provs = {s}
-    return provs
-
-
-_IDCORE = re.compile(
-    r"^(?P<p>[a-z0-9]+):(?:(?:movie|tv|show):)?(?P<i>[^:]+)$",
-    re.I,
-)
-
-
-def _idcore(k: str) -> tuple[str | None, str | None]:
-    m = _IDCORE.match(str(k) or "")
-    return (m.group("p"), m.group("i")) if m else (None, None)
-
-
-def _mk_event(action: str, feat: str, key: str, m: dict[str, Any], now_epoch: int) -> dict[str, Any]:
-    return {
-        "ts": now_epoch,
-        "action": action,
-        "feature": feat,
-        "key": key,
-        "source": m.get("src", ""),
-        "title": m.get("title", ""),
-        "type": m.get("type", ""),
-    }
-
-
-def _emit_lane_events(
-    ev: list[dict[str, Any]],
-    feature: str,
-    prev_map: dict[str, Any],
-    cur_map: dict[str, Any],
-    now_epoch: int,
-) -> tuple[list[str], list[str]]:
-    """Diff a feature's previous vs. current key->item maps and append events onto `ev`.
-
-    Pairs likely renames (matching/similar title with an overlapping
-    provider, or a matching id-core) into a single "update" event instead
-    of a separate add+remove, then emits "add"/"remove" events for
-    whatever is left unpaired. Returns the final (adds, removes) key
-    lists after rename pairing.
-    """
-    pk, ck = set(prev_map), set(cur_map)
-    adds, rems = sorted(ck - pk), sorted(pk - ck)
-
-    for rk in list(rems):
-        rm = prev_map.get(rk) or {}
-        rp = _provset(rm)
-        rp_name, rp_id = _idcore(rk)
-        for ak in list(adds):
-            am = cur_map.get(ak) or {}
-            ap = _provset(am)
-            ap_name, ap_id = _idcore(ak)
-            same_title = _titles_match_loose(rm, am)
-            same_idcore = rp_name == ap_name and rp_id and ap_id and rp_id == ap_id
-            if (same_title or same_idcore) and (rp & ap or same_idcore):
-                rems.remove(rk)
-                adds.remove(ak)
-                ev.append(_mk_event("update", feature, ak, am, now_epoch))
-                break
-
-    for k in adds:
-        ev.append(_mk_event("add", feature, k, cur_map.get(k) or {}, now_epoch))
-    for k in rems:
-        ev.append(_mk_event("remove", feature, k, prev_map.get(k) or {}, now_epoch))
-
-    return adds, rems
-
-
 class Stats:
     def __init__(self, path: Path | None = None) -> None:
-        self.path = Path(path) if path else STATS_PATH
+        raw_path = Path(path) if path else None
+        self.base_path = raw_path.parent if raw_path is not None and raw_path.suffix else (raw_path or CONFIG)
+        self.path = raw_path or legacy_path(self.base_path, STATISTICS_JSON)
         self.lock = threading.Lock()
         self.data: dict[str, Any] = {}
         self._load()
 
     # load/save
     def _load(self) -> None:
-        d = _read_json(self.path)
-        d.setdefault("events", [])
-        d.setdefault("samples", [])
-        d.setdefault("current", {})
-        d.setdefault("current_by_feature", {})
-        d.setdefault("counters", {"added": 0, "removed": 0})
-        d.setdefault("last_run", {"added": 0, "removed": 0, "ts": 0})
-        d.setdefault("http", {"events": [], "counters": {}, "last": {}})
-        d.setdefault("feature_totals", [])
-        d.setdefault("ingested_runs", [])
-        self.data = d
+        self.data = sqlite_statistics.load_statistics(self.base_path)
 
     def _save(self) -> None:
         try:
             self.data["generated_at"] = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
-            _write_json_atomic(self.path, self.data)
+            sqlite_statistics.save_statistics(self.base_path, self.data)
         except Exception:
             pass
 
@@ -565,26 +403,20 @@ class Stats:
     # Report ingestion
     def _ingest_latest_report_features_once(self) -> None:
         try:
-            if not (REPORT_DIR.exists() and REPORT_DIR.is_dir()):
-                return
-            files = sorted(
-                REPORT_DIR.glob("sync-*.json"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )[:3]
-            if not files:
+            from cw_platform.local_db.sync_reports import base_path_from_report_dir, recent_feature_reports
+
+            reports = recent_feature_reports(base_path_from_report_dir(REPORT_DIR), limit=3)
+            if not reports:
                 return
             with self.lock:
                 seen: list[str] = list(self.data.get("ingested_runs") or [])
-            for f in files:
-                try:
-                    j = json.loads(f.read_text("utf-8") or "{}")
-                except Exception:
+            for report in reports:
+                run_id = str(report.get("run_id") or report.get("finished_at") or report.get("started_at") or "")
+                if not run_id:
                     continue
-                run_id = str(j.get("finished_at") or j.get("started_at") or f.name)
                 if run_id in seen:
                     continue
-                feats = j.get("features") or {}
+                feats = report.get("features") or {}
                 any_rec = False
                 for name, lane in (feats or {}).items():
                     a = int((lane or {}).get("added") or 0)
@@ -727,6 +559,7 @@ class Stats:
 
     def reset(self) -> None:
         with self.lock:
+            sqlite_statistics.clear_statistics(self.base_path)
             self.data = {
                 "events": [],
                 "samples": [],

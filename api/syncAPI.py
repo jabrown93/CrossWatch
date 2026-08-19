@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from datetime import datetime, timezone, date
 from contextlib import contextmanager
@@ -16,8 +16,19 @@ from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from cw_platform.modules_registry import get_sync_module_path_by_name, sync_provider_names, sync_provider_supports_feature
+from cw_platform.access_policy import filter_pairs_for_user, managed_profile_id, managed_profile_instances, pair_ids_for_user, request_user, user_can_access_pair
+from cw_platform.provider_instances import list_user_profiles, normalize_user_profile_id
+from cw_platform.local_db.legacy_files import LAST_SYNC_JSON
 from cw_platform.reason_labels import friendly_reason
+from cw_platform.run_control import (
+    cancel_requested,
+    cancel_state,
+    clear_cancel,
+    clear_queue_stop,
+    request_cancel,
+)
 from cw_platform.value_coercion import coerce_bool
+from services.scheduler_webhooks import notify_scheduler_webhook, resolve_completion_event
 
 __all__ = ["router", "_is_sync_running", "_load_state", "_find_state_path"]
 
@@ -40,8 +51,8 @@ def _rt():
         m.LOG_BUFFERS,      # 0
         m.RUNNING_PROCS,    # 1
         m.SYNC_PROC_LOCK,   # 2
-        m.STATE_PATH,       # 3
-        m.STATE_PATHS,      # 4
+        None,               # 3
+        (),                 # 4
         m.STATS,            # 5
         m.REPORT_DIR,       # 6
         m.strip_ansi,       # 7
@@ -163,6 +174,8 @@ def _normalize_features(f: dict | None) -> dict:
             v["enable"] = coerce_bool(v.get("enable", True), True)
             v["add"] = coerce_bool(v.get("add", True), True)
             v["remove"] = coerce_bool(v.get("remove", False))
+        if k == "history" and isinstance(f.get(k), dict):
+            f[k]["rewatches"] = coerce_bool(f[k].get("rewatches", False))
         if isinstance(f.get(k), dict) and ("use_anime_mapping" in f[k] or "anime_only_sync" in f[k]):
             use_map = coerce_bool(f[k].get("use_anime_mapping", False))
             f[k]["use_anime_mapping"] = use_map
@@ -266,6 +279,8 @@ def _summary_reset() -> None:
                 "crosswatch_post": None,
                 "result": "",
                 "exit_code": None,
+                "cancel_requested": False,
+                "cancelled": False,
                 "timeline": {"start": False, "pre": False, "post": False, "done": False},
                 "raw_started_ts": None,
                 "_phase": {
@@ -294,7 +309,7 @@ def _seed_summary_provider_counts(phase: str) -> None:
     if ph not in ("pre", "post"):
         return
     try:
-        counts = _counts_from_state(_load_state()) or _provider_count_defaults()
+        counts = _provider_counts_current()
     except Exception:
         counts = _provider_count_defaults()
     if not isinstance(counts, dict):
@@ -509,9 +524,16 @@ def _emit_unresolved_details(total_unresolved: int | None = None) -> None:
 
 def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
     rt = _rt()
-    LOG_BUFFERS, RUNNING_PROCS, STATE_PATH, _append_log, strip_ansi = rt[0], rt[1], rt[3], rt[8], rt[7]
+    LOG_BUFFERS, RUNNING_PROCS, _append_log, strip_ansi = rt[0], rt[1], rt[8], rt[7]
     overrides = overrides or {}
+    scheduler_context = dict(overrides)
+    scheduler_context["run_id"] = str(run_id)
+    scheduler_webhook_cfg: dict[str, Any] | None = None
+    scheduler_start_sent = False
+    was_cancelled = False
+    clear_cancel()
     _summary_reset()
+    _summary_set("run_id", str(run_id))
     LOG_BUFFERS["SYNC"] = []
     os.environ["CW_RUN_ID"] = str(run_id)
     _sync_progress_ui("::CLEAR::")
@@ -609,12 +631,36 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
     try:
         load_config, _save = _env()
         cfg = load_config()
+        scheduler_webhook_cfg = cfg if isinstance(cfg, dict) else {}
+
+        try:
+            scheduler_start_sent = notify_scheduler_webhook(
+                scheduler_webhook_cfg,
+                "start",
+                scheduler_context,
+                _summary_snapshot(),
+                log_fn=lambda msg: _append_log("SYNC", msg),
+            )
+        except Exception:
+            scheduler_start_sent = False
 
         req_pair_id = ""
         try:
             req_pair_id = str((overrides or {}).get("pair_id") or (overrides or {}).get("pair_scope") or "").strip()
         except Exception:
             req_pair_id = ""
+        req_pair_ids: set[str] = set()
+        try:
+            raw_scope = (overrides or {}).get("pair_scope_ids")
+            if isinstance(raw_scope, list):
+                req_pair_ids = {str(value or "").strip() for value in raw_scope if str(value or "").strip()}
+        except Exception:
+            req_pair_ids = set()
+
+        if req_pair_ids:
+            _summary_set("pair_scope_ids", sorted(req_pair_ids))
+            cfg = dict(cfg)
+            cfg["pairs"] = [p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") in req_pair_ids]
 
         if req_pair_id:
             pair = next((p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") == req_pair_id), None)
@@ -628,6 +674,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
             pair_src = str(pair.get("source") or pair_src)
             pair_dst = str(pair.get("target") or pair_dst)
             pair_mode = str(pair.get("mode") or pair_mode).strip().lower() or pair_mode
+            _summary_set("pair_scope_ids", [req_pair_id])
             _sync_progress_ui(f"[i] Running single pair: {pair_src} → {pair_dst} ({req_pair_id})")
 
         with _orch_scope_env():
@@ -661,24 +708,34 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
 
             mgr = OrchestratorClass(config=cfg)
             dry = coerce_bool((cfg.get("sync") or {}).get("dry_run", False)) or coerce_bool((overrides or {}).get("dry_run"))
+            runtime_cfg = cfg.get("runtime") or {}
+            sync_cfg = cfg.get("sync") or {}
+            write_state_json = coerce_bool(
+                sync_cfg.get("write_state_json", runtime_cfg.get("write_state_json", True)),
+                True,
+            )
             result = mgr.run_pairs(
                 dry_run=dry,
                 progress=_sync_progress_ui,
-                write_state_json=True,
-                state_path=STATE_PATH,
+                write_state_json=write_state_json,
                 use_snapshot=True,
             )
+
+        if coerce_bool(result.get("cancelled")) or cancel_requested(run_id):
+            was_cancelled = True
+            _summary_set("cancelled", True)
+            _sync_progress_ui("[!] Sync cancelled - already applied changes were kept.")
 
         added_res = int(result.get("added", 0))
         removed_res = int(result.get("removed", 0))
         try:
-            state = _load_state()
+            state = _load_state_features({"watchlist", "history", "ratings", "playlists"}) if write_state_json else {}
             if state:
                 _STATS = _rt()[5]
                 _STATS.refresh_from_state(state)
                 _STATS.record_summary(added_res, removed_res)
                 try:
-                    counts = _counts_from_state(state)
+                    counts = _provider_counts_from_db()
                     if counts is None:
                         _append_log("SYNC", "[!] Provider-counts: state malformed; keeping last known counts")
                         counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
@@ -687,8 +744,10 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                         _PROVIDER_COUNTS_CACHE["data"] = counts
                 except Exception as e:
                     _append_log("SYNC", f"[!] Provider-counts cache warm failed: {e}")
-            else:
+            elif write_state_json:
                 _append_log("SYNC", "[!] No state found after sync; stats not updated.")
+            else:
+                _append_log("SYNC", "[i] State persistence disabled; state-backed stats skipped.")
         except Exception as e:
             _append_log("SYNC", f"[!] Stats update failed: {e}")
 
@@ -706,10 +765,12 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
         unresolved = _merge_total("unresolved")
         errors = _merge_total("errors")
         blocked = _merge_total("blocked")
+        for key, value in (("skipped", skipped), ("unresolved", unresolved), ("errors", errors), ("blocked", blocked)):
+            _summary_set(key, value)
         extra = f", Total blocked: {blocked}"
 
         _sync_progress_ui(
-            f"[i] Done. Total added: {added}, Total removed: {removed}, Total updated: {updated}, "
+            f"[i] {'Cancelled' if was_cancelled else 'Done'}. Total added: {added}, Total removed: {removed}, Total updated: {updated}, "
             f"Total skipped: {skipped}, Total unresolved: {unresolved}, Total errors: {errors}{extra}"
         )
         if unresolved > 0:
@@ -725,8 +786,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
         try:
             load_config, _ = _env()
             cfg2 = load_config()
-            state2 = _load_state()
-            counts2 = _counts_from_state(state2) if state2 else None
+            counts2 = _provider_counts_from_db()
             if counts2 is None:
                 counts2 = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
             if counts2:
@@ -734,6 +794,29 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                 _PROVIDER_COUNTS_CACHE["data"] = counts2
         except Exception:
             pass
+        try:
+            snap = _summary_snapshot()
+            exit_code = snap.get("exit_code")
+            if exit_code is not None:
+                event = resolve_completion_event(scheduler_webhook_cfg, snap)
+                notify_scheduler_webhook(
+                    scheduler_webhook_cfg,
+                    event,
+                    scheduler_context,
+                    snap,
+                    log_fn=lambda msg: _append_log("SYNC", msg),
+                )
+            elif scheduler_start_sent:
+                notify_scheduler_webhook(
+                    scheduler_webhook_cfg,
+                    "failure",
+                    scheduler_context,
+                    snap,
+                    log_fn=lambda msg: _append_log("SYNC", msg),
+                )
+        except Exception:
+            pass
+        clear_cancel()
         RUNNING_PROCS.pop("SYNC", None)
 
 def _lanes_enabled_defaults() -> dict[str, bool]:
@@ -999,18 +1082,23 @@ def _parse_sync_line(line: str) -> None:
             pass
         try:
             REPORT_DIR = _rt()[6]
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            path = REPORT_DIR / f"sync-{ts}.json"
-            with path.open("w", encoding="utf-8") as f:
-                json.dump(_summary_snapshot(), f, indent=2)
+            from cw_platform.local_db.sync_reports import base_path_from_report_dir, save_report
+
+            save_report(base_path_from_report_dir(REPORT_DIR), _summary_snapshot())
         except Exception:
             pass
 
 # State file helpers
 def _find_state_path() -> Path | None:
-    for p in _rt()[4]:
-        if p.exists():
-            return p
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.local_db import crosswatch_db_path
+
+        db_path = crosswatch_db_path(CONFIG)
+        if db_path.exists():
+            return db_path
+    except Exception:
+        pass
     return None
 
 _STATE_CACHE_LOCK = threading.Lock()
@@ -1032,9 +1120,6 @@ def _peek_state_key() -> Any:
         return (str(sp), 0, 0)
 
 def _load_state() -> dict[str, Any]:
-    sp = _find_state_path()
-    if not sp:
-        return {}
     now = time.time()
     try:
         key = _peek_state_key()
@@ -1053,8 +1138,10 @@ def _load_state() -> dict[str, Any]:
 
     data: dict[str, Any] = {}
     try:
-        raw = sp.read_bytes()
-        obj = json.loads(raw) if raw else {}
+        from cw_platform.config_base import CONFIG
+        from cw_platform.orchestrator._state_store import StateStore
+
+        obj = StateStore(CONFIG).load_state()
         data = obj if isinstance(obj, dict) else {}
     except Exception:
         data = {}
@@ -1098,6 +1185,17 @@ def _iter_baseline_items(node: dict[str, Any]) -> Iterator[tuple[Any, dict[str, 
         for it in items:
             if isinstance(it, dict):
                 yield it.get("key"), it
+
+
+def _load_state_features(features: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.orchestrator._state_store import StateStore
+
+        obj = StateStore(CONFIG).load_state_features(features)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
 
 
 def _show_title_maps_from_state(state: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
@@ -1224,7 +1322,7 @@ def _get_episode_code_map() -> dict[str, tuple[int, int]]:
             cm = _EP_META_CACHE.get("code_map")
             if isinstance(cm, dict):
                 return cast(dict[str, tuple[int, int]], cm)
-    state = _load_state()
+    state = _load_state_features({"history", "ratings", "watchlist", "playlists"})
     cm2 = _episode_code_map_from_state(state or {})
     with _EP_META_CACHE_LOCK:
         _EP_META_CACHE["key"] = skey
@@ -1239,7 +1337,7 @@ def _get_title_maps() -> tuple[dict[str, str], dict[str, str]]:
             im = _TITLE_MAP_CACHE.get("id_map")
             if isinstance(km, dict) and isinstance(im, dict):
                 return cast(dict[str, str], km), cast(dict[str, str], im)
-    state = _load_state()
+    state = _load_state_features({"history", "ratings", "watchlist", "playlists"})
     km2, im2 = _show_title_maps_from_state(state or {})
     with _TITLE_MAP_CACHE_LOCK:
         _TITLE_MAP_CACHE["key"] = skey
@@ -1596,7 +1694,7 @@ def _is_sync_running() -> bool:
 
 # API endpoint to list sync providers
 @router.get("/sync/providers")
-def api_sync_providers() -> JSONResponse:
+def api_sync_providers(request: Request = cast(Request, None)) -> JSONResponse:
     HIDDEN = {"BASE"}
     FEATURE_KEYS = ("watchlist", "ratings", "history", "playlists", "progress")
     try:
@@ -1626,9 +1724,48 @@ def api_sync_providers() -> JSONResponse:
             for k in FEATURE_KEYS
         }
 
+    def _norm_progress_caps(caps: Any) -> dict:
+        if not isinstance(caps, Mapping):
+            return {}
+
+        out: dict[str, Any] = {}
+        for key in ("server_completion_percent", "requires_duration"):
+            if key in caps:
+                out[key] = caps.get(key)
+
+        policy = caps.get("completion_policy")
+        if isinstance(policy, Mapping):
+            write = policy.get("progress_write")
+            if isinstance(write, Mapping):
+                clean_write: dict[str, Any] = {}
+                for key in ("mode", "percent", "auto_completes_at_percent", "default_percent", "min_duration_seconds", "setting"):
+                    if key in write:
+                        clean_write[key] = write.get(key)
+                if clean_write:
+                    out["completion_policy"] = {"progress_write": clean_write}
+
+        return out
+
     def _norm_caps(caps: dict | None) -> dict:
         caps = dict(caps or {})
-        return {"bidirectional": bool(caps.get("bidirectional", False))}
+        out: dict[str, Any] = {"bidirectional": bool(caps.get("bidirectional", False))}
+        progress = _norm_progress_caps(caps.get("progress"))
+        if progress:
+            out["progress"] = progress
+        history = caps.get("history")
+        if isinstance(history, Mapping):
+            rewatches = history.get("rewatches")
+            if isinstance(rewatches, Mapping):
+                clean: dict[str, Any] = {
+                    "read": bool(rewatches.get("read", False)),
+                    "write": bool(rewatches.get("write", False)),
+                }
+                if rewatches.get("account_gate"):
+                    clean["account_gate"] = str(rewatches.get("account_gate"))
+                out["history"] = {"rewatches": clean}
+            elif isinstance(rewatches, bool):
+                out["history"] = {"rewatches": {"read": rewatches, "write": rewatches}}
+        return out
 
     def _configured_state(mod, provider_name: str) -> bool:
         ops = getattr(mod, "OPS", None)
@@ -1745,6 +1882,10 @@ def api_sync_providers() -> JSONResponse:
         seen.add(mf["name"])
         items.append(mf)
     items.sort(key=lambda x: (x.get("label") or x.get("name") or "").lower())
+    user = request_user(request)
+    if user and not bool(user.get("is_admin")):
+        allowed = set(managed_profile_instances(cfg, user).keys())
+        items = [item for item in items if str(item.get("name") or "").strip().upper() in allowed]
     return JSONResponse(items)
 
 # Pairs data models
@@ -1757,6 +1898,7 @@ class PairIn(BaseModel):
     enabled: bool | None = None
     providers: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
+    profile_id: str | None = None
 
 class PairPatch(BaseModel):
     source: str | None = None
@@ -1767,9 +1909,44 @@ class PairPatch(BaseModel):
     enabled: bool | None = None
     providers: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
+    profile_id: str | None = None
+
+def _request_user(request: Request | None) -> dict[str, Any] | None:
+    try:
+        user = request_user(request)
+        return dict(user) if isinstance(user, Mapping) else None
+    except Exception:
+        return None
+
+
+def _managed_pair_blocked(cfg: dict[str, Any], request: Request | None, pair: Mapping[str, Any]) -> bool:
+    user = _request_user(request)
+    return bool(user and not user.get("is_admin") and not user_can_access_pair(cfg, user, pair))
+
+
+def _valid_profile_ids(cfg: Mapping[str, Any]) -> set[str]:
+    return {normalize_user_profile_id(row.get("id")) for row in list_user_profiles(cfg) if normalize_user_profile_id(row.get("id"))}
+
+
+def _normalize_pair_profile_id(cfg: Mapping[str, Any], raw: Any) -> str:
+    pid = normalize_user_profile_id(raw)
+    return pid if pid and pid in _valid_profile_ids(cfg) else ""
+
+
+def _apply_pair_profile_scope(cfg: dict[str, Any], request: Request | None, item: dict[str, Any]) -> None:
+    user = _request_user(request)
+    if user and not user.get("is_admin"):
+        item["profile_id"] = managed_profile_id(user)
+        return
+    pid = _normalize_pair_profile_id(cfg, item.get("profile_id"))
+    if pid:
+        item["profile_id"] = pid
+    else:
+        item.pop("profile_id", None)
+
 
 @router.get("/pairs")
-def api_pairs_list() -> JSONResponse:
+def api_pairs_list(request: Request = cast(Request, None)) -> JSONResponse:
     load_config, save_config = _env()
     try:
         cfg = load_config()
@@ -1799,9 +1976,18 @@ def api_pairs_list() -> JSONResponse:
                 if newp != (it.get("providers") or {}):
                     it["providers"] = newp
                     dirty = True
-        if dirty:
+            pid = _normalize_pair_profile_id(cfg, it.get("profile_id"))
+            if pid:
+                if it.get("profile_id") != pid:
+                    it["profile_id"] = pid
+                    dirty = True
+            elif "profile_id" in it:
+                it.pop("profile_id", None)
+                dirty = True
+        user = _request_user(request)
+        if dirty and not (user and not user.get("is_admin")):
             save_config(cfg)
-        return JSONResponse(arr)
+        return JSONResponse(filter_pairs_for_user(cfg, user, arr))
     except Exception as e:
         try:
             _rt()[8]("TRBL", f"/api/pairs GET failed: {e}")
@@ -1810,7 +1996,7 @@ def api_pairs_list() -> JSONResponse:
         return JSONResponse({"ok": False, "error": _public_error("pairs_list_failed")}, status_code=500)
 
 @router.post("/pairs")
-def api_pairs_add(payload: PairIn = Body(...)) -> dict[str, Any]:
+def api_pairs_add(payload: PairIn = Body(...), request: Request = cast(Request, None)) -> dict[str, Any]:
     load_config, save_config = _env()
     try:
         cfg = load_config()
@@ -1822,7 +2008,10 @@ def api_pairs_add(payload: PairIn = Body(...)) -> dict[str, Any]:
         item["target_instance"] = _norm_instance_id(item.get("target_instance"))
         item["enabled"] = coerce_bool(item.get("enabled", False))
         item["features"] = _normalize_features(item.get("features") or {"watchlist": True})
+        _apply_pair_profile_scope(cfg, request, item)
         _enforce_pair_feature_constraints(item)
+        if _managed_pair_blocked(cfg, request, item):
+            return {"ok": False, "error": "profile_scope_denied"}
         prov = _normalize_pair_providers(item.get("providers"))
         if prov:
             item["providers"] = prov
@@ -1841,11 +2030,15 @@ def api_pairs_add(payload: PairIn = Body(...)) -> dict[str, Any]:
         return {"ok": False, "error": _public_error("pair_create_failed")}
 
 @router.post("/pairs/reorder")
-def api_pairs_reorder(order: list[str] = Body(...)) -> dict:
+def api_pairs_reorder(order: list[str] = Body(...), request: Request = cast(Request, None)) -> dict:
     load_config, save_config = _env()
     try:
         cfg = load_config()
         arr = _cfg_pairs(cfg)
+        user = _request_user(request)
+        if user and not user.get("is_admin"):
+            allowed_ids = {str(pair.get("id") or "") for pair in filter_pairs_for_user(cfg, user, arr)}
+            order = [pid for pid in (order or []) if str(pid) in allowed_ids]
 
         index_map = {str(p.get("id")): i for i, p in enumerate(arr)}
         seen: set[str] = set()
@@ -1884,7 +2077,7 @@ def api_pairs_reorder(order: list[str] = Body(...)) -> dict:
         return {"ok": False, "error": _public_error("pair_reorder_failed")}
 
 @router.put("/pairs/{pair_id}")
-def api_pairs_update(pair_id: str, payload: PairPatch = Body(...)) -> dict[str, Any]:
+def api_pairs_update(pair_id: str, payload: PairPatch = Body(...), request: Request = cast(Request, None)) -> dict[str, Any]:
     load_config, save_config = _env()
     try:
         cfg = load_config()
@@ -1893,6 +2086,8 @@ def api_pairs_update(pair_id: str, payload: PairPatch = Body(...)) -> dict[str, 
 
         for it in arr:
             if str(it.get("id")) == str(pair_id):
+                if _managed_pair_blocked(cfg, request, it):
+                    return {"ok": False, "error": "profile_scope_denied"}
                 if "features" in upd:
                     it["features"] = _normalize_features(upd.pop("features"))
                 if "providers" in upd:
@@ -1903,8 +2098,12 @@ def api_pairs_update(pair_id: str, payload: PairPatch = Body(...)) -> dict[str, 
                     upd["target_instance"] = _norm_instance_id(upd.get("target_instance"))
                 for k, v in upd.items():
                     it[k] = v
+                if "profile_id" in upd:
+                    _apply_pair_profile_scope(cfg, request, it)
 
                 _enforce_pair_feature_constraints(it)
+                if _managed_pair_blocked(cfg, request, it):
+                    return {"ok": False, "error": "profile_scope_denied"}
                 save_config(cfg)
                 return {"ok": True}
         return {"ok": False, "error": "not_found"}
@@ -1964,12 +2163,15 @@ def _purge_pair_state(pair_id: str) -> dict[str, Any]:
     return {'removed': removed, 'errors': errors}
 
 @router.delete("/pairs/{pair_id}")
-def api_pairs_delete(pair_id: str, purge_state: bool = True) -> dict[str, Any]:
+def api_pairs_delete(pair_id: str, purge_state: bool = True, request: Request = cast(Request, None)) -> dict[str, Any]:
     load_config, save_config = _env()
     state = {"removed": [], "errors": []}
     try:
         cfg = load_config()
         arr = _cfg_pairs(cfg)
+        pair = next((it for it in arr if str(it.get("id")) == str(pair_id)), None)
+        if pair is not None and _managed_pair_blocked(cfg, request, pair):
+            return {"ok": False, "error": "profile_scope_denied"}
         before = len(arr)
         arr[:] = [it for it in arr if str(it.get("id")) != str(pair_id)]
         deleted = before - len(arr)
@@ -2073,6 +2275,32 @@ def _counts_from_state(state: dict | None) -> dict | None:
     return out
 
 
+def _provider_counts_from_db() -> dict[str, int] | None:
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.orchestrator._state_store import StateStore
+
+        counts = StateStore(CONFIG).provider_feature_counts("watchlist")
+    except Exception:
+        return None
+    if not counts:
+        return None
+    out = _provider_count_defaults(counts)
+    for key, value in counts.items():
+        name = str(key or "").strip().upper()
+        if not name:
+            continue
+        out[name] = int(value or 0)
+    return out
+
+
+def _provider_counts_current() -> dict[str, int]:
+    counts = _provider_counts_from_db()
+    if counts is not None:
+        return counts
+    cached = _PROVIDER_COUNTS_CACHE.get("data")
+    return dict(cached) if isinstance(cached, dict) else _provider_count_defaults()
+
 
 def _sanitize_scope(v: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(v or "").strip())
@@ -2112,7 +2340,7 @@ def _provider_counts_fast(*, max_age: int = 30, force: bool = False) -> dict:
         and (now - _PROVIDER_COUNTS_CACHE["ts"] < max(0, int(max_age)))
     ):
         return dict(_PROVIDER_COUNTS_CACHE["data"])
-    counts = _counts_from_state(_load_state())
+    counts = _provider_counts_from_db()
     if counts is None:
         counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
     _PROVIDER_COUNTS_CACHE["ts"] = now
@@ -2127,12 +2355,67 @@ def api_provider_counts(
 ) -> dict:
     src = (source or "state").lower().strip()
     if src in ("state", "auto"):
-        return _counts_from_state(_load_state()) or _provider_count_defaults()
+        return _provider_counts_current()
     return _provider_counts_fast(max_age=max_age, force=bool(force))
+
+
+def _enabled_from_pairs(pairs: Sequence[Mapping[str, Any]]) -> dict[str, bool]:
+    out = _lanes_enabled_defaults()
+    for key in FEATURE_KEYS:
+        out[key] = False
+    for pair in pairs:
+        feats = pair.get("features")
+        if not isinstance(feats, Mapping):
+            continue
+        for key in FEATURE_KEYS:
+            value = feats.get(key)
+            if isinstance(value, Mapping):
+                out[key] = out[key] or coerce_bool(value.get("enable", value.get("enabled", True)), True)
+            else:
+                out[key] = out[key] or coerce_bool(value, False)
+    return out
+
+
+def _empty_summary_for_pairs(pairs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "running": False,
+        "features": {key: {"added": 0, "removed": 0, "updated": 0} for key in FEATURE_KEYS},
+        "enabled": _enabled_from_pairs(pairs),
+        "timeline": {},
+        "provider_counts": {},
+        "pair_scope_ids": [str(pair.get("id") or "").strip() for pair in pairs if str(pair.get("id") or "").strip()],
+    }
+
+
+def _scope_summary_for_user(cfg: dict[str, Any], user: Mapping[str, Any] | None, snap: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(user, Mapping) or bool(user.get("is_admin")):
+        return snap
+    pairs = filter_pairs_for_user(cfg, user, [pair for pair in (cfg.get("pairs") or []) if isinstance(pair, dict)])
+    allowed_ids = {str(pair.get("id") or "").strip() for pair in pairs if str(pair.get("id") or "").strip()}
+    scope_raw = snap.get("pair_scope_ids")
+    scope_ids = {str(value or "").strip() for value in scope_raw if str(value or "").strip()} if isinstance(scope_raw, list) else set()
+    if scope_ids and not (scope_ids & allowed_ids):
+        return _empty_summary_for_pairs(pairs)
+    if not scope_ids and (snap.get("run_id") or snap.get("running")):
+        return _empty_summary_for_pairs(pairs)
+    out = dict(snap)
+    out["enabled"] = _enabled_from_pairs(pairs)
+    out["pair_scope_ids"] = sorted(scope_ids & allowed_ids) if scope_ids else sorted(allowed_ids)
+    allowed_providers: set[str] = set()
+    for pair in pairs:
+        for key in ("source", "target"):
+            prov = str(pair.get(key) or "").strip().upper()
+            if prov:
+                allowed_providers.add(prov)
+    for key in ("provider_counts", "provider_counts_pre", "provider_counts_post"):
+        counts = out.get(key)
+        if isinstance(counts, Mapping):
+            out[key] = {str(k).upper(): v for k, v in counts.items() if str(k).strip().upper() in allowed_providers}
+    return out
 
 # Trigger sync run endpoint
 @router.post("/run")
-def api_run_sync(payload: dict | None = Body(None)) -> dict[str, Any]:
+def api_run_sync(payload: dict | None = Body(None), request: Request = cast(Request, None)) -> dict[str, Any]:
     rt = _rt()
     LOG_BUFFERS, RUNNING_PROCS, SYNC_PROC_LOCK = rt[0], rt[1], rt[2]
     with SYNC_PROC_LOCK:
@@ -2140,11 +2423,14 @@ def api_run_sync(payload: dict | None = Body(None)) -> dict[str, Any]:
             return {"ok": False, "error": "Sync already running"}
         cfg = _env()[0]()
         pairs = list((cfg or {}).get("pairs") or [])
+        user = _request_user(request)
+        if user and not user.get("is_admin"):
+            pairs = filter_pairs_for_user(cfg, user, pairs)
 
         pair_id = ""
         try:
             if isinstance(payload, dict):
-                pair_id = str(payload.get("pair_id") or payload.get("pairId") or "").strip()
+                pair_id = str(payload.get("pair_id") or payload.get("pairId") or payload.get("pair_scope") or "").strip()
         except Exception:
             pair_id = ""
 
@@ -2164,11 +2450,23 @@ def api_run_sync(payload: dict | None = Body(None)) -> dict[str, Any]:
             _sync_progress_ui("[SYNC] exit code: 0")
 
             return {"ok": True, "skipped": "no_pairs_configured"}
+        if str((payload or {}).get("source") or "").strip().lower() != "scheduler":
+            clear_queue_stop()
+
         run_id = str(int(time.time()))
+        overrides = {
+            key: value
+            for key, value in (payload or {}).items()
+            if key not in {"pair_id", "pairId", "pair_scope", "pair_scope_ids"}
+        }
+        if pair_id:
+            overrides["pair_id"] = pair_id
+        if user and not user.get("is_admin"):
+            overrides["pair_scope_ids"] = [str(pair.get("id") or "") for pair in pairs if str(pair.get("id") or "")]
         th = threading.Thread(
             target=_run_pairs_thread,
             args=(run_id,),
-            kwargs={"overrides": (payload or {})},
+            kwargs={"overrides": overrides},
             daemon=True,
         )
         th.start()
@@ -2176,8 +2474,61 @@ def api_run_sync(payload: dict | None = Body(None)) -> dict[str, Any]:
         _rt()[8]("SYNC", f"[i] Triggered sync run {run_id}")
         return {"ok": True, "run_id": run_id}
 
+def run_log_visible_to_user(cfg: Mapping[str, Any], user: Mapping[str, Any] | None) -> bool:
+    if not isinstance(user, Mapping) or bool(user.get("is_admin")):
+        return True
+    try:
+        allowed = pair_ids_for_user(dict(cfg or {}), user)
+        scope_raw = _summary_snapshot().get("pair_scope_ids")
+        scope_ids = {str(value or "").strip() for value in scope_raw if str(value or "").strip()} if isinstance(scope_raw, list) else set()
+    except Exception:
+        return False
+    return bool(scope_ids) and scope_ids.issubset(allowed)
+
+
+@router.post("/run/cancel")
+def api_cancel_sync(request: Request = cast(Request, None)) -> Any:
+    if not _is_sync_running():
+        clear_cancel()
+        return {"ok": False, "error": "No sync running", "running": False}
+    user = _request_user(request)
+    if user and not user.get("is_admin"):
+        try:
+            cfg = _env()[0]()
+            allowed_ids = pair_ids_for_user(cfg, user)
+            snap = _summary_snapshot()
+            scope_raw = snap.get("pair_scope_ids")
+            scope_ids = {str(value or "").strip() for value in scope_raw if str(value or "").strip()} if isinstance(scope_raw, list) else set()
+            if not scope_ids or not (scope_ids & allowed_ids):
+                return JSONResponse({"ok": False, "error": "profile_scope_denied"}, status_code=403)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "profile_scope_denied"}, status_code=403)
+    run_id = str(_summary_snapshot().get("run_id") or "")
+    state = request_cancel(run_id, reason="user")
+    _summary_set("cancel_requested", True)
+    _rt()[8]("SYNC", "[!] Cancel requested; finishing the current step and stopping.")
+    return {"ok": True, "running": True, "run_id": state.get("run_id"), "requested_at": state.get("requested_at")}
+
+
+@router.get("/run/cancel")
+def api_cancel_status() -> dict[str, Any]:
+    state = cancel_state()
+    return {
+        "ok": True,
+        "running": _is_sync_running(),
+        "cancel_requested": bool(state.get("run_id")),
+        "run_id": state.get("run_id"),
+        "requested_at": state.get("requested_at"),
+    }
+
+
 @router.get("/run/summary")
-def api_run_summary() -> JSONResponse:
+def api_run_summary(request: Request = cast(Request, None)) -> JSONResponse:
+    try:
+        cfg = _env()[0]()
+    except Exception:
+        cfg = {}
+    user = _request_user(request)
     snap0 = _summary_snapshot()
     snap = dict(snap0 or {})
     snap.setdefault("features", {})
@@ -2190,7 +2541,7 @@ def api_run_summary() -> JSONResponse:
         snap["timeline"] = tl
 
     try:
-        snap["provider_counts"] = _counts_from_state(_load_state()) or _provider_count_defaults()
+        snap["provider_counts"] = _provider_counts_current()
     except Exception:
         snap["provider_counts"] = _provider_count_defaults()
 
@@ -2199,10 +2550,18 @@ def api_run_summary() -> JSONResponse:
     except Exception:
         pass
 
-    return JSONResponse(snap)
+    return JSONResponse(_scope_summary_for_user(cfg, user, snap))
 
 @router.get("/run/unresolved")
-def api_run_unresolved() -> JSONResponse:
+def api_run_unresolved(request: Request = cast(Request, None)) -> JSONResponse:
+    user = _request_user(request)
+    if user and not user.get("is_admin"):
+        try:
+            cfg = _env()[0]()
+        except Exception:
+            cfg = {}
+        if not run_log_visible_to_user(cfg, user):
+            return JSONResponse({"total": 0, "items": []})
     try:
         from cw_platform.orchestrator._unresolved import load_unresolved_items
         records = load_unresolved_items()
@@ -2241,17 +2600,22 @@ def api_run_unresolved() -> JSONResponse:
     return JSONResponse({"total": len(items), "items": items})
 
 @router.get("/run/summary/file")
-def api_run_summary_file() -> Response:
+def api_run_summary_file(request: Request = cast(Request, None)) -> Response:
+    try:
+        cfg = _env()[0]()
+    except Exception:
+        cfg = {}
+    user = _request_user(request)
     snap0 = _summary_snapshot()
     snap = dict(snap0 or {})
     snap.setdefault("features", {})
     snap.setdefault("enabled", _lanes_enabled_defaults())
 
-    js = json.dumps(snap, indent=2)
+    js = json.dumps(_scope_summary_for_user(cfg, user, snap), indent=2)
     return Response(
         content=js,
         media_type="application/json",
-        headers={"Content-Disposition": 'attachment; filename="last_sync.json"'},
+        headers={"Content-Disposition": f'attachment; filename="{LAST_SYNC_JSON}"'},
     )
 
 _SSE_HEARTBEAT_SEC = 15.0
@@ -2291,6 +2655,12 @@ def _sync_log_base_seq() -> int:
 async def api_run_summary_stream(request: Request, since: str = "") -> StreamingResponse:
     import html, re
     TAG_RE = re.compile(r"<[^>]+>")
+    try:
+        cfg_for_scope = _env()[0]()
+    except Exception:
+        cfg_for_scope = {}
+    user_for_scope = _request_user(request)
+    managed_scope = bool(user_for_scope and not user_for_scope.get("is_admin"))
 
     def dehtml(s: str) -> str:
         return html.unescape(TAG_RE.sub("", s or ""))
@@ -2366,6 +2736,7 @@ async def api_run_summary_stream(request: Request, since: str = "") -> Streaming
                 break
             emitted = False
             buf_len = 0
+            log_visible = (not managed_scope) or run_log_visible_to_user(cfg_for_scope, user_for_scope)
             try:
                 buf = LOG_BUFFERS.get("SYNC") or []
                 buf_len = len(buf)
@@ -2381,10 +2752,11 @@ async def api_run_summary_stream(request: Request, since: str = "") -> Streaming
                 # Snapshot the batch: buf is the live buffer and each yield is
                 # a suspension point, so appends (or head trims) during
                 # emission would otherwise let the cursor advance past records
-                # that were never iterated.
+                # that were never iterated. Hidden logs (managed users without
+                # run-log visibility) still advance the cursor, just unemitted.
                 batch = buf[start_idx:]
                 if batch:
-                    for j, line in enumerate(batch):
+                    for j, line in enumerate(batch if log_visible else []):
                         raw = dehtml(line).strip()
                         if raw.startswith("{"):
                             try:
@@ -2418,9 +2790,12 @@ async def api_run_summary_stream(request: Request, since: str = "") -> Streaming
                 except Exception:
                     pass
 
+            snap = _scope_summary_for_user(cfg_for_scope, user_for_scope, snap)
             key = (
                 snap.get("running"),
                 snap.get("exit_code"),
+                snap.get("cancel_requested"),
+                snap.get("cancelled"),
                 _provider_counts_key(snap.get("provider_counts") or snap.get("provider_counts_post")),
                 snap.get("result"),
                 snap.get("duration_sec"),

@@ -1,17 +1,9 @@
 /* assets/js/modals/exporter/index.js */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
-const fjson=async(u,o)=>{const r=await fetch(u,o);if(!r.ok)throw new Error(`${r.status} ${r.statusText}`);return r.json()};
+const fjson=async(u,o)=>{const r=await fetch(u,o);if(!r.ok){let d=null;try{d=await r.json()}catch{}const e=new Error(d?.detail?.code||`${r.status} ${r.statusText}`);e.payload=d;throw e}return r.json()};
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>Array.from(r.querySelectorAll(s));
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
 const LS={get:(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}},set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}}};
-
-function injectCSS(){
-  if($("#cw-exporter-css")) return;
-  const el=document.createElement("style");
-  el.id="cw-exporter-css";
-  el.textContent=`.cx-modal-shell.cw-exporter-modal{width:min(var(--cxModalMaxW,1200px),calc(100vw - 40px))!important;max-width:min(var(--cxModalMaxW,1200px),calc(100vw - 40px))!important;height:min(var(--cxModalMaxH,84vh),calc(100vh - 40px))!important;background:linear-gradient(180deg,rgba(8,10,18,.98),rgba(6,8,14,.98))!important;border:1px solid rgba(108,126,255,.18)!important;box-shadow:0 28px 90px rgba(0,0,0,.58),inset 0 0 0 1px rgba(255,255,255,.03)!important}.cw-exporter{position:relative;display:flex;flex-direction:column;height:100%;min-height:0;background:radial-gradient(1100px 380px at -10% -10%,rgba(122,107,255,.11),transparent 45%),radial-gradient(900px 320px at 110% 0,rgba(35,168,255,.08),transparent 40%),linear-gradient(180deg,rgba(7,9,16,.985),rgba(5,7,12,.99));color:#e8eeff}.cw-exporter .cx-head{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.01))}.cw-exporter .cx-left{display:flex;align-items:center;gap:12px;min-width:0;flex-wrap:wrap}.cw-exporter .head-mark{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,rgba(111,91,255,.22),rgba(38,196,255,.14));border:1px solid rgba(122,107,255,.22);box-shadow:inset 0 0 0 1px rgba(255,255,255,.03);font-size:16px;flex:0 0 auto}.cw-exporter .head-copy{display:flex;flex-direction:column;gap:2px;min-width:220px;flex:1 1 280px}.cw-exporter .cx-title{font-weight:900;font-size:15px;letter-spacing:.08em;text-transform:uppercase}.cw-exporter .cx-sub{font-size:12px;opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cw-exporter .badge{display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px;flex:0 0 auto;min-height:34px;padding:7px 12px;border-radius:999px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.04);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;opacity:.86;line-height:1.25;max-width:100%}.cw-exporter .badge-item{display:inline-flex;align-items:center;gap:7px;min-height:24px;padding:0 9px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.18);white-space:nowrap}.cw-exporter .badge-logo,.cw-exporter .prov-icon img,.cw-exporter .prov-btn img,.cw-exporter .prov-opt img{width:14px;height:14px;display:block;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}.cw-exporter .badge-fallback,.cw-exporter .prov-fallback{font-size:10px;font-weight:900;opacity:.9}.cw-exporter .ex-intro{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 14px 12px;border-bottom:1px solid rgba(255,255,255,.06);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.006))}.cw-exporter .ex-intro-copy{min-width:0}.cw-exporter .ex-intro-title{font-size:13px;font-weight:800;color:#f4f7ff}.cw-exporter .ex-intro-sub{margin-top:4px;font-size:12px;line-height:1.45;color:rgba(205,215,235,.74)}.cw-exporter .ex-warnings{margin-top:7px;display:flex;gap:6px;flex-wrap:wrap}.cw-exporter .warn{display:inline-flex;align-items:center;min-height:24px;padding:0 9px;border-radius:999px;border:1px solid rgba(255,183,77,.24);background:rgba(255,183,77,.10);color:rgba(255,224,178,.95);font-size:11px}.cw-exporter .ex-intro-meta{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.cw-exporter .ex-intro-meta .mini{display:inline-flex;align-items:center;min-height:28px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.035);font-size:11px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:rgba(230,237,250,.84)}.cw-exporter .close-btn,.cw-exporter .btn{height:38px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#eef3ff;border-radius:14px;padding:0 14px;cursor:pointer;font-size:12px;font-weight:800;letter-spacing:.05em;transition:background .16s ease,border-color .16s ease,transform .12s ease,box-shadow .16s ease}.cw-exporter .close-btn{height:auto;padding:8px 14px;border-radius:999px;font-size:11px;letter-spacing:.08em;text-transform:uppercase}.cw-exporter .close-btn:hover,.cw-exporter .btn:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.18)}.cw-exporter .close-btn:active,.cw-exporter .btn:active{transform:translateY(1px)}.cw-exporter .btn.primary{background:linear-gradient(135deg,rgba(111,91,255,.26),rgba(59,130,246,.22));border-color:rgba(122,107,255,.32);box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}.cw-exporter .btn.primary:hover{background:linear-gradient(135deg,rgba(111,91,255,.32),rgba(59,130,246,.26))}.cw-exporter .btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}.cw-exporter .ex-body{flex:1;min-height:0;display:grid;grid-template-rows:auto 1fr;gap:10px;padding:12px 14px 14px;overflow:hidden}.cw-exporter .row{display:grid;grid-template-columns:minmax(150px,.9fr) minmax(120px,.65fr) minmax(150px,.85fr) minmax(130px,.75fr) minmax(150px,.85fr);gap:10px;align-items:start;padding:12px;border:1px solid rgba(255,255,255,.08);border-radius:18px;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 18px 40px rgba(0,0,0,.18)}.cw-exporter .field{display:flex;flex-direction:column;gap:6px;min-width:0}.cw-exporter .field label{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;opacity:.72;padding-left:2px}.cw-exporter .provider-field{position:relative}.cw-exporter .prov-native{display:none}.cw-exporter .prov-dd{position:relative}.cw-exporter .prov-btn{width:100%;height:38px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 12px;border-radius:14px;border:1px solid rgba(255,255,255,.1);background:rgba(7,10,18,.92);color:#e7eeff;box-shadow:inset 0 1px 0 rgba(255,255,255,.03);cursor:pointer}.cw-exporter .prov-btn:hover{background:rgba(10,14,24,.96);border-color:rgba(255,255,255,.14)}.cw-exporter .prov-btn:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(122,107,255,.14)}.cw-exporter .prov-val{display:flex;align-items:center;gap:10px;min-width:0}.cw-exporter .prov-val span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-exporter .prov-chev{font-size:12px;opacity:.72}.cw-exporter .prov-menu{position:absolute;left:0;right:0;top:calc(100% + 6px);z-index:20;padding:6px;border-radius:16px;border:1px solid rgba(255,255,255,.1);background:linear-gradient(180deg,rgba(10,14,24,.98),rgba(7,10,18,.98));box-shadow:0 18px 34px rgba(0,0,0,.34);display:none}.cw-exporter .prov-menu.open{display:block}.cw-exporter .prov-opt{width:100%;display:flex;align-items:center;gap:10px;padding:9px 10px;border:0;background:transparent;color:#eef3ff;border-radius:12px;cursor:pointer;text-align:left}.cw-exporter .prov-opt:hover,.cw-exporter .prov-opt.active{background:rgba(72,104,220,.22)}.cw-exporter .input{width:100%;background:rgba(7,10,18,.92);border:1px solid rgba(255,255,255,.1);color:#e7eeff;border-radius:14px;padding:0 12px;height:38px;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.03);transition:border-color .16s ease,box-shadow .16s ease,background .16s ease}.cw-exporter select.input{appearance:none;background-image:linear-gradient(45deg,transparent 50%,rgba(255,255,255,.74) 50%),linear-gradient(135deg,rgba(255,255,255,.74) 50%,transparent 50%);background-position:calc(100% - 16px) calc(50% - 3px),calc(100% - 10px) calc(50% - 3px);background-size:6px 6px;background-repeat:no-repeat;padding-right:34px}.cw-exporter .input::placeholder{color:rgba(224,232,255,.38)}.cw-exporter .input:focus{border-color:rgba(122,107,255,.48);box-shadow:0 0 0 3px rgba(122,107,255,.14);background:rgba(9,13,23,.96)}.cw-exporter .search{min-width:0}.cw-exporter .action-row{grid-column:1/-1;display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap}.cw-exporter .action-left{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}.cw-exporter .media-field{display:flex;flex-direction:column;gap:6px;min-width:0}.cw-exporter .watched-date-wrap[hidden]{display:none}.cw-exporter .media-picks,#ex-media{display:flex;gap:7px;flex-wrap:wrap;min-height:38px;align-items:center}.cw-exporter .media-pick{display:inline-flex;align-items:center;gap:7px;min-height:34px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.16);font-size:11px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}.cw-exporter .media-pick input{accent-color:#7a6bff}.cw-exporter .media-pick.disabled{opacity:.45}.cw-exporter .row-right{margin-left:auto;display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;gap:8px;min-width:0}.cw-exporter .hint{font-size:12px;opacity:.72}.cw-exporter .count-chip,.cw-exporter .toggle{display:inline-flex;align-items:center;min-height:38px;padding:0 12px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.16)}.cw-exporter .count-chip{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}.cw-exporter .toggle{gap:10px;cursor:pointer;user-select:none}.cw-exporter .toggle input{display:none}.cw-exporter .toggle-track{width:42px;height:24px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);position:relative;transition:background .18s ease,border-color .18s ease,box-shadow .18s ease}.cw-exporter .toggle-knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#eef3ff;box-shadow:0 4px 10px rgba(0,0,0,.35);transition:transform .18s ease,background .18s ease}.cw-exporter .toggle input:checked+.toggle-track{background:linear-gradient(90deg,rgba(111,91,255,.40),rgba(42,191,255,.28));border-color:rgba(122,107,255,.30);box-shadow:inset 0 0 0 1px rgba(255,255,255,.03)}.cw-exporter .toggle input:checked+.toggle-track .toggle-knob{transform:translateX(18px);background:#fff}.cw-exporter .toggle-label{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;opacity:.8}.cw-exporter .ex-grid-wrap{min-height:0;border:1px solid rgba(255,255,255,.08);border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.02));overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 20px 40px rgba(0,0,0,.16)}.cw-exporter .ex-grid{height:100%;overflow:auto}.cw-exporter table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}.cw-exporter thead th{position:sticky;top:0;z-index:2;background:rgba(8,10,18,.94);backdrop-filter:blur(10px);text-align:left;opacity:.82;user-select:none}.cw-exporter th,.cw-exporter td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:12px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cw-exporter th:first-child,.cw-exporter td:first-child{width:46px;min-width:46px;max-width:46px;padding-left:14px;padding-right:10px;text-align:center}.cw-exporter tbody tr{transition:background .14s ease,box-shadow .14s ease}.cw-exporter tbody tr:hover{background:rgba(255,255,255,.03)}.cw-exporter tbody tr:last-child td{border-bottom:0}.cw-exporter th .resizer{position:absolute;right:-2px;top:0;width:6px;height:100%;cursor:col-resize}.cw-exporter th:hover .resizer{background:linear-gradient(90deg,transparent 0,rgba(122,107,255,.38) 50%,transparent 100%)}.cw-exporter .td-wrap,.cw-exporter .ids{white-space:normal;overflow:visible;text-overflow:clip}.cw-exporter .ids span{display:inline-flex;align-items:center;min-height:22px;margin:0 6px 6px 0;padding:0 8px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)}.cw-exporter .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px}.cw-exporter input[type=checkbox].glow-check{appearance:none;-webkit-appearance:none;position:relative;display:inline-grid;place-items:center;cursor:pointer;width:18px!important;height:18px!important;margin:0;padding:0;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:linear-gradient(180deg,rgba(17,22,31,.96),rgba(10,14,20,.98));box-shadow:inset 0 1px 0 rgba(255,255,255,.035);outline:none;transition:border-color .16s ease,background .16s ease,box-shadow .16s ease}.cw-exporter input[type=checkbox].glow-check:hover{border-color:rgba(126,136,255,.24);background:linear-gradient(180deg,rgba(19,25,36,.98),rgba(11,15,23,.99))}.cw-exporter input[type=checkbox].glow-check::after{content:"";width:5px;height:9px;border-right:2px solid #f7f9ff;border-bottom:2px solid #f7f9ff;transform:rotate(45deg) translate(-1px,-1px);opacity:0;transition:opacity .14s ease,transform .14s ease}.cw-exporter input[type=checkbox].glow-check:checked{border-color:rgba(104,116,255,.34);background:linear-gradient(180deg,rgba(76,86,186,.88),rgba(46,64,150,.92));box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 0 0 3px rgba(90,106,255,.10)}.cw-exporter input[type=checkbox].glow-check:checked::after{opacity:1;transform:rotate(45deg) translate(0,0)}.cw-exporter input[type=checkbox].glow-check:focus-visible{box-shadow:0 0 0 3px rgba(90,106,255,.14),inset 0 1px 0 rgba(255,255,255,.08)}.wait-overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(5,8,20,.66);backdrop-filter:blur(6px);z-index:9999;opacity:1;transition:opacity .18s ease}.wait-overlay.hidden{opacity:0;pointer-events:none}.wait-card{display:flex;flex-direction:column;align-items:center;gap:14px;padding:22px 26px;border-radius:20px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(10,13,23,.96),rgba(8,10,18,.96));box-shadow:0 24px 60px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.04)}.wait-ring{width:52px;height:52px;border-radius:50%;position:relative;filter:drop-shadow(0 0 12px rgba(122,107,255,.28))}.wait-ring::before{content:"";position:absolute;inset:0;border-radius:50%;padding:4px;background:conic-gradient(#7a6bff,#23a8ff,#7a6bff);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:wait-spin 1.1s linear infinite}.wait-text{font-weight:800;color:#dbe8ff;letter-spacing:.04em}@keyframes wait-spin{to{transform:rotate(360deg)}}@media (max-width:1080px){.cw-exporter .ex-intro{grid-template-columns:1fr}.cw-exporter .ex-intro-meta{justify-content:flex-start}.cw-exporter .row{grid-template-columns:repeat(2,minmax(0,1fr))}.cw-exporter .search,.cw-exporter .action-row{grid-column:1/-1}.cw-exporter .action-row{align-items:flex-start;flex-direction:column}.cw-exporter .row-right{justify-content:flex-start;margin-left:0;flex-wrap:wrap}}@media (max-width:720px){.cw-exporter .badge{display:flex;flex:1 1 auto}.cx-modal-shell.cw-exporter-modal{width:min(var(--cxModalMaxW,1200px),calc(100vw - 20px))!important;max-width:min(var(--cxModalMaxW,1200px),calc(100vw - 20px))!important;height:min(var(--cxModalMaxH,84vh),calc(100vh - 20px))!important}.cw-exporter .cx-head{grid-template-columns:1fr;padding:12px}.cw-exporter .ex-intro{padding:10px 12px 12px}.cw-exporter .ex-body{padding:12px;gap:10px}.cw-exporter .row{grid-template-columns:1fr;padding:10px}.cw-exporter .search{grid-column:auto}.cw-exporter .row-right{justify-content:flex-start}.cw-exporter th,.cw-exporter td{padding:9px 10px}}`;
-  document.head.appendChild(el);
-}
 
 async function injectExporterStyles(){
   if(document.querySelector('link[data-cw-exporter-styles]')) return;
@@ -28,7 +20,7 @@ async function injectExporterStyles(){
 const closeModal=()=>window.cxCloseModal?window.cxCloseModal():document.querySelector(".cx-modal-shell")?.dispatchEvent(new CustomEvent("cw-modal-close",{bubbles:true}));
 async function downloadFile(u){const r=await fetch(u);if(!r.ok)throw new Error(`Download failed: ${r.status}`);const blob=await r.blob(),cd=r.headers.get("Content-Disposition")||"",m=/filename="([^"]+)"/i.exec(cd),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=m?.[1]||"export.csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)}
 
-function enableColumnResize(table,key="cw.exporter.cols.v2"){
+function enableColumnResize(table,key){
   try{
     if(!table?.isConnected) return;
     const ths=$$("thead th",table); if(!ths.length) return;
@@ -45,6 +37,92 @@ function enableColumnResize(table,key="cw.exporter.cols.v2"){
   }catch(err){console.warn("Column resize init failed:",err)}
 }
 
+const mediaLabel=t=>({movie:"Movies",show:"Shows",season:"Seasons",episode:"Episodes"}[t]||t);
+const featureLabel=f=>({history:"History",ratings:"Ratings",watchlist:"Watchlist",combined:"History & Ratings"}[f]||f);
+const reasonLabel=r=>({
+  already_exists:"Already in tracker",
+  duplicate_in_file:"Duplicate in file",
+  rating_update:"Update rating",
+  missing_identity:"Missing usable ID",
+  missing_watched_at:"Missing watched date",
+  missing_rating:"Missing rating",
+  unsupported_feature:"Unsupported feature",
+  unsupported_media_type:"Unsupported type",
+  import_source_mismatch:"Wrong export type",
+  import_no_rows:"No importable rows",
+  import_file_too_large:"File too large",
+  import_unsupported_file_type:"Unsupported file type",
+  import_zip_too_large:"ZIP too large",
+  import_zip_too_many_files:"Too many ZIP files",
+  import_zip_encrypted:"Encrypted ZIP not supported",
+  import_zip_unsupported_member:"No supported files in ZIP",
+  import_parse_failed:"Could not parse export",
+  import_target_unavailable:"CrossWatch tracker not connected"
+}[r]||String(r||"Ready"));
+const helpIcon=(tip,label="Help")=>`<button type="button" class="cx-help ex-help material-symbols-rounded" title="${esc(tip)}" aria-label="${esc(label)}">help</button>`;
+
+const TEMPLATE=`<div class="cw-exporter">
+  <div class="cx-head">
+    <div class="cx-left"><div class="head-mark material-symbols-rounded">import_export</div><div class="head-copy"><div class="cx-title">Import / Export</div><div class="cx-sub">Bring data into CrossWatch or export it out.</div></div></div>
+    <div class="ex-actions"><div class="ex-tabs" role="tablist"><button type="button" class="ex-tab active" data-tab="import">Import</button><button type="button" class="ex-tab" data-tab="export">Export</button></div><button class="close-btn" id="ex-close">Close</button></div>
+  </div>
+  <div class="ex-progress hidden" id="ex-progress">
+    <div class="ex-progress-head"><div><strong id="ex-progress-title">Working</strong><span id="ex-progress-sub">Preparing...</span></div><b id="ex-progress-percent">0%</b></div>
+    <div class="ex-progress-bar"><span id="ex-progress-fill"></span></div>
+    <div class="ex-progress-grid"><div><span>Stage</span><b id="ex-progress-stage">Starting</b></div><div><span>Elapsed</span><b id="ex-progress-elapsed">0s</b></div><div><span>Rows</span><b id="ex-progress-rows">-</b></div></div>
+  </div>
+  <div class="im-body">
+    <div class="im-setup">
+      <div class="im-panel im-panel-main">
+        <div class="im-panel-head"><span class="material-symbols-rounded">source_environment</span><b>Import setup</b></div>
+        <div class="im-fields">
+          <div class="field"><label for="im-source">Source ${helpIcon("Provider or export format to import. Auto detect uses filenames and common columns.", "Source help")}</label><select id="im-source" class="input"><option value="auto">Auto detect</option><option value="trakt">Trakt export ZIP</option><option value="letterboxd">Letterboxd ZIP</option><option value="simkl">Simkl backup JSON</option><option value="imdb">IMDb CSV</option><option value="tvtime">TV Time export</option><option value="yamtrack">Yamtrack CSV</option><option value="generic">Generic CSV/JSON</option></select></div>
+          <div class="field"><label for="im-target">Target profile ${helpIcon("Target profile from CrossWatch Tracker", "Target profile help")}</label><select id="im-target" class="input"><option value="default">Default</option></select></div>
+        </div>
+        <div class="field expect-field"><label>How to export ${helpIcon("Shows where to create the export and which files CrossWatch expects.", "How to export help")}</label><div class="hint import-expect" id="im-expect">Pick a source to see the export steps.</div></div>
+      </div>
+      <div class="im-panel im-panel-file">
+        <div class="im-panel-head"><span class="material-symbols-rounded">upload_file</span><b>Export file</b>${helpIcon("Upload the provider export ZIP, JSON or CSV. Files are previewed before anything is imported.", "Export file help")}</div>
+        <input id="im-file" class="file-native" type="file" accept=".zip,.json,.csv,.txt,application/zip,application/json,text/csv">
+        <button type="button" class="file-pick-btn" id="im-file-btn"><span class="material-symbols-rounded">upload_file</span><span id="im-file-name">Choose export file</span></button>
+        <button class="btn" id="im-upload">Preview file</button>
+      </div>
+      <div class="im-panel im-panel-options">
+        <div class="im-panel-head"><span class="material-symbols-rounded">tune</span><b>Include</b>${helpIcon("Choose which data types and media types are included in the preview and import.", "Include help")}</div>
+        <div class="media-picks im-pick-group">
+          <label class="media-pick"><input type="checkbox" data-im-feature="history" checked><span>History</span></label>
+          <label class="media-pick"><input type="checkbox" data-im-feature="ratings" checked><span>Ratings</span></label>
+          <label class="media-pick"><input type="checkbox" data-im-feature="watchlist" checked><span>Watchlist</span></label>
+        </div>
+        <div class="media-picks im-pick-group">
+          <label class="media-pick"><input type="checkbox" data-im-media="movie" checked><span>Movies</span></label>
+          <label class="media-pick"><input type="checkbox" data-im-media="show" checked><span>Shows</span></label>
+          <label class="media-pick"><input type="checkbox" data-im-media="season" checked><span>Seasons</span></label>
+          <label class="media-pick"><input type="checkbox" data-im-media="episode" checked><span>Episodes</span></label>
+        </div>
+      </div>
+    </div>
+    <div class="im-summary" id="im-summary"></div>
+    <div class="im-preview-tools">
+      <div class="field search"><label for="im-q">Search preview ${helpIcon("Filter preview rows by title, year, provider ID, status, or media type.", "Search preview help")}</label><input id="im-q" class="input" type="text" placeholder="Title, year or id..."></div>
+      <div class="im-status-tabs" id="im-status-tabs" role="group" aria-label="Preview status filter"><button type="button" class="im-filter active" data-im-status="all" title="Show all preview rows">All</button><button type="button" class="im-filter" data-im-status="ready" title="Rows that are not in the target profile yet">Ready</button><button type="button" class="im-filter" data-im-status="exists" title="Rows the target profile already holds. Turn on Include existing to import them anyway">In tracker</button><button type="button" class="im-filter" data-im-status="duplicate" title="Rows that appear more than once inside the export file">Duplicate</button><button type="button" class="im-filter" data-im-status="missing_identity" title="Rows without a usable provider ID or title/year match">Missing IDs</button><button type="button" class="im-filter" data-im-status="invalid" title="Rows missing required data like watched date or rating">Invalid</button><button type="button" class="im-filter" data-im-status="unsupported" title="Rows CrossWatch cannot import yet">Unsupported</button></div>
+      <div class="im-import-actions"><div class="hint count-chip" id="im-count">No preview</div><div class="im-page-actions"><button type="button" class="btn icon-btn im-page-btn" id="im-prev" disabled title="Previous preview page" aria-label="Previous preview page"><span class="material-symbols-rounded">chevron_left</span></button><div class="hint count-chip" id="im-page">Rows 0-0 of 0</div><button type="button" class="btn icon-btn im-page-btn" id="im-next" disabled title="Next preview page" aria-label="Next preview page"><span class="material-symbols-rounded">chevron_right</span></button></div><label class="toggle" title="Also import rows the target profile already holds. Use this to restore or merge a backup"><input id="im-include-existing" type="checkbox"><span class="toggle-track"><span class="toggle-knob"></span></span><span class="toggle-label">Include existing</span></label><label class="toggle" title="Import all importable rows matching the filters"><input id="im-all-ready" type="checkbox" checked><span class="toggle-track"><span class="toggle-knob"></span></span><span class="toggle-label">All ready</span></label><button class="btn primary" id="im-import" disabled title="Import selected rows into the target CrossWatch Tracker profile">Import</button></div>
+    </div>
+    <div class="ex-grid-wrap"><div class="ex-grid"><table id="im-table"><colgroup></colgroup><thead><tr><th data-col="sel" style="width:34px"></th><th data-col="title" style="width:220px">Title</th><th data-col="feature" style="width:92px">Feature</th><th data-col="type" style="width:88px">Type</th><th data-col="ids">IDs</th><th data-col="status" style="width:160px">Status</th></tr></thead><tbody id="im-tbody"><tr><td colspan="6" class="hint">Choose an export file to preview it here.</td></tr></tbody></table></div></div>
+  </div>
+  <div class="ex-body hidden">
+    <div class="row">
+      <div class="field provider-field"><label for="ex-prov-btn">Provider</label><select id="ex-prov" name="ex-prov" class="prov-native" data-cw-icon-select="off" aria-hidden="true" tabindex="-1"></select><div class="prov-dd"><button type="button" id="ex-prov-btn" class="prov-btn" aria-haspopup="listbox" aria-expanded="false"><span class="prov-val" id="ex-prov-val"></span><span class="prov-chev">v</span></button><div id="ex-prov-menu" class="prov-menu" role="listbox"></div></div></div>
+      <div class="field"><label for="ex-inst">Instance</label><select id="ex-inst" name="ex-inst" class="input"></select></div>
+      <div class="field"><label for="ex-feat">Feature</label><select id="ex-feat" name="ex-feat" class="input"><option value="watchlist">Watchlist</option><option value="history">History</option><option value="ratings">Ratings</option><option value="combined">History &amp; Ratings</option></select></div>
+      <div class="field"><label for="ex-fmt">Format</label><select id="ex-fmt" name="ex-fmt" class="input"></select></div>
+      <div class="field search"><label for="ex-q">Search</label><input id="ex-q" name="ex-q" class="input" type="text" placeholder="Title, year or id..."></div>
+      <div class="action-row"><div class="action-left"><div class="media-field"><label>Media types</label><div class="media-picks"><span id="ex-media"></span><label class="media-pick watched-date-wrap" id="ex-watched-date-wrap" title="Include WatchedDate in Letterboxd exports"><input id="ex-watched-date" type="checkbox" checked><span>WatchedDate</span></label><label class="media-pick rewatch-wrap" id="ex-rewatch-wrap" title="Keep separate watched events when the source supports rewatches"><input id="ex-rewatches" type="checkbox" checked><span>Rewatches</span></label></div></div></div><div class="row-right"><div class="hint count-chip" id="ex-count">-</div><label class="toggle" title="Export all filtered results (live)"><input id="ex-all" type="checkbox" checked><span class="toggle-track"><span class="toggle-knob"></span></span><span class="toggle-label">All filtered</span></label><button class="btn" id="ex-preview">Preview</button><button class="btn primary" id="ex-export">Export</button></div></div>
+    </div>
+    <div class="ex-grid-wrap"><div class="ex-grid"><table id="ex-table"><colgroup></colgroup><thead><tr><th data-col="sel" style="width:34px"></th><th data-col="title" style="width:220px">Title</th><th data-col="year" style="width:82px">Year</th><th data-col="type" style="width:92px">Type</th><th data-col="ids">IDs</th><th data-col="extra" style="width:142px">Watched / Rating</th></tr></thead><tbody id="ex-tbody"><tr><td colspan="6" class="hint">Loading...</td></tr></tbody></table></div></div>
+  </div>
+</div><div class="wait-overlay hidden" id="ex-wait"><div class="wait-card" role="status" aria-live="assertive"><div class="wait-ring"></div><div class="wait-text" id="ex-wait-text">Loading...</div></div></div>`;
+
 // Document-level listener must outlive mount() but not the modal; kept here so
 // unmount() can remove it — otherwise each open leaks a handler pinning the
 // discarded modal subtree. The generation counter stops a stale mount (its
@@ -55,7 +133,6 @@ let onDocClick=null, mountGen=0;
 export default {
   async mount(root){
     const gen=++mountGen;
-    injectCSS();
     await injectExporterStyles();
     if(gen!==mountGen) return;
     const shell=root.closest(".cx-modal-shell");
@@ -63,104 +140,254 @@ export default {
     root.classList.add("cw-exporter-modal");
     root.style.setProperty("--cxModalMaxW","1200px");
     root.style.setProperty("--cxModalMaxH","84vh");
-    root.innerHTML=`<div class="cw-exporter"><div class="cx-head"><div class="cx-left"><div class="head-mark">⇩</div><div class="head-copy"><div class="cx-title">Exporter</div><div class="cx-sub">Filter, preview and export source data.</div></div><div class="badge" id="ex-badge">-</div></div><div class="ex-actions"><button class="close-btn" id="ex-close">Close</button></div></div><div class="ex-intro"><div class="ex-intro-copy"><div class="ex-intro-title">Build a scoped export before downloading</div><div class="ex-intro-sub" id="ex-summary-copy">Choose a provider, narrow the preview, then export exactly the rows you want.</div><div class="ex-warnings" id="ex-warnings"></div></div><div class="ex-intro-meta" id="ex-summary-meta"><span class="mini">Mode all</span><span class="mini">Selected 0</span><span class="mini">Total 0</span></div></div><div class="ex-body"><div class="row"><div class="field provider-field"><label for="ex-prov-btn">Provider</label><select id="ex-prov" name="ex-prov" class="prov-native" data-cw-icon-select="off" aria-hidden="true" tabindex="-1"></select><div class="prov-dd"><button type="button" id="ex-prov-btn" class="prov-btn" aria-haspopup="listbox" aria-expanded="false"><span class="prov-val" id="ex-prov-val"></span><span class="prov-chev">▾</span></button><div id="ex-prov-menu" class="prov-menu" role="listbox"></div></div></div><div class="field"><label for="ex-inst">Instance</label><select id="ex-inst" name="ex-inst" class="input"></select></div><div class="field"><label for="ex-feat">Feature</label><select id="ex-feat" name="ex-feat" class="input"><option value="watchlist">Watchlist</option><option value="history">History</option><option value="ratings">Ratings</option><option value="combined">History &amp; Ratings</option></select></div><div class="field"><label for="ex-fmt">Format</label><select id="ex-fmt" name="ex-fmt" class="input"></select></div><div class="field search"><label for="ex-q">Search</label><input id="ex-q" name="ex-q" class="input" type="text" placeholder="Title, year or id..."></div><div class="action-row"><div class="action-left"><div class="media-field"><label>Media types</label><div class="media-picks"><span id="ex-media"></span><label class="media-pick watched-date-wrap" id="ex-watched-date-wrap" title="Include WatchedDate in Letterboxd exports"><input id="ex-watched-date" type="checkbox" checked><span>WatchedDate</span></label></div></div></div><div class="row-right"><div class="hint count-chip" id="ex-count">-</div><label class="toggle" title="Export all filtered results (live)"><input id="ex-all" type="checkbox" checked><span class="toggle-track"><span class="toggle-knob"></span></span><span class="toggle-label">All filtered</span></label><button class="btn" id="ex-preview">Preview</button><button class="btn primary" id="ex-export">Export</button></div></div></div><div class="ex-grid-wrap"><div class="ex-grid"><table id="ex-table"><colgroup></colgroup><thead><tr><th data-col="sel" style="width:34px"></th><th data-col="title" style="width:220px">Title</th><th data-col="year" style="width:82px">Year</th><th data-col="type" style="width:92px">Type</th><th data-col="ids">IDs</th><th data-col="extra" style="width:142px">Watched / Rating</th></tr></thead><tbody id="ex-tbody"><tr><td colspan="6" class="hint">Loading...</td></tr></tbody></table></div></div></div></div><div class="wait-overlay hidden" id="ex-wait"><div class="wait-card" role="status" aria-live="assertive"><div class="wait-ring"></div><div class="wait-text" id="ex-wait-text">Loading...</div></div></div>`;
+    root.innerHTML=TEMPLATE;
+    root.addEventListener("click",e=>{if(e.target.closest(".ex-help")){e.preventDefault();e.stopPropagation()}},true);
+    root.addEventListener("mousedown",e=>{if(e.target.closest(".ex-help")) e.stopPropagation()},true);
 
-    const el=n=>$(n,root), PM=window.CW?.ProviderMeta, badge=el("#ex-badge"), countEl=el("#ex-count"), summaryCopy=el("#ex-summary-copy"), summaryMeta=el("#ex-summary-meta"), warnEl=el("#ex-warnings"), provSel=el("#ex-prov"), provBtn=el("#ex-prov-btn"), provVal=el("#ex-prov-val"), provMenu=el("#ex-prov-menu"), instSel=el("#ex-inst"), featSel=el("#ex-feat"), fmtSel=el("#ex-fmt"), mediaWrap=el("#ex-media"), watchedDateWrap=el("#ex-watched-date-wrap"), watchedDateChk=el("#ex-watched-date"), qInput=el("#ex-q"), allChk=el("#ex-all"), btnPrev=el("#ex-preview"), btnExp=el("#ex-export"), tbody=el("#ex-tbody"), table=el("#ex-table"), wait=el("#ex-wait"), waitText=el("#ex-wait-text");
-    const state={opts:null,total:0,matchedTotal:0,droppedTotal:0,lastQuery:"",selected:new Set(),mode:"all"};
-    const PREFS_KEY="cw.exporter.prefs", prefs=LS.get(PREFS_KEY,{}), savePrefs=()=>LS.set(PREFS_KEY,{provider:provSel.value,instance:instSel.value,feature:featSel.value,format:fmtSel.value,media_types:selectedMediaTypes(),include_watched_date:watchedDateChk.checked,q:qInput.value,all:allChk.checked});
-    let waitTimer, shownAt=0;
-    const logoHtml=(p,cls="badge-logo")=>{const src=PM?.logLogoPath?.(p)||PM?.logoPath?.(p)||"", label=PM?.label?.(p)||String(p||""); return src?`<img class="${cls}" src="${src}" alt="${esc(label)}">`:`<span class="prov-fallback">${esc(label.slice(0,2).toUpperCase())}</span>`};
-    const provText=p=>esc(PM?.label?.(p)||p);
-    const provOption=p=>`<button type="button" class="prov-opt${provSel.value===p?" active":""}" data-provider="${esc(p)}" role="option" aria-selected="${provSel.value===p}">${logoHtml(p,"prov-logo")}<span>${provText(p)}</span></button>`;
-    const renderProv=()=>{provVal.innerHTML=`${logoHtml(provSel.value,"prov-logo")}<span>${provText(provSel.value)}</span>`; provMenu.innerHTML=[...provSel.options].map(o=>provOption(o.value)).join("")};
-    const closeProv=()=>{provMenu.classList.remove("open"); provBtn.setAttribute("aria-expanded","false")};
-    const openProv=()=>{provMenu.classList.add("open"); provBtn.setAttribute("aria-expanded","true")};
-    const setWait=t=>waitText.textContent=t, showWait=(t="Loading...")=>{setWait(t);wait.classList.remove("hidden");shownAt=performance.now();clearTimeout(waitTimer);waitTimer=setTimeout(()=>setWait(`${t} (still working...)`),3000)}, hideWait=()=>{clearTimeout(waitTimer);const ms=250-(performance.now()-shownAt);setTimeout(()=>wait.classList.add("hidden"),Math.max(0,ms))};
-    const refreshCounts=()=>{const sel=state.mode==="all"?state.total:state.selected.size; countEl.textContent=`Selected: ${sel} of ${state.total}`; const dropped=state.droppedTotal?` ${state.droppedTotal} row(s) skipped for this target.`:""; summaryCopy.textContent=(state.mode==="all"?"Export is currently scoped to all filtered rows in the preview.":"Export is currently scoped to the manually selected preview rows.")+dropped; summaryMeta.innerHTML=`<span class="mini">Mode ${state.mode}</span><span class="mini">Selected ${sel}</span><span class="mini">Matched ${state.matchedTotal||state.total}</span><span class="mini">Exportable ${state.total}</span>`};
-    const fmtBadge=counts=>!counts?"-":Object.keys(counts).map(p=>{const c=counts[p]||{}; return `<span class="badge-item">${logoHtml(p)}<span>${esc(PM?.label?.(p)||p)} W${c.watchlist||0}/H${c.history||0}/R${c.ratings||0}/C${c.combined||0}</span></span>`}).join("");
-    const rowHTML=it=>`<tr data-key="${esc(it.key)}"><td><input type="checkbox" name="export-row" class="glow-check row-check" aria-label="Select ${esc(it.title||it.key||"row")}" ${state.mode==="all"||state.selected.has(it.key)?"checked":""}></td><td class="td-wrap">${esc(it.title||"")}</td><td>${esc(it.year||"")}</td><td>${esc(it.type||"")}</td><td class="ids">${Object.entries(it.ids||{}).map(([k,v])=>`<span class="mono">${esc(k)}:${esc(v)}</span>`).join(" ")}</td><td>${esc(it.rating||it.watched_at||"")}</td></tr>`;
-    const selectedMediaTypes=()=>$$('input[type="checkbox"][data-media]',mediaWrap).filter(x=>x.checked&&!x.disabled).map(x=>x.dataset.media);
-    const mediaLabel=t=>({movie:"Movies",show:"Shows",season:"Seasons",episode:"Episodes"}[t]||t);
-    const setMediaTypes=types=>{$$('input[type="checkbox"][data-media]',mediaWrap).forEach(cb=>{cb.checked=(types||[]).includes(cb.dataset.media)})};
-    const renderWarnings=warnings=>{warnEl.innerHTML=(warnings||[]).map(w=>`<span class="warn">${esc(w)}</span>`).join("")};
-    const syncInstances=()=>{const prov=provSel.value,list=state.opts?.instances?.[prov]||[{id:"default",label:"Default"}];instSel.innerHTML=[`<option value="all">All</option>`,...list.map(x=>`<option value="${esc(x.id)}">${esc(x.label||x.id)}</option>`)].join("");const want=prefs.instance;if(want&&(want==="all"||list.some(x=>x.id===want))) instSel.value=want; if(!instSel.value) instSel.value="all"; renderProv()};
-    const syncFormats=()=>{const list=state.opts?.formats?.[featSel.value]||[], labels=state.opts?.labels||{};const prev=fmtSel.value;fmtSel.innerHTML=list.map(x=>`<option value="${esc(x)}">${esc(labels[x]||x.toUpperCase())}</option>`).join(""); if(list.includes(prev)) fmtSel.value=prev; else if(prefs.format&&list.includes(prefs.format)) fmtSel.value=prefs.format};
-    const syncWatchedDateOption=()=>{
-      watchedDateWrap.hidden=!(fmtSel.value==="letterboxd"&&["history","combined"].includes(featSel.value));
+    const el=n=>$(n,root), PM=window.CW?.ProviderMeta;
+    const wait=el("#ex-wait"), waitText=el("#ex-wait-text");
+    const prog={box:el("#ex-progress"),title:el("#ex-progress-title"),sub:el("#ex-progress-sub"),pct:el("#ex-progress-percent"),fill:el("#ex-progress-fill"),stage:el("#ex-progress-stage"),elapsed:el("#ex-progress-elapsed"),rows:el("#ex-progress-rows")};
+    let waitTimer, shownAt=0, progressTimer, progressStart=0, progressPct=0, progressOk=true;
+    const setWait=t=>waitText.textContent=t;
+    const setProgress=(pct,stage,sub,rows="-")=>{progressPct=Math.max(0,Math.min(100,Math.round(pct||0)));prog.pct.textContent=`${progressPct}%`;prog.fill.style.width=`${progressPct}%`;prog.stage.textContent=stage||"Working";prog.sub.textContent=sub||stage||"Working...";prog.rows.textContent=rows};
+    const showProgress=(title,stage)=>{clearInterval(progressTimer);progressOk=true;progressStart=performance.now();progressPct=8;prog.title.textContent=title;setProgress(progressPct,stage,stage);prog.box.classList.remove("hidden","done","error");prog.box.classList.add("active");progressTimer=setInterval(()=>{const elapsed=Math.max(0,Math.round((performance.now()-progressStart)/1000));prog.elapsed.textContent=`${elapsed}s`;if(progressPct<88)setProgress(progressPct+Math.max(1,Math.round((88-progressPct)*.08)),prog.stage.textContent,prog.sub.textContent,prog.rows.textContent)},400)};
+    const finishProgress=(ok=true,sub="Done")=>{progressOk=ok;clearInterval(progressTimer);prog.box.classList.remove("active");prog.box.classList.toggle("done",ok);prog.box.classList.toggle("error",!ok);setProgress(100,ok?"Done":"Error",sub,prog.rows.textContent);setTimeout(()=>prog.box.classList.add("hidden"),ok?850:1800)};
+    const showWait=(t="Loading...")=>{setWait(t);wait.classList.add("hidden");shownAt=performance.now();showProgress(t,t);clearTimeout(waitTimer);waitTimer=setTimeout(()=>{prog.sub.textContent=`${t} (still working...)`},3000)};
+    const hideWait=()=>{clearTimeout(waitTimer);const ms=250-(performance.now()-shownAt);setTimeout(()=>{if(progressOk)finishProgress(true)},Math.max(0,ms))};
+    const debounce=(fn,ms=250)=>{let t; return (...a)=>{clearTimeout(t); t=setTimeout(()=>fn(...a),ms)}};
+
+    const tabs=$$(".ex-tab",root), imBody=el(".im-body"), exBody=el(".ex-body");
+    const setTab=tab=>{tabs.forEach(b=>b.classList.toggle("active",b.dataset.tab===tab));imBody.classList.toggle("hidden",tab!=="import");exBody.classList.toggle("hidden",tab!=="export")};
+
+    const im={
+      source:el("#im-source"), target:el("#im-target"), file:el("#im-file"), fileBtn:el("#im-file-btn"), fileName:el("#im-file-name"), q:el("#im-q"),
+      count:el("#im-count"), page:el("#im-page"), prev:el("#im-prev"), next:el("#im-next"), summary:el("#im-summary"), tbody:el("#im-tbody"), table:el("#im-table"),
+      allReady:el("#im-all-ready"), includeExisting:el("#im-include-existing"), upload:el("#im-upload"), commit:el("#im-import"), expect:el("#im-expect"), expectField:el(".expect-field"),
+      state:{opts:null,importId:"",selected:new Set(),mode:"ready",status:"all",file:null,total:0,ready:0,exists:0,summary:null,filteredTotal:0,offset:0,pageSize:200}
     };
-    const syncCapabilities=()=>{
-      const allowed=new Set(state.opts?.capabilities?.[fmtSel.value]?.media_types||state.opts?.media_types||[]);
-      const fmtLabel=state.opts?.labels?.[fmtSel.value]||fmtSel.value||"Selected format";
-      $$('input[type="checkbox"][data-media]',mediaWrap).forEach(cb=>{
-        cb.disabled=!!allowed.size&&!allowed.has(cb.dataset.media);
-        const pill=cb.closest(".media-pick");
-        pill?.classList.toggle("disabled",cb.disabled);
-        if(pill) pill.title=cb.disabled?`${fmtLabel} supports ${[...allowed].map(mediaLabel).join(", ")} only.`:"";
-        if(cb.disabled) cb.checked=false;
-      });
-      if(!selectedMediaTypes().length){
-        const fallback=(state.opts?.default_media_types||["movie"]).find(t=>!$$('input[type="checkbox"][data-media]',mediaWrap).find(cb=>cb.dataset.media===t)?.disabled);
-        if(fallback) setMediaTypes([fallback]);
+    const imFeatures=()=>$$("[data-im-feature]",root).filter(x=>x.checked).map(x=>x.dataset.imFeature);
+    const imMedia=()=>$$("[data-im-media]",root).filter(x=>x.checked).map(x=>x.dataset.imMedia);
+    const imIncludeExisting=()=>!!im.includeExisting?.checked;
+    const imTargetConnected=()=>{const id=im.target.value||"default";const t=(im.state.opts?.targets||[]).find(x=>String(x.id)===String(id));return !t||t.connected!==false};
+    const syncTargetState=()=>{const ok=imTargetConnected();im.upload.disabled=!ok;im.fileBtn.classList.toggle("disabled",!ok);if(!ok){im.expectField?.classList.remove("hidden");im.expect.innerHTML=`<b>CrossWatch tracker not connected</b><span>Connect the CrossWatch Tracker under Connections before importing. Nothing can be written until then.</span>`}return ok};
+    const imImportable=row=>row.status==="ready"||(imIncludeExisting()&&row.status==="exists");
+    const imStatusClass=s=>`im-status status-${String(s||"").replace(/[^a-z_]+/g,"")}`;
+    const setImportStatus=status=>{im.state.status=status||"all";$$("[data-im-status]",root).forEach(x=>x.classList.toggle("active",x.dataset.imStatus===im.state.status))};
+    const renderImportExpect=()=>{
+      if(!imTargetConnected()) return;
+      const src=im.source.value, spec=im.state.opts?.source_expectations?.[src], files=spec?.files||[];
+      const guide=im.state.opts?.source_guides?.[src];
+      if(src==="auto"){
+        im.expect.innerHTML=`<b>Auto detect</b><span>Upload a Trakt ZIP, Letterboxd ZIP, Simkl backup JSON, or matching ZIP.</span>`;
+        return;
+      }
+      const steps=(guide?.steps||[]).map((step,i)=>`<li><b>${i+1}</b><span>${esc(step)}</span></li>`).join("");
+      const expected=files.length?`<small>Expected: ${esc(files.join(", "))}</small>`:"";
+      im.expect.innerHTML=`<b>${esc(guide?.title||spec?.label||"How to export")}</b><ol>${steps}</ol>${expected}`;
+    };
+    const setImportGuideVisible=visible=>im.expectField?.classList.toggle("hidden",!visible);
+    const resetImportPreview=(message="Choose an export file to preview it here.")=>{
+      im.state.importId=""; im.state.selected.clear(); im.state.total=0; im.state.ready=0; im.state.exists=0; im.state.filteredTotal=0; im.state.offset=0; im.state.mode="ready"; im.allReady.checked=true;
+      im.summary.innerHTML="";
+      im.tbody.innerHTML=`<tr><td colspan="6" class="hint">${esc(message)}</td></tr>`;
+      setImportGuideVisible(true);
+      refreshImportCount();
+    };
+    const imRowHTML=row=>{
+      const ids=Object.entries(row.ids||{}).map(([k,v])=>`<span class="mono">${esc(k)}:${esc(v)}</span>`).join(" ");
+      const allowed=imImportable(row);
+      const checked=im.state.mode==="ready"?allowed:im.state.selected.has(row.id);
+      const disabled=!allowed;
+      return `<tr data-row-id="${esc(row.id)}"><td><input type="checkbox" name="import-row" class="glow-check im-row-check" aria-label="Include ${esc(row.title||row.key||"row")}" ${checked?"checked":""} ${disabled?"disabled":""}></td><td class="td-wrap">${esc(row.title||"")}</td><td>${esc(featureLabel(row.feature))}</td><td>${esc(row.media_type||"")}</td><td class="ids">${ids}</td><td><span class="${imStatusClass(row.status)}">${esc(row.status==="ready"?(row.reason?reasonLabel(row.reason):"Ready"):reasonLabel(row.reason))}</span></td></tr>`;
+    };
+    const sumCard=(n,label,cls,tip)=>`<div class="sum-card${cls?` ${cls}`:""}" title="${esc(tip||"")}"><b>${esc(n)}</b><span>${esc(label)}</span></div>`;
+    const renderImportSummary=s=>{
+      im.state.summary=s||null;
+      if(!s){im.summary.innerHTML="";return}
+      const inc=imIncludeExisting(), st=s.by_status||{}, ready=s.by_feature_ready||{}, held=s.by_feature_exists||{};
+      const feat=f=>(ready[f]||0)+(inc?(held[f]||0):0);
+      const total=(s.ready||0)+(inc?(s.exists||0):0);
+      const exists=st.exists||0, dupes=st.duplicate||0, issues=(st.invalid||0)+(st.missing_identity||0)+(st.unsupported||0);
+      im.summary.innerHTML=
+        sumCard(total,"Will import","primary",`Rows written when you press Import${inc?" (including rows already in the tracker)":""}. The three cards after this one add up to it.`)
+        +sumCard(feat("history"),"History","",`History rows included in the ${total} above`)
+        +sumCard(feat("ratings"),"Ratings","",`Rating rows included in the ${total} above`)
+        +sumCard(feat("watchlist"),"Watchlist","",`Watchlist rows included in the ${total} above`)
+        +(exists?sumCard(exists,inc?"In tracker (included)":"In tracker, skipped",inc?"":"muted",inc?"Already in the target profile and being re-written because Include existing is on":"Already in the target profile under the same key. Turn on Include existing to import them anyway"):"")
+        +(dupes?sumCard(dupes,"Duplicate in file","muted","The export lists these rows more than once. Never imported."):"")
+        +(issues?sumCard(issues,"Needs review","warn","Rows with no usable ID, no watched date, or no rating"):"");
+    };
+    const importCount=()=>im.state.mode==="ready"?((im.state.ready||0)+(imIncludeExisting()?(im.state.exists||0):0)):im.state.selected.size;
+    const syncUploadCta=()=>im.upload.classList.toggle("primary",!!(im.state.file||im.file.files?.[0])&&!im.state.importId);
+    const refreshImportCount=()=>{
+      const n=importCount(), total=im.state.filteredTotal||0;
+      im.count.textContent=im.state.importId?`Importing ${n} of ${im.state.total}`:"No preview";
+      if(im.page){
+        const start=im.state.importId&&total?im.state.offset+1:0, end=im.state.importId?Math.min(im.state.offset+im.state.pageSize,total):0;
+        im.page.textContent=`Rows ${start}-${end} of ${total}`;
+      }
+      syncUploadCta();
+      if(im.prev) im.prev.disabled=!im.state.importId||im.state.offset<=0;
+      if(im.next) im.next.disabled=!im.state.importId||im.state.offset+im.state.pageSize>=total;
+      im.commit.disabled=!im.state.importId||n<=0;
+    };
+    const loadImportRows=async()=>{
+      if(!im.state.importId) return;
+      try{
+        const url=`/api/import/preview/${encodeURIComponent(im.state.importId)}?features=${encodeURIComponent(imFeatures().join(","))}&media_types=${encodeURIComponent(imMedia().join(","))}&status=${encodeURIComponent(im.state.status)}&q=${encodeURIComponent(im.q.value||"")}&limit=${encodeURIComponent(im.state.pageSize)}&offset=${encodeURIComponent(im.state.offset)}`;
+        const data=await fjson(url);
+        im.state.total=data.total||0; im.state.ready=data.summary?.ready||0; im.state.exists=data.summary?.exists||0; im.state.filteredTotal=data.filtered_total||0;
+        im.tbody.innerHTML=(data.rows||[]).map(imRowHTML).join("")||`<tr><td colspan="6" class="hint">No rows match the filters.</td></tr>`;
+        renderImportSummary(data.summary); refreshImportCount();
+      }catch(e){
+        im.tbody.innerHTML=`<tr><td colspan="6" class="hint">${esc(e.message||"Preview failed")}</td></tr>`;
+        im.state.total=0; im.state.ready=0; im.state.exists=0; im.state.filteredTotal=0; im.state.offset=0; refreshImportCount();
       }
     };
-
-    async function renderPreview(auto=false){
-      if(!state.opts?.providers?.length){tbody.innerHTML=`<tr><td colspan="6" class="hint">No state loaded. Nothing to show.</td></tr>`; state.total=0; state.selected.clear(); btnExp.disabled=true; return refreshCounts()}
-      tbody.innerHTML=`<tr><td colspan="6" class="hint">Loading...</td></tr>`; showWait(auto?"Refreshing...":"Generating preview...");
+    const uploadImport=async()=>{
+      const file=im.state.file||im.file.files?.[0];
+      if(!file){im.tbody.innerHTML=`<tr><td colspan="6" class="hint">Choose a ZIP, JSON or CSV file first.</td></tr>`;return}
+      showWait("Parsing import...");
+      im.upload.disabled=true;
       try{
-        state.lastQuery=qInput.value||"";
-        const media=selectedMediaTypes().join(",");
-        const data=await fjson(`/api/export/sample?provider=${encodeURIComponent(provSel.value)}&provider_instance=${encodeURIComponent(instSel.value)}&feature=${encodeURIComponent(featSel.value)}&format=${encodeURIComponent(fmtSel.value)}&media_types=${encodeURIComponent(media)}&include_watched_date=${encodeURIComponent(watchedDateChk.checked)}&limit=50&q=${encodeURIComponent(state.lastQuery)}`);
-        state.total=data.total||0; state.matchedTotal=data.matched_total||0; state.droppedTotal=data.dropped_total||0; if(state.mode==="all") state.selected.clear();
-        tbody.innerHTML=(data.items||[]).map(rowHTML).join("")||`<tr><td colspan="6" class="hint">No items.</td></tr>`;
-        renderWarnings(data.warnings||[]); btnExp.disabled=!state.total&&!state.selected.size; refreshCounts();
-      }catch{
-        tbody.innerHTML=`<tr><td colspan="6" class="hint">No data.</td></tr>`; state.total=0; state.matchedTotal=0; state.droppedTotal=0; state.selected.clear(); renderWarnings([]); btnExp.disabled=true; refreshCounts();
-      }finally{hideWait()}
-    }
-
-    async function doExport(){
-      const label=btnExp.textContent; btnExp.disabled=true; btnExp.textContent="Preparing..."; showWait("Preparing file...");
+        const body=new FormData();
+        body.append("file",file);
+        body.append("source",im.source.value);
+        body.append("target_instance",im.target.value||"default");
+        const data=await fjson("/api/import/preview",{method:"POST",body});
+        im.state.importId=data.import_id||""; im.state.mode="ready"; im.state.selected.clear(); im.state.offset=0; im.allReady.checked=true;
+        im.state.total=data.total||0; im.state.ready=data.summary?.ready||0; im.state.exists=data.summary?.exists||0; im.state.filteredTotal=data.filtered_total||0;
+        prog.rows.textContent=`${im.state.total}`;
+        setImportStatus("ready");
+        im.tbody.innerHTML=(data.rows||[]).map(imRowHTML).join("")||`<tr><td colspan="6" class="hint">No ready rows to import.</td></tr>`;
+        setImportGuideVisible(false);
+        renderImportSummary(data.summary); refreshImportCount();
+      }catch(e){
+        const code=e?.payload?.detail?.code||e.message||"import_failed";
+        im.state.importId=""; im.state.selected.clear(); im.state.total=0; im.state.ready=0; im.state.exists=0; im.state.filteredTotal=0; im.state.offset=0;
+        im.summary.innerHTML="";
+        im.tbody.innerHTML=`<tr><td colspan="6" class="hint">${esc(reasonLabel(code))}</td></tr>`;
+        setImportGuideVisible(true);
+        refreshImportCount();
+        finishProgress(false,reasonLabel(code));
+      }finally{im.upload.disabled=false;hideWait()}
+    };
+    const commitImport=async()=>{
+      if(!im.state.importId) return;
+      if(!syncTargetState()){im.tbody.innerHTML=`<tr><td colspan="6" class="hint">Connect the CrossWatch tracker before importing.</td></tr>`;return}
+      const rows=importCount();
+      im.commit.disabled=true;
+      const oldLabel=im.commit.textContent;
+      im.commit.textContent="Importing...";
+      showWait(`Importing ${rows} row(s)...`);
+      prog.rows.textContent=`${rows}`;
       try{
-        const ids=state.mode==="manual"&&state.selected.size?`&ids=${encodeURIComponent([...state.selected].join(","))}`:"";
-        await downloadFile(`/api/export/file?provider=${encodeURIComponent(provSel.value)}&provider_instance=${encodeURIComponent(instSel.value)}&feature=${encodeURIComponent(featSel.value)}&format=${encodeURIComponent(fmtSel.value)}&media_types=${encodeURIComponent(selectedMediaTypes().join(","))}&include_watched_date=${encodeURIComponent(watchedDateChk.checked)}&q=${encodeURIComponent(state.lastQuery)}${ids}`);
-      }finally{btnExp.disabled=false; btnExp.textContent=label; hideWait()}
-    }
+        const payload={import_id:im.state.importId,target_instance:im.target.value||"default",mode:im.state.mode,row_ids:[...im.state.selected],features:imFeatures(),media_types:imMedia(),include_existing:imIncludeExisting()};
+        const data=await fjson("/api/import/commit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+        prog.rows.textContent=`${data.applied||0}`;
+        im.tbody.innerHTML=`<tr><td colspan="6" class="hint">Imported ${esc(data.applied||0)} item(s) into CrossWatch.</td></tr>`;
+        im.summary.innerHTML=`<div class="sum-card primary"><b>${esc(data.applied||0)}</b><span>Imported</span></div><div class="sum-card"><b>${esc(data.skipped||0)}</b><span>Skipped</span></div>`;
+        im.state.importId=""; im.state.selected.clear(); im.state.total=0; im.state.ready=0; im.state.exists=0; im.state.filteredTotal=0; im.state.offset=0;
+        im.state.file=null; im.file.value=""; setImportFileName();
+        refreshImportCount();
+        setImportGuideVisible(false);
+      }catch(e){
+        im.tbody.innerHTML=`<tr><td colspan="6" class="hint">${esc(reasonLabel(e?.payload?.detail?.code||e.message||"Import failed"))}</td></tr>`;
+        refreshImportCount();
+        finishProgress(false,reasonLabel(e?.payload?.detail?.code||e.message||"Import failed"));
+      }finally{im.commit.textContent=oldLabel;hideWait()}
+    };
 
-    showWait("Loading options...");
+    const ex={
+      count:el("#ex-count"), provSel:el("#ex-prov"), provBtn:el("#ex-prov-btn"), provVal:el("#ex-prov-val"), provMenu:el("#ex-prov-menu"), instSel:el("#ex-inst"),
+      featSel:el("#ex-feat"), fmtSel:el("#ex-fmt"), mediaWrap:el("#ex-media"), watchedDateWrap:el("#ex-watched-date-wrap"), watchedDateChk:el("#ex-watched-date"), rewatchWrap:el("#ex-rewatch-wrap"), rewatchChk:el("#ex-rewatches"),
+      qInput:el("#ex-q"), allChk:el("#ex-all"), btnPrev:el("#ex-preview"), btnExp:el("#ex-export"), tbody:el("#ex-tbody"), table:el("#ex-table"),
+      state:{opts:null,total:0,matchedTotal:0,droppedTotal:0,lastQuery:"",selected:new Set(),mode:"all"}
+    };
+    const PREFS_KEY="cw.exporter.prefs", prefs=LS.get(PREFS_KEY,{});
+    const selectedMediaTypes=()=>$$('input[type="checkbox"][data-media]',ex.mediaWrap).filter(x=>x.checked&&!x.disabled).map(x=>x.dataset.media);
+    const savePrefs=()=>LS.set(PREFS_KEY,{provider:ex.provSel.value,instance:ex.instSel.value,feature:ex.featSel.value,format:ex.fmtSel.value,media_types:selectedMediaTypes(),include_watched_date:ex.watchedDateChk.checked,include_rewatches:ex.rewatchChk.checked,q:ex.qInput.value,all:ex.allChk.checked});
+    const logoHtml=(p,cls="badge-logo")=>{const src=PM?.logLogoPath?.(p)||PM?.logoPath?.(p)||"", label=PM?.label?.(p)||String(p||""); return src?`<img class="${cls}" src="${src}" alt="${esc(label)}">`:`<span class="prov-fallback">${esc(label.slice(0,2).toUpperCase())}</span>`};
+    const provText=p=>esc(PM?.label?.(p)||p);
+    const provOption=p=>`<button type="button" class="prov-opt${ex.provSel.value===p?" active":""}" data-provider="${esc(p)}" role="option" aria-selected="${ex.provSel.value===p}">${logoHtml(p,"prov-logo")}<span>${provText(p)}</span></button>`;
+    const renderProv=()=>{ex.provVal.innerHTML=`${logoHtml(ex.provSel.value,"prov-logo")}<span>${provText(ex.provSel.value)}</span>`; ex.provMenu.innerHTML=[...ex.provSel.options].map(o=>provOption(o.value)).join("")};
+    const closeProv=()=>{ex.provMenu.classList.remove("open"); ex.provBtn.setAttribute("aria-expanded","false")};
+    const openProv=()=>{ex.provMenu.classList.add("open"); ex.provBtn.setAttribute("aria-expanded","true")};
+    const refreshCounts=()=>{const sel=ex.state.mode==="all"?ex.state.total:ex.state.selected.size; ex.count.textContent=`Selected: ${sel} of ${ex.state.total}`};
+    const rowHTML=it=>`<tr data-key="${esc(it.key)}"><td><input type="checkbox" name="export-row" class="glow-check row-check" aria-label="Select ${esc(it.title||it.key||"row")}" ${ex.state.mode==="all"||ex.state.selected.has(it.key)?"checked":""}></td><td class="td-wrap">${esc(it.title||"")}</td><td>${esc(it.year||"")}</td><td>${esc(it.type||"")}</td><td class="ids">${Object.entries(it.ids||{}).map(([k,v])=>`<span class="mono">${esc(k)}:${esc(v)}</span>`).join(" ")}</td><td>${esc(it.rating||it.watched_at||"")}</td></tr>`;
+    const setMediaTypes=types=>{$$('input[type="checkbox"][data-media]',ex.mediaWrap).forEach(cb=>{cb.checked=(types||[]).includes(cb.dataset.media)})};
+    const syncInstances=()=>{const prov=ex.provSel.value,list=ex.state.opts?.instances?.[prov]||[{id:"default",label:"Default"}];ex.instSel.innerHTML=[`<option value="all">All</option>`,...list.map(x=>`<option value="${esc(x.id)}">${esc(x.label||x.id)}</option>`)].join("");const want=prefs.instance;if(want&&(want==="all"||list.some(x=>x.id===want))) ex.instSel.value=want; if(!ex.instSel.value) ex.instSel.value="all"; renderProv()};
+    const syncFormats=()=>{const list=ex.state.opts?.formats?.[ex.featSel.value]||[], labels=ex.state.opts?.labels||{};const prev=ex.fmtSel.value;ex.fmtSel.innerHTML=list.map(x=>`<option value="${esc(x)}">${esc(labels[x]||x.toUpperCase())}</option>`).join(""); if(list.includes(prev)) ex.fmtSel.value=prev; else if(prefs.format&&list.includes(prefs.format)) ex.fmtSel.value=prefs.format};
+    const syncWatchedDateOption=()=>{ex.watchedDateWrap.hidden=!(ex.fmtSel.value==="letterboxd"&&["history","combined"].includes(ex.featSel.value))};
+    const syncCapabilities=()=>{const allowed=new Set(ex.state.opts?.capabilities?.[ex.fmtSel.value]?.media_types||ex.state.opts?.media_types||[]), fmtLabel=ex.state.opts?.labels?.[ex.fmtSel.value]||ex.fmtSel.value||"Selected format";$$('input[type="checkbox"][data-media]',ex.mediaWrap).forEach(cb=>{cb.disabled=!!allowed.size&&!allowed.has(cb.dataset.media);const pill=cb.closest(".media-pick");pill?.classList.toggle("disabled",cb.disabled);if(pill) pill.title=cb.disabled?`${fmtLabel} supports ${[...allowed].map(mediaLabel).join(", ")} only.`:"";if(cb.disabled) cb.checked=false});if(!selectedMediaTypes().length){const fallback=(ex.state.opts?.default_media_types||["movie"]).find(t=>!$$('input[type="checkbox"][data-media]',ex.mediaWrap).find(cb=>cb.dataset.media===t)?.disabled);if(fallback) setMediaTypes([fallback])}};
+    const sourceRewatches=()=>!!ex.state.opts?.rewatches?.[ex.provSel.value];
+    const syncRewatchOption=()=>{const show=sourceRewatches()&&["history","combined"].includes(ex.featSel.value);ex.rewatchWrap.hidden=!show;if(!show)ex.rewatchChk.checked=false;else if(prefs.include_rewatches!==false)ex.rewatchChk.checked=true};
+    async function renderPreview(auto=false){if(!ex.state.opts?.providers?.length){ex.tbody.innerHTML=`<tr><td colspan="6" class="hint">No state loaded. Nothing to show.</td></tr>`;ex.state.total=0;ex.state.selected.clear();ex.btnExp.disabled=true;return refreshCounts()}ex.tbody.innerHTML=`<tr><td colspan="6" class="hint">Loading...</td></tr>`;try{ex.state.lastQuery=ex.qInput.value||"";const media=selectedMediaTypes().join(","),data=await fjson(`/api/export/sample?provider=${encodeURIComponent(ex.provSel.value)}&provider_instance=${encodeURIComponent(ex.instSel.value)}&feature=${encodeURIComponent(ex.featSel.value)}&format=${encodeURIComponent(ex.fmtSel.value)}&media_types=${encodeURIComponent(media)}&include_watched_date=${encodeURIComponent(ex.watchedDateChk.checked)}&include_rewatches=${encodeURIComponent(ex.rewatchChk.checked)}&limit=50&q=${encodeURIComponent(ex.state.lastQuery)}`);ex.state.total=data.total||0;ex.state.matchedTotal=data.matched_total||0;ex.state.droppedTotal=data.dropped_total||0;if(ex.state.mode==="all") ex.state.selected.clear();ex.tbody.innerHTML=(data.items||[]).map(rowHTML).join("")||`<tr><td colspan="6" class="hint">No items.</td></tr>`;ex.btnExp.disabled=!ex.state.total&&!ex.state.selected.size;refreshCounts()}catch{ex.tbody.innerHTML=`<tr><td colspan="6" class="hint">No data.</td></tr>`;ex.state.total=0;ex.state.selected.clear();ex.btnExp.disabled=true;refreshCounts()}}
+    async function doExport(){const label=ex.btnExp.textContent;ex.btnExp.disabled=true;ex.btnExp.textContent="Preparing...";try{const ids=ex.state.mode==="manual"&&ex.state.selected.size?`&ids=${encodeURIComponent([...ex.state.selected].join(","))}`:"";await downloadFile(`/api/export/file?provider=${encodeURIComponent(ex.provSel.value)}&provider_instance=${encodeURIComponent(ex.instSel.value)}&feature=${encodeURIComponent(ex.featSel.value)}&format=${encodeURIComponent(ex.fmtSel.value)}&media_types=${encodeURIComponent(selectedMediaTypes().join(","))}&include_watched_date=${encodeURIComponent(ex.watchedDateChk.checked)}&include_rewatches=${encodeURIComponent(ex.rewatchChk.checked)}&q=${encodeURIComponent(ex.state.lastQuery)}${ids}`)}catch(e){window.CW?.DOM?.showToast?.(`Export failed: ${e.message||e}`,false)}finally{ex.btnExp.disabled=false;ex.btnExp.textContent=label}}
+    let exportPreviewLoaded=false;
+    tabs.forEach(btn=>btn.addEventListener("click",()=>{const tab=btn.dataset.tab;setTab(tab);if(tab==="export"&&!exportPreviewLoaded){exportPreviewLoaded=true;renderPreview(false)}}));
+
     try{
-      state.opts=await fjson("/api/export/options").catch(()=>({providers:[],counts:{},formats:{watchlist:["letterboxd","imdb","justwatch","yamtrack","tmdb"],history:["letterboxd","justwatch","yamtrack"],ratings:["letterboxd","tmdb"],combined:["letterboxd","yamtrack"]},labels:{letterboxd:"Letterboxd",imdb:"IMDb (list)",justwatch:"JustWatch",yamtrack:"Yamtrack",tmdb:"TMDB (Auto: IMDb/Trakt/SIMKL)"},capabilities:{letterboxd:{media_types:["movie"]},imdb:{media_types:["movie","show","season","episode"]},justwatch:{media_types:["movie","show","season","episode"]},yamtrack:{media_types:["movie","show","season","episode"]},tmdb:{media_types:["movie","show","season","episode"]}},media_types:["movie","show","season","episode"],default_media_types:["movie"] }));
-      badge.innerHTML=state.opts.providers?.length?fmtBadge(state.opts.counts):"No state.json detected";
-      if(state.opts.providers?.length){provSel.innerHTML=state.opts.providers.map(p=>`<option value="${esc(p)}">${esc(PM?.label?.(p)||p)}</option>`).join("")}else{provSel.innerHTML='<option value="" disabled>(no providers)</option>'; provSel.disabled=instSel.disabled=true; instSel.innerHTML='<option value="all">All</option>'}
-      mediaWrap.innerHTML=(state.opts.media_types||["movie","show","season","episode"]).map(t=>`<label class="media-pick"><input type="checkbox" data-media="${esc(t)}"><span>${esc(mediaLabel(t))}</span></label>`).join("");
-      if(state.opts.providers?.includes(prefs.provider)) provSel.value=prefs.provider;
-      if(["watchlist","history","ratings","combined"].includes(prefs.feature)) featSel.value=prefs.feature;
-      qInput.value=prefs.q||""; allChk.checked=prefs.all!==false; watchedDateChk.checked=prefs.include_watched_date!==false; syncInstances(); syncFormats();
-      setMediaTypes(prefs.media_types||state.opts.default_media_types||["movie"]);
-      syncCapabilities(); syncWatchedDateOption(); enableColumnResize(table);
-    }finally{hideWait()}
+      const [exOpts, imOpts]=await Promise.all([
+        fjson("/api/export/options").catch(()=>({providers:[],counts:{},formats:{watchlist:["letterboxd","imdb","justwatch","yamtrack","tmdb"],history:["letterboxd","justwatch","yamtrack"],ratings:["letterboxd","tmdb"],combined:["letterboxd","yamtrack"]},labels:{letterboxd:"Letterboxd",imdb:"IMDb (list)",justwatch:"JustWatch",yamtrack:"Yamtrack",tmdb:"TMDB (Auto: IMDb/Trakt/SIMKL)"},capabilities:{letterboxd:{media_types:["movie"]},imdb:{media_types:["movie","show","season","episode"]},justwatch:{media_types:["movie","show","season","episode"]},yamtrack:{media_types:["movie","show","season","episode"]},tmdb:{media_types:["movie","show","season","episode"]}},media_types:["movie","show","season","episode"],default_media_types:["movie"]})),
+        fjson("/api/import/options").catch(()=>({targets:[{id:"default",label:"Default"}]}))
+      ]);
+      ex.state.opts=exOpts; im.state.opts=imOpts;
+      if(imOpts.sources?.length) im.source.innerHTML=imOpts.sources.map(x=>`<option value="${esc(x.id)}">${esc(x.label||x.id)}</option>`).join("");
+      im.target.innerHTML=(imOpts.targets||[{id:"default",label:"Default"}]).map(x=>`<option value="${esc(x.id)}">${esc(x.label||x.id)}${x.connected===false?" (not connected)":""}</option>`).join("");
+      syncTargetState();
+      renderImportExpect();
+      if(ex.state.opts.providers?.length){ex.provSel.innerHTML=ex.state.opts.providers.map(p=>`<option value="${esc(p)}">${esc(PM?.label?.(p)||p)}</option>`).join("")}else{ex.provSel.innerHTML='<option value="" disabled>(no providers)</option>';ex.provSel.disabled=ex.instSel.disabled=true;ex.instSel.innerHTML='<option value="all">All</option>'}
+      ex.mediaWrap.innerHTML=(ex.state.opts.media_types||["movie","show","season","episode"]).map(t=>`<label class="media-pick"><input type="checkbox" data-media="${esc(t)}"><span>${esc(mediaLabel(t))}</span></label>`).join("");
+      if(ex.state.opts.providers?.includes(prefs.provider)) ex.provSel.value=prefs.provider;
+      if(["watchlist","history","ratings","combined"].includes(prefs.feature)) ex.featSel.value=prefs.feature;
+      ex.qInput.value=prefs.q||"";ex.allChk.checked=prefs.all!==false;ex.watchedDateChk.checked=prefs.include_watched_date!==false;ex.rewatchChk.checked=prefs.include_rewatches!==false;syncInstances();syncFormats();setMediaTypes(prefs.media_types||ex.state.opts.default_media_types||["movie"]);syncCapabilities();syncWatchedDateOption();syncRewatchOption();enableColumnResize(ex.table,"cw.exporter.cols.v2");enableColumnResize(im.table,"cw.importer.cols.v1");
+    }catch(e){
+      console.warn("Import/export options failed:",e);
+    }
 
-    const debounce=(fn,ms=250)=>{let t; return (...a)=>{clearTimeout(t); t=setTimeout(()=>fn(...a),ms)}};
-    const autoRefresh=debounce(()=>renderPreview(true),200), reset=cb=>()=>{state.selected.clear(); state.mode="all"; allChk.checked=true; cb?.(); savePrefs(); autoRefresh()};
-    provBtn.addEventListener("click",e=>{e.stopPropagation(); provMenu.classList.contains("open")?closeProv():openProv()});
-    provMenu.addEventListener("click",e=>{const btn=e.target.closest(".prov-opt"); if(!btn) return; provSel.value=btn.dataset.provider; closeProv(); reset(syncInstances)()});
+    const autoRefresh=debounce(()=>renderPreview(true),200), reset=cb=>()=>{ex.state.selected.clear();ex.state.mode="all";ex.allChk.checked=true;cb?.();savePrefs();autoRefresh()};
+    ex.provBtn.addEventListener("click",e=>{e.stopPropagation();ex.provMenu.classList.contains("open")?closeProv():openProv()});
+    ex.provMenu.addEventListener("click",e=>{const btn=e.target.closest(".prov-opt");if(!btn) return;ex.provSel.value=btn.dataset.provider;closeProv();reset(()=>{syncInstances();syncRewatchOption()})()});
     if(gen!==mountGen) return;
     if(onDocClick) document.removeEventListener("click",onDocClick);
     onDocClick=e=>{if(!e.target.closest(".provider-field")) closeProv()};
     document.addEventListener("click",onDocClick);
-    instSel.addEventListener("change",reset());
-    featSel.addEventListener("change",reset(()=>{syncFormats(); syncCapabilities(); syncWatchedDateOption()}));
-    fmtSel.addEventListener("change",()=>{syncCapabilities(); syncWatchedDateOption(); savePrefs(); autoRefresh()});
-    watchedDateChk.addEventListener("change",()=>{savePrefs(); autoRefresh()});
-    mediaWrap.addEventListener("change",e=>{if(!e.target.closest('input[type="checkbox"][data-media]')) return; if(!selectedMediaTypes().length){e.target.checked=true} savePrefs(); autoRefresh()});
-    qInput.addEventListener("input",()=>{savePrefs(); autoRefresh()});
-    allChk.addEventListener("change",()=>{state.mode=allChk.checked?"all":"manual"; if(state.mode==="all") state.selected.clear(); savePrefs(); autoRefresh()});
-    btnPrev.addEventListener("click",()=>renderPreview(false));
-    btnExp.addEventListener("click",doExport);
+    ex.instSel.addEventListener("change",reset());
+    ex.featSel.addEventListener("change",reset(()=>{syncFormats();syncCapabilities();syncWatchedDateOption();syncRewatchOption()}));
+    ex.fmtSel.addEventListener("change",()=>{syncCapabilities();syncWatchedDateOption();savePrefs();autoRefresh()});
+    ex.watchedDateChk.addEventListener("change",()=>{savePrefs();autoRefresh()});
+    ex.rewatchChk.addEventListener("change",()=>{savePrefs();autoRefresh()});
+    ex.mediaWrap.addEventListener("change",e=>{if(!e.target.closest('input[type="checkbox"][data-media]')) return;if(!selectedMediaTypes().length){e.target.checked=true}savePrefs();autoRefresh()});
+    ex.qInput.addEventListener("input",()=>{savePrefs();autoRefresh()});
+    ex.allChk.addEventListener("change",()=>{ex.state.mode=ex.allChk.checked?"all":"manual";if(ex.state.mode==="all") ex.state.selected.clear();savePrefs();autoRefresh()});
+    ex.btnPrev.addEventListener("click",()=>renderPreview(false));
+    ex.btnExp.addEventListener("click",doExport);
+    ex.tbody.addEventListener("change",e=>{const cb=e.target.closest(".row-check");if(!cb) return;const key=cb.closest("tr")?.dataset.key;if(!key) return;if(ex.state.mode==="all"){ex.state.mode="manual";ex.allChk.checked=false}cb.checked?ex.state.selected.add(key):ex.state.selected.delete(key);refreshCounts()});
+    ex.tbody.addEventListener("click",e=>{const tr=e.target.closest("tr[data-key]");if(!tr||e.target.closest("input,button,select,.resizer")) return;const cb=$(".row-check",tr);if(cb){cb.checked=!cb.checked;cb.dispatchEvent(new Event("change",{bubbles:true}))}});
+
+    const loadImportFirstPage=()=>{im.state.offset=0;loadImportRows()};
+    const refreshImport=debounce(loadImportFirstPage,200);
+    im.source.addEventListener("change",()=>{renderImportExpect();resetImportPreview()});
+    const setImportFileName=()=>{const name=(im.state.file||im.file.files?.[0])?.name||"Choose export file";im.fileName.textContent=name;im.fileBtn.title=name;syncUploadCta()};
+    im.fileBtn.addEventListener("click",()=>im.file.click());
+    im.file.addEventListener("change",()=>{im.state.file=im.file.files?.[0]||null;setImportFileName();resetImportPreview()});
+    ["dragenter","dragover"].forEach(type=>im.fileBtn.addEventListener(type,e=>{e.preventDefault();im.fileBtn.classList.add("dragging")}));
+    ["dragleave","drop"].forEach(type=>im.fileBtn.addEventListener(type,e=>{e.preventDefault();im.fileBtn.classList.remove("dragging")}));
+    im.fileBtn.addEventListener("drop",e=>{const file=e.dataTransfer?.files?.[0];if(file){im.state.file=file;setImportFileName();resetImportPreview()}});
+    im.upload.addEventListener("click",uploadImport);
+    im.commit.addEventListener("click",commitImport);
+    im.q.addEventListener("input",refreshImport);
+    im.prev.addEventListener("click",()=>{im.state.offset=Math.max(0,im.state.offset-im.state.pageSize);loadImportRows()});
+    im.next.addEventListener("click",()=>{if(im.state.offset+im.state.pageSize<im.state.filteredTotal){im.state.offset+=im.state.pageSize;loadImportRows()}});
+    el("#im-status-tabs").addEventListener("click",e=>{const btn=e.target.closest("[data-im-status]");if(!btn) return;setImportStatus(btn.dataset.imStatus||"all");loadImportFirstPage()});
+    im.target.addEventListener("change",()=>{if(!syncTargetState()) return;if(im.state.file||im.file.files?.[0]) uploadImport()});
+    $$("[data-im-feature],[data-im-media]",root).forEach(cb=>cb.addEventListener("change",()=>{if(!imFeatures().length) cb.checked=true;if(!imMedia().length) cb.checked=true;loadImportFirstPage()}));
+    im.allReady.addEventListener("change",()=>{im.state.mode=im.allReady.checked?"ready":"selected";if(im.state.mode==="ready") im.state.selected.clear();refreshImportCount();loadImportRows()});
+    im.includeExisting.addEventListener("change",()=>{renderImportSummary(im.state.summary);refreshImportCount();loadImportRows()});
+    im.tbody.addEventListener("change",e=>{const cb=e.target.closest(".im-row-check");if(!cb) return;const id=cb.closest("tr")?.dataset.rowId;if(!id) return;if(im.state.mode==="ready"){im.state.mode="selected";im.allReady.checked=false}cb.checked?im.state.selected.add(id):im.state.selected.delete(id);refreshImportCount()});
+    im.tbody.addEventListener("click",e=>{const tr=e.target.closest("tr[data-row-id]");if(!tr||e.target.closest("input,button,select,.resizer")) return;const cb=$(".im-row-check",tr);if(cb&&!cb.disabled){cb.checked=!cb.checked;cb.dispatchEvent(new Event("change",{bubbles:true}))}});
     el("#ex-close").addEventListener("click",closeModal);
-    tbody.addEventListener("change",e=>{const cb=e.target.closest(".row-check"); if(!cb) return; const key=cb.closest("tr")?.dataset.key; if(!key) return; if(state.mode==="all"){state.mode="manual"; allChk.checked=false} cb.checked?state.selected.add(key):state.selected.delete(key); refreshCounts()});
-    tbody.addEventListener("click",e=>{const tr=e.target.closest("tr[data-key]"); if(!tr||e.target.closest("input,button,select,.resizer")) return; const cb=$(".row-check",tr); if(cb){cb.checked=!cb.checked; cb.dispatchEvent(new Event("change",{bubbles:true}))}});
-    await renderPreview(false);
   },
   unmount(){
     mountGen++;

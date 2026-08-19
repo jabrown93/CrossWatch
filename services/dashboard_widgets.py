@@ -3,11 +3,13 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import re
 from typing import Any, Iterable, Mapping
 
 from services.activity import list_events
+from cw_platform.provider_instances import normalize_instance_id, provider_display_key
 
 try:
     from _logging import log as _cw_log
@@ -600,12 +602,24 @@ def _resolve_missing_art(
     _art_debug(row, "metadata_resolved", tmdb=tmdb)
 
 
-def _ensure_cover_art(row: dict[str, Any], *, size: str) -> None:
-    if row.get("cover"):
-        return
-    cover = _cover_url(row, size=size)
-    if cover:
-        row["cover"] = cover
+def _ensure_art_urls(
+    row: dict[str, Any], *, size: str, episode_still: bool, cover_size: str, backdrop_fallback: bool
+) -> None:
+    if not row.get("poster"):
+        row["poster"] = (
+            _grid_art_url(row, size=size) if backdrop_fallback else _poster_url(row, size=size, episode_still=episode_still)
+        )
+    if not row.get("cover"):
+        row["cover"] = _cover_url(row, size=cover_size)
+
+
+_ART_RESOLVE_WORKERS = 8
+
+
+def _needs_metadata_lookup(row: Mapping[str, Any]) -> bool:
+    if not (row.get("poster") or row.get("tmdb")):
+        return True
+    return _media_type(row) == "episode" and _looks_like_episode_code(row.get("title"))
 
 
 def _resolve_missing_art_rows(
@@ -615,16 +629,69 @@ def _resolve_missing_art_rows(
     episode_still: bool = False,
     cover_size: str = "w342",
     backdrop_fallback: bool = False,
+    resolve_art_type: bool = False,
 ) -> list[dict[str, Any]]:
-    for row in rows:
+    def _resolve_row(row: dict[str, Any]) -> None:
         _resolve_episode_show_title(row)
         _resolve_missing_art(row, size=size, episode_still=episode_still, backdrop_fallback=backdrop_fallback)
-        _ensure_cover_art(row, size=cover_size)
+        if resolve_art_type:
+            row["art_type"] = _resolved_art_type(row, _tmdb_id(row))
+        _ensure_art_urls(
+            row, size=size, episode_still=episode_still, cover_size=cover_size, backdrop_fallback=backdrop_fallback
+        )
+
+    pending = sum(1 for row in rows if _needs_metadata_lookup(row))
+    if pending > 1:
+        _metadata_manager()
+        with ThreadPoolExecutor(max_workers=min(_ART_RESOLVE_WORKERS, pending)) as pool:
+            list(pool.map(_resolve_row, rows))
+        return rows
+
+    for row in rows:
+        _resolve_row(row)
     return rows
 
 
 def _provider_ref(provider: str, instance: str) -> dict[str, str]:
-    return {"provider": str(provider or "").upper(), "instance": str(instance or _DEFAULT_INSTANCE)}
+    return {"provider": provider_display_key(provider), "instance": normalize_instance_id(instance)}
+
+
+def _normalize_user_filter(user_filter: Mapping[str, Any] | None) -> dict[str, set[str]]:
+    if not isinstance(user_filter, Mapping):
+        return {}
+    out: dict[str, set[str]] = {}
+    for provider, raw_instances in user_filter.items():
+        prov = provider_display_key(provider)
+        if not prov:
+            continue
+        values = raw_instances if isinstance(raw_instances, list) else [raw_instances]
+        instances = {normalize_instance_id(instance) for instance in values if str(instance or "").strip()}
+        if instances:
+            out[prov] = instances
+    return out
+
+
+def _endpoint_matches_user(provider: Any, instance: Any, user_filter: Mapping[str, Any] | None) -> bool:
+    filt = _normalize_user_filter(user_filter)
+    if not filt:
+        return True
+    prov = provider_display_key(provider)
+    return bool(prov) and normalize_instance_id(instance) in filt.get(prov, set())
+
+
+def _sources_match_user(sources: Any, user_filter: Mapping[str, Any] | None) -> bool:
+    filt = _normalize_user_filter(user_filter)
+    if not filt:
+        return True
+    if not isinstance(sources, list):
+        return False
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        prov = provider_display_key(source.get("provider"))
+        if prov and normalize_instance_id(source.get("instance")) in filt.get(prov, set()):
+            return True
+    return False
 
 
 def _sources_from_item(item: Mapping[str, Any], *, default_provider: str = "CROSSWATCH") -> list[dict[str, str]]:
@@ -676,7 +743,7 @@ def _rating_row(raw_key: str, item: Mapping[str, Any], sources: list[dict[str, s
     return {
         "key": _canonical_key(raw_key, item),
         "type": typ,
-        "art_type": _resolved_art_type(item, _tmdb_id(item)),
+        "art_type": _art_type(item),
         "title": _title(item),
         "year": _year(item),
         "season": _season_number(item),
@@ -688,8 +755,6 @@ def _rating_row(raw_key: str, item: Mapping[str, Any], sources: list[dict[str, s
         "updated_epoch": _update_epoch(item),
         "ids": _ids(item),
         "tmdb": _tmdb_id(item),
-        "poster": _grid_art_url(item, size="w300"),
-        "cover": _cover_url(item, size="w342"),
         "sources": sources,
     }
 
@@ -753,6 +818,14 @@ def _merge_rating_row(prev: Mapping[str, Any], row: Mapping[str, Any]) -> dict[s
     prev_tracker = bool(prev_row.get(_RATING_TRACKER_FLAG))
     next_tracker = bool(next_row.get(_RATING_TRACKER_FLAG))
     if prev_tracker == next_tracker:
+        if _rating_value(prev_row) == _rating_value(next_row):
+            prev_epoch = int(prev_row.get("sort_epoch") or 0)
+            next_epoch = int(next_row.get("sort_epoch") or 0)
+            if prev_epoch > 0 and next_epoch > 0 and prev_epoch != next_epoch:
+                chosen, other = (prev_row, next_row) if prev_epoch < next_epoch else (next_row, prev_row)
+                _merge_sources(chosen, other)
+                _copy_richer_media_fields(chosen, other)
+                return chosen
         return _merge_media_row(prev_row, next_row, sort_key="sort_epoch")
     chosen, other = (prev_row, next_row) if prev_tracker else (next_row, prev_row)
     _merge_sources(chosen, other)
@@ -778,6 +851,7 @@ def latest_ratings_widget(
     *,
     limit: int = 12,
     tracker_items: Mapping[str, Any] | None = None,
+    user_filter: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows: dict[str, dict[str, Any]] = {}
     aliases: dict[str, str] = {}
@@ -801,6 +875,8 @@ def latest_ratings_widget(
         item = _unwrap_rating_item(raw_item)
         row = _rating_row(str(raw_key), item, _sources_from_item(item))
         if row:
+            if not _sources_match_user(row.get("sources"), user_filter):
+                continue
             row[_RATING_TRACKER_FLAG] = True
             put(row)
 
@@ -808,6 +884,8 @@ def latest_ratings_widget(
     provider_keys = sorted({str(p).upper() for p in providers.keys()}) if isinstance(providers, Mapping) else []
     for provider in provider_keys:
         for instance, block in _provider_blocks(state, provider):
+            if not _endpoint_matches_user(provider, instance, user_filter):
+                continue
             for raw_key, raw_item in _feature_items(block, "ratings").items():
                 item = _unwrap_rating_item(raw_item)
                 row = _rating_row(str(raw_key), item, [_provider_ref(provider, instance)])
@@ -825,7 +903,9 @@ def latest_ratings_widget(
         reverse=True,
     )
     cap = max(1, min(int(limit or 12), 24))
-    selected = _resolve_missing_art_rows(items[:cap], size="w300", episode_still=True, backdrop_fallback=True)
+    selected = _resolve_missing_art_rows(
+        items[:cap], size="w300", episode_still=True, backdrop_fallback=True, resolve_art_type=True
+    )
     for row in selected:
         row.pop(_RATING_TRACKER_FLAG, None)
     return {"ok": True, "items": selected, "total": len(items)}
@@ -871,10 +951,13 @@ def _activity_row(event: Mapping[str, Any]) -> dict[str, Any]:
         "status": str(event.get("status") or "").lower(),
         "event": str(event.get("event") or "").lower(),
         "method": str(event.get("method") or "").lower(),
+        "runtime_minutes": _as_float(event.get("runtime_minutes")),
+        "duration_minutes": _as_float(event.get("duration_minutes")),
+        "duration_ms": _as_float(event.get("duration_ms")),
+        "duration": _as_float(event.get("duration")),
+        "runtime": _as_float(event.get("runtime")),
         "ids": _ids(event),
         "tmdb": _tmdb_id(event),
-        "poster": _poster_url(event, size="w300", episode_still=True),
-        "cover": _cover_url(event, size="w342"),
         "source": source,
         "targets": clean_targets,
         "sources": clean_sources,
@@ -903,8 +986,6 @@ def _history_state_row(raw_key: str, item: Mapping[str, Any], sources: list[dict
         "method": "sync_state",
         "ids": _ids(item),
         "tmdb": _tmdb_id(item),
-        "poster": _poster_url(item, size="w300", episode_still=True),
-        "cover": _cover_url(item, size="w342"),
         "sources": sources,
     }
 
@@ -977,12 +1058,14 @@ def _history_aliases(row: Mapping[str, Any], alias_map: Mapping[str, str] | None
     return aliases
 
 
-def _latest_history_state_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _latest_history_state_rows(state: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     providers = state.get("providers") if isinstance(state.get("providers"), Mapping) else {}
     provider_keys = sorted({str(p).upper() for p in providers.keys()}) if isinstance(providers, Mapping) else []
     for provider in provider_keys:
         for instance, block in _provider_blocks(state, provider):
+            if not _endpoint_matches_user(provider, instance, user_filter):
+                continue
             for raw_key, raw_item in _feature_items(block, "history").items():
                 item = _unwrap_history_item(raw_item)
                 row = _history_state_row(str(raw_key), item, [_provider_ref(provider, instance)])
@@ -1003,12 +1086,14 @@ def _latest_history_state_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]
     return sorted(rows.values(), key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
 
 
-def _latest_history_tracker_rows(items: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _latest_history_tracker_rows(items: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     for raw_key, raw_item in (items or {}).items():
         item = _unwrap_history_item(raw_item)
         row = _history_state_row(str(raw_key), item, _sources_from_item(item))
         if not row:
+            continue
+        if not _sources_match_user(row.get("sources"), user_filter):
             continue
         rows[str(row["key"])] = row
     return sorted(rows.values(), key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
@@ -1048,25 +1133,76 @@ def recent_history_widget(
     *,
     limit: int = 8,
     tracker_items: Mapping[str, Any] | None = None,
+    user_filter: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     cap = max(1, min(int(limit or 8), 24))
-    state_rows = _latest_history_state_rows(state or {})
-    tracker_rows = _latest_history_tracker_rows(tracker_items or {})
+    state_rows = _latest_history_state_rows(state or {}, user_filter=user_filter)
+    tracker_rows = _latest_history_tracker_rows(tracker_items or {}, user_filter=user_filter)
     rows = _merge_history_rows(state_rows, tracker_rows, alias_map=_history_alias_representatives())
     selected = _resolve_missing_art_rows(rows[:cap], size="w300", episode_still=True)
     return {"ok": True, "items": selected, "total": len(rows)}
 
 
-def recent_scrobble_widget(*, limit: int = 8) -> dict[str, Any]:
+def recent_scrobble_widget(*, limit: int = 8, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
     cap = max(1, min(int(limit or 8), 24))
     payload = list_events(limit=max(cap, 12), offset=0, status="ok", kind="all", group_routes=True)
     rows = [
-        _activity_row(item)
+        row
         for item in payload.get("items") or []
+        for row in [_activity_row(item)]
         if isinstance(item, Mapping) and str(item.get("kind") or "").strip().lower() in {"scrobble", "history_sync"}
+        if _sources_match_user(row.get("sources"), user_filter)
     ]
     selected = _resolve_missing_art_rows(rows[:cap], size="w300", episode_still=True)
-    return {"ok": True, "items": selected, "total": len(rows)}
+    scrobble = _scrobble_summary(user_filter=user_filter)
+    return {
+        "ok": True,
+        "items": selected,
+        "total": len(rows),
+        "scrobble_total": scrobble["total"],
+        "scrobble_hours": scrobble["hours"],
+    }
+
+
+def _scrobble_total(*, user_filter: Mapping[str, Any] | None = None) -> int:
+    return int(_scrobble_summary(user_filter=user_filter).get("total") or 0)
+
+
+def _duration_minutes(item: Mapping[str, Any]) -> float:
+    direct = _as_float(item.get("runtime_minutes") or item.get("duration_minutes"))
+    if direct and direct > 0:
+        return direct
+    duration_ms = _as_float(item.get("duration_ms"))
+    if duration_ms and duration_ms > 0:
+        return duration_ms / 60000.0
+    raw = _as_float(item.get("duration") or item.get("runtime"))
+    if raw and raw > 0:
+        return raw / 60.0 if raw > 300 else raw
+    return 115.0 if _media_type(item) == "movie" else 45.0
+
+
+def _scrobble_summary(*, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        payload = list_events(
+            limit=1000,
+            offset=0,
+            status="ok",
+            kind="scrobble",
+            group_routes=True,
+        )
+    except Exception:
+        return {"total": 0, "hours": 0.0}
+    rows = [
+        row
+        for item in payload.get("items") or []
+        for row in [_activity_row(item)]
+        if isinstance(item, Mapping) and _sources_match_user(row.get("sources"), user_filter)
+    ]
+    total = len(rows) if _normalize_user_filter(user_filter) else max(0, int(payload.get("total") or 0))
+    minutes = sum(_duration_minutes(row) for row in rows)
+    if total > len(rows) and rows:
+        minutes = (minutes / len(rows)) * total
+    return {"total": total, "hours": round(minutes / 60.0, 1)}
 
 
 def _progress_epoch(item: Mapping[str, Any], raw_key: str = "") -> int:
@@ -1115,8 +1251,6 @@ def _progress_row(raw_key: str, item: Mapping[str, Any], sources: list[dict[str,
         "sort_epoch": sort_epoch,
         "ids": _ids(item),
         "tmdb": _tmdb_id(item),
-        "poster": _poster_url(item, size="w300", episode_still=True),
-        "cover": _cover_url(item, size="w342"),
         "sources": sources,
     }
 
@@ -1126,6 +1260,7 @@ def recent_progress_widget(
     *,
     limit: int = 8,
     tracker_items: Mapping[str, Any] | None = None,
+    user_filter: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows: dict[str, dict[str, Any]] = {}
 
@@ -1140,12 +1275,16 @@ def recent_progress_widget(
         item = raw_item if isinstance(raw_item, Mapping) else {}
         row = _progress_row(str(raw_key), item, _sources_from_item(item))
         if row:
+            if not _sources_match_user(row.get("sources"), user_filter):
+                continue
             put(row)
 
     providers = (state or {}).get("providers") if isinstance((state or {}).get("providers"), Mapping) else {}
     provider_keys = sorted({str(p).upper() for p in providers.keys()}) if isinstance(providers, Mapping) else []
     for provider in provider_keys:
         for instance, block in _provider_blocks(state or {}, provider):
+            if not _endpoint_matches_user(provider, instance, user_filter):
+                continue
             for raw_key, raw_item in _feature_items(block, "progress").items():
                 item = raw_item if isinstance(raw_item, Mapping) else {}
                 row = _progress_row(str(raw_key), item, [_provider_ref(provider, instance)])
@@ -1158,12 +1297,17 @@ def recent_progress_widget(
     return {"ok": True, "items": selected, "total": len(items)}
 
 
-def recent_playlists_widget(*, limit: int = 8) -> dict[str, Any]:
+def recent_playlists_widget(*, limit: int = 8, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
     try:
         from cw_platform.config_base import load_config
         from services import playlists
 
         rows = playlists.activity(load_config() or {}, limit=max(1, min(int(limit or 8), 24)))
+        if _normalize_user_filter(user_filter):
+            rows = [
+                row for row in rows
+                if isinstance(row, Mapping) and _sources_match_user(_sources_from_item(row, default_provider=""), user_filter)
+            ]
     except Exception:
         rows = []
     return {"ok": True, "items": rows, "total": len(rows)}
@@ -1178,6 +1322,7 @@ def dashboard_widgets_payload(
     progress_limit: int = 8,
     playlists_limit: int = 8,
     include: set[str] | None = None,
+    user_filter: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested = {str(key).strip().lower() for key in include} if include is not None else {
         "history",
@@ -1192,21 +1337,24 @@ def dashboard_widgets_payload(
             state,
             limit=history_limit,
             tracker_items=_tracker_feature_items("history"),
+            user_filter=user_filter,
         )
     if "scrobble" in requested:
-        payload["recent_scrobble"] = recent_scrobble_widget(limit=scrobble_limit)
+        payload["recent_scrobble"] = recent_scrobble_widget(limit=scrobble_limit, user_filter=user_filter)
     if "ratings" in requested:
         payload["latest_ratings"] = latest_ratings_widget(
             state,
             limit=ratings_limit,
             tracker_items=_tracker_feature_items("ratings"),
+            user_filter=user_filter,
         )
     if "progress" in requested:
         payload["recent_progress"] = recent_progress_widget(
             state,
             limit=progress_limit,
             tracker_items=_tracker_feature_items("progress"),
+            user_filter=user_filter,
         )
     if "playlists" in requested:
-        payload["recent_playlists"] = recent_playlists_widget(limit=playlists_limit)
+        payload["recent_playlists"] = recent_playlists_widget(limit=playlists_limit, user_filter=user_filter)
     return payload

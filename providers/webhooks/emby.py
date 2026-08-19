@@ -20,7 +20,7 @@ from providers.scrobble.currently_watching import update_from_payload as _cw_upd
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
 from providers.scrobble.sources import source_enabled
-from providers.webhooks.config import configured_webhook_sinks
+from providers.webhooks.config import configured_webhook_sinks, profile_scoped_webhook
 from providers.webhooks.dispatch import dispatch_scrobble as _dispatch_scrobble
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
@@ -810,7 +810,7 @@ def _body_ids_desc(b: dict[str, Any]) -> str:
     return str(ids or "none")
 
 
-def _call_remove_across(ids: dict[str, Any], media_type: str) -> None:
+def _call_remove_across(ids: dict[str, Any], media_type: str, origin: str = "") -> None:
     if not isinstance(ids, dict) or not ids:
         return
     try:
@@ -831,13 +831,13 @@ def _call_remove_across(ids: dict[str, Any], media_type: str) -> None:
         pass
     try:
         if callable(_rm_across):
-            _rm_across(ids, media_type)
+            _rm_across(ids, media_type, scope=origin or None)
             return
     except Exception:
         pass
     try:
         if callable(_rm_across_api):
-            _rm_across_api(ids, media_type)  # type: ignore[misc]
+            _rm_across_api(ids, media_type, origin=origin or None)  # type: ignore[misc]
             return
     except Exception:
         pass
@@ -938,6 +938,10 @@ def process_webhook(
             or (payload.get("Server") or {}).get("UserName")
             or "unknown"
         ).strip()
+
+        if not allow_users and profile_scoped_webhook(cfg, "emby", provider_instance):
+            _emit(logger, "blocked - profile-scoped webhook has no username whitelist", "WARNING")
+            return {"ok": True, "ignored": True}
 
         if allow_users and acc_title and acc_title not in allow_users:
             _emit(logger, f"user '{_mask_account(acc_title)}' blocked by filters_emby", "DEBUG")
@@ -1116,7 +1120,7 @@ def process_webhook(
         if r.status_code < 400:
             if intended == "/scrobble/stop" and prog >= watched_at and not st.get("wl_removed") is True:
                 try:
-                    _call_remove_across(ids_all or {}, media_type)
+                    _call_remove_across(ids_all or {}, media_type, origin=f"emby:{provider_instance}")
                     st = {**st, "wl_removed": True}
                 except Exception:
                     pass

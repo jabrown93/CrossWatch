@@ -6,8 +6,16 @@ const _cwJSONHeaders = { "Content-Type": "application/json" };
 const _cwSecretIds = [
   "plex_home_pin", "simkl_client_id", "simkl_client_secret",
   "trakt_client_id", "trakt_client_secret", "anilist_client_id", "anilist_client_secret",
-  "tmdb_api_key", "tmdb_sync_api_key", "tmdb_sync_session_id", "mdblist_key", "publicmetadb_key", "tautulli_key",
-  "kodi_password", "app_auth_oidc_client_secret", "security_api_key"
+  "tmdb_api_key", "tmdb_sync_api_key", "tmdb_sync_session_id", "mdblist_key", "publicmetadb_key", "tautulli_key", "floppy_token",
+  "scrob_key", "scrob_password", "kodi_password", "app_auth_oidc_client_secret", "security_api_key"
+];
+const _cwTouchedIds = [
+  ..._cwSecretIds,
+  "tautulli_server", "tautulli_user_id",
+  "floppy_server", "floppy_verify_ssl",
+  "scrob_server", "scrob_username", "scrob_verify_ssl", "scrob_totp",
+  "cw_tracker_label", "cw_tracker_retention_days", "cw_tracker_auto_snapshot", "cw_tracker_max_snapshots",
+  "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress"
 ];
 
 function _cwEl(id) { return document.getElementById(id); }
@@ -185,23 +193,12 @@ function _cwSelectNums(id) {
   return el?.selectedOptions ? Array.from(el.selectedOptions).map((o) => parseInt(String(o.value), 10)).filter(Number.isFinite) : null;
 }
 
-function _cwEnsureStyle(id, css) {
-  if (_cwEl(id)) return;
-  try {
-    const style = document.createElement("style");
-    style.id = id;
-    style.textContent = css;
-    document.head.appendChild(style);
-  } catch {}
-}
-
 function _cwEnsureSaveToast() {
   let el = document.querySelector(".save-toast");
   const inline = _cwEl("save_msg");
   if (!el && inline && !inline.closest("#save-fab")) el = inline;
   if (el) return el;
   try {
-    _cwEnsureStyle("cw-save-toast-style", ".save-toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9999;max-width:calc(100vw - 24px);padding:10px 14px;border-radius:999px;backdrop-filter:blur(10px);background:rgba(20,20,30,.82);border:1px solid rgba(255,255,255,.14);color:#fff;font-size:13px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.save-toast.ok{border-color:rgba(80,220,140,.35)}.save-toast.error{border-color:rgba(255,120,120,.35)}.save-toast.hide{display:none}");
     el = document.createElement("div");
     el.className = "save-toast hide";
     el.setAttribute("aria-live", "polite");
@@ -229,7 +226,6 @@ function _cwEnsureAuthErrorBox() {
   let el = _cwEl("app_auth_error");
   if (el) return el;
   try {
-    _cwEnsureStyle("cw-inline-error-style", ".cw-inline-error{margin-top:10px;padding:8px 10px;border-radius:12px;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.18);color:rgba(255,220,220,.95);font-size:12px}.cw-inline-error.hidden{display:none}.cw-invalid{border-color:rgba(255,100,100,.55)!important;box-shadow:0 0 0 2px rgba(255,80,80,.12)!important}");
     el = document.createElement("div");
     el.id = "app_auth_error";
     el.className = "cw-inline-error hidden";
@@ -260,11 +256,17 @@ function _cwAbortSave(msg) {
   throw err;
 }
 
-function _cwWireTouched(ids = _cwSecretIds) {
+function _cwTouched(id) {
+  return !!_cwEl(id)?.dataset?.touched;
+}
+
+function _cwWireTouched(ids = _cwTouchedIds) {
   ids.forEach((id) => {
     const el = _cwEl(id);
     if (el && !el.__touchedWired) {
-      el.addEventListener("input", () => { el.dataset.touched = "1"; });
+      const markTouched = () => { el.dataset.touched = "1"; };
+      el.addEventListener("input", markTouched);
+      el.addEventListener("change", markTouched);
       el.__touchedWired = true;
     }
   });
@@ -304,14 +306,48 @@ function _cwReadSecret(id, previousValue) {
 function _cwProviderAuthError(provider, code) {
   const key = _cwNorm(code);
   if (provider === "tautulli") {
-    if (key === "server_url_required") return "Enter Tautulli server URL";
-    if (key === "api_key_required") return "Enter your Tautulli API key";
+    if (key === "server_url_required" || key === "server_url required") return "Enter Tautulli server URL";
+    if (key === "api_key_required" || key === "api_key required") return "Enter your Tautulli API key";
     if (key === "invalid_api_key") return "Invalid Tautulli API key";
     if (key === "validation_timeout") return "Tautulli validation timed out";
     if (key === "validation_failed") return "Could not connect to Tautulli";
     if (key === "validation_bad_response") return "Tautulli validation returned an unexpected response";
     if (key.startsWith("validation_http_")) return "Tautulli validation failed";
     return "Saving Tautulli failed";
+  }
+  if (provider === "floppy") {
+    if (key === "server_url_required") return "Enter Floppy server URL";
+    if (key === "api_token_required") return "Enter your Floppy API token";
+    if (key === "invalid_api_token") return "Invalid Floppy API token";
+    if (key === "validation_timeout") return "Floppy validation timed out";
+    if (key === "unreachable" || key === "validation_failed") return "Could not connect to Floppy";
+    if (key === "invalid_ssl") return "Floppy SSL validation failed";
+    if (key === "validation_bad_response") return "Floppy validation returned an unexpected response";
+    if (key === "server_error") return "Floppy server error";
+    if (key.startsWith("validation_http_")) return "Floppy validation failed";
+    return "Saving Floppy failed";
+  }
+  if (provider === "scrob") {
+    if (key === "server_url_required") return "Enter Scrob server URL";
+    if (key === "api_key_required") return "Enter your Scrob API key";
+    if (key === "username_required") return "Enter your Scrob username";
+    if (key === "password_required") return "Enter your Scrob password";
+    if (key === "invalid_api_key") return "Invalid Scrob API key";
+    if (key === "invalid_credentials") return "Invalid Scrob username or password";
+    if (key === "totp_required") return "Enter the 6 digit code from your authenticator app";
+    if (key === "invalid_totp_code") return "That two factor code was not accepted";
+    if (key === "credentials_mismatch") return "That API key belongs to a different Scrob account than this login";
+    if (key === "password_login_disabled") return "Password login is disabled on this Scrob server";
+    if (key === "email_not_confirmed") return "Confirm your Scrob account email first";
+    if (key === "api_not_found") return "No Scrob API found at this URL";
+    if (key === "api_prefix_mismatch") return "Scrob API not reachable at this URL";
+    if (key === "validation_timeout") return "Scrob validation timed out";
+    if (key === "unreachable" || key === "validation_failed") return "Could not reach Scrob";
+    if (key === "invalid_ssl") return "Scrob SSL validation failed";
+    if (key === "validation_bad_response") return "Scrob returned an unexpected response";
+    if (key === "server_error") return "Scrob server error";
+    if (key.startsWith("validation_http_")) return "Scrob validation failed";
+    return "Saving Scrob failed";
   }
   if (provider === "publicmetadb") {
     if (key === "api_key_required") return "Enter your PublicMetaDB API key";
@@ -377,6 +413,42 @@ async function _cwValidateTautulliSecret(inst, payload) {
   if (!resp?.ok || body?.ok === false) {
     _cwAbortSave(_cwProviderAuthError("tautulli", body?.error || body?.detail || `http_${resp?.status || 0}`));
   }
+}
+
+async function _cwValidateFloppySecret(inst, payload) {
+  const server = _cwNorm(payload?.server_url);
+  const token = _cwNorm(payload?.api_token);
+  if (!server && !token && typeof payload?.verify_ssl !== "boolean") return;
+  const url = `/api/floppy/save?instance=${encodeURIComponent(_cwNormInst(inst))}`;
+  const resp = await _cwRequest(url, {
+    method: "POST",
+    headers: _cwJSONHeaders,
+    body: JSON.stringify(payload || {})
+  }, 15000);
+  const body = await _cwReadBody(resp);
+  if (!resp?.ok || body?.ok === false) {
+    _cwAbortSave(_cwProviderAuthError("floppy", body?.error || body?.detail || `http_${resp?.status || 0}`));
+  }
+}
+
+async function _cwValidateScrobSecret(inst, payload) {
+  const server = _cwNorm(payload?.server_url);
+  const key = _cwNorm(payload?.api_key);
+  const username = _cwNorm(payload?.username);
+  const password = typeof payload?.password === "string" ? payload.password : "";
+  const touched = !!(server || key || username || password || typeof payload?.verify_ssl === "boolean" || _cwNorm(payload?.totp_code));
+  if (!touched) return null;
+  const url = `/api/scrob/save?instance=${encodeURIComponent(_cwNormInst(inst))}&validate_only=1`;
+  const resp = await _cwRequest(url, {
+    method: "POST",
+    headers: _cwJSONHeaders,
+    body: JSON.stringify({ ...(payload || {}), validate_only: true })
+  }, 20000);
+  const body = await _cwReadBody(resp);
+  if (!resp?.ok || body?.ok === false) {
+    _cwAbortSave(_cwProviderAuthError("scrob", body?.error || body?.detail || `http_${resp?.status || 0}`));
+  }
+  return body || null;
 }
 
 async function _cwSaveAppAuth(serverCfg) {
@@ -517,6 +589,14 @@ async function saveSettings() {
       if (!ok) return;
     } catch (e) {
       console.warn("saveSettings: app_auth merge failed", e);
+      if (e?.__cwAbortSave) throw e;
+    }
+
+    try {
+      const flushUsers = _cwFn("cwAppUsersSavePending", window);
+      if (flushUsers) await flushUsers();
+    } catch (e) {
+      console.warn("saveSettings: app users save failed", e);
       if (e?.__cwAbortSave) throw e;
     }
 
@@ -713,33 +793,45 @@ async function saveSettings() {
     }
 
     try {
-      const prevCw = serverCfg?.crosswatch || {};
-      const nextCw = { ...(cfg.crosswatch || {}) };
-      let cwChanged = false;
-      const intOr = (id, prev) => {
-        const raw = _getVal(id);
-        const n = parseInt(raw, 10);
-        return Number.isNaN(n) ? prev : Math.max(0, n);
-      };
-      const setCw = (key, next, prev) => { if (next !== prev) { nextCw[key] = next; cwChanged = true; } };
-
-      setCw("enabled", _cwEl("cw_enabled") ? _cwTruthy(_cwEl("cw_enabled").value) : (prevCw.enabled !== false), prevCw.enabled !== false);
-      setCw("retention_days", intOr("cw_retention_days", Number.isFinite(prevCw.retention_days) ? Number(prevCw.retention_days) : 30), Number.isFinite(prevCw.retention_days) ? Number(prevCw.retention_days) : 30);
-      setCw("auto_snapshot", _cwEl("cw_auto_snapshot") ? _cwTruthy(_cwEl("cw_auto_snapshot").value) : (prevCw.auto_snapshot !== false), prevCw.auto_snapshot !== false);
-      setCw("max_snapshots", intOr("cw_max_snapshots", Number.isFinite(prevCw.max_snapshots) ? Number(prevCw.max_snapshots) : 64), Number.isFinite(prevCw.max_snapshots) ? Number(prevCw.max_snapshots) : 64);
-
-      const prevRestore = {
-        watchlist: _cwNorm(prevCw.restore_watchlist || "latest") || "latest",
-        history: _cwNorm(prevCw.restore_history || "latest") || "latest",
-        ratings: _cwNorm(prevCw.restore_ratings || "latest") || "latest"
-      };
-      ["watchlist", "history", "ratings"].forEach((key) => {
-        const el = _cwEl(`cw_restore_${key}`);
-        if (!el) return;
-        const next = _cwNorm(el.value) || "latest";
-        if (next !== prevRestore[key]) { nextCw[`restore_${key}`] = next; cwChanged = true; }
-      });
-      if (cwChanged) { cfg.crosswatch = nextCw; mark(); }
+      const trackerLabelEl = _cwEl("cw_tracker_label");
+      const trackerFieldIds = [
+        "cw_tracker_label", "cw_tracker_retention_days", "cw_tracker_auto_snapshot", "cw_tracker_max_snapshots",
+        "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress"
+      ];
+      const trackerTouched = trackerFieldIds.some((id) => _cwTouched(id));
+      if (trackerLabelEl && trackerTouched) {
+        const inst = _cwSelectedInst("crosswatch", "cw.ui.crosswatch.auth.instance.v1");
+        const prevRoot = serverCfg?.crosswatch && typeof serverCfg.crosswatch === "object" ? serverCfg.crosswatch : {};
+        const prevBlock = _cwInstBlock(prevRoot, inst);
+        if (prevBlock?.connected !== true) throw new Error("Connect CrossWatch Local Tracker before saving.");
+        cfg.crosswatch = cfg.crosswatch && typeof cfg.crosswatch === "object" ? cfg.crosswatch : {};
+        const target = _cwEnsureInstBlock(cfg.crosswatch, inst);
+        let dirty = false;
+        const set = (key, next, prev) => {
+          if (next !== prev) {
+            target[key] = next;
+            dirty = true;
+          }
+        };
+        const intOr = (id, prev, fallback) => {
+          const raw = _cwNorm(_cwEl(id)?.value);
+          const n = parseInt(raw, 10);
+          return Number.isNaN(n) ? (Number.isFinite(prev) ? Number(prev) : fallback) : Math.max(0, n);
+        };
+        const labelEl = _cwEl("cw_tracker_label");
+        if (labelEl && labelEl.value.length > 12) labelEl.value = labelEl.value.slice(0, 12);
+        if (_cwTouched("cw_tracker_label")) set("label", _cwNorm(labelEl?.value).slice(0, 12), _cwNorm(prevBlock?.label).slice(0, 12));
+        if (_cwTouched("cw_tracker_retention_days")) set("retention_days", intOr("cw_tracker_retention_days", Number(prevBlock?.retention_days), 30), Number.isFinite(prevBlock?.retention_days) ? Number(prevBlock.retention_days) : 30);
+        if (_cwTouched("cw_tracker_auto_snapshot")) set("auto_snapshot", _cwTruthy(_cwEl("cw_tracker_auto_snapshot")?.value), prevBlock?.auto_snapshot !== false);
+        if (_cwTouched("cw_tracker_max_snapshots")) set("max_snapshots", intOr("cw_tracker_max_snapshots", Number(prevBlock?.max_snapshots), 64), Number.isFinite(prevBlock?.max_snapshots) ? Number(prevBlock.max_snapshots) : 64);
+        ["watchlist", "history", "ratings", "progress"].forEach((key) => {
+          const el = _cwEl(`cw_tracker_restore_${key}`);
+          if (!el || !_cwTouched(`cw_tracker_restore_${key}`)) return;
+          const next = _cwNorm(el.value) || "latest";
+          set(`restore_${key}`, next, _cwNorm(prevBlock?.[`restore_${key}`] || "latest") || "latest");
+        });
+        if (dirty) mark();
+      }
     } catch {}
 
     try {
@@ -751,11 +843,13 @@ async function saveSettings() {
         mdblist: _cwInstBlock(serverCfg?.mdblist, _cwSelectedInst("mdblist")),
         publicmetadb: _cwInstBlock(serverCfg?.publicmetadb, _cwSelectedInst("publicmetadb")),
         tmdb_sync: _cwInstBlock(serverCfg?.tmdb_sync, _cwSelectedInst("tmdb_sync", "cw.ui.tmdb_sync.auth.instance.v1")),
-        kodi: _cwInstBlock(serverCfg?.kodi, _cwSelectedInst("kodi", "cw.ui.kodi.auth.instance.v1"))
+        kodi: _cwInstBlock(serverCfg?.kodi, _cwSelectedInst("kodi", "cw.ui.kodi.auth.instance.v1")),
+        floppy: _cwInstBlock(serverCfg?.floppy, _cwSelectedInst("floppy", "cw.ui.floppy.auth.instance.v1")),
+        scrob: _cwInstBlock(serverCfg?.scrob, _cwSelectedInst("scrob", "cw.ui.scrob.auth.instance.v1"))
       };
       const publicmetadbInst = _cwSelectedInst("publicmetadb");
       const publicmetadbKey = _cwReadSecret("publicmetadb_key", _cwNorm(secrets.publicmetadb?.api_key));
-      const tmdbKey = _cwReadSecret("tmdb_api_key", _cwNorm(serverCfg?.tmdb?.api_key));
+      const tmdbKey = _cwReadSecret("tmdb_api_key", _cwNorm(serverCfg?.tmdb?.api_key || serverCfg?.metadata?.tmdb_api_key));
       await _cwValidateProviderSecret("publicmetadb", publicmetadbInst, publicmetadbKey);
       await _cwValidateTmdbSecret(tmdbKey);
       [
@@ -779,27 +873,90 @@ async function saveSettings() {
       const tautulliInst = _cwSelectedInst("tautulli");
       const tautulliPrev = _cwInstBlock(serverCfg?.tautulli, tautulliInst);
       const tautulliServer = _cwNorm(_cwEl("tautulli_server")?.value || "");
+      const tautulliServerTouched = _cwTouched("tautulli_server");
       const tautulliKey = _cwReadSecret("tautulli_key", _cwNorm(tautulliPrev?.api_key));
       const tautulliUserEl = _cwEl("tautulli_user_id");
       const tautulliUser = _cwNorm(tautulliUserEl?.value || "");
       const tautulliUserTouched = !!tautulliUserEl?.dataset?.touched;
       const tautulliPayload = {};
-      const tautulliServerChanged = !!tautulliServer && tautulliServer !== _cwNorm(tautulliPrev?.server_url);
-      if (tautulliServer) tautulliPayload.server_url = tautulliServer;
+      const tautulliServerChanged = tautulliServerTouched && !!tautulliServer && tautulliServer !== _cwNorm(tautulliPrev?.server_url);
+      if (tautulliServer && (tautulliServerChanged || (tautulliKey.changed && tautulliKey.set))) tautulliPayload.server_url = tautulliServer;
       if (tautulliKey.changed && tautulliKey.set) tautulliPayload.api_key = tautulliKey.set;
-      if (tautulliUser || tautulliUserTouched) tautulliPayload.user_id = tautulliUser;
+      if (tautulliUserTouched) tautulliPayload.user_id = tautulliUser;
       if (tautulliServerChanged || (tautulliKey.changed && tautulliKey.set)) {
         await _cwValidateTautulliSecret(tautulliInst, tautulliPayload);
       }
-      if (tautulliServerChanged || tautulliKey.changed || tautulliUser || tautulliUserTouched) {
+      if (tautulliServerChanged || tautulliKey.changed || tautulliUserTouched) {
         cfg.tautulli = cfg.tautulli && typeof cfg.tautulli === "object" ? cfg.tautulli : {};
         const ttarget = _cwEnsureInstBlock(cfg.tautulli, tautulliInst);
-        if (tautulliServer) ttarget.server_url = tautulliServer;
+        if (tautulliServerChanged) ttarget.server_url = tautulliServer;
         if (tautulliKey.changed) _cwApplySecret(ttarget, "api_key", tautulliKey);
-        if (tautulliUser || tautulliUserTouched) {
+        if (tautulliUserTouched) {
           ttarget.history = ttarget.history && typeof ttarget.history === "object" ? ttarget.history : {};
           ttarget.history.user_id = tautulliUser;
         }
+        mark();
+      }
+
+      const floppyInst = _cwSelectedInst("floppy", "cw.ui.floppy.auth.instance.v1");
+      const floppyPrev = _cwInstBlock(serverCfg?.floppy, floppyInst);
+      const floppyServer = _cwNorm(_cwEl("floppy_server")?.value || "");
+      const floppyServerTouched = _cwTouched("floppy_server");
+      const floppyToken = _cwReadSecret("floppy_token", _cwNorm(floppyPrev?.api_token));
+      const floppyVerifyEl = _cwEl("floppy_verify_ssl");
+      const floppyVerify = floppyVerifyEl ? !!floppyVerifyEl.checked : floppyPrev?.verify_ssl === true;
+      const floppyServerChanged = floppyServerTouched && !!floppyServer && floppyServer !== _cwNorm(floppyPrev?.server_url);
+      const floppyVerifyChanged = _cwTouched("floppy_verify_ssl") && floppyVerify !== (floppyPrev?.verify_ssl === true);
+      const floppyPayload = {};
+      if (floppyServer && (floppyServerChanged || (floppyToken.changed && floppyToken.set) || floppyVerifyChanged)) floppyPayload.server_url = floppyServer;
+      if (floppyToken.changed && floppyToken.set) floppyPayload.api_token = floppyToken.set;
+      if (floppyVerifyEl && (floppyVerifyChanged || floppyServerChanged || (floppyToken.changed && floppyToken.set))) floppyPayload.verify_ssl = floppyVerify;
+      if (floppyServerChanged || (floppyToken.changed && floppyToken.set) || floppyVerifyChanged) {
+        await _cwValidateFloppySecret(floppyInst, floppyPayload);
+      }
+      if (floppyServerChanged || floppyToken.changed || floppyVerifyChanged) {
+        cfg.floppy = cfg.floppy && typeof cfg.floppy === "object" ? cfg.floppy : {};
+        const ftarget = _cwEnsureInstBlock(cfg.floppy, floppyInst);
+        if (floppyServerChanged) ftarget.server_url = floppyServer;
+        if (floppyToken.changed) _cwApplySecret(ftarget, "api_token", floppyToken);
+        if (floppyVerifyChanged) ftarget.verify_ssl = floppyVerify;
+        mark();
+      }
+
+      const scrobInst = _cwSelectedInst("scrob", "cw.ui.scrob.auth.instance.v1");
+      const scrobPrev = secrets.scrob || {};
+      const scrobPending = window.__cwScrobPendingAuth?.[scrobInst];
+      const scrobPendingValid = !!(
+        scrobPending?.data &&
+        (!window.cwAuth?.scrob?.currentSignature || scrobPending.signature === window.cwAuth.scrob.currentSignature())
+      );
+      const scrobFieldIds = ["scrob_server", "scrob_key", "scrob_username", "scrob_password", "scrob_verify_ssl", "scrob_totp"];
+      const scrobTouched = scrobFieldIds.some((id) => _cwTouched(id));
+      let scrobAuth = scrobPendingValid ? { ...(scrobPending.data || {}) } : null;
+      if (!scrobAuth && scrobTouched) {
+        const scrobServer = _cwNorm(_cwEl("scrob_server")?.value || "");
+        const scrobKey = _cwReadSecret("scrob_key", _cwNorm(scrobPrev?.api_key));
+        const scrobPassword = _cwReadSecret("scrob_password", _cwNorm(scrobPrev?.password));
+        const scrobUserEl = _cwEl("scrob_username");
+        const scrobVerifyEl = _cwEl("scrob_verify_ssl");
+        const scrobPayload = {};
+        if (scrobServer) scrobPayload.server_url = scrobServer;
+        if (scrobKey.changed && scrobKey.set) scrobPayload.api_key = scrobKey.set;
+        if (scrobUserEl && (scrobUserEl.dataset?.touched || _cwNorm(scrobUserEl.value))) scrobPayload.username = _cwNorm(scrobUserEl.value || "");
+        if (scrobPassword.changed && scrobPassword.set) scrobPayload.password = scrobPassword.set;
+        if (scrobVerifyEl) scrobPayload.verify_ssl = !!scrobVerifyEl.checked;
+        if (_cwNorm(_cwEl("scrob_totp")?.value || "")) scrobPayload.totp_code = _cwNorm(_cwEl("scrob_totp")?.value || "");
+        scrobAuth = await _cwValidateScrobSecret(scrobInst, scrobPayload);
+      }
+      if (scrobAuth?.ok) {
+        cfg.scrob = cfg.scrob && typeof cfg.scrob === "object" ? cfg.scrob : {};
+        const starget = _cwEnsureInstBlock(cfg.scrob, scrobInst);
+        [
+          "server_url", "api_key", "username", "password", "verify_ssl", "api_prefix",
+          "access_token", "expires_at", "capabilities", "totp_enabled", "reauth_required"
+        ].forEach((key) => {
+          if (Object.prototype.hasOwnProperty.call(scrobAuth, key)) starget[key] = scrobAuth[key];
+        });
         mark();
       }
     } catch (e) {

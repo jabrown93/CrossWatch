@@ -9,6 +9,7 @@ import re
 import time
 from functools import lru_cache
 from importlib import import_module
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -19,7 +20,28 @@ __all__ = ["router"]
 
 router = APIRouter(prefix="/api", tags=["version"])
 
-CURRENT_VERSION = os.getenv("APP_VERSION", "v0.10.6")
+VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
+FALLBACK_VERSION = "v0.11.1"
+
+
+def _usable_version(value: Any) -> str:
+    raw = str(value or "").strip()
+    return "" if raw.lower().lstrip("v") in ("", "0.0.0") else raw
+
+
+def resolve_current_version() -> str:
+    try:
+        stamped = VERSION_FILE.read_text(encoding="utf-8")
+    except Exception:
+        stamped = ""
+    for candidate in (stamped, os.getenv("APP_VERSION")):
+        usable = _usable_version(candidate)
+        if usable:
+            return usable
+    return FALLBACK_VERSION
+
+
+CURRENT_VERSION = resolve_current_version()
 REPO = os.getenv("GITHUB_REPO", "cenodude/CrossWatch")
 
 

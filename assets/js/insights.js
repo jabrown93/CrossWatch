@@ -11,10 +11,22 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
   const FEATS = featureMeta.order || Object.keys(FEAT_LABEL);
   const DEFAULT_RECENT_SYNCS_LIMIT = 3;
   const PREF_KEY = "insights.settings.v1";
+  const CW_SNAPSHOT_PROFILE_KEY = "insights.crosswatch.snapshotProfile";
   const $ = (s, r = d) => r.querySelector(s), $$ = (s, r = d) => [...r.querySelectorAll(s)], lc = s => String(s || "").toLowerCase();
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
   const featureLabel = v => featureMeta.label?.(v) || FEAT_LABEL[lc(v)] || String(v || "");
   const providerLabel = v => providerMeta.label?.(v) || String(v || "");
   const providerLogo = v => providerMeta.logoPath?.(v) || "";
+  const overviewProfile = () => w.CW?.OverviewProfile || null;
+  const overviewProfileId = () => String(overviewProfile()?.id || "").trim();
+  const overviewFilter = () => overviewProfile()?.filter || {};
+  const overviewInstancesFor = prov => {
+    const filter = overviewFilter();
+    const up = String(prov || "").trim().toUpperCase();
+    const low = lc(prov);
+    return Array.isArray(filter[up]) ? filter[up].map(String) : Array.isArray(filter[low]) ? filter[low].map(String) : null;
+  };
+  const overviewHasScope = () => !!Object.keys(overviewFilter() || {}).length;
   const titleOf = x => x?.display_title || x?.title || x?.series_title || x?.name || (x?.type === "episode" && x?.series_title && Number.isInteger(x?.season) && Number.isInteger(x?.episode) ? `${x.series_title} S${String(x.season).padStart(2,"0")}E${String(x.episode).padStart(2,"0")}` : x?.key) || "item";
   const subtitleOf = x => x?.display_subtitle || "";
   const readJSON = (key, fallback = {}) => { try { return JSON.parse(localStorage.getItem(key) || "{}") || fallback; } catch { return fallback; } };
@@ -97,7 +109,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
   let _prefs = loadPrefs(), _visibleFeats = visibleFeatures(_prefs);
   const clampFeature = name => _visibleFeats.includes(String(name)) ? name : (_visibleFeats[0] || "watchlist");
   let _feature = clampFeature(localStorage.getItem("insights.feature"));
-  let _lastStatsFetch = 0, _cwSnapModal = null;
+  let _lastStatsFetch = 0, _cwSnapModal = null, _lastInsightsData = null, _fullInsightsTimer = 0, _configuredProvidersCache = null, _tilesFeature = null;
 
   function syncPrefs(instancesByProvider = {}) {
     const next = normalizePrefs(_prefs, instancesByProvider), changed = JSON.stringify(next) !== JSON.stringify(_prefs);
@@ -111,168 +123,6 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     }
   }
 
-  function ensureStyles() {
-    const id = "insights-provider-styles-v12";
-    if (d.getElementById(id)) return;
-    const s = d.createElement("style");
-    s.id = id;
-    s.textContent = `#insights-footer{position:static;left:auto;right:auto;bottom:auto;z-index:2;margin-top:16px}#insights-footer .ins-foot-wrap{position:relative;display:flex;flex-direction:column;gap:12px;padding:12px;border-radius:18px;background:linear-gradient(180deg,rgba(9,11,19,.82),rgba(8,10,18,.62));box-shadow:inset 0 1px 0 rgba(255,255,255,.06),inset 0 0 0 1px rgba(130,150,255,.10),0 18px 36px rgba(0,0,0,.32);backdrop-filter:blur(10px) saturate(118%);-webkit-backdrop-filter:blur(10px) saturate(118%)}#insights-footer .ins-foot-wrap::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(135deg,rgba(124,92,255,.10),transparent 34%,transparent 68%,rgba(45,161,255,.08));opacity:.9}@media(max-width:820px){#insights-footer{position:static;margin-top:10px}}#insights-switch{display:grid;grid-template-columns:minmax(0,1fr) 34px;align-items:center;gap:10px}#insights-switch .seg{min-width:0;display:grid;grid-template-columns:repeat(var(--ins-feat-count,4),minmax(0,1fr));gap:8px}#insights-switch .seg-btn{min-width:0;display:flex;align-items:center;justify-content:center;height:40px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;appearance:none;border:1px solid rgba(255,255,255,.08);cursor:pointer;font:inherit;font-weight:500;letter-spacing:.18px;font-size:.79rem;padding:0 14px;border-radius:999px;color:rgba(234,240,255,.82);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02));box-shadow:inset 0 1px 0 rgba(255,255,255,.06);transition:transform .14s ease,box-shadow .16s ease,border-color .16s ease,color .16s ease,background .16s ease}#insights-switch .seg-btn:hover{transform:translateY(-1px);color:#fff;border-color:rgba(124,92,255,.22);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 10px 18px rgba(0,0,0,.16)}#insights-switch .seg-btn.active{color:#f4f7ff;border-color:rgba(124,92,255,.34);background:linear-gradient(180deg,rgba(124,92,255,.18),rgba(45,161,255,.10));box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 0 0 1px rgba(124,92,255,.20),0 12px 22px rgba(13,19,38,.34)}#insights-switch .ins-gear{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border:1px solid rgba(255,255,255,.08)!important;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025))!important;border-radius:999px!important;padding:0!important;color:#fff!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.08);transition:transform .14s ease,box-shadow .16s ease,border-color .16s ease,color .16s ease}#insights-switch .ins-gear .material-symbols-rounded{display:block;font-size:22px;line-height:1;color:#fff;font-variation-settings:"FILL" 0,"wght" 500,"GRAD" 0,"opsz" 24}#insights-switch .ins-gear:hover{transform:translateY(-1px);color:#fff!important;border-color:rgba(124,92,255,.24)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 10px 18px rgba(0,0,0,.16)}#stats-card #stat-providers{--prov-cols:4;--tile-h:104px;display:grid!important;grid-template-columns:repeat(var(--prov-cols),minmax(0,1fr))!important;grid-auto-rows:var(--tile-h)!important;gap:12px!important;width:100%!important;align-items:stretch!important}#stats-card #stat-providers .tile{--brand:255,255,255;--wm:none;position:relative!important;display:block!important;height:var(--tile-h)!important;min-height:var(--tile-h)!important;max-height:var(--tile-h)!important;border-radius:18px!important;background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02))!important;overflow:hidden!important;isolation:isolate!important;margin:0!important;padding:0!important;border:1px solid rgba(var(--brand),.18)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 16px 30px rgba(0,0,0,.26),0 0 0 1px rgba(var(--brand),.06);backdrop-filter:blur(4px) saturate(120%);-webkit-backdrop-filter:blur(4px) saturate(120%);transition:transform .16s ease,box-shadow .18s ease,border-color .18s ease}#stats-card #stat-providers .tile:hover{transform:translateY(-2px);border-color:rgba(var(--brand),.28)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 20px 36px rgba(0,0,0,.30),0 0 26px rgba(var(--brand),.14)}#stats-card #stat-providers .tile::before{content:"";position:absolute;inset:0;pointer-events:none;z-index:0;background:radial-gradient(88% 72% at 18% 14%,rgba(var(--brand),.20),transparent 52%),radial-gradient(72% 58% at 82% 76%,rgba(var(--brand),.10),transparent 66%),linear-gradient(180deg,rgba(255,255,255,.04),transparent 42%)}#stats-card #stat-providers .tile::after{content:"";position:absolute;left:50%;top:54%;transform:translate(-50%,-50%) rotate(-8deg);width:220%;height:220%;background-repeat:no-repeat;background-position:center;background-size:contain;background-image:var(--wm);mix-blend-mode:screen;opacity:.22;filter:saturate(1.4) brightness(1.18) contrast(1.02)}#stats-card #stat-providers .tile.inactive{border-color:rgba(var(--brand),.12)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 20px rgba(0,0,0,.20),0 0 0 1px rgba(var(--brand),.04);filter:saturate(.88)}#stats-card #stat-providers .tile.inactive::after{opacity:.14;filter:saturate(.95) brightness(.96)}#stats-card #stat-providers .tile .tile-head{position:absolute;left:50%;top:8px;transform:translateX(-50%);display:flex;align-items:center;justify-content:center;gap:8px;z-index:2;pointer-events:none}#stats-card #stat-providers .tile .tile-k{display:none!important}#stats-card #stat-providers .tile .tile-state{display:inline-flex;align-items:center;gap:5px;padding:2px 6px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:rgba(6,10,18,.24);color:rgba(236,241,255,.58);font-size:10px;line-height:1;font-weight:800;letter-spacing:.08em;text-transform:uppercase;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}#stats-card #stat-providers .tile .tile-state i{display:block;width:7px;height:7px;border-radius:999px;background:rgba(148,163,184,.55);box-shadow:0 0 0 1px rgba(255,255,255,.06)}#stats-card #stat-providers .tile .tile-state.on{color:rgba(216,255,232,.78);border-color:rgba(34,197,94,.18);background:rgba(8,26,18,.24)}#stats-card #stat-providers .tile .tile-state.on i{background:#21d07a;box-shadow:0 0 12px rgba(33,208,122,.42)}#stats-card #stat-providers .tile .n{position:absolute;top:53%;left:50%;transform:translate(-50%,-50%) scale(var(--ins-font-scale,1));transform-origin:center;margin:0;font-weight:900;letter-spacing:.25px;font-variant-numeric:tabular-nums;font-size:clamp(28px,calc(var(--tile-h)*.46),54px);line-height:1;color:rgba(255,255,255,.38);z-index:1}@supports(-webkit-background-clip:text){#stats-card #stat-providers .tile .n{background-image:linear-gradient(180deg,rgba(255,255,255,.88),rgba(232,236,245,.48) 52%,rgba(255,255,255,.16));-webkit-background-clip:text;-webkit-text-fill-color:transparent;color:transparent}}@supports(background-clip:text){#stats-card #stat-providers .tile .n{background-image:linear-gradient(180deg,rgba(255,255,255,.88),rgba(232,236,245,.48) 52%,rgba(255,255,255,.16));background-clip:text;color:transparent}}#stats-card #stat-providers [data-provider=crosswatch] .cw-snapshot{position:absolute;left:10px;right:10px;bottom:10px;padding:0 2px;font-size:11px;line-height:1.2;font-weight:800;text-align:center;color:rgba(255,255,255,.62);text-shadow:0 1px 2px rgba(0,0,0,.85);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;z-index:2}#stats-card #stat-providers .tile .mse{position:absolute;left:50%;bottom:4px;display:inline-flex!important;align-items:center!important;justify-content:center!important;gap:2px!important;width:max-content!important;max-width:none;padding:0;white-space:nowrap;text-align:center;transform:translateX(-50%) scale(var(--ins-mse-scale,1));transform-origin:center bottom;pointer-events:none;z-index:2}html.cw-compact #stats-card #stat-providers .tile .mse{display:inline-flex!important;align-items:center!important;justify-content:center!important;width:max-content!important}html.cw-compact #stats-card #stat-providers .tile .mse .mse-chip{flex:0 0 auto!important}#stats-card #stat-providers .tile .mse .mse-chip{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;gap:1px;min-width:0;padding:2px 5px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(6,10,18,.36);box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}#stats-card #stat-providers .tile .mse .mse-chip .k{font-size:10px;line-height:1;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.48);font-weight:800}#stats-card #stat-providers .tile .mse .mse-chip .v{font-size:12px;line-height:1;color:rgba(255,255,255,.82);font-weight:900;font-variant-numeric:tabular-nums}.cw-snap-picker{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(4,8,16,.46);backdrop-filter:blur(10px) saturate(116%);-webkit-backdrop-filter:blur(10px) saturate(116%);z-index:1200;opacity:1;transition:opacity .16s ease}.cw-snap-picker.cw-snap-hidden{opacity:0;pointer-events:none}.cw-snap-dialog{width:min(760px,calc(100vw - 32px));display:grid;gap:14px;padding:16px;border-radius:22px;background:linear-gradient(180deg,rgba(10,13,22,.92),rgba(7,10,18,.84));border:1px solid rgba(124,92,255,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 28px 60px rgba(0,0,0,.42),0 0 0 1px rgba(59,130,246,.06)}.cw-snap-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.cw-snap-title-wrap{min-width:0;display:grid;gap:4px}.cw-snap-kicker{font-size:10px;line-height:1;letter-spacing:.16em;text-transform:uppercase;color:rgba(190,198,214,.56);font-weight:800}.cw-snap-title{font-size:14px;line-height:1.25;font-weight:800;color:rgba(243,246,255,.92)}.cw-snap-title .hl{color:#d9e6ff}.snap-icon-close,.snap-close,.snap-btn{appearance:none;font:inherit}.snap-icon-close{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04);color:rgba(240,244,255,.74);cursor:pointer;transition:transform .14s ease,border-color .16s ease,background .16s ease,color .16s ease}.snap-icon-close:hover{transform:translateY(-1px);border-color:rgba(124,92,255,.24);background:rgba(255,255,255,.06);color:#fff}.cw-snap-body{display:grid;gap:8px;grid-auto-rows:max-content;align-content:start;justify-items:center;max-height:min(56vh,392px);overflow:auto;padding-right:2px}.cw-snap-empty{padding:10px 2px;font-size:13px;line-height:1.45;color:rgba(197,205,220,.72)}.snap-btn{width:min(100%,640px);display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.022));color:rgba(240,244,255,.84);cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.05);transition:transform .14s ease,border-color .16s ease,box-shadow .18s ease,background .16s ease}.snap-btn:hover{transform:translateY(-1px);border-color:rgba(124,92,255,.24);background:linear-gradient(180deg,rgba(124,92,255,.10),rgba(45,161,255,.06));box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 14px 24px rgba(0,0,0,.20)}.snap-btn:active{transform:translateY(0)}.snap-btn .snap-name{min-width:0;font-size:13px;line-height:1.2;font-weight:800;letter-spacing:.01em;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.snap-btn .snap-meta{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;min-width:56px;padding:4px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(8,12,22,.44);font-size:10px;line-height:1;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:rgba(201,210,226,.64)}.snap-btn.is-latest .snap-meta{color:rgba(216,255,232,.82);border-color:rgba(34,197,94,.20);background:rgba(8,26,18,.30)}.cw-snap-foot{display:flex;justify-content:flex-end}.snap-close{padding:8px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04);color:rgba(236,241,255,.78);cursor:pointer;transition:transform .14s ease,border-color .16s ease,background .16s ease}.snap-close:hover{transform:translateY(-1px);border-color:rgba(124,92,255,.22);background:rgba(255,255,255,.06);color:#fff}#sync-history{display:grid;gap:12px}#sync-history .history-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.018));border:1px solid rgba(255,255,255,.06);box-shadow:inset 0 1px 0 rgba(255,255,255,.04);transition:border-color .16s ease,transform .14s ease,box-shadow .18s ease}#sync-history .history-item:hover{transform:translateY(-1px);border-color:rgba(124,92,255,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 22px rgba(0,0,0,.14)}#sync-history .history-item.ok{border-color:rgba(34,197,94,.12)}#sync-history .history-item.warn{border-color:rgba(245,158,11,.16)}#sync-history .history-item.err{border-color:rgba(239,68,68,.18)}#sync-history .history-main{min-width:0;display:grid;gap:4px}#sync-history .history-meta{display:flex;align-items:center;gap:8px;min-width:0;font-size:12px;opacity:1}#sync-history .history-time{min-width:0;color:rgba(227,233,245,.82);font-weight:700;letter-spacing:.01em}#sync-history .history-sub{font-size:11px;line-height:1.2;color:rgba(174,182,194,.72);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#sync-history .history-badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}#sync-history .history-badges .badge,#sync-history .history-meta .badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 8px;border-radius:999px;line-height:1.1;border:1px solid rgba(255,255,255,.10);background:rgba(8,10,18,.46);font-size:11px;font-weight:800}#sync-history .history-meta .badge.ok{background:rgba(25,195,125,.12);border-color:rgba(25,195,125,.30);color:#c8ffe6}#sync-history .history-meta .badge.warn{background:rgba(255,196,0,.10);border-color:rgba(255,196,0,.28);color:#ffe28a}#sync-history .history-meta .badge.err{background:rgba(255,77,79,.12);border-color:rgba(255,77,79,.30);color:#ffd2d2}#sync-history .history-badges .badge.add{background:rgba(25,195,125,.10);border-color:rgba(25,195,125,.26);color:#c8ffe6}#sync-history .history-badges .badge.del{background:rgba(255,77,79,.10);border-color:rgba(255,77,79,.26);color:#ffd2d2}#sync-history .history-badges .badge.micro{background:rgba(124,92,255,.10);border-color:rgba(124,92,255,.24);color:#ddd7ff}@media(max-width:720px){#insights-switch{grid-template-columns:minmax(0,1fr) 32px;gap:8px}#insights-switch .seg{gap:8px}#insights-switch .seg-btn{height:38px;padding:0 12px;font-size:.76rem}#insights-switch .ins-gear{width:32px;height:32px}}@media(max-width:560px){#insights-switch{grid-template-columns:minmax(0,1fr) 30px;gap:6px}#insights-switch .seg{gap:6px}#insights-switch .seg-btn{height:36px;padding:0 10px;font-size:.72rem}#insights-switch .ins-gear{width:30px;height:30px}#stats-card #stat-providers{grid-template-columns:repeat(2,minmax(0,1fr))!important}#stats-card #stat-providers .tile{border-radius:16px!important}#stats-card #stat-providers .tile .tile-state .txt{display:none}}@media(max-width:380px){#stats-card #stat-providers{grid-template-columns:repeat(1,minmax(0,1fr))!important}#sync-history .history-item{align-items:flex-start;flex-direction:column}#sync-history .history-badges{justify-content:flex-start}}`;
-    d.head.appendChild(s);
-    const s2 = d.createElement("style");
-    s2.id = "insights-provider-styles-v14-mse";
-    s2.textContent = `#stats-card #stat-providers .tile .mse{left:3px!important;right:3px!important;bottom:6px!important;display:flex!important;align-items:flex-end!important;justify-content:center!important;width:auto!important;max-width:none!important;transform:none!important;pointer-events:none!important}html.cw-compact #stats-card #stat-providers .tile .mse{display:flex!important;width:auto!important}#stats-card #stat-providers .tile .mse .mse-row{display:inline-flex!important;align-items:center!important;justify-content:center!important;gap:2px!important;width:max-content!important;max-width:100%!important;min-width:0!important;white-space:nowrap!important;line-height:1!important;transform:scale(var(--ins-mse-scale,1));transform-origin:center bottom}#stats-card #stat-providers .tile .mse.is-wrap{bottom:7px!important}#stats-card #stat-providers .tile .mse.is-wrap .mse-row{display:grid!important;grid-template-columns:auto auto!important;justify-items:center!important;align-items:center!important;gap:2px!important;width:max-content!important;max-width:100%!important;white-space:normal!important}#stats-card #stat-providers .tile .mse.is-wrap .mse-chip-anime{grid-column:1/-1!important;justify-self:center!important}#stats-card #stat-providers .tile .mse .mse-chip{display:inline-flex!important;align-items:center!important;justify-content:center!important;flex:0 0 auto!important;min-width:max-content!important;max-width:none!important;gap:1px!important;padding:2px 3px!important;overflow:visible!important;border-color:rgba(255,255,255,.10)!important;background:rgba(6,10,18,.56)!important}#stats-card #stat-providers .tile .mse .mse-chip .k{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;min-width:1ch;font-size:9px!important;letter-spacing:0!important;color:rgba(255,255,255,.58)!important}#stats-card #stat-providers .tile .mse .mse-chip .v{flex:0 0 auto;min-width:auto;overflow:visible;text-overflow:clip;font-size:10px!important;color:rgba(255,255,255,.88)!important;font-variant-numeric:tabular-nums}#stats-card #stat-providers .tile .mse .mse-chip-anime{padding-inline:3px!important}html[data-cw-theme="flat-light"] #stats-card #stat-providers .tile .mse .mse-chip{background:rgba(255,255,255,.72)!important;border-color:rgba(16,24,40,.12)!important}html[data-cw-theme="flat-light"] #stats-card #stat-providers .tile .mse .mse-chip .k{color:rgba(52,64,84,.62)!important}html[data-cw-theme="flat-light"] #stats-card #stat-providers .tile .mse .mse-chip .v{color:rgba(23,32,51,.86)!important}`;
-    d.head.appendChild(s2);
-    const s3 = d.createElement("style");
-    s3.id = "insights-provider-styles-v8-segmented";
-    s3.textContent = `
-#insights-switch{
-  display:grid!important;
-  grid-template-columns:minmax(0,1fr) 28px!important;
-  align-items:center!important;
-  gap:6px!important;
-  width:100%!important;
-  max-width:100%!important;
-}
-#insights-switch .seg{
-  display:grid!important;
-  grid-template-columns:repeat(var(--ins-feat-count,4),minmax(0,1fr))!important;
-  width:100%!important;
-  max-width:100%!important;
-  gap:0!important;
-  overflow:hidden!important;
-  border:1px solid rgba(255,255,255,.14)!important;
-  border-radius:14px!important;
-  background:linear-gradient(180deg,rgba(31,36,47,.78),rgba(25,29,39,.78))!important;
-  box-shadow:none!important;
-}
-#insights-switch .seg-btn{
-  min-width:0!important;
-  display:inline-flex!important;
-  align-items:center!important;
-  justify-content:center!important;
-  gap:5px!important;
-  height:34px!important;
-  min-height:34px!important;
-  padding:0 7px!important;
-  border:0!important;
-  border-left:1px solid rgba(255,255,255,.10)!important;
-  border-radius:0!important;
-  background:transparent!important;
-  box-shadow:none!important;
-  color:rgba(216,224,239,.78)!important;
-  transform:none!important;
-  font-size:12px!important;
-  font-weight:700!important;
-  letter-spacing:0!important;
-}
-#insights-switch .seg-btn .material-symbols-rounded{
-  flex:0 0 auto!important;
-  font-size:17px!important;
-  line-height:1!important;
-  color:currentColor!important;
-  -webkit-text-fill-color:currentColor!important;
-  font-variation-settings:"FILL" 0,"wght" 500,"GRAD" 0,"opsz" 18!important;
-}
-#insights-switch .seg-btn span:last-child{
-  min-width:0!important;
-  overflow:hidden!important;
-  text-overflow:ellipsis!important;
-  white-space:nowrap!important;
-}
-#insights-switch .seg-btn:first-child{
-  border-left:0!important;
-}
-#insights-switch .seg[data-count="5"] .seg-btn{
-  padding:0 6px!important;
-  font-size:11px!important;
-}
-#insights-switch[data-labels="icon"] .seg-btn{
-  padding:0!important;
-  gap:0!important;
-}
-#insights-switch[data-labels="icon"] .seg-btn span:last-child{
-  display:none!important;
-}
-#insights-switch[data-labels="icon"] .seg-btn .material-symbols-rounded{
-  font-size:18px!important;
-}
-#insights-switch .seg-btn:hover{
-  background:rgba(53,61,77,.78)!important;
-  color:#f5f7fb!important;
-  box-shadow:none!important;
-  transform:none!important;
-}
-#insights-switch .seg-btn.active{
-  background:linear-gradient(180deg,rgba(79,95,154,.92),rgba(62,75,125,.92))!important;
-  color:#ffffff!important;
-  border-color:rgba(132,150,230,.42)!important;
-  box-shadow:inset 0 0 0 1px rgba(151,166,242,.20),0 0 14px rgba(99,116,194,.22)!important;
-}
-#insights-switch .ins-gear{
-  width:28px!important;
-  height:28px!important;
-  padding:0!important;
-  border:0!important;
-  border-radius:999px!important;
-  background:transparent!important;
-  box-shadow:none!important;
-  transform:none!important;
-  color:rgba(226,233,246,.86)!important;
-}
-#insights-switch .ins-gear:hover{
-  background:transparent!important;
-  color:#ffffff!important;
-  box-shadow:none!important;
-  transform:none!important;
-}
-#insights-switch .ins-gear .material-symbols-rounded{
-  font-size:21px!important;
-  color:currentColor!important;
-  -webkit-text-fill-color:currentColor!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .seg{
-  background:#ffffff!important;
-  border-color:rgba(21,31,48,.18)!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .seg-btn{
-  border-left-color:rgba(21,31,48,.18)!important;
-  color:#344054!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .seg-btn:hover{
-  background:#eef2f7!important;
-  color:#172033!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .seg-btn.active{
-  background:#e9ecf7!important;
-  color:#172033!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .ins-gear{
-  background:transparent!important;
-  border:0!important;
-  color:#172033!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .ins-gear .material-symbols-rounded{
-  color:#172033!important;
-  -webkit-text-fill-color:#172033!important;
-  opacity:1!important;
-}
-html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
-  background:transparent!important;
-}
-@media(max-width:560px){
-  #insights-switch{grid-template-columns:minmax(0,1fr) 26px!important;width:100%!important;gap:4px!important}
-  #insights-switch .seg{display:grid!important;grid-template-columns:repeat(var(--ins-feat-count,4),minmax(0,1fr))!important;width:100%!important}
-  #insights-switch .seg-btn{height:32px!important;min-height:32px!important;padding:0 4px!important;font-size:10px!important;gap:3px!important}
-  #insights-switch .seg-btn .material-symbols-rounded{font-size:15px!important}
-  #insights-switch .ins-gear{width:26px!important;height:26px!important}
-}
-@media(max-width:430px){
-  #insights-switch .seg-btn span:last-child{display:none!important}
-  #insights-switch .seg-btn{padding:0!important}
-}
-`;
-    d.head.appendChild(s3);
-  }
 
   async function openInsightSettingsModal() {
     try {
@@ -287,6 +137,10 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
 
   const getConfiguredProviders = async force => {
     try {
+      if (document.documentElement?.dataset?.cwRole === "user") {
+        const keys = Object.keys(overviewFilter() || {}).map(k => String(k || "").trim()).filter(Boolean);
+        if (keys.length) return new Set(keys);
+      }
       let cfg = w._cfgCache;
       const needsConfigLoad = force || !cfg || typeof cfg !== "object" || !Object.keys(cfg).length;
       if (needsConfigLoad && typeof w.CW?.API?.Config?.load === "function") {
@@ -296,34 +150,60 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
         } catch {}
       }
       const out = typeof w.getConfiguredProviders === "function" ? await w.getConfiguredProviders(cfg || {}) : ["crosswatch"];
-      return out instanceof Set ? out : new Set([...(out || [])]);
+      const set = out instanceof Set ? out : new Set([...(out || [])]);
+      _configuredProvidersCache = new Set([...set]);
+      return set;
     } catch (e) {
       console.error("[Insights] Failed to resolve configured providers", e);
       return new Set(["crosswatch"]);
     }
   };
 
+  function configuredProvidersSnapshot(active = {}) {
+    if (_configuredProvidersCache?.size) return new Set([..._configuredProvidersCache]);
+    try {
+      if (typeof w.getConfiguredProviders === "function") {
+        const cfg = w._cfgCache;
+        if (cfg && typeof cfg === "object" && Object.keys(cfg).length) {
+          const out = w.getConfiguredProviders(cfg);
+          const set = out instanceof Set ? out : new Set([...(out || [])]);
+          if (set.size) {
+            _configuredProvidersCache = new Set([...set]);
+            return set;
+          }
+        }
+      }
+    } catch {}
+    return new Set(Object.entries(active || {}).filter(([, live]) => !!live).map(([key]) => key));
+  }
+
   function filterProviderTotals(block, instancesByProvider = {}) {
     const raw = block?.raw || {}, instCounts = raw.providers_instances, instMse = raw.providers_instances_mse;
-    if (!selectionDiffers(_prefs, instancesByProvider) || !instCounts || typeof instCounts !== "object") {
+    const activeOverviewFilter = overviewFilter();
+    const hasOverviewFilter = !!Object.keys(activeOverviewFilter || {}).length;
+    if (!hasOverviewFilter && (!selectionDiffers(_prefs, instancesByProvider) || !instCounts || typeof instCounts !== "object")) {
       return { providers: block.providers || {}, mse: raw.providers_mse || null, now: block.now };
     }
     const out = {}, outMse = {}, selected = _prefs?.instances || {}, zero = () => ({ movies:0, shows:0, anime:0, episodes:0 });
     for (const [prov, byInst] of Object.entries(instCounts || {})) {
       const key = lc(prov), map = byInst && typeof byInst === "object" ? byInst : {}, keys = Object.keys(map), want = Array.isArray(selected[key]) ? selected[key].map(String) : selected[key] === undefined ? keys : [];
-      out[key] = want.reduce((sum, id) => sum + (map[id] | 0), 0);
+      const overviewWant = activeOverviewFilter[String(prov || "").toUpperCase()] || activeOverviewFilter[String(prov || "").toLowerCase()];
+      const finalWant = hasOverviewFilter ? want.filter(id => (overviewWant || []).map(String).includes(String(id))) : want;
+      out[key] = finalWant.reduce((sum, id) => sum + (map[id] | 0), 0);
       const mseMap = instMse?.[key] && typeof instMse[key] === "object" ? instMse[key] : {}, agg = zero();
-      for (const id of want) {
+      for (const id of finalWant) {
         const part = mseMap[id];
         if (!part || typeof part !== "object") continue;
         agg.movies += part.movies | 0; agg.shows += part.shows | 0; agg.anime += part.anime | 0; agg.episodes += part.episodes | 0;
       }
       outMse[key] = agg;
     }
-    for (const [prov, v] of Object.entries(block.providers || {})) if (out[lc(prov)] === undefined) out[lc(prov)] = v | 0;
-    for (const [prov, v] of Object.entries(raw.providers_mse || {})) if (outMse[lc(prov)] === undefined) outMse[lc(prov)] = v;
+    if (!hasOverviewFilter) {
+      for (const [prov, v] of Object.entries(block.providers || {})) if (out[lc(prov)] === undefined) out[lc(prov)] = v | 0;
+      for (const [prov, v] of Object.entries(raw.providers_mse || {})) if (outMse[lc(prov)] === undefined) outMse[lc(prov)] = v;
+    }
     const vals = Object.values(out).map(v => v | 0).filter(v => v > 0);
-    return { providers: out, mse: outMse, now: vals.length ? Math.max(...vals) : block.now | 0 };
+    return { providers: out, mse: outMse, now: vals.length ? Math.max(...vals) : hasOverviewFilter ? 0 : block.now | 0 };
   }
 
   function pickBlock(data, feat) {
@@ -405,10 +285,10 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     else if (maxDigits <= 3 && totalDigits <= 8) minScale = .89;
     el.style.setProperty("--ins-mse-scale", String(Math.max(minScale, Math.min(1, (tw - 10) / mw)).toFixed(3)));
   }
-  function animateNumber(el, to, duration = 650) {
+  function animateNumber(el, to, duration = 650, animate = true) {
     if (!el) return;
     const from = parseInt(el.dataset?.v || el.textContent || "0", 10) || 0, done = () => { el.textContent = String(to); el.dataset.v = String(to); fitProviderNumber(el); };
-    if (from === to) return done();
+    if (!animate || from === to) return done();
     const start = performance.now(), dur = Math.max(180, duration);
     const step = now => {
       const p = Math.min(1, (now - start) / dur);
@@ -425,21 +305,25 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
   w.addEventListener("resize", refitProviderNumbers, { passive: true });
 
   const footWrap = () => {
-    ensureStyles();
+    const stats = $("#stats-card");
+    if (!stats) {
+      $("#insights-footer")?.remove();
+      return null;
+    }
     let foot = $("#insights-footer");
     if (!foot) {
       foot = d.createElement("div");
       foot.id = "insights-footer";
       foot.className = "ins-footer";
       foot.innerHTML = '<div class="ins-foot-wrap"></div>';
-      ($("#stats-card") || d.body).appendChild(foot);
+      stats.appendChild(foot);
     }
     return $(".ins-foot-wrap", foot) || foot;
   };
 
   function placeSwitchBeforeTiles() {
     const wrap = footWrap(), sw = $("#insights-switch"), grid = $("#stat-providers");
-    if (!sw) return;
+    if (!wrap || !sw) return;
     if (!wrap.contains(sw)) wrap.appendChild(sw);
     const ref = grid?.parentNode === wrap ? grid : null;
     if (sw.nextSibling !== ref) try { wrap.insertBefore(sw, ref); } catch {}
@@ -459,17 +343,18 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     _feature = want;
     localStorage.setItem("insights.feature", want);
     markActiveSwitcher();
-    refreshInsights(true);
+    refreshInsightsFastThenFull(true);
   }
 
   function ensureSwitch() {
     const wrap = footWrap();
+    if (!wrap) return;
     let host = $("#insights-switch");
     if (!host) {
       host = d.createElement("div");
       host.id = "insights-switch";
       host.className = "ins-switch";
-      host.innerHTML = '<div class="seg" role="tablist" aria-label="Insights features"></div><button class="ins-gear" type="button" title="Insight settings" aria-label="Insight settings"><span class="material-symbols-rounded" aria-hidden="true">settings</span></button>';
+      host.innerHTML = '<div class="seg" role="tablist" aria-label="Insights features"></div>';
       wrap.appendChild(host);
     } else if (host.parentNode !== wrap) wrap.appendChild(host);
     if (!host.dataset.bound) {
@@ -485,8 +370,11 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     host.style.setProperty("--ins-feat-count", String(featCount));
     host.dataset.labels = featCount >= 4 ? "icon" : "text";
     if (seg) seg.dataset.count = String(featCount);
-    if (host.dataset.feats !== sig || host.dataset.cur !== _feature) {
-      seg.innerHTML = _visibleFeats.map(f => `<button class="seg-btn${_feature === f ? " active" : ""}" data-key="${f}" role="tab" aria-selected="${_feature === f}" title="${featureLabel(f)}" aria-label="${featureLabel(f)}"><span class="material-symbols-rounded" aria-hidden="true">${FEAT_ICON[lc(f)] || "insights"}</span><span>${featureLabel(f)}</span></button>`).join("");
+    host.querySelector(":scope > .ins-gear")?.remove();
+    const needsGear = seg && !seg.querySelector(".ins-gear");
+    if (host.dataset.feats !== sig || host.dataset.cur !== _feature || needsGear) {
+      const settingsButton = '<button class="ins-gear" type="button" title="Insight settings" aria-label="Insight settings"><span class="material-symbols-rounded" aria-hidden="true">settings</span></button>';
+      seg.innerHTML = _visibleFeats.map(f => `<button class="seg-btn${_feature === f ? " active" : ""}" data-key="${f}" role="tab" aria-selected="${_feature === f}" title="${featureLabel(f)}" aria-label="${featureLabel(f)}"><span class="material-symbols-rounded" aria-hidden="true">${FEAT_ICON[lc(f)] || "insights"}</span><span>${featureLabel(f)}</span></button>`).join("") + settingsButton;
       host.dataset.feats = sig;
       host.dataset.cur = _feature;
     }
@@ -494,13 +382,23 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     markActiveSwitcher();
   }
 
-  const providerSelected = prov => {
+  const providerSelected = (prov, instancesByProvider = {}) => {
+    const scoped = overviewInstancesFor(prov);
+    if (overviewHasScope() && !Array.isArray(scoped)) return false;
     const cur = _prefs?.instances?.[lc(prov)];
-    return cur === undefined || !Array.isArray(cur) ? cur !== false : cur.length > 0;
+    const selected = cur === undefined || !Array.isArray(cur)
+      ? (cur !== false ? (instancesByProvider?.[lc(prov)] || instancesByProvider?.[String(prov || "").toUpperCase()] || []) : [])
+      : cur.map(String);
+    if (!overviewHasScope()) return cur === undefined || !Array.isArray(cur) ? cur !== false : cur.length > 0;
+    if (!Array.isArray(scoped)) return false;
+    if (!selected.length) return scoped.length > 0;
+    const allowed = new Set(scoped.map(String));
+    return selected.some(id => allowed.has(String(id)));
   };
 
-  function renderProviderStats(provTotals = {}, provActive = {}, configuredSet = new Set(), breakdownMap = {}, instancesByProvider = {}) {
+  function renderProviderStats(provTotals = {}, provActive = {}, configuredSet = new Set(), breakdownMap = {}, instancesByProvider = {}, animate = true) {
     const wrap = footWrap();
+    if (!wrap) return;
     let host = $("#stat-providers");
     if (!host) {
       host = d.createElement("div");
@@ -509,6 +407,7 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     } else if (host.parentNode !== wrap) wrap.appendChild(host);
     if (!host.dataset.bound) {
       host.addEventListener("click", ev => {
+        if (document.documentElement?.dataset?.cwRole === "user") return;
         const tile = ev.target.closest('.tile[data-provider="crosswatch"]');
         if (tile && _feature !== "playlists") openCrosswatchSnapshotPicker(_feature);
       });
@@ -552,7 +451,7 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
       $(".tile-k", tile).textContent = label;
       $(".tile-state", tile).classList.toggle("on", live);
       $(".tile-state .txt", tile).textContent = live ? "Live" : "Idle";
-      animateNumber($(".n", tile), total, 650);
+      animateNumber($(".n", tile), total, 650, animate);
 
       const info = $(".mse", tile);
       if (!per || prov === "crosswatch" || _feature === "playlists") {
@@ -582,16 +481,41 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     placeSwitchBeforeTiles();
   }
 
+  function crosswatchSnapshotProfiles(cwSnapshots) {
+    const profiles = Array.isArray(cwSnapshots?._profiles) ? cwSnapshots._profiles : [];
+    return profiles.length ? profiles : [{ id: "default", label: "Default", root_dir: "/config/.cw_provider" }];
+  }
+
+  function crosswatchSnapshotProfileId(cwSnapshots, preferred = "") {
+    const profiles = crosswatchSnapshotProfiles(cwSnapshots);
+    const ids = new Set(profiles.map(p => String(p.id || "default")));
+    const wanted = String(preferred || localStorage.getItem(CW_SNAPSHOT_PROFILE_KEY) || "default");
+    if (ids.has(wanted)) return wanted;
+    return ids.has("default") ? "default" : String(profiles[0]?.id || "default");
+  }
+
+  function crosswatchSnapshotProfileInfo(cwSnapshots, profileId, feature) {
+    const inst = crosswatchSnapshotProfileId(cwSnapshots, profileId);
+    return cwSnapshots?._by_profile?.[inst]?.[feature] || (inst === "default" ? cwSnapshots?.[feature] : null) || null;
+  }
+
+  function crosswatchSnapshotProfileLabel(cwSnapshots, profileId) {
+    const inst = crosswatchSnapshotProfileId(cwSnapshots, profileId);
+    return crosswatchSnapshotProfiles(cwSnapshots).find(p => String(p.id || "default") === inst)?.label || inst;
+  }
+
   function renderCrossWatchSnapshotHint(cwSnapshots) {
     const tile = d.querySelector('#stat-providers [data-provider="crosswatch"]');
     if (!tile) return;
     const old = $(".cw-snapshot", tile);
     if (_feature === "playlists") return void old?.remove();
-    const info = cwSnapshots?.[_feature];
+    const inst = crosswatchSnapshotProfileId(cwSnapshots);
+    const info = crosswatchSnapshotProfileInfo(cwSnapshots, inst, _feature);
     if (!info?.has_snapshots || !info?.actual) return void old?.remove();
     const label = old || (() => { const el = d.createElement("div"); el.className = "cw-snapshot"; tile.appendChild(el); return el; })();
-    label.textContent = String(info.selected || "latest") === "latest" ? "Latest" : (info.human || info.actual);
-    label.title = info.actual;
+    const selected = String(info.selected || "latest") === "latest" ? "Latest" : (info.human || info.actual);
+    label.textContent = inst === "default" ? selected : `${inst}: ${selected}`;
+    label.title = `${crosswatchSnapshotProfileLabel(cwSnapshots, inst)} - ${info.actual}`;
   }
 
   function renderHistoryTabs(hist) {
@@ -604,9 +528,11 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     const list = $(".list", wrap);
     if (!list) return;
     const display = recentSyncsDisplay();
+    const profile = window.CW?.OverviewProfile;
     const rows = (Array.isArray(hist) ? hist : []).slice()
       .sort((a, b) => new Date(b.finished_at || b.started_at || 0) - new Date(a.finished_at || a.started_at || 0))
       .filter(row => row?.features_enabled?.[_feature] !== false)
+      .filter(row => !profile?.filter || !Object.keys(profile.filter || {}).length || profile.matchesEndpoint(row?.source, row?.source_instance) || profile.matchesEndpoint(row?.target, row?.target_instance))
       .filter(row => display.mode !== "hours" || ((rowTs(row) || 0) >= display.sinceMs))
       .slice(0, display.limit);
     if (!rows.length) return void (list.innerHTML = `<div class="history-item"><div class="history-meta muted">${display.mode === "hours" ? `No runs in the last ${display.hours} hours` : "No runs for this feature"}</div></div>`);
@@ -642,6 +568,7 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
   }
 
   async function renderFromData(data, statsOnly = false, forceConfigured = false) {
+    _lastInsightsData = data || {};
     const blk = hydrateBlock(data);
     footWrap();
     ensureSwitch();
@@ -651,14 +578,29 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
       if (data?.watchtime) renderWatchtime(data.watchtime);
     }
     renderTopStats(blk);
-    const configured = await getConfiguredProviders(forceConfigured);
-    renderProviderStats(blk.providers, blk.active, configured, blk.raw?.providers_mse || null, data?.instances_by_provider || {});
+    const animateTiles = _tilesFeature === _feature;
+    _tilesFeature = _feature;
+    const optimisticConfigured = configuredProvidersSnapshot(blk.active);
+    renderProviderStats(blk.providers, blk.active, optimisticConfigured, blk.raw?.providers_mse || null, data?.instances_by_provider || {}, animateTiles);
     renderCrossWatchSnapshotHint(data?.crosswatch_snapshots || null);
+    getConfiguredProviders(forceConfigured)
+      .then((configured) => {
+        renderProviderStats(blk.providers, blk.active, configured, blk.raw?.providers_mse || null, data?.instances_by_provider || {}, animateTiles);
+        renderCrossWatchSnapshotHint(data?.crosswatch_snapshots || null);
+      })
+      .catch((e) => console.error("[Insights] Failed to resolve configured providers", e));
   }
 
   async function refreshInsights(force = false) {
     if (authSetupPending()) return;
-    try { await renderFromData(await fetchJSON(`/api/insights?limit_samples=60&history=60${force ? `&t=${Date.now()}` : ""}`), false, force); }
+    try {
+      const profileParam = overviewProfileId() ? `&user_profile=${encodeURIComponent(overviewProfileId())}` : "";
+      const [data] = await Promise.all([
+        fetchJSON(`/api/insights?limit_samples=60&history=60${profileParam}${force ? `&t=${Date.now()}` : ""}`),
+        getConfiguredProviders(force).catch(() => null),
+      ]);
+      await renderFromData(data, false, force);
+    }
     catch (e) {
       if (String(e?.message || e || "").includes("auth setup pending")) return;
       console.error("[Insights] Failed to load /api/insights", e);
@@ -670,18 +612,36 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     const now = Date.now();
     if (!force && now - _lastStatsFetch < 900) return;
     _lastStatsFetch = now;
-    try { await renderFromData(await fetchJSON("/api/insights?limit_samples=0&history=60"), true, force); }
+    try {
+      const profileParam = overviewProfileId() ? `&user_profile=${encodeURIComponent(overviewProfileId())}` : "";
+      const [data] = await Promise.all([
+        fetchJSON(`/api/insights?limit_samples=0&history=0&include_events=0${profileParam}${force ? `&t=${Date.now()}` : ""}`),
+        getConfiguredProviders(force).catch(() => null),
+      ]);
+      await renderFromData(data, true, force);
+    }
     catch (e) {
       if (String(e?.message || e || "").includes("auth setup pending")) return;
       console.error("[Insights] Failed to load /api/insights (stats)", e);
     }
   }
 
-  w.addEventListener("insights:settings-changed", () => { _prefs = loadPrefs(); _visibleFeats = visibleFeatures(_prefs); _feature = clampFeature(_feature); localStorage.setItem("insights.feature", _feature); refreshInsights(true); });
+  function refreshInsightsFastThenFull(force = false) {
+    if (authSetupPending()) return;
+    try { refreshStats(force); } catch {}
+    clearTimeout(_fullInsightsTimer);
+    _fullInsightsTimer = setTimeout(() => {
+      _fullInsightsTimer = 0;
+      refreshInsights(force);
+    }, 180);
+  }
+
+  w.addEventListener("insights:settings-changed", () => { _prefs = loadPrefs(); _visibleFeats = visibleFeatures(_prefs); _feature = clampFeature(_feature); localStorage.setItem("insights.feature", _feature); refreshInsightsFastThenFull(true); });
+  w.addEventListener("cw:overview-profile-changed", () => refreshInsightsFastThenFull(true));
 
   w.Insights = Object.assign(w.Insights || {}, {
     renderSparkline, refreshInsights, refreshStats, fetchJSON, animateNumber, animateChart, titleOf, subtitleOf,
-    switchFeature, get feature() { return _feature; }
+    switchFeature, refreshInsightsFastThenFull, get feature() { return _feature; }
   });
   w.renderSparkline = renderSparkline;
   w.refreshInsights = refreshInsights;
@@ -695,7 +655,7 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
     let tries = 0, limit = max || 20;
     (function tick() {
       if (authSetupPending()) return;
-      if ($("#sync-history") || $("#stat-now") || $("#sparkline")) return refreshInsights();
+      if ($("#sync-history") || $("#stat-now") || $("#sparkline")) return refreshInsightsFastThenFull();
       if (++tries < limit) setTimeout(tick, 250);
     })();
   };
@@ -704,7 +664,7 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
   d.addEventListener("tab-changed", ev => {
     if (authSetupPending()) return;
     const tab = String(ev?.detail?.id || ev?.detail?.tab || "").toLowerCase();
-    if (tab === "main") refreshInsights(true);
+    if (tab === "main") refreshInsightsFastThenFull(true);
   });
 
   const snapLabel = name => {
@@ -722,35 +682,59 @@ html[data-cw-theme="flat-light"] #insights-switch .ins-gear:hover{
       if (close) modal.classList.add("cw-snap-hidden");
       const btn = ev.target.closest(".snap-btn");
       if (!btn) return;
-      const feature = modal.dataset.feature, name = btn.dataset.name;
-      try { await postOK(`/api/crosswatch/select-snapshot?feature=${feature}&snapshot=${encodeURIComponent(name)}`); }
+      const feature = modal.dataset.feature, name = btn.dataset.name, profile = btn.dataset.profile || modal.dataset.providerInstance || "default";
+      try { await postOK(`/api/crosswatch/select-snapshot?feature=${encodeURIComponent(feature)}&snapshot=${encodeURIComponent(name)}&provider_instance=${encodeURIComponent(profile)}`); }
       catch (err) {
         console.error("[Insights] Failed to select snapshot", err);
         return void w.cxToast?.("Failed to set snapshot. Check server logs.");
       }
+      try { localStorage.setItem(CW_SNAPSHOT_PROFILE_KEY, profile); } catch {}
       modal.classList.add("cw-snap-hidden");
-      w.cxToast?.(`Snapshot set: ${name === "latest" ? "latest" : snapLabel(name)}`);
+      w.cxToast?.(`Snapshot set for ${profile}: ${name === "latest" ? "latest" : snapLabel(name)}`);
       refreshInsights(true);
+    });
+    modal.addEventListener("change", ev => {
+      const sel = ev.target.closest(".cw-snap-profile-select");
+      if (sel) loadCrosswatchSnapshotChoices(modal, modal.dataset.feature, sel.value);
     });
     d.body.appendChild(modal);
     _cwSnapModal = modal;
     return modal;
   }
 
-  async function openCrosswatchSnapshotPicker(feature) {
-    const modal = ensureCrosswatchSnapshotModal(), body = $(".cw-snap-body", modal), head = $(".cw-snap-head .hl", modal);
-    modal.dataset.feature = feature;
-    if (head) head.textContent = featureLabel(feature);
+  async function loadCrosswatchSnapshotChoices(modal, feature, profileId) {
+    const body = $(".cw-snap-body", modal);
+    const cwSnapshots = _lastInsightsData?.crosswatch_snapshots || {};
+    const profiles = crosswatchSnapshotProfiles(cwSnapshots);
+    const inst = crosswatchSnapshotProfileId(cwSnapshots, profileId);
+    const profile = profiles.find(p => String(p.id || "default") === inst) || profiles[0] || { id: "default", label: "Default", root_dir: "/config/.cw_provider" };
+    const info = crosswatchSnapshotProfileInfo(cwSnapshots, inst, feature);
+    const rootDir = String(info?.root_dir || profile.root_dir || "/config/.cw_provider").replace(/[\\/]+$/, "");
+    const selected = String(info?.selected || "latest");
+    modal.dataset.providerInstance = inst;
+    try { localStorage.setItem(CW_SNAPSHOT_PROFILE_KEY, inst); } catch {}
+
+    body.innerHTML = `${profiles.length > 1
+      ? `<label class="cw-snap-profile"><span>Profile</span><select class="cw-snap-profile-select">${profiles.map(p => `<option value="${esc(p.id || "default")}"${String(p.id || "default") === inst ? " selected" : ""}>${esc(p.label || p.id || "Default")}</option>`).join("")}</select></label>`
+      : `<div class="cw-snap-profile is-single"><span>Profile</span><strong>${esc(profile.label || inst)}</strong></div>`}<div class="cw-snap-list"><div class="cw-snap-empty muted">Loading snapshots...</div></div>`;
+    const list = $(".cw-snap-list", body);
 
     try {
-      const data = await fetchJSON(`/api/files?path=${encodeURIComponent("/config/.cw_provider/snapshots")}`);
+      const data = await fetchJSON(`/api/files?path=${encodeURIComponent(`${rootDir}/snapshots`)}`);
       const files = (Array.isArray(data?.files) ? data.files : data || []).filter(f => !f.is_dir && f.name?.endsWith(`-${feature}.json`)).sort((a, b) => a.name.localeCompare(b.name)).slice(-10).reverse();
-      if (!files.length) body.innerHTML = '<div class="cw-snap-empty muted">No snapshots found for this feature yet.</div>';
-      else body.innerHTML = [{ name: "latest", label: "Latest snapshot", meta: "Live" }, ...files.map(f => ({ name: f.name, label: snapLabel(f.name), meta: "Saved" }))].map(o => `<button class="snap-btn${o.name === "latest" ? " is-latest" : ""}" data-name="${o.name}" type="button"><span class="snap-name">${o.label}</span><span class="snap-meta">${o.meta}</span></button>`).join("");
+      if (!files.length) list.innerHTML = '<div class="cw-snap-empty muted">No snapshots found for this feature yet.</div>';
+      else list.innerHTML = [{ name: "latest", label: "Latest snapshot", meta: selected === "latest" ? "Active" : "Live" }, ...files.map(f => ({ name: f.name, label: snapLabel(f.name), meta: f.name === selected ? "Active" : "Saved" }))].map(o => `<button class="snap-btn${o.name === "latest" ? " is-latest" : ""}${o.meta === "Active" ? " is-active" : ""}" data-name="${esc(o.name)}" data-profile="${esc(inst)}" type="button"><span class="snap-name">${esc(o.label)}</span><span class="snap-meta">${esc(o.meta)}</span></button>`).join("");
     } catch (e) {
       console.error("[Insights] Failed to load snapshot files", e);
-      body.innerHTML = '<div class="cw-snap-empty muted">Failed to load snapshots. Check server logs or configuration.</div>';
+      list.innerHTML = '<div class="cw-snap-empty muted">Failed to load snapshots. Check server logs or configuration.</div>';
     }
+  }
+
+  async function openCrosswatchSnapshotPicker(feature, profileId = "") {
+    const modal = ensureCrosswatchSnapshotModal(), head = $(".cw-snap-head .hl", modal);
+    modal.dataset.feature = feature;
+    if (head) head.textContent = featureLabel(feature);
+    await loadCrosswatchSnapshotChoices(modal, feature, profileId);
     modal.classList.remove("cw-snap-hidden");
   }
 })(window, document);

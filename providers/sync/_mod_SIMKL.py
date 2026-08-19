@@ -39,7 +39,9 @@ def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any)
     attempted: list[str] = []
     for it in items or []:
         try:
-            k = str(key_of(it) or "").strip()
+            k = str(it.get("_cw_event_key") or "").strip() if isinstance(it, Mapping) and it.get("_cw_rewatch_sync") is True else ""
+            if not k:
+                k = str(key_of(it) or "").strip()
         except Exception:
             k = ""
         if k:
@@ -60,7 +62,9 @@ def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any)
                 continue
             if isinstance(obj, Mapping):
                 try:
-                    k = str(key_of(obj) or "").strip()
+                    k = str(obj.get("_cw_event_key") or "").strip() if obj.get("_cw_rewatch_sync") is True else ""
+                    if not k:
+                        k = str(key_of(obj) or "").strip()
                 except Exception:
                     k = ""
                 if k:
@@ -237,10 +241,15 @@ def get_manifest() -> Mapping[str, Any]:
             "watchlist": {
                 "index_semantics": "present",
                 "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "anime": True, "seasons": False, "episodes": False},
+                "upsert": True,
+                "remove": True,
             },
             "history": {
                 "index_semantics": "present",
                 "observed_deletes": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": "pro_vip"},
             },
             "ratings": {
                 "index_semantics": "present",
@@ -256,6 +265,10 @@ def get_manifest() -> Mapping[str, Any]:
                 "types": {"movies": True, "shows": False, "seasons": False, "episodes": True, "anime": True},
                 "upsert": True,
                 "remove": True,
+                "completion_policy": {
+                    "progress_write": {"mode": "none"},
+                    "stop_scrobble": {"marks_watched_percent": 80, "comparison": "gte"},
+                },
             },
             "playlists": dict(_PLAYLIST_CAPABILITIES),
         },
@@ -732,10 +745,15 @@ class _SIMKLOPS:
             "watchlist": {
                 "index_semantics": "present",
                 "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "anime": True, "seasons": False, "episodes": False},
+                "upsert": True,
+                "remove": True,
             },
             "history": {
                 "index_semantics": "present",
                 "observed_deletes": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": "pro_vip"},
             },
             "ratings": {
                 "index_semantics": "present",
@@ -747,6 +765,10 @@ class _SIMKLOPS:
                 "types": {"movies": True, "shows": False, "seasons": False, "episodes": True, "anime": True},
                 "upsert": True,
                 "remove": True,
+                "completion_policy": {
+                    "progress_write": {"mode": "none"},
+                    "stop_scrobble": {"marks_watched_percent": 80, "comparison": "gte"},
+                },
             },
             "playlists": dict(_PLAYLIST_CAPABILITIES),
         }

@@ -10,6 +10,9 @@ import os
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from urllib.parse import urlsplit
+from cw_platform.run_control import consume_queue_stop
+from services.scheduler_webhooks import notify_scheduler_webhook
 
 try:
     from zoneinfo import ZoneInfo  # py39+
@@ -21,6 +24,18 @@ def _env_timezone_name() -> str:
     return tz
 
 # safety config defaults due to autostart and potential for misconfiguration
+DEFAULT_WEBHOOKS: dict[str, Any] = {
+    "enabled": False,
+    "url": "",
+    "base_url": "",
+    "start_url": "",
+    "success_url": "",
+    "failure_url": "",
+    "payload_format": "crosswatch",
+    "notifiarr_channel_id": "",
+    "timeout_seconds": 10,
+}
+
 DEFAULT_SCHEDULING: dict[str, Any] = {
     "enabled": False,
     "mode": "disabled",
@@ -29,12 +44,14 @@ DEFAULT_SCHEDULING: dict[str, Any] = {
     "custom_interval_minutes": 60,
     "timezone": "",
     "jitter_seconds": 0,
+    "webhooks": dict(DEFAULT_WEBHOOKS),
     "advanced": {
         "enabled": False,
         "jobs": [],
         "capture_jobs": [],
         "backup_jobs": [],
         "event_rules": [],
+        "workflows": [],
     },
 }
 
@@ -119,6 +136,45 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return bool(default)
 
 
+def _normalize_scheduler_webhooks(value: Any) -> dict[str, Any]:
+    src = value if isinstance(value, dict) else {}
+    out = dict(DEFAULT_WEBHOOKS)
+    out["enabled"] = _as_bool(src.get("enabled"), False)
+    out["url"] = _http_url_or_blank(src.get("url") or src.get("default_url"))
+    out["base_url"] = _http_url_or_blank(src.get("base_url") or src.get("healthchecks_base_url"))
+    for key in ("start_url", "success_url", "failure_url"):
+        out[key] = _http_url_or_blank(src.get(key))
+    out["payload_format"] = _payload_format(src.get("payload_format") or src.get("format"))
+    out["notifiarr_channel_id"] = _digits_or_blank(src.get("notifiarr_channel_id") or src.get("notifiarrChannelId"))
+    out["timeout_seconds"] = _as_int(src.get("timeout_seconds"), 10, minimum=1, maximum=60)
+    return out
+
+
+def _http_url_or_blank(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return ""
+    return url
+
+
+def _payload_format(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"notifiarr", "notifiarr_passthrough"}:
+        return "notifiarr"
+    return "crosswatch"
+
+
+def _digits_or_blank(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text.isdigit() else ""
+
+
 def _normalize_event_name(value: Any) -> str:
     raw = str(value or "").strip().lower()
     if raw.startswith("/scrobble/"):
@@ -163,9 +219,12 @@ def merge_defaults(s: dict[str, Any]) -> dict[str, Any]:
                 out_adv["backup_jobs"] = []
             if not isinstance(out_adv.get("event_rules"), list):
                 out_adv["event_rules"] = []
+            if not isinstance(out_adv.get("workflows"), list):
+                out_adv["workflows"] = []
             out["advanced"] = out_adv
     if not isinstance(out.get("advanced"), dict):
         out["advanced"] = dict(DEFAULT_SCHEDULING["advanced"])
+    out["webhooks"] = _normalize_scheduler_webhooks(out.get("webhooks"))
     return out
 
 def _align_next_hour_in_tz(now_tz: datetime) -> datetime:
@@ -255,6 +314,39 @@ def _normalize_job(j: dict[str, Any]) -> dict[str, Any]:
         "days": days2,
         "after": (str(j.get("after") or "").strip() or None),
         "active": bool(j.get("active", True)),
+    }
+
+
+def _normalize_workflow_step(step: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(step.get("id") or "").strip() or f"step_{_now_ts()}",
+        "pair_id": (str(step.get("pair_id") or "").strip() or None),
+        "active": _as_bool(step.get("active"), True),
+    }
+
+
+def _normalize_workflow(raw: dict[str, Any]) -> dict[str, Any]:
+    mode = str(raw.get("mode") or "hourly").strip().lower()
+    if mode not in {"hourly", "every_n_hours", "daily_time", "custom_interval"}:
+        mode = "hourly"
+    steps_raw = raw.get("steps") or []
+    steps: list[dict[str, Any]] = []
+    if isinstance(steps_raw, list):
+        for item in steps_raw:
+            if not isinstance(item, dict):
+                continue
+            step = _normalize_workflow_step(item)
+            if step["active"] and step["pair_id"]:
+                steps.append(step)
+    return {
+        "id": str(raw.get("id") or "").strip() or f"workflow_{_now_ts()}",
+        "name": str(raw.get("name") or "").strip(),
+        "mode": mode,
+        "every_n_hours": _as_int(raw.get("every_n_hours"), 1, minimum=1),
+        "daily_time": str(raw.get("daily_time") or "03:30").strip() or "03:30",
+        "custom_interval_minutes": _as_int(raw.get("custom_interval_minutes"), 60, minimum=15),
+        "steps": steps,
+        "active": _as_bool(raw.get("active"), True),
     }
 
 
@@ -380,6 +472,28 @@ def _iter_adv_jobs(sch: dict[str, Any]) -> list[dict[str, Any]]:
         if not j["at"] or _parse_hhmm(j["at"]) is None:
             continue
         out.append(j)
+    return out
+
+
+def _iter_adv_workflows(sch: dict[str, Any]) -> list[dict[str, Any]]:
+    adv = sch.get("advanced") or {}
+    if not isinstance(adv, dict) or not adv.get("enabled"):
+        return []
+    workflows = adv.get("workflows") or []
+    if not isinstance(workflows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in workflows:
+        if not isinstance(raw, dict):
+            continue
+        workflow = _normalize_workflow(raw)
+        if not workflow["active"]:
+            continue
+        if not workflow["steps"]:
+            continue
+        if workflow["mode"] == "daily_time" and _parse_hhmm(workflow["daily_time"]) is None:
+            continue
+        out.append(workflow)
     return out
 
 
@@ -535,6 +649,56 @@ def _next_job_time(now_local: datetime, job: dict[str, Any]) -> datetime | None:
     return None
 
 
+def _workflow_slot(now_local: datetime, workflow: dict[str, Any]) -> datetime | None:
+    base = now_local.replace(second=0, microsecond=0)
+    mode = workflow.get("mode")
+    if mode == "daily_time":
+        hhmm = _parse_hhmm(workflow.get("daily_time") or "")
+        if not hhmm:
+            return None
+        hh, mm = hhmm
+        cand = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return cand if cand <= base else None
+
+    if mode == "every_n_hours":
+        interval = max(1, _as_int(workflow.get("every_n_hours"), 1, minimum=1)) * 60
+    elif mode == "custom_interval":
+        interval = max(15, _as_int(workflow.get("custom_interval_minutes"), 60, minimum=15))
+    else:
+        interval = 60
+
+    midnight = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = int((base - midnight).total_seconds() // 60)
+    return midnight + timedelta(minutes=(elapsed // interval) * interval)
+
+
+def _next_workflow_time(now_local: datetime, workflow: dict[str, Any]) -> datetime | None:
+    base = now_local.replace(second=0, microsecond=0)
+    mode = workflow.get("mode")
+    if mode == "daily_time":
+        hhmm = _parse_hhmm(workflow.get("daily_time") or "")
+        if not hhmm:
+            return None
+        hh, mm = hhmm
+        cand = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return cand if cand > base else cand + timedelta(days=1)
+
+    if mode == "every_n_hours":
+        interval = max(1, _as_int(workflow.get("every_n_hours"), 1, minimum=1)) * 60
+    elif mode == "custom_interval":
+        interval = max(15, _as_int(workflow.get("custom_interval_minutes"), 60, minimum=15))
+    else:
+        interval = 60
+
+    midnight = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = int((base - midnight).total_seconds() // 60)
+    return midnight + timedelta(minutes=((elapsed // interval) + 1) * interval)
+
+
+def _workflow_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d@%H:%M")
+
+
 def _topo_order(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_id = {j["id"]: j for j in jobs}
     pending = list(jobs)
@@ -602,6 +766,7 @@ class SyncScheduler:
         self._adv_seed_key: str = ""
         self._adv_seed_day: str = ""
         self._last_logged_next: int = 0
+        self._last_logged_webhook_state: str = ""
         self._event_last_run_at: dict[str, int] = {}
         self._event_last_fingerprint: dict[str, tuple[int, str]] = {}
         self._event_run_history: dict[str, list[int]] = {}
@@ -626,6 +791,32 @@ class SyncScheduler:
         cfg = self.load_config_cb() or {}
         return merge_defaults(cfg.get("scheduling") or {})
 
+    def _log_webhook_state(self, sch: dict[str, Any] | None = None) -> None:
+        hooks = (sch or self._get_sched_cfg()).get("webhooks") or {}
+        if not isinstance(hooks, dict) or hooks.get("enabled") is not True:
+            self._last_logged_webhook_state = "off"
+            return
+
+        fmt = _payload_format(hooks.get("payload_format") or hooks.get("format"))
+        label = "Notifiarr Passthrough" if fmt == "notifiarr" else "CrossWatch JSON"
+        common_url = str(hooks.get("url") or hooks.get("default_url") or "").strip()
+        urls = [
+            common_url,
+            str(hooks.get("base_url") or hooks.get("healthchecks_base_url") or "").strip(),
+            str(hooks.get("start_url") or "").strip(),
+            str(hooks.get("success_url") or "").strip(),
+            str(hooks.get("failure_url") or "").strip(),
+        ]
+        configured = bool(common_url) if fmt == "notifiarr" else any(urls)
+        state = f"on:{fmt}:{int(configured)}"
+        if state == self._last_logged_webhook_state:
+            return
+        self._last_logged_webhook_state = state
+        if configured:
+            self._log(f"scheduler webhooks enabled ({label})", level="INFO")
+        else:
+            self._log(f"scheduler webhooks enabled but no callback URL configured ({label})", level="INFO")
+
     def _set_sched_cfg(self, s: dict[str, Any]) -> None:
         cfg = self.load_config_cb() or {}
         cfg["scheduling"] = merge_defaults(s or {})
@@ -649,11 +840,24 @@ class SyncScheduler:
 
     def _adv_signature(self, sch: dict[str, Any]) -> str:
         jobs = _iter_adv_jobs(sch)
+        workflows = _iter_adv_workflows(sch)
         capture_jobs = _iter_adv_capture_jobs(sch)
         backup_jobs = _iter_adv_backup_jobs(sch)
         pairs = [
-            ("sync", str(j.get("id") or ""), str(j.get("pair_id") or ""), str(j.get("at") or ""), tuple(j.get("days") or []))
+            ("sync", str(j.get("id") or ""), str(j.get("pair_id") or ""), str(j.get("at") or ""), tuple(j.get("days") or []), str(j.get("after") or ""))
             for j in jobs
+        ]
+        pairs += [
+            (
+                "workflow",
+                str(w.get("id") or ""),
+                str(w.get("mode") or ""),
+                int(w.get("every_n_hours") or 1),
+                str(w.get("daily_time") or ""),
+                int(w.get("custom_interval_minutes") or 60),
+                tuple((str(s.get("id") or ""), str(s.get("pair_id") or ""), bool(s.get("active", True))) for s in (w.get("steps") or [])),
+            )
+            for w in workflows
         ]
         pairs += [
             (
@@ -702,6 +906,12 @@ class SyncScheduler:
             if dt is None or dt >= current:
                 continue
             self._adv_last_key[job["id"]] = f"{today}@{job.get('at')}"
+
+        for workflow in _iter_adv_workflows(sch):
+            dt = _workflow_slot(base, workflow)
+            if dt is None or dt >= current:
+                continue
+            self._adv_last_key[f"workflow:{workflow['id']}"] = _workflow_key(dt)
 
         for job in _iter_adv_capture_jobs(sch):
             dt = _job_due_today(base, job)
@@ -851,6 +1061,7 @@ class SyncScheduler:
             self._thread = threading.Thread(target=self._loop, name="SyncScheduler", daemon=True)
             self._thread.start()
         self._log("scheduler thread started", level="INFO")
+        self._log_webhook_state()
 
     def stop(self) -> None:
         t = self._thread
@@ -867,6 +1078,7 @@ class SyncScheduler:
 
     def refresh(self) -> None:
         self._poke.set()
+        self._log_webhook_state()
         if not self._thread or not self._thread.is_alive():
             self.start()
 
@@ -988,6 +1200,24 @@ class SyncScheduler:
         except TypeError:
             return bool(self.run_sync_fn())
 
+    def _notify_sync_start_rejected(self, payload: dict[str, Any], reason: str) -> None:
+        summary = {
+            "exit_code": 1,
+            "errors": 1,
+            "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "reason": str(reason or "scheduler_rejected"),
+        }
+        try:
+            notify_scheduler_webhook(
+                self.load_config_cb() or {},
+                "failure",
+                payload,
+                summary,
+                log_fn=lambda msg: self._log(msg, level="INFO"),
+            )
+        except Exception:
+            pass
+
     def _update_next(self, nxt: datetime | None, *, effective_mode: str) -> None:
         sch = self._get_sched_cfg()
         with self._lock:
@@ -1010,9 +1240,10 @@ class SyncScheduler:
 
     def _adv_next(self, sch: dict[str, Any], now_local: datetime, tz: Any | None) -> datetime | None:
         jobs = _iter_adv_jobs(sch)
+        workflows = _iter_adv_workflows(sch)
         capture_jobs = _iter_adv_capture_jobs(sch)
         backup_jobs = _iter_adv_backup_jobs(sch)
-        if not jobs and not capture_jobs and not backup_jobs:
+        if not jobs and not workflows and not capture_jobs and not backup_jobs:
             return None
 
         now = _as_now_in_tz(tz)
@@ -1029,6 +1260,14 @@ class SyncScheduler:
                 if not dep_key.startswith(today):
                     cand2 = _next_job_time(base + timedelta(days=1), j)
                     cand = cand2 or cand
+            if best is None or cand < best:
+                best = cand
+        for workflow in workflows:
+            cand = _workflow_slot(base, workflow)
+            if cand is None or self._adv_last_key.get(f"workflow:{workflow['id']}") == _workflow_key(cand):
+                cand = _next_workflow_time(base, workflow)
+            if cand is None:
+                continue
             if best is None or cand < best:
                 best = cand
         for j in capture_jobs:
@@ -1065,6 +1304,27 @@ class SyncScheduler:
             if self._adv_last_key.get(j["id"]) == key:
                 continue
             due.append((dt, j))
+
+        due.sort(key=lambda x: (x[0], str(x[1].get("id") or "")))
+        return due
+
+    def _adv_due_workflows(self, sch: dict[str, Any], tz: Any | None) -> list[tuple[datetime, dict[str, Any]]]:
+        workflows = _iter_adv_workflows(sch)
+        if not workflows:
+            return []
+
+        now = _as_now_in_tz(tz)
+        base = now.replace(second=0, microsecond=0)
+
+        due: list[tuple[datetime, dict[str, Any]]] = []
+        for workflow in workflows:
+            dt = _workflow_slot(base, workflow)
+            if dt is None:
+                continue
+            key = _workflow_key(dt)
+            if self._adv_last_key.get(f"workflow:{workflow['id']}") == key:
+                continue
+            due.append((dt, workflow))
 
         due.sort(key=lambda x: (x[0], str(x[1].get("id") or "")))
         return due
@@ -1159,9 +1419,10 @@ class SyncScheduler:
 
     def _adv_run_due(self, sch: dict[str, Any], tz: Any | None) -> bool:
         due = self._adv_due_jobs(sch, tz)
+        due_workflows = self._adv_due_workflows(sch, tz)
         due_capture = self._adv_due_capture_jobs(sch, tz)
         due_backup = self._adv_due_backup_jobs(sch, tz)
-        if not due and not due_capture and not due_backup:
+        if not due and not due_workflows and not due_capture and not due_backup:
             return False
 
         now = _as_now_in_tz(tz)
@@ -1173,6 +1434,10 @@ class SyncScheduler:
 
         for j in ordered:
             if self._stop.is_set():
+                break
+            if consume_queue_stop():
+                self._log("advanced: sync cancelled by user; skipping remaining jobs", level="INFO")
+                ok_all = False
                 break
 
             dep = j.get("after")
@@ -1195,6 +1460,7 @@ class SyncScheduler:
             if not ok:
                 ok_all = False
                 self._log(f"advanced: job {j['id']} failed", level="ERROR")
+                self._notify_sync_start_rejected(payload, "advanced job failed")
             else:
                 self._log(f"advanced: job {j['id']} ok", level="INFO")
 
@@ -1207,6 +1473,74 @@ class SyncScheduler:
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
             executed.add(j["id"])
+
+        for due_at, workflow in due_workflows:
+            if self._stop.is_set():
+                break
+
+            workflow_ok = True
+            steps = list(workflow.get("steps") or [])
+            for step in steps:
+                if self._stop.is_set():
+                    break
+                if consume_queue_stop():
+                    self._log(
+                        f"advanced workflow: sync cancelled by user; skipping remaining steps of {workflow['id']}",
+                        level="INFO",
+                    )
+                    ok_all = False
+                    workflow_ok = False
+                    break
+
+                waited = 0
+                while self.is_sync_running_fn() and not self._stop.is_set():
+                    if waited == 0:
+                        self._log("advanced workflow: sync is busy; waiting to run due workflow", level="INFO")
+                    waited += 1
+                    self._sleep_or_poke(2.0)
+                    if self._poke.is_set():
+                        self._poke.clear()
+                        return True
+
+                payload = {
+                    "source": "scheduler",
+                    "scheduler_mode": "advanced_workflow",
+                    "workflow_id": workflow["id"],
+                    "workflow_step_id": step["id"],
+                    "pair_id": step["pair_id"],
+                }
+
+                self._log(f"advanced workflow: running {workflow['id']} step {step['id']} for pair {step['pair_id']}", level="INFO")
+                ok = self._run_sync(payload)
+                if not ok:
+                    ok_all = False
+                    workflow_ok = False
+                    self._log(f"advanced workflow: step {step['id']} failed", level="ERROR")
+                    self._notify_sync_start_rejected(payload, "advanced workflow step failed")
+                else:
+                    self._log(f"advanced workflow: step {step['id']} ok", level="INFO")
+
+                with self._lock:
+                    self._status["last_run_ok"] = ok
+                    self._status["last_run_at"] = _now_ts()
+                    self._status["last_error"] = "" if ok else "advanced workflow step failed"
+                    self._status["last_job_id"] = step["id"]
+                    self._status["last_pair_id"] = step["pair_id"] or ""
+                    self._status["last_capture_job_id"] = ""
+                    self._status["last_capture_provider"] = ""
+                    self._status["last_capture_feature"] = ""
+                    self._status["last_backup_job_id"] = ""
+                    self._status["last_backup_scope"] = ""
+                    self._status["last_rule_id"] = ""
+                    self._status["last_event_source"] = ""
+                    self._status["last_event_name"] = ""
+
+                if not ok:
+                    break
+
+            self._adv_last_key[f"workflow:{workflow['id']}"] = _workflow_key(due_at)
+            if workflow_ok:
+                self._log(f"advanced workflow: workflow {workflow['id']} ok", level="INFO")
 
         for _, j in due_capture:
             if self._stop.is_set():
@@ -1298,6 +1632,8 @@ class SyncScheduler:
         payload = {"source": "scheduler", "scheduler_mode": "standard"}
         self._log("standard: triggering sync run", level="INFO")
         ok = self._run_sync(payload)
+        if not ok:
+            self._notify_sync_start_rejected(payload, "standard run failed")
         self._set_last_run_status(ok, "" if ok else "standard run failed")
         self._log("standard: run ok" if ok else "standard: run failed", level="INFO" if ok else "ERROR")
         return ok

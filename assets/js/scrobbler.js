@@ -3,8 +3,10 @@
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (function (w, d) {
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const label = (v) => ({ plex: "Plex", jellyfin: "Jellyfin", emby: "Emby", kodi: "Kodi", trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList" }[String(v || "").toLowerCase()] || String(v || "").toUpperCase());
-  const logo = (v) => ({ plex: "/assets/img/PLEX.svg", jellyfin: "/assets/img/JELLYFIN.svg", emby: "/assets/img/EMBY.svg", kodi: "/assets/img/KODI.png", trakt: "/assets/img/TRAKT.svg", simkl: "/assets/img/SIMKL.svg", mdblist: "/assets/img/MDBLIST.svg" }[String(v || "").toLowerCase()] || "");
+  const providerMeta = () => w.CW?.ProviderMeta || {};
+  const label = (v) => providerMeta().label?.(v) || String(v || "").toUpperCase();
+  const logo = (v) => providerMeta().logoPath?.(v) || "";
+  const plexRatingSinks = ["crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay"];
   const state = { root: null, overview: null, busy: false, panels: { watcherDefaults: false, ratings: false, webhookDefaults: false }, delBtn: null, delTimer: 0, regenBtn: null, regenTimer: 0, legacyConfirm: false, legacyTimer: 0, hybridDismissed: false };
 
   async function j(url, options = {}) {
@@ -54,11 +56,23 @@
   }
 
   function webhookProfileName(x) {
-    return x.provider_instance === "default" ? "Default" : x.provider_instance;
+    return String(x.profile_label || x.source_label || x.provider_instance || "default").trim() || "Default";
   }
 
-  function instanceName(v) {
+  function instanceName(v, labelValue = "") {
+    const labelText = String(labelValue || "").trim();
+    if (labelText) return labelText;
     return String(v || "default") === "default" ? "Default" : String(v || "default");
+  }
+
+  function profileConnector(row) {
+    const name = String(row?.user_profile_label || "").trim();
+    if (!name) return `<div class="sc2-rt-conn"><span class="sc2-rt-conn-line"></span></div>`;
+    return `<div class="sc2-rt-conn has-profile"><span class="sc2-rt-conn-line"></span>
+      <span class="sc2-rt-profile" title="${esc(`User profile: ${name}`)}">
+        <span class="material-symbols-rounded" aria-hidden="true">person</span>
+        <span class="sc2-rt-profile-name">${esc(name)}</span>
+      </span></div>`;
   }
 
   function routeFilterSummary(filters = {}) {
@@ -95,28 +109,31 @@
   function renderSummary(o) {
     const s = o.summary || {};
     const r = o.watcher_runtime || {};
+    const webhooksOn = Number(s.active_webhooks || 0) > 0;
+    const routesOn = Number(s.enabled_routes || 0) > 0;
     const cards = [
-      ["Webhooks", `${s.active_webhooks || 0}/${s.eligible_profiles || 0}`, "webhook"],
-      ["Watcher routes", `${s.enabled_routes || 0}/${s.total_routes || 0}`, "bolt"],
-      ["Watcher status", r.running ? "Running" : "Stopped", "monitor_heart"],
+      ["Webhooks", `${s.active_webhooks || 0}/${s.eligible_profiles || 0}`, "webhook", "webhooks", webhooksOn ? "" : "is-empty"],
+      ["Watcher routes", `${s.enabled_routes || 0}/${s.total_routes || 0}`, "bolt", "watcher-routes", routesOn ? "" : "is-empty"],
+      ["Watcher status", r.running ? "Running" : "Stopped", "monitor_heart", "watcher-status", r.running ? "" : "is-stopped"],
     ];
-    return `<section class="sc2-summary">${cards.map(([a, b, icon, c]) => `<article class="sc2-summary-card"><span class="material-symbols-rounded sc2-summary-icon">${esc(icon)}</span><div><div class="sc2-k">${esc(a)}</div><div class="sc2-v">${esc(b)}</div><div class="sc2-muted">${esc(c)}</div></div></article>`).join("")}</section>`;
+    return `<section class="sc2-summary">${cards.map(([a, b, icon, stat, state]) => `<article class="sc2-summary-card ${state}" data-stat="${esc(stat)}"><span class="material-symbols-rounded sc2-summary-icon">${esc(icon)}</span><div><div class="sc2-k">${esc(a)}</div><div class="sc2-v">${esc(b)}</div><div class="sc2-muted"></div></div></article>`).join("")}</section>`;
   }
 
   function renderWebhooks(o) {
     const rows = o.webhooks || [];
+    const sectionState = rows.some((x) => x.enabled) ? "" : " is-empty";
     return `
-      <section class="sc2-section" id="sc-sec-webhook">
+      <section class="sc2-section${sectionState}" id="sc-sec-webhook">
         <div class="sc2-section-head"><div><h4>Webhooks</h4><p>Manage media-server profile endpoints.</p></div></div>
         <div class="sc2-route-card-grid">
           ${rows.map((x) => {
             const [text] = webhookState(x);
             return `
-            <article class="sc2-route sc2-route-card sc2-webhook-card ${x.enabled ? "is-enabled" : "is-disabled"} ${x.active ? "is-live" : "is-idle"}" data-action="edit-webhook" data-provider="${esc(x.provider)}" data-instance="${esc(x.provider_instance)}" data-sink="${esc(x.sink)}" title="Edit webhook">
+            <article class="sc2-route sc2-route-card sc2-webhook-card ${x.enabled ? "is-enabled" : "is-disabled"} ${x.active ? "is-live" : "is-idle"} ${x.user_profile_label ? "has-user-profile" : ""}" data-action="edit-webhook" data-provider="${esc(x.provider)}" data-instance="${esc(x.provider_instance)}" data-sink="${esc(x.sink)}" title="Edit webhook">
               <div class="sc2-route-flow-wrap">
                 <div class="sc2-route-endpoint">${providerLogo(x.provider)}<div><strong>${esc(label(x.provider))}</strong><span>${esc(webhookProfileName(x))}</span></div></div>
-                <div class="sc2-rt-conn"><span class="sc2-rt-conn-line"></span></div>
-                <div class="sc2-route-endpoint">${providerLogo(x.sink)}<div><strong>${esc(label(x.sink))}</strong><span>${esc(instanceName(x.sink_instance))}</span></div></div>
+                ${profileConnector(x)}
+                <div class="sc2-route-endpoint sc2-route-endpoint-sink"><div><strong>${esc(label(x.sink))}</strong><span>${esc(instanceName(x.sink_instance, x.sink_profile_label))}</span></div>${providerLogo(x.sink)}</div>
               </div>
               <div class="sc2-route-meta">
                 <span class="sc2-route-type"><span class="material-symbols-rounded">webhook</span>Webhook</span>
@@ -144,21 +161,23 @@
 
   function renderRoutes(o) {
     const rows = o.routes || [];
+    const sectionState = rows.some((r) => r.enabled) ? "" : " is-empty";
     return `
-      <section class="sc2-section" id="sc-sec-watch">
+      <section class="sc2-section${sectionState}" id="sc-sec-watch">
         <div class="sc2-section-head"><div><h4>Watcher routes</h4><p>Configure routes that send play events from media servers to trackers.</p></div></div>
         <div class="sc2-route-card-grid">
           ${rows.length ? rows.map((r) => `
-            <article class="sc2-route sc2-route-card ${r.enabled ? "is-enabled" : "is-disabled"} ${r.runtime?.running ? "is-live" : "is-idle"}" data-action="edit-route" data-route="${esc(r.id)}" title="Edit route">
+            <article class="sc2-route sc2-route-card ${r.enabled ? "is-enabled" : "is-disabled"} ${r.runtime?.running ? "is-live" : "is-idle"} ${r.user_profile_label ? "has-user-profile" : ""}" data-action="edit-route" data-route="${esc(r.id)}" title="Edit route">
               <div class="sc2-route-flow-wrap">
-                <div class="sc2-route-endpoint">${providerLogo(r.provider)}<div><strong>${esc(label(r.provider))}</strong><span>${esc(instanceName(r.provider_instance))}</span></div></div>
-                <div class="sc2-rt-conn"><span class="sc2-rt-conn-line"></span></div>
-                <div class="sc2-route-endpoint">${providerLogo(r.sink)}<div><strong>${esc(label(r.sink))}</strong><span>${esc(instanceName(r.sink_instance))}</span></div></div>
+                <div class="sc2-route-endpoint">${providerLogo(r.provider)}<div><strong>${esc(label(r.provider))}</strong><span>${esc(instanceName(r.provider_instance, r.source_label))}</span></div></div>
+                ${profileConnector(r)}
+                <div class="sc2-route-endpoint sc2-route-endpoint-sink"><div><strong>${esc(label(r.sink))}</strong><span>${esc(instanceName(r.sink_instance, r.sink_label))}</span></div>${providerLogo(r.sink)}</div>
               </div>
               <div class="sc2-route-meta">
                 <span class="sc2-route-type"><span class="material-symbols-rounded">sensors</span>Watcher</span>
                 <span class="sc2-route-id">${esc(r.id || "Route")}</span>
                 <span class="sc2-route-filters sc2-muted">${esc(routeFilterSummary(r.filters))}</span>
+                ${r.needs_account_filter ? `<span class="sc2-route-warn" title="This route is assigned to a user profile but has no account whitelist, so play events are blocked."><span class="material-symbols-rounded">warning</span>No account filter</span>` : ""}
               </div>
               <div class="sc2-route-actions">
                 <button type="button" class="btn small sc2-round-action sc2-route-toggle ${r.enabled ? "is-on" : "is-off"}" data-action="toggle-route" data-route="${esc(r.id)}" title="${esc(r.enabled ? "Disable route" : "Enable route")}" aria-label="${esc(r.enabled ? "Disable route" : "Enable route")}"><span class="material-symbols-rounded">power_settings_new</span><span>${esc(r.enabled ? "On" : "Off")}</span></button>
@@ -182,10 +201,11 @@
 
   function renderRuntime(o) {
     const r = o.watcher_runtime || {};
+    const sectionState = r.running ? "" : " is-stopped";
     const routes = r.routes || [];
     const runningRoutes = routes.filter((x) => x.running).map((x) => x.id).join(", ") || "None";
     return `
-      <section class="sc2-section sc2-runtime" id="sc-sec-runtime">
+      <section class="sc2-section sc2-runtime${sectionState}" id="sc-sec-runtime">
         <div class="sc2-section-head"><div><h4>Watcher status</h4><p>Control and monitor the Scrobbler watcher.</p></div></div>
         <div class="sc2-runtime-grid sc2-runtime-dashboard">
           <article class="sc2-runtime-tile is-groups"><span class="material-symbols-rounded">alt_route</span><div><small>Running routes</small><strong>${esc(runningRoutes)}</strong></div></article>
@@ -236,7 +256,7 @@
     const r = st.global_plex_ratings || {};
     const open = state.panels.ratings;
     const url = r.endpoint_url || "";
-    const on = ["simkl", "trakt", "mdblist"].filter((k) => r[k]);
+    const on = plexRatingSinks.filter((k) => r[k]);
     const summary = on.length ? `→ ${on.map(label).join(", ")}` : "No destinations selected";
     return `
       <section class="sc2-section sc2-collapse ${open ? "is-open" : ""}" id="sc-sec-ratings">
@@ -247,7 +267,7 @@
         </button>
         <div class="sc2-collapse-body">
           <div class="sc2-rating-targets">
-            ${["simkl", "trakt", "mdblist"].map((k) => `<button type="button" class="sc2-rating-pill provider-${k} ${r[k] ? "is-on" : ""}" data-rating-target="${k}"><span class="material-symbols-rounded">${r[k] ? "check_circle" : "radio_button_unchecked"}</span>${esc(label(k))}</button>`).join("")}
+            ${plexRatingSinks.map((k) => `<button type="button" class="sc2-rating-pill provider-${k} ${r[k] ? "is-on" : ""}" data-rating-target="${k}"><span class="material-symbols-rounded">${r[k] ? "check_circle" : "radio_button_unchecked"}</span>${esc(label(k))}</button>`).join("")}
           </div>
           <div class="sc2-endpoint">
             <code title="${esc(url)}">${esc(url || "Global Plex ratings URL is unavailable until a token exists")}</code>
@@ -556,7 +576,7 @@
         e.preventDefault();
         const cur = state.overview?.source_state?.global_plex_ratings || {};
         const key = ratingTarget.getAttribute("data-rating-target");
-        await saveSettings({ global_plex_ratings: { simkl: !!cur.simkl, trakt: !!cur.trakt, mdblist: !!cur.mdblist, [key]: !cur[key] } }, ratingTarget);
+        await saveSettings({ global_plex_ratings: Object.fromEntries(plexRatingSinks.map((sink) => [sink, sink === key ? !cur[sink] : !!cur[sink]])) }, ratingTarget);
         return;
       }
       const copyUrl = e.target.closest("[data-copy-url]");

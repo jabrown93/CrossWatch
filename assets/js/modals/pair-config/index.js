@@ -8,6 +8,7 @@ import { createLibraryController } from "./libraries.js";
 import { providerLogoHTML, providerToneRgb, sharedFeatureOrder, sharedFeatureLabel } from "./meta.js";
 import { ensurePairConfigStyles } from "./styles.js";
 import { createTabsController } from "./tabs.js";
+import { commonFeaturesForPair, ratingsDisabledForPair, sanitizeFeaturesForPair } from "./custom-rules.js";
 
 const TWO_WAY_WARNING =
   "Two-way sync means both sides can write to each other. It keeps both providers aligned, but it also heavily increases the risk of conflicts, duplicates, overwrites, and deletions. Use with extreme caution.";
@@ -18,6 +19,8 @@ const Q=(s,r=document)=>r.querySelector(s);
 const QA=(s,r=document)=>Array.from(r.querySelectorAll(s));
 const G=typeof window!=="undefined"?window:globalThis;
 const jclone=(o)=>JSON.parse(JSON.stringify(o||{}));
+const escHTML=(s)=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const PROGRESS_LEGACY_MAX_PERCENT = 95;
 
 const isEmby = v => same(v, "emby");
 function hasEmby(state){ return isEmby(state?.src) || isEmby(state?.dst) }
@@ -29,6 +32,9 @@ const isJelly=(v)=>same(v,"jellyfin");
 const isTrakt=(v)=>same(v,"trakt");
 const isMDBList=(v)=>same(v,"mdblist");
 const isPublicMetaDB=(v)=>same(v,"publicmetadb");
+const isFloppy=(v)=>same(v,"floppy");
+const isScrob=(v)=>same(v,"scrob");
+const isStremio=(v)=>same(v,"stremio");
 const isPlex = (v) => same(v, "plex");
 const isKodi = (v) => same(v, "kodi");
 const isCrossWatch = (v) => same(v, "crosswatch");
@@ -42,24 +48,52 @@ function hasJelly(state){return isJelly(state?.src)||isJelly(state?.dst)}
 function hasTrakt(state){return isTrakt(state?.src)||isTrakt(state?.dst)}
 function hasMDBList(state){return isMDBList(state?.src)||isMDBList(state?.dst)}
 function hasPublicMetaDB(state){return isPublicMetaDB(state?.src)||isPublicMetaDB(state?.dst)}
+function hasFloppy(state){return isFloppy(state?.src)||isFloppy(state?.dst)}
+function hasScrob(state){return isScrob(state?.src)||isScrob(state?.dst)}
+function hasStremio(state){return isStremio(state?.src)||isStremio(state?.dst)}
+function pairInstanceForKind(state, kind){
+  const want=String(kind||"").trim().toLowerCase();
+  if(!want) return "default";
+  if(same(state?.src, want)) return String(state?.src_instance||"default")||"default";
+  if(same(state?.dst, want)) return String(state?.dst_instance||"default")||"default";
+  return "default";
+}
 const isAniList=(v)=>same(v,"anilist");
 function hasAniList(state){return isAniList(state?.src)||isAniList(state?.dst)}
 function hasOwn(obj,key){return !!obj&&Object.prototype.hasOwnProperty.call(obj,key)}
 function isTwoWayMode(state){return !!ID("cx-mode-two")?.checked||String(state?.mode||"").toLowerCase().startsWith("two")}
 function anilistCanReceive(state){return isAniList(state?.dst)||(hasAniList(state)&&isTwoWayMode(state))}
 function globalAnimeMappingEnabled(state){return !!state?.cfgRaw?.anime_mapping?.enabled}
+function hasAnimeProvider(state){return hasAniList(state)||isSimkl(state?.src)||isSimkl(state?.dst)}
+function tmdbMetadataReady(state){return !!String(state?.cfgRaw?.tmdb?.api_key||state?.cfgRaw?.metadata?.tmdb_api_key||"").trim()}
+function animeHistoryBlockReason(state){
+  if(!tmdbMetadataReady(state)) return "Requires a TMDB metadata key. Add one under Settings &rsaquo; Metadata first.";
+  if(!globalAnimeMappingEnabled(state)) return "Enabling this also turns on Anime ID Mapping and downloads the AniBridge dataset.";
+  return "";
+}
+function normalizeAnimeHistoryOptions(state){
+  const opts=Object.assign({}, state?.options?.history||{});
+  if(!hasAnimeProvider(state)||!tmdbMetadataReady(state)){
+    opts.use_anime_mapping=false;
+  }else{
+    opts.use_anime_mapping=!!opts.use_anime_mapping;
+  }
+  opts.anime_only_sync=false;
+  state.options.history=opts;
+  return opts;
+}
 function normalizeAnimeFeatureOptions(state, feature){
   const key=String(feature||"watchlist").trim().toLowerCase()||"watchlist";
   const opts=Object.assign({}, state?.options?.[key]||{});
-  if(!hasAniList(state)){
+  if(!hasAnimeProvider(state)){
     opts.use_anime_mapping=false;
     opts.anime_only_sync=false;
     state.options[key]=opts;
     return opts;
   }
-  if(!hasOwn(opts,"use_anime_mapping")) opts.use_anime_mapping=globalAnimeMappingEnabled(state);
-  opts.use_anime_mapping=!!opts.use_anime_mapping;
   const canOnly=anilistCanReceive(state);
+  if(!hasOwn(opts,"use_anime_mapping")) opts.use_anime_mapping=canOnly||globalAnimeMappingEnabled(state);
+  opts.use_anime_mapping=!!opts.use_anime_mapping;
   if(!opts.use_anime_mapping || !canOnly){
     opts.anime_only_sync=false;
   }else if(!hasOwn(opts,"anime_only_sync")){
@@ -71,12 +105,8 @@ function normalizeAnimeFeatureOptions(state, feature){
   return opts;
 }
 
-const RATINGS_TYPE_RULES={SIMKL:{disable:["seasons","episodes"]},TMDB:{disable:["seasons"]},ANILIST:{disable:["seasons","episodes"]}};
 function ratingsDisabledFor(state){
-  const names=[state?.src,state?.dst].map(x=>String(x||"").trim().toUpperCase());
-  const out=new Set();
-  names.forEach(n=>{const r=RATINGS_TYPE_RULES[n];if(r&&Array.isArray(r.disable))r.disable.forEach(t=>out.add(t))});
-  return out;
+  return ratingsDisabledForPair(Object.assign({}, state || {}, {twoWay:isTwoWayMode(state)}));
 }
 function applyRatingsTypeRules(state){
   const rt=state.options?.ratings||{};
@@ -100,7 +130,8 @@ function applyRatingsTypeRules(state){
 }
 
 // Inline footer
-function ensureInlineFoot(modal){if(!modal)return;const card=Q(".cx-card",modal)||modal;let bar=card.querySelector(":scope > .cx-actions");if(!bar){bar=document.createElement("div");bar.className="cx-actions";const cancel=document.createElement("button");cancel.className="cx-btn";cancel.textContent="Cancel";cancel.addEventListener("click",()=>G.cxCloseModal?.());const save=document.createElement("button");save.className="cx-btn primary";save.id="cx-inline-save";save.textContent="Save";save.addEventListener("click",async()=>{const b=ID("cx-inline-save");if(!b)return;const old=b.textContent;b.disabled=true;b.textContent="Saving…";try{await modal.__doSave?.()}finally{b.disabled=false;b.textContent=old}});bar.append(cancel,save);card.appendChild(bar)}}
+function closePairConfigModal(modal){try{G.cxCloseModal?.()}catch{}if(modal?.isConnected)modal.dispatchEvent(new CustomEvent("cw-modal-close",{bubbles:true}))}
+function ensureInlineFoot(modal){if(!modal)return;const card=Q(".cx-card",modal)||modal;let bar=card.querySelector(":scope > .cx-actions");if(!bar){bar=document.createElement("div");bar.className="cx-actions";const cancel=document.createElement("button");cancel.type="button";cancel.className="cx-btn";cancel.textContent="Cancel";cancel.addEventListener("click",(e)=>{e.preventDefault();closePairConfigModal(modal)});const save=document.createElement("button");save.type="button";save.className="cx-btn primary";save.id="cx-inline-save";save.textContent="Save";save.addEventListener("click",async(e)=>{e.preventDefault();const run=modal.__doSave;if(typeof run!=="function")return;const b=ID("cx-inline-save");if(!b)return;const old=b.textContent;b.disabled=true;b.textContent="Saving...";try{await run()}finally{b.disabled=false;b.textContent=old}});bar.append(cancel,save);card.appendChild(bar)}}
 
 // Ratings summary
 function updateRtSummary(){
@@ -170,10 +201,13 @@ const tpl=()=>`
                 <div class="flow-title">Sync flow: <span id="cx-flow-title">One-way</span></div>
                 <div id="cx-flow-features" class="flow-feature-dots" aria-label="Enabled connection features"></div>
               </div>
-              <div class="flow-mode-inline">
-                <div class="seg">
-                  <input type="radio" name="cx-mode" id="cx-mode-one" value="one"/><label for="cx-mode-one">One-way</label>
-                  <input type="radio" name="cx-mode" id="cx-mode-two" value="two"/><label for="cx-mode-two" title="${TWO_WAY_WARNING}">Two-way</label>
+              <div class="flow-control-row">
+                <div id="cx-user-profile-slot" class="cx-user-profile-slot"></div>
+                <div class="flow-mode-inline">
+                  <div class="seg">
+                    <input type="radio" name="cx-mode" id="cx-mode-one" value="one"/><label for="cx-mode-one">One-way</label>
+                    <input type="radio" name="cx-mode" id="cx-mode-two" value="two"/><label for="cx-mode-two" title="${TWO_WAY_WARNING}">Two-way</label>
+                  </div>
                 </div>
               </div>
             </div>
@@ -200,13 +234,13 @@ const tpl=()=>`
 // State
 function defaultState(){
   return {
-    providers:[],src:null,dst:null,src_instance:"default",dst_instance:"default",instanceMap:{},feature:"globals",mode:"one-way",enabled:true,
+    providers:[],src:null,dst:null,src_instance:"default",dst_instance:"default",instanceMap:{},userProfiles:[],selected_user_profile_id:"",applying_user_profile:false,feature:"globals",mode:"one-way",enabled:true,
     options:{
       watchlist:{enable:false,add:false,remove:false},
       ratings:{enable:false,add:false,remove:false,types:["movies","shows","seasons","episodes"],mode:"all",from_date:""},
-      history:{enable:false,add:false,remove:false},
+      history:{enable:false,add:false,remove:false,rewatches:false},
       playlists:{enable:false,add:true,remove:false},
-      progress:{enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false}
+      progress:{enable:false,add:false,remove:false,min_seconds:60,delta_seconds:30,max_percent:PROGRESS_LEGACY_MAX_PERCENT,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false}
     },
     pairProviders:{},
     jellyfin:{watchlist:{mode:"favorites",playlist_name:"Watchlist"}},
@@ -307,6 +341,17 @@ async function loadProviderInstances(state){
   }catch{state.instanceMap={}}
 }
 
+async function loadUserProfiles(state){
+  try{
+    const r=await fetch("/api/user-profiles",{cache:"no-store"});
+    const j=r.ok?await r.json():{};
+    const rows=Array.isArray(j?.items)?j.items:[];
+    state.userProfiles=rows
+      .map(row=>({id:String(row?.id||"").trim(),label:String(row?.label||row?.id||"").trim(),instances:row?.instances&&typeof row.instances==="object"?row.instances:{}}))
+      .filter(row=>row.id&&row.label);
+  }catch{state.userProfiles=[]}
+}
+
 async function loadProviders(state){
   const list=await getJSON("/api/sync/providers?cb="+Date.now());
   if(!Array.isArray(list)) throw new Error("Invalid sync providers response");
@@ -351,25 +396,96 @@ async function loadConfigBits(state){
 
 // UI utils
 const byName=(state,n)=>state.providers.find(p=>p.name===n);
+function progressCapsForProvider(state, providerName){
+  return byName(state, providerName)?.capabilities?.progress || {};
+}
+function historyRewatchCapsForProvider(state, providerName){
+  return byName(state, providerName)?.capabilities?.history?.rewatches || {};
+}
+function providerSupportsHistoryRewatch(state, providerName, op){
+  const caps = historyRewatchCapsForProvider(state, providerName);
+  return !!(caps && caps[op]);
+}
+function pairSupportsHistoryRewatches(state, src = state?.src, dst = state?.dst, twoWay = isTwoWayMode(state)){
+  if(!src || !dst) return false;
+  if(twoWay){
+    return providerSupportsHistoryRewatch(state, src, "read")
+      && providerSupportsHistoryRewatch(state, src, "write")
+      && providerSupportsHistoryRewatch(state, dst, "read")
+      && providerSupportsHistoryRewatch(state, dst, "write");
+  }
+  return providerSupportsHistoryRewatch(state, src, "read")
+    && providerSupportsHistoryRewatch(state, dst, "read")
+    && providerSupportsHistoryRewatch(state, dst, "write");
+}
+function progressCompletionPercentFromCaps(caps){
+  const progress = (caps && typeof caps === "object") ? caps : {};
+  const policy = (progress.completion_policy && typeof progress.completion_policy === "object") ? progress.completion_policy : {};
+  const write = (policy.progress_write && typeof policy.progress_write === "object") ? policy.progress_write : {};
+  const mode = String(write.mode || "").trim().toLowerCase();
+  if(mode === "none" || mode === "stop_only" || mode === "stop_scrobble") return null;
+  const raw = write.percent ?? write.auto_completes_at_percent ?? write.default_percent ?? progress.server_completion_percent;
+  const percent = Number(raw);
+  return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null;
+}
+function progressRecommendationEntries(state){
+  const targets = isTwoWayMode(state) ? [state?.src, state?.dst] : [state?.dst];
+  const seen = new Set();
+  return targets.map(name => {
+    const key = String(name || "").trim().toUpperCase();
+    if(!key || seen.has(key)) return null;
+    seen.add(key);
+    const percent = progressCompletionPercentFromCaps(progressCapsForProvider(state, key));
+    if(!Number.isFinite(percent)) return null;
+    return {name: key, label: byName(state, key)?.label || key, percent};
+  }).filter(Boolean);
+}
+function formatProgressPercent(value){
+  const n = Number(value);
+  return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/,"").replace(/\.$/,"");
+}
+function recommendedProgressMaxPercent(state){
+  const values = progressRecommendationEntries(state).map(entry => Number(entry.percent)).filter(v => Number.isFinite(v));
+  return values.length ? Math.min(...values) : PROGRESS_LEGACY_MAX_PERCENT;
+}
+function progressRecommendationText(state){
+  if(!isTwoWayMode(state)) return "";
+  const entries = progressRecommendationEntries(state);
+  if(entries.length < 2) return "";
+  return "Recommended targets: " + entries.map(entry => `${entry.label} ${formatProgressPercent(entry.percent)}%`).join(" / ");
+}
+function applyProgressMaxRecommendation(state, progress){
+  const pr = progress || {};
+  const recommended = recommendedProgressMaxPercent(state);
+  const autoValue = isTwoWayMode(state) ? PROGRESS_LEGACY_MAX_PERCENT : recommended;
+  const current = Number(pr.max_percent);
+  const previous = Number(state?._progressMaxRecommended);
+  const useRecommended = !state?._progressMaxPercentEdited && (
+    !Number.isFinite(current) ||
+    current === PROGRESS_LEGACY_MAX_PERCENT ||
+    (Number.isFinite(previous) && current === previous)
+  );
+  const maxPercent = useRecommended ? autoValue : Math.max(0, Math.min(100, current));
+  if(state){
+    state._progressMaxRecommended = autoValue;
+    state.options.progress = Object.assign({}, pr, {max_percent: maxPercent});
+  }
+  return {maxPercent, recommended, usingRecommendation: useRecommended};
+}
 const commonFeatures=(state)=>{
-  if(!state.src||!state.dst) return [];
-  const a=byName(state,state.src)?.features||{};
-  const b=byName(state,state.dst)?.features||{};
-  const keys=["watchlist","ratings","history","progress","playlists"];
-  return keys.filter(k=>{
-    if(k==="progress") return isProgressPair(state) && !!a.progress && !!b.progress;
-    return !!a[k] && !!b[k];
-  });
+  const ruleState=Object.assign({}, state || {}, {twoWay:isTwoWayMode(state)});
+  return commonFeaturesForPair(ruleState, name => byName(state, name)?.features || {}, isProgressPair);
 };
 const defaultFor=(k)=>
   k==="watchlist"?{enable:false,add:false,remove:false}:
+  k==="history"?{enable:false,add:false,remove:false,rewatches:false}:
   k==="playlists"?{enable:false,add:true,remove:false}:
-  k==="progress"?{enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false}:
+  k==="progress"?{enable:false,add:false,remove:false,min_seconds:60,delta_seconds:30,max_percent:PROGRESS_LEGACY_MAX_PERCENT,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false}:
   {enable:false,add:false,remove:false};
 function getOpts(state,key){
   if(!state.visited.has(key)){
     if(key==="ratings") state.options.ratings=Object.assign({enable:false,add:false,remove:false,types:["movies","shows","seasons","episodes"],mode:"all",from_date:""},state.options.ratings||{});
-    else if(key==="progress") state.options.progress=Object.assign({enable:false,add:true,remove:false,min_seconds:60,delta_seconds:30,max_percent:95,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false},state.options.progress||{});
+    else if(key==="progress") state.options.progress=Object.assign({enable:false,add:false,remove:false,min_seconds:60,delta_seconds:30,max_percent:PROGRESS_LEGACY_MAX_PERCENT,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false},state.options.progress||{});
     else state.options[key]=state.options[key]??defaultFor(key);
     state.visited.add(key);
   }
@@ -521,6 +637,7 @@ const {
   hasKodi,
   getOpts,
   onLibrariesChanged: (state) => refreshProviderCardSummaries(state),
+  instanceFor: (state, kind) => pairInstanceForKind(state, kind),
 });
 
 function renderProviderSelects(state){
@@ -532,7 +649,7 @@ function renderProviderSelects(state){
     if(isMedia(name)) return "Media server";
     if(isKodi(name)) return "Media client";
     if(isCrossWatch(name)) return "Tracker";
-    if(isTrakt(name)||isSimkl(name)||same(name,"mdblist")||same(name,"publicmetadb")||same(name,"tautulli")) return "Tracker";
+    if(isTrakt(name)||isSimkl(name)||same(name,"mdblist")||same(name,"publicmetadb")||same(name,"floppy")||same(name,"punchplay")||same(name,"tautulli")) return "Tracker";
     if(same(name,"tmdb")||same(name,"anilist")) return "Metadata";
     return "Provider";
   };
@@ -572,8 +689,8 @@ function renderProviderSelects(state){
   };
   bindCardTrigger(ID("cx-src-trigger"),srcSel);
   bindCardTrigger(ID("cx-dst-trigger"),dstSel);
-  srcSel.onchange=()=>{state.src=srcSel.value||null;upd();renderInstanceSelects(state);updateFlow(state,true);refreshTabs(state);renderFeaturePanel(state);renderWarnings(state)};
-  dstSel.onchange=()=>{state.dst=dstSel.value||null;upd();renderInstanceSelects(state);updateFlow(state,true);refreshTabs(state);renderFeaturePanel(state);renderWarnings(state)};
+  srcSel.onchange=()=>{resetPairUserProfileControl(state);state.src=srcSel.value||null;upd();renderInstanceSelects(state);updateFlow(state,true);refreshTabs(state);renderFeaturePanel(state);renderWarnings(state)};
+  dstSel.onchange=()=>{resetPairUserProfileControl(state);state.dst=dstSel.value||null;upd();renderInstanceSelects(state);updateFlow(state,true);refreshTabs(state);renderFeaturePanel(state);renderWarnings(state)};
   upd();renderInstanceSelects(state);ID("cx-mode-two").checked=state.mode==="two-way";ID("cx-mode-one").checked=!ID("cx-mode-two").checked;ID("cx-enabled").checked=!!state.enabled;
 }
 
@@ -586,17 +703,25 @@ function renderInstanceSelects(state){
     const key=String(prov||"").toUpperCase();
     const raw=map[key]||map[String(prov||"").toLowerCase()]||[];
     const arr=Array.isArray(raw)?raw:[];
-    const ids=[];
+    const rows=[];
     for(const x of arr){
-      if(typeof x==="string") ids.push(x);
-      else if(x&&typeof x==="object"&&x.id) ids.push(String(x.id));
+      if(typeof x==="string"){
+        const id=norm(x);
+        if(id) rows.push({id,label:id==="default"?"Default":id});
+      }else if(x&&typeof x==="object"&&x.id){
+        const id=norm(x.id);
+        const label=String(x.display_label||x.label||x.id||"").trim()||(id==="default"?"Default":id);
+        if(id) rows.push({id,label});
+      }
     }
-    const uniq=["default",...ids.map(norm).filter(x=>x&&x!=="default")];
-    return [...new Set(uniq)];
+    const byId=new Map([["default",{id:"default",label:"Default"}]]);
+    rows.filter(row=>row.id&&row.id!=="default").forEach(row=>byId.set(row.id,row));
+    return Array.from(byId.values());
   };
   const fill=(sel, prov, cur)=>{
-    const ids=optsFor(prov);
-    sel.innerHTML=ids.map(id=>`<option value="${id}">${id==="default"?"Default":id}</option>`).join("");
+    const rows=optsFor(prov);
+    const ids=rows.map(row=>row.id);
+    sel.innerHTML=rows.map(row=>`<option value="${escHTML(row.id)}" title="${escHTML(row.id)}">${escHTML(row.label)}</option>`).join("");
     const want=norm(cur);
     sel.value=ids.includes(want)?want:"default";
     sel.disabled=!prov;
@@ -607,8 +732,74 @@ function renderInstanceSelects(state){
   state.src_instance=norm(srcInstSel.value);
   state.dst_instance=norm(dstInstSel.value);
 
-  srcInstSel.onchange=()=>{state.src_instance=norm(srcInstSel.value)};
-  dstInstSel.onchange=()=>{state.dst_instance=norm(dstInstSel.value)};
+  const onInstChange=()=>{if(!state.applying_user_profile) resetPairUserProfileControl(state);try{renderFeaturePanel(state)}catch{}};
+  srcInstSel.onchange=()=>{state.src_instance=norm(srcInstSel.value);onInstChange()};
+  dstInstSel.onchange=()=>{state.dst_instance=norm(dstInstSel.value);onInstChange()};
+
+  try{
+    G.CW?.ProfileSelect?.enhanceProfile?.(srcInstSel,{className:"cx-profile-select-glass"});
+    G.CW?.ProfileSelect?.enhanceProfile?.(dstInstSel,{className:"cx-profile-select-glass"});
+  }catch{}
+  renderPairUserProfileControl(state);
+}
+
+function resetPairUserProfileControl(state){
+  if(state) state.selected_user_profile_id="";
+  const sel=ID("cx-user-profile");
+  if(!sel) return;
+  sel.value="";
+}
+
+function profileInstanceValues(profile, provider){
+  const key=String(provider||"").trim().toUpperCase();
+  const insts=profile&&typeof profile==="object"?profile.instances:null;
+  const raw=insts&&typeof insts==="object"?insts[key]:null;
+  return (Array.isArray(raw)?raw:[raw]).map(x=>String(x||"").trim()).filter(Boolean);
+}
+
+function profileCanOwnCurrentPair(profile,state){
+  const srcKey=String(state.src||"").trim().toUpperCase();
+  const dstKey=String(state.dst||"").trim().toUpperCase();
+  const srcInst=String(state.src_instance||"default").trim()||"default";
+  const dstInst=String(state.dst_instance||"default").trim()||"default";
+  if(!srcKey||!dstKey) return true;
+  return profileInstanceValues(profile,srcKey).includes(srcInst)&&profileInstanceValues(profile,dstKey).includes(dstInst);
+}
+
+function eligiblePairUserProfiles(state){
+  const profiles=Array.isArray(state.userProfiles)?state.userProfiles:[];
+  return profiles.filter(p=>profileCanOwnCurrentPair(p,state));
+}
+
+function renderPairUserProfileControl(state){
+  const slot=ID("cx-user-profile-slot");
+  if(!slot) return;
+  let row=ID("cx-user-profile-row");
+  if(!row){
+    row=document.createElement("div");
+    row.id="cx-user-profile-row";
+    row.className="cx-user-profile-row";
+    row.innerHTML=`<select id="cx-user-profile" class="cx-user-profile-select" aria-label="Connection user profile"></select>`;
+    slot.appendChild(row);
+  }
+  const allProfiles=Array.isArray(state.userProfiles)?state.userProfiles:[];
+  const profiles=eligiblePairUserProfiles(state);
+  slot.classList.toggle("hidden",!allProfiles.length);
+  row.classList.toggle("hidden",!allProfiles.length);
+  const sel=ID("cx-user-profile");
+  if(!sel) return;
+  const current=String(state.selected_user_profile_id||sel.value||"");
+  sel.innerHTML=`<option value="">Unassigned</option>${profiles.map(p=>`<option value="${escHTML(p.id)}">${escHTML(p.label)}</option>`).join("")}`;
+  const keep=profiles.some(p=>p.id===current)?current:"";
+  sel.value=keep;
+  state.selected_user_profile_id=keep;
+  if(sel.__cwUserProfileBound) return;
+  sel.__cwUserProfileBound=true;
+  sel.addEventListener("change",()=>{
+    const selected=String(sel.value||"");
+    const profile=eligiblePairUserProfiles(state).find(p=>p.id===selected);
+    state.selected_user_profile_id=profile?selected:"";
+  });
 }
 
 // Fold toggles (works with draggable modals)
@@ -643,6 +834,8 @@ function applySubDisable(feature){
       "#plx-wl-pms","#plx-wl-limit","#plx-wl-delay","#plx-wl-title","#plx-wl-meta","#plx-wl-guid",
       "#cx-jf-wl-mode-fav","#cx-jf-wl-mode-pl","#cx-jf-wl-mode-col","#cx-jf-wl-pl-name",
       "#cx-em-wl-mode-fav","#cx-em-wl-mode-pl","#cx-em-wl-mode-col","#cx-em-wl-pl-name",
+      "#cx-floppy-wl-name",
+      "#cx-scrob-wl-name",
       "#cx-wl-q","#cx-wl-delay","#cx-wl-guid",
       "#tr-wl-etag","#tr-wl-ttl","#tr-wl-batch","#tr-wl-log","#tr-wl-freeze"
     ],
@@ -650,12 +843,19 @@ function applySubDisable(feature){
       "#cx-rt-add","#cx-rt-remove","#cx-rt-anime-map","#cx-rt-anime-only","#cx-rt-type-all","#cx-rt-type-movies","#cx-rt-type-shows","#cx-rt-type-seasons","#cx-rt-type-episodes","#cx-rt-mode","#cx-rt-from-date",
       "#tr-rt-perpage","#tr-rt-maxpages","#tr-rt-chunk"
     ],
-    history: ["#cx-hs-add", "#cx-hs-remove", "#cx-tr-hs-numfb", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-tr-hs-ignore-dropped", "#cx-md-hs-ignore-dropped", "#cx-sm-hs-ignore-dropped", "#cx-tr-hs-unres"],
+    history: ["#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-anime-map", "#cx-tr-hs-numfb", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-tr-hs-ignore-dropped", "#cx-md-hs-ignore-dropped", "#cx-sm-hs-ignore-dropped", "#cx-tr-hs-unres"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
     progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance"]
   };
   const on=ID(feature==="ratings"?"cx-rt-enable":feature==="watchlist"?"cx-wl-enable":feature==="history"?"cx-hs-enable":feature==="progress"?"cx-pr-enable":"cx-pl-enable")?.checked;
   (map[feature]||[]).forEach(sel=>{const n=Q(sel);if(n){n.disabled=!on;n.closest?.(".opt-row")?.classList.toggle("muted",!on)}});
+  const onlyId=feature==="watchlist"?"cx-wl-anime-only":feature==="ratings"?"cx-rt-anime-only":"";
+  const mapId=feature==="watchlist"?"cx-wl-anime-map":feature==="ratings"?"cx-rt-anime-map":"";
+  const only=onlyId?ID(onlyId):null;
+  if(only){
+    only.disabled=!on||!ID(mapId)?.checked;
+    only.closest?.(".opt-row")?.classList.toggle("muted",only.disabled);
+  }
 }
 
 function countProviderLibraries(state, providerName){
@@ -994,8 +1194,12 @@ function renderFeaturePanel(state){
     const jfw = state.jellyfin?.watchlist || { mode: "favorites", playlist_name: "Watchlist" };
     const pmw = state.pairProviders?.publicmetadb || {};
     const pmwName = (pmw.watchlist_name || state.cfgRaw?.publicmetadb?.watchlist_name || "Watchlist");
+    const floppyw = state.pairProviders?.floppy || {};
+    const floppyName = (floppyw.watchlist_name || state.cfgRaw?.floppy?.watchlist_name || "Watchlist");
+    const scrobw = state.pairProviders?.scrob || {};
+    const scrobName = (scrobw.watchlist_name || state.cfgRaw?.scrob?.watchlist_name || "Watchlist");
     const trPair = (state.pairProviders?.trakt) || {};
-    const showAnime = hasAniList(state);
+    const showAnime = hasAnimeProvider(state);
     const canAnimeOnly = anilistCanReceive(state);
     const animeOnlyDisabled = !wl.use_anime_mapping || !canAnimeOnly;
 
@@ -1011,16 +1215,16 @@ function renderFeaturePanel(state){
       </div>
 
       ${showAnime?`
-        <div class="panel-title small" style="margin-top:6px">AniList options</div>
+        <div class="panel-title small" style="margin-top:6px">Anime options</div>
         <div class="grid2 compact">
           <div class="opt-row">
             <label for="cx-wl-anime-map">Use Anime ID Mapping</label>
             <label class="switch"><input id="cx-wl-anime-map" type="checkbox" ${wl.use_anime_mapping?"checked":""}><span class="slider"></span></label>
           </div>
-          <div class="opt-row ${animeOnlyDisabled?"muted":""}">
+          ${canAnimeOnly?`<div class="opt-row ${animeOnlyDisabled?"muted":""}">
             <label for="cx-wl-anime-only">Anime-only sync</label>
             <label class="switch"><input id="cx-wl-anime-only" type="checkbox" ${wl.anime_only_sync?"checked":""} ${animeOnlyDisabled?"disabled":""}><span class="slider"></span></label>
-          </div>
+          </div>`:""}
         </div>
       `:""}
 
@@ -1076,6 +1280,27 @@ function renderFeaturePanel(state){
             <input id="cx-pmdb-wl-name" class="input" type="text" value="${pmwName}" placeholder="Watchlist">
           </div>
         </div>
+      `:""}
+
+      ${hasFloppy(state)?`
+        <div class="panel-title small" style="margin-top:6px">Floppy specifics</div>
+        <div class="grid2 compact">
+          <div class="opt-row" style="grid-column:1/-1">
+            <label for="cx-floppy-wl-name">List name</label>
+            <input id="cx-floppy-wl-name" class="input" type="text" value="${floppyName}" placeholder="Watchlist">
+          </div>
+        </div>
+      `:""}
+
+      ${hasScrob(state)?`
+        <div class="panel-title small" style="margin-top:6px">Scrob specifics</div>
+        <div class="grid2 compact">
+          <div class="opt-row" style="grid-column:1/-1">
+            <label for="cx-scrob-wl-name">List name</label>
+            <input id="cx-scrob-wl-name" class="input" type="text" value="${scrobName}" placeholder="Watchlist">
+          </div>
+        </div>
+        <div class="muted">Scrob has no dedicated watchlist, so CrossWatch syncs a normal Scrob list by name. It is created on the first push if it does not exist yet.</div>
       `:""}
     `;
 
@@ -1211,7 +1436,7 @@ function renderFeaturePanel(state){
   if(state.feature==="ratings"){
     getOpts(state,"ratings");
     const rt=normalizeAnimeFeatureOptions(state,"ratings"),hasType=t=>Array.isArray(rt.types)&&rt.types.includes(t);
-    const showAnime = hasAniList(state);
+    const showAnime = hasAnimeProvider(state);
     const canAnimeOnly = anilistCanReceive(state);
     const animeOnlyDisabled = !rt.use_anime_mapping || !canAnimeOnly;
 
@@ -1220,16 +1445,16 @@ function renderFeaturePanel(state){
       <div class="grid2"><div class="opt-row"><label for="cx-rt-add">Add / Update</label><label class="switch"><input id="cx-rt-add" type="checkbox" ${rt.add?"checked":""}><span class="slider"></span></label></div>
       <div class="opt-row"><label for="cx-rt-remove">Remove (clear)</label><label class="switch"><input id="cx-rt-remove" type="checkbox" ${rt.remove?"checked":""}><span class="slider"></span></label></div></div>
       ${showAnime?`
-        <div class="panel-title small" style="margin-top:6px">AniList options</div>
+        <div class="panel-title small" style="margin-top:6px">Anime options</div>
         <div class="grid2 compact">
           <div class="opt-row">
             <label for="cx-rt-anime-map">Use Anime ID Mapping</label>
             <label class="switch"><input id="cx-rt-anime-map" type="checkbox" ${rt.use_anime_mapping?"checked":""}><span class="slider"></span></label>
           </div>
-          <div class="opt-row ${animeOnlyDisabled?"muted":""}">
+          ${canAnimeOnly?`<div class="opt-row ${animeOnlyDisabled?"muted":""}">
             <label for="cx-rt-anime-only">Anime-only sync</label>
             <label class="switch"><input id="cx-rt-anime-only" type="checkbox" ${rt.anime_only_sync?"checked":""} ${animeOnlyDisabled?"disabled":""}><span class="slider"></span></label>
-          </div>
+          </div>`:""}
         </div>
       `:""}
       <div class="panel-title small">Scope</div>
@@ -1296,6 +1521,27 @@ function renderFeaturePanel(state){
       `);
     }
 
+    if (hasStremio(state)) {
+      const sr = ((state.cfgRaw?.stremio) || {}).ratings || {};
+      parts.push(`
+        <div class="panel-title small" style="margin-top:6px">Stremio</div>
+        <details id="cx-st-rt">
+          <summary class="muted" style="margin-bottom:10px;">Stremio ratings controls</summary>
+          <div class="grid2 compact">
+            <div class="opt-row">
+              <label for="st-rt-liked-min">Liked from</label>
+              <input id="st-rt-liked-min" class="input small" type="number" min="0" max="10" step="0.1" value="${sr.liked_min ?? 6.0}">
+            </div>
+            <div class="opt-row">
+              <label for="st-rt-loved-min">Loved from</label>
+              <input id="st-rt-loved-min" class="input small" type="number" min="0" max="10" step="0.1" value="${sr.loved_min ?? 8.0}">
+            </div>
+          </div>
+          <div class="hint">Ratings below Liked from are not sent to Stremio.</div>
+        </details>
+      `);
+    }
+
     if (hasMDBList(state)) {
       const md = (state.cfgRaw?.mdblist) || {};
       parts.push(`
@@ -1333,6 +1579,7 @@ function renderFeaturePanel(state){
 
   if (state.feature === "history") {
     const hs = getOpts(state, "history");
+    const rwSupported = pairSupportsHistoryRewatches(state);
     const trCfg = (state.cfgRaw?.trakt) || {};
     const emCfg = (state.cfgRaw?.emby?.history) || {};
 
@@ -1402,6 +1649,21 @@ function renderFeaturePanel(state){
           </label>
         </div>`
       : "";
+    const animeOpts = normalizeAnimeHistoryOptions(state);
+    const animeBlocked = !tmdbMetadataReady(state);
+    const animeNote = animeHistoryBlockReason(state);
+    const animeRow = hasAnimeProvider(state)
+      ? `
+      <div class="panel-title small" style="margin-top:6px">Anime</div>
+      <div class="opt-row ${animeBlocked ? "muted" : ""}">
+        <label for="cx-hs-anime-map">Anime episode mapping</label>
+        <label class="switch">
+          <input id="cx-hs-anime-map" type="checkbox" ${animeOpts.use_anime_mapping ? "checked" : ""} ${animeBlocked ? "disabled" : ""}>
+          <span class="slider"></span>
+        </label>
+      </div>
+      ${animeNote ? `<div class="muted">${animeNote}</div>` : ""}`
+      : "";
 left.innerHTML = `
       <div class="panel-title">History | Basics</div>
       <div class="opt-row">
@@ -1426,11 +1688,19 @@ left.innerHTML = `
             <span class="slider"></span>
           </label>
         </div>
+        <div class="opt-row" style="grid-column:1/-1">
+          <label for="cx-hs-rewatches">Rewatches</label>
+          <label class="switch">
+            <input id="cx-hs-rewatches" type="checkbox" ${hs.rewatches && rwSupported ? "checked" : ""} ${rwSupported ? "" : "disabled"}>
+            <span class="slider"></span>
+          </label>
+        </div>
         ${trColRow}
         ${mdDroppedRow}
         ${smDroppedRow}
       </div>
-      <div class="muted">Synchronize plays between providers. “Remove” is not recommended and should only be enabled for specific cases like mirroring.</div>
+      ${animeRow}
+      <div class="muted">${rwSupported ? "Synchronize plays between providers. Rewatches require event-capable providers; SIMKL requires Pro/VIP. Remove is not recommended." : "Synchronize plays between providers. Rewatches are available only when both sides support event history; SIMKL requires Pro/VIP."}</div>
     `;
 
     const parts = [`<div class="panel-title">Advanced</div>`];
@@ -1536,6 +1806,12 @@ left.innerHTML = `
 
     right.innerHTML = parts.join("");
     applySubDisable("history");
+    const rw = ID("cx-hs-rewatches");
+    if(rw && !rwSupported){
+      rw.checked = false;
+      rw.disabled = true;
+      rw.closest(".opt-row")?.classList.add("disabled");
+    }
     return;
   }
 
@@ -1566,7 +1842,7 @@ left.innerHTML = `
       const choices=all.filter(m=>m.valid!==false&&compat(m)&&avail(m));
       if(!choices.length){ host.innerHTML=`<div class="muted">No compatible mapping profiles. On the Playlists page, create endpoints for ${e(state.src)} and ${e(state.dst)}, then a MAP-xx linking them.</div>`; return; }
       host.innerHTML=choices.map(m=>`<label class="opt-row" style="justify-content:flex-start;gap:10px;cursor:pointer">
-        <input type="checkbox" class="cx-plmap" value="${e(m.id)}" ${sel.has(String(m.id))?"checked":""}>
+        <input type="checkbox" class="cx-plmap" name="cx-plmap" value="${e(m.id)}" ${sel.has(String(m.id))?"checked":""}>
         <span><b>${e(m.id)}</b> ${e(m.name||"")} <span class="muted">(${e((m.source||{}).label)} → ${e((m.target||{}).label)}, ${e(m.membership)})</span></span>
       </label>`).join("");
       host.querySelectorAll(".cx-plmap").forEach(cb=>cb.addEventListener("change",()=>{
@@ -1583,16 +1859,20 @@ left.innerHTML = `
     const pr = getOpts(state, "progress") || {};
     const minS = Number.isFinite(pr.min_seconds) ? pr.min_seconds : 60;
     const deltaS = Number.isFinite(pr.delta_seconds) ? pr.delta_seconds : 30;
-    const maxP = Number.isFinite(pr.max_percent) ? pr.max_percent : 80;
+    const { maxPercent: maxP } = applyProgressMaxRecommendation(state, pr);
+    const progressRecommendation = progressRecommendationText(state);
+    const progressEnabled = !!pr.enable;
+    const progressAdd = progressEnabled && !!pr.add;
+    if(!progressEnabled && pr.add) state.options.progress = Object.assign({}, state.options.progress || pr, {add:false});
     const replayEnabled = pr.replay_enabled === true || ["1", "true", "yes", "on"].includes(String(pr.replay_enabled ?? "").trim().toLowerCase());
     const timestampTolerance = Number.isFinite(Number(pr.timestamp_tolerance_seconds)) ? Math.max(0, Math.min(300, Math.round(Number(pr.timestamp_tolerance_seconds)))) : 30;
 
     left.innerHTML = `<div class="panel-title">Progress | Basics</div>
       <div class="grid2">
         <div class="opt-row"><label for="cx-pr-enable" data-tip-id="cx-pr-enable">Enable</label>
-          <label class="switch"><input id="cx-pr-enable" type="checkbox" ${pr.enable ? "checked" : ""}><span class="slider"></span></label></div>
+          <label class="switch"><input id="cx-pr-enable" type="checkbox" ${progressEnabled ? "checked" : ""}><span class="slider"></span></label></div>
         <div class="opt-row"><label for="cx-pr-add" data-tip-id="cx-pr-add">Add / Update</label>
-          <label class="switch"><input id="cx-pr-add" type="checkbox" ${pr.add ? "checked" : ""}><span class="slider"></span></label></div>
+          <label class="switch"><input id="cx-pr-add" type="checkbox" ${progressAdd ? "checked" : ""}><span class="slider"></span></label></div>
         <div class="opt-row"><label for="cx-pr-remove" data-tip-id="cx-pr-remove">Remove</label>
           <label class="switch"><input id="cx-pr-remove" type="checkbox" ${pr.remove ? "checked" : ""}><span class="slider"></span></label></div>
       </div>`;
@@ -1610,6 +1890,7 @@ left.innerHTML = `
         <div class="opt-row"><label for="cx-pr-tolerance" data-tip-id="cx-pr-tolerance">Timestamp tolerance (s)</label>
           <input id="cx-pr-tolerance" class="input small" type="number" min="0" max="300" step="1" value="${timestampTolerance}"></div>
       </div>
+      ${progressRecommendation ? `<div class="muted" style="margin-top:10px">${escHTML(progressRecommendation)}</div>` : ""}
       <div class="muted" style="margin-top:10px;color:#f0b35a">Warning: replay progress marks watched targets unwatched before writing the resume position.</div>
       <div class="muted" style="margin-top:10px">Tip: Progress does not infer clears from absence. It only syncs resume positions.</div>`;
 
@@ -1829,10 +2110,9 @@ function bindChangeHandlers(state,root){
     }
 
     if (id === "cx-pr-enable") {
-      if (!!ID("cx-pr-enable")?.checked) {
-        const add = ID("cx-pr-add");
-        if (add) add.checked = true;
-      }
+      const enabled = !!ID("cx-pr-enable")?.checked;
+      const add = ID("cx-pr-add");
+      if (add) add.checked = enabled;
       applySubDisable("progress");
     }
 
@@ -1894,10 +2174,14 @@ function bindChangeHandlers(state,root){
 
     if (id.startsWith("cx-hs-")) {
       const prev = state.options.history || {};
+      const animeEl = ID("cx-hs-anime-map");
       state.options.history = Object.assign({}, prev, {
         enable: !!ID("cx-hs-enable")?.checked,
         add:    !!ID("cx-hs-add")?.checked,
         remove: !!ID("cx-hs-remove")?.checked,
+        rewatches: !!ID("cx-hs-rewatches")?.checked,
+        use_anime_mapping: !!(animeEl && animeEl.checked && tmdbMetadataReady(state)),
+        anime_only_sync: false,
       });
       state.visited.add("history");
     }
@@ -1914,9 +2198,10 @@ function bindChangeHandlers(state,root){
 
     if(id.startsWith("cx-pr-")){
       const prev=state.options.progress||{};
+      if(id==="cx-pr-maxp") state._progressMaxPercentEdited = true;
       const minS=parseInt(ID("cx-pr-min")?.value||"60",10);
       const delS=parseInt(ID("cx-pr-delta")?.value||"30",10);
-      const maxP=parseFloat(ID("cx-pr-maxp")?.value||"95");
+      const maxP=parseFloat(ID("cx-pr-maxp")?.value||String(PROGRESS_LEGACY_MAX_PERCENT));
       const tolerance=parseInt(ID("cx-pr-tolerance")?.value||"30",10);
       state.options.progress=Object.assign({},prev,{
         enable:!!ID("cx-pr-enable")?.checked,
@@ -1972,6 +2257,20 @@ function bindChangeHandlers(state,root){
       state.pairProviders.publicmetadb=pm;
     }
 
+    if(id==="cx-floppy-wl-name"){
+      state.pairProviders=state.pairProviders||{};
+      const fp=Object.assign({},state.pairProviders.floppy||{});
+      fp.watchlist_name=(ID("cx-floppy-wl-name")?.value||"").trim()||"Watchlist";
+      state.pairProviders.floppy=fp;
+    }
+
+    if(id==="cx-scrob-wl-name"){
+      state.pairProviders=state.pairProviders||{};
+      const sb=Object.assign({},state.pairProviders.scrob||{});
+      sb.watchlist_name=(ID("cx-scrob-wl-name")?.value||"").trim()||"Watchlist";
+      state.pairProviders.scrob=sb;
+    }
+
     if (/^(plx-|jf-|em-)/.test(id)) {
       refreshProviderCardSummaries(state);
     }
@@ -1987,9 +2286,10 @@ async function saveConfigBits(state){
   try{
     const cur=await fetch("/api/config",{cache:"no-store"}).then(r=>r.ok?r.json():{});
     const cfg=typeof structuredClone==="function"?structuredClone(cur||{}):jclone(cur||{});
-    const shouldEnableAnimeMapping = hasAniList(state) && (
+    const shouldEnableAnimeMapping = hasAnimeProvider(state) && (
       !!normalizeAnimeFeatureOptions(state, "watchlist").use_anime_mapping ||
-      !!normalizeAnimeFeatureOptions(state, "ratings").use_anime_mapping
+      !!normalizeAnimeFeatureOptions(state, "ratings").use_anime_mapping ||
+      !!normalizeAnimeHistoryOptions(state).use_anime_mapping
     );
 
     if(ID("gl-dry")){
@@ -2195,6 +2495,25 @@ async function saveConfigBits(state){
       cfg.simkl = sm;
     }
 
+    const hasST = String(state.src||"").toUpperCase()==="STREMIO" || String(state.dst||"").toUpperCase()==="STREMIO";
+    if(hasST){
+      const st = Object.assign({}, cfg.stremio||{});
+      const ratings = Object.assign({}, st.ratings||{});
+      const likedEl = ID("st-rt-liked-min");
+      const lovedEl = ID("st-rt-loved-min");
+      const clampFloat = (value, fallback) => {
+        const n = Number.parseFloat(String(value ?? "").trim());
+        return Number.isFinite(n) ? Math.min(10, Math.max(0, Math.round(n * 10) / 10)) : fallback;
+      };
+      if(likedEl || lovedEl){
+        ratings.liked_min = clampFloat(likedEl?.value, 6.0);
+        ratings.loved_min = clampFloat(lovedEl?.value, 8.0);
+        if(ratings.loved_min < ratings.liked_min) ratings.loved_min = ratings.liked_min;
+        st.ratings = ratings;
+        cfg.stremio = st;
+      }
+    }
+
     const hasMD = String(state.src||"").toUpperCase()==="MDBLIST" || String(state.dst||"").toUpperCase()==="MDBLIST";
     if(hasMD){
       const md = Object.assign({}, cfg.mdblist||{});
@@ -2246,8 +2565,8 @@ function buildPayload(state,wrap){
   const modeTwo=!!ID("cx-mode-two")?.checked;const enabled=!!ID("cx-enabled")?.checked;
   const get=k=>Object.assign(defaultFor(k), (state.options||{})[k]||{});
   const watchlist=get("watchlist");
-  const animePair=isAniList(src)||isAniList(dst);
-  const animeCanReceive=isAniList(dst)||(animePair&&modeTwo);
+  const animePair=isAniList(src)||isAniList(dst)||isSimkl(src)||isSimkl(dst);
+  const animeCanReceive=isAniList(dst)||((isAniList(src)||isAniList(dst))&&modeTwo);
   const ratings=get("ratings");
   const normalizeAnimePairBlock=(block)=>{
     if(animePair){
@@ -2264,9 +2583,16 @@ function buildPayload(state,wrap){
   normalizeAnimePairBlock(watchlist);
   normalizeAnimePairBlock(ratings);
   const progress=get("progress");
+  progress.max_percent = applyProgressMaxRecommendation(state, progress).maxPercent;
   const dis=ratingsDisabledFor({src,dst});
   if(ratings&&Array.isArray(ratings.types)&&dis.size)ratings.types=ratings.types.filter(t=>!dis.has(String(t)));
-  const payload={source:src,target:dst,source_instance:String(srcInst||"default"),target_instance:String(dstInst||"default"),enabled,mode:modeTwo?"two-way":"one-way",features:{watchlist,ratings,history:get("history"),progress,playlists:get("playlists")}};
+  const history=get("history");
+  if(history && !pairSupportsHistoryRewatches(state, src, dst, modeTwo)) history.rewatches=false;
+  const features=sanitizeFeaturesForPair({src,dst,twoWay:modeTwo},{watchlist,ratings,history,progress,playlists:get("playlists")});
+  const payload={source:src,target:dst,source_instance:String(srcInst||"default"),target_instance:String(dstInst||"default"),enabled,mode:modeTwo?"two-way":"one-way",features};
+  const eid=wrap.dataset&&wrap.dataset.editingId?String(wrap.dataset.editingId||""):"";
+  const selectedProfileId=String(state.selected_user_profile_id||ID("cx-user-profile")?.value||"").trim();
+  if(selectedProfileId||eid) payload.profile_id=selectedProfileId;
   const prov={};
   const pp=state.pairProviders||{};
   const usePlex=(String(src).toUpperCase()==="PLEX"||String(dst).toUpperCase()==="PLEX");
@@ -2274,6 +2600,8 @@ function buildPayload(state,wrap){
   const useEm=(String(src).toUpperCase()==="EMBY"||String(dst).toUpperCase()==="EMBY");
   const useTr=(String(src).toUpperCase()==="TRAKT"||String(dst).toUpperCase()==="TRAKT");
   const usePmdb=(String(src).toUpperCase()==="PUBLICMETADB"||String(dst).toUpperCase()==="PUBLICMETADB");
+  const useFloppy=(String(src).toUpperCase()==="FLOPPY"||String(dst).toUpperCase()==="FLOPPY");
+  const useScrob=(String(src).toUpperCase()==="SCROB"||String(dst).toUpperCase()==="SCROB");
   if(usePlex) prov.plex={strict_id_matching:getPairProviderStrictValue(state, "plex")};
   if(useJf) prov.jellyfin={strict_id_matching:getPairProviderStrictValue(state, "jellyfin")};
   if(useEm) prov.emby={strict_id_matching:getPairProviderStrictValue(state, "emby")};
@@ -2281,6 +2609,16 @@ function buildPayload(state,wrap){
     const pmSrc=pp.publicmetadb||{};
     const name=(ID("cx-pmdb-wl-name")?.value||pmSrc.watchlist_name||state.cfgRaw?.publicmetadb?.watchlist_name||"Watchlist").trim()||"Watchlist";
     prov.publicmetadb=Object.assign({},pmSrc,{watchlist_name:name});
+  }
+  if(useFloppy){
+    const fpSrc=pp.floppy||{};
+    const name=(ID("cx-floppy-wl-name")?.value||fpSrc.watchlist_name||state.cfgRaw?.floppy?.watchlist_name||"Watchlist").trim()||"Watchlist";
+    prov.floppy=Object.assign({},fpSrc,{watchlist_name:name});
+  }
+  if(useScrob){
+    const sbSrc=pp.scrob||{};
+    const name=(ID("cx-scrob-wl-name")?.value||sbSrc.watchlist_name||state.cfgRaw?.scrob?.watchlist_name||"Watchlist").trim()||"Watchlist";
+    prov.scrob=Object.assign({},sbSrc,{watchlist_name:name});
   }
   if(useTr){
     const trSrc=pp.trakt||{};
@@ -2313,7 +2651,7 @@ function buildPayload(state,wrap){
     }
   }
   if(Object.keys(prov).length) payload.providers=prov;
-  const eid=wrap.dataset&&wrap.dataset.editingId?String(wrap.dataset.editingId||""):"";if(eid)payload.id=eid;return payload;
+  if(eid)payload.id=eid;return payload;
 }
 
 // Save:
@@ -2326,11 +2664,18 @@ async function savePair(payload){
 
 export default{
   async mount(hostEl,props){
-    ensurePairConfigStyles();
     hostEl.classList.add("pair-config-modal");
     hostEl.style.setProperty("--cxModalMaxW", "1280px");
     hostEl.style.setProperty("--cxModalMaxH", "92vh");
     hostEl.style.setProperty("--cxModalW", "min(var(--cxModalMaxW,1280px),calc(100vw - 64px))");
+    hostEl.style.setProperty("--cx-actions-position", "relative");
+    hostEl.style.setProperty("--cx-actions-z", "30");
+    hostEl.style.setProperty("--cx-actions-pointer", "auto");
+    hostEl.style.setProperty("--cx-tab-active-bg", "var(--pc-panel)");
+    hostEl.style.setProperty("--cx-tab-active-border", "var(--pc-border-soft)");
+    hostEl.style.setProperty("--cx-tab-active-shadow", "none");
+    hostEl.style.setProperty("--cx-tab-active-before-opacity", ".7");
+    await ensurePairConfigStyles();
     hostEl.innerHTML=tpl();
     const wrap=ID("cx-modal",hostEl);
     const state=defaultState();
@@ -2357,12 +2702,14 @@ export default{
       const r0=state.options.ratings, rI=f.ratings||{};
       state.options.ratings=Object.assign({},r0,rI,{types:Array.isArray(rI.types)&&rI.types.length?rI.types:r0.types,mode:rI.mode||r0.mode,from_date:rI.from_date||r0.from_date||""});
       state.pairProviders = normalizePairProviders(pair.providers);
+      state.selected_user_profile_id=String(pair.profile_id||"").trim();
       wrap.dataset.editingId=pair?.id?String(pair.id):"";
     }
 
     await loadConfigBits(state);
     await loadProviders(state);
     await loadProviderInstances(state);
+    await loadUserProfiles(state);
 
     state.feature="globals";
     renderProviderSelects(state);
@@ -2374,7 +2721,7 @@ export default{
     restartFlowAnimation(ID("cx-mode-two")?.checked ? "two" : "one");
 
     ID("cx-enabled").addEventListener("change",()=>updateFlow(state,true));
-    QA('input[name="cx-mode"]').forEach(el=>el.addEventListener("change",()=>{state.mode=ID("cx-mode-two")?.checked?"two-way":"one-way";updateFlow(state,true);renderFeaturePanel(state)}));
+    QA('input[name="cx-mode"]').forEach(el=>el.addEventListener("change",()=>{state.mode=ID("cx-mode-two")?.checked?"two-way":"one-way";sanitizeFeaturesForPair(state,state.options);updateFlow(state,true);refreshTabs(state);renderFeaturePanel(state)}));
     bindChangeHandlers(state,wrap);
     queueMicrotask(() => applyHelpIcons(wrap, { QA }));
     ensureInlineFoot(hostEl);
@@ -2407,7 +2754,7 @@ export default{
         window.dispatchEvent?.(new CustomEvent("cx:pairs:changed",{detail:payload}));
         window.cxAfterPairSave?.(payload);
       }catch(e){console.warn("[pair save] refresh failed",e)}
-      window.cxCloseModal?.();
+      closePairConfigModal(hostEl);
     };
   },
   unmount(){}

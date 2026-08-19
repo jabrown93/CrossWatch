@@ -10,10 +10,13 @@ import re
 import secrets
 import base64
 import hashlib
+import threading
+from contextlib import contextmanager
 from datetime import datetime
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from .config_env import apply_env_overrides, env_overrides
 
@@ -41,7 +44,22 @@ def CONFIG_BASE() -> Path:
 CONFIG: Path = CONFIG_BASE()
 CONFIG.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_SCHEDULER_WEBHOOKS: dict[str, Any] = {
+    "enabled": False,
+    "url": "",
+    "base_url": "",
+    "start_url": "",
+    "success_url": "",
+    "failure_url": "",
+    "payload_format": "crosswatch",
+    "notifiarr_channel_id": "",
+    "timeout_seconds": 10,
+    "alert_on_unresolved": False,
+}
+
 _ENC_PREFIX = "enc:v1:"
+_CONFIG_LOCK = threading.RLock()
+_CONFIG_FILE_LOCK_STATE = threading.local()
 
 def _config_key_file() -> Path:
     return CONFIG / ".cw_master_key"
@@ -168,6 +186,10 @@ def _is_sensitive_path(path: tuple[str, ...]) -> bool:
     if len(clean) >= 2 and clean[0] == "security" and clean[1] == "webhook_ids":
         return True
 
+    if len(clean) >= 3 and clean[0] == "scheduling" and clean[1] == "webhooks":
+        if clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url"}:
+            return True
+
     leaf = clean[-1]
     exact = {
         "api_key", "apikey",
@@ -177,11 +199,14 @@ def _is_sensitive_path(path: tuple[str, ...]) -> bool:
         "session_id",
         "token_hash", "salt", "hash",
         "device_code",
+        "pending_secret",
         "_pending_request_token",
         "_pending_tv_login",
         "_pending_tv_caller",
         "request_token",
         "token",
+        "auth_key",
+        "authkey",
         "password",
         "secret",
         "webhook_secret",
@@ -233,6 +258,9 @@ def _encrypt_secret_tree_stable(obj: Any, prev: Any, path: tuple[str, ...] = ())
 
 # Default config
 DEFAULT_CFG: dict[str, Any] = {
+    "user_profiles": {},
+    "provider_instance_ids": {},
+
     # --- Providers -----------------------------------------------------------
     "plex": {
         "server_url": "",                               # http(s)://host:32400 (required for sync & watcher).
@@ -369,6 +397,30 @@ DEFAULT_CFG: dict[str, Any] = {
         },
     },
 
+    "punchplay": {
+        "auth_method": "device_code",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "bearer",
+        "scope": "",
+        "expires_at": 0,
+        "refresh_expires_at": 0,
+        "username": "",
+        "user_id": "",
+        "device_id": "",
+        "timeout": 20.0,
+        "max_retries": 3,
+        "history_per_page": 100,
+        "history_max_pages": 5000,
+        "rate_limit": {
+            "get_per_sec": 2.0,
+            "post_per_sec": 0.5,
+            "bulk_per_min": 30,
+            "playback_per_5min": 120,
+            "sync_read_per_min": 120,
+        },
+    },
+
     "nuvio": {
         "base_url": "https://api.nuvio.tv",
         "access_token": "",
@@ -378,9 +430,49 @@ DEFAULT_CFG: dict[str, Any] = {
         "profile_name": "",
     },
 
+    "stremio": {
+        "auth_key": "",
+        "ratings": {
+            "liked_min": 6.0,                           # Numeric ratings from this value up to loved_min become Liked
+            "loved_min": 8.0,                           # Numeric ratings from this value up to 10 become Loved
+        },
+    },
+
+    "floppy": {
+        "server_url": "",                               # http(s)://host:8000
+        "api_token": "",                                # Floppy API token from Settings > Advanced
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 12.0,                                # HTTP timeout (seconds)
+        "watchlist_name": "Watchlist",
+        "rate_limit": {
+            "get_per_sec": 20,
+            "post_per_sec": 20,
+        },
+    },
+
+    "scrob": {
+        "server_url": "",                               # http(s)://host:7330 (the URL you open Scrob with)
+        "api_key": "",                                  # Scrob API key from Connections > API Key
+        "username": "",                                 # Scrob account username (writes need a signed in session)
+        "password": "",                                 # Scrob account password
+        "api_prefix": "",                               # Detected on connect: "" direct backend, "/api/proxy" behind the Scrob frontend
+        "access_token": "",                             # Short lived Scrob JWT, re-issued from username/password
+        "expires_at": 0,                                # Unix seconds the access token expires at
+        "totp_enabled": False,                          # Scrob account uses 2FA, so the token cannot be renewed unattended
+        "reauth_required": False,                       # 2FA session expired; reads keep working, writes need a new code
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 12.0,                                # HTTP timeout (seconds)
+        "watchlist_name": "Watchlist",                  # Scrob list used as the CrossWatch watchlist
+        "history_max_pages": 500,                       # Safety cap for paged history reads
+        "rate_limit": {
+            "get_per_sec": 10,
+            "post_per_sec": 5,
+        },
+    },
+
     "playback_progress": {
         "disabled_profiles": [],                        # Provider profiles excluded from Continue Watching, e.g. ["trakt:default"]
-        "provider_timeout_seconds": 12.0,               # Max time this screen waits for provider profiles during one refresh
+        "provider_timeout_seconds": 20.0,               # Max time this screen waits for provider profiles during one refresh
     },
     
      "tautulli": {
@@ -566,6 +658,7 @@ DEFAULT_CFG: dict[str, Any] = {
     },
 
     "crosswatch": {
+        "connected":        False,                      # True after local tracker connection is created
         "root_dir":         "/config/.cw_provider",     # Root folder for local provider state
         "enabled":          True,                       # Enable/disable CrossWatch as sync provider
         "retention_days":   30,                         # Snapshot retention in days; 0 = keep forever
@@ -591,6 +684,7 @@ DEFAULT_CFG: dict[str, Any] = {
         # Execution behavior:
         "verify_after_write": False,                    # When supported, re-check destination after writes
         "dry_run": False,                               # Plan and log only; do not perform writes
+        "write_state_json": True,                       # Write sync state baselines/stats; leave on true
         "drop_guard": False,                            # Guard against sudden inventory shrink (protects from bad/suspect snapshots)
         "allow_mass_delete": True,                      # If False, block large delete plans (e.g., >~10% of baseline)
         "tombstone_ttl_days": 1,                        # How long “observed deletes” (tombstones) stay valid
@@ -626,10 +720,18 @@ DEFAULT_CFG: dict[str, Any] = {
         "snapshot_ttl_sec": 300,                        # Reuse snapshots within 5 min
         "apply_chunk_size": 100,                        # Sweet spot for apply chunking
         "apply_chunk_pause_ms": 50,                     # Small pause between chunks
-        "apply_chunk_size_by_provider": {               # SIMKL/TRAKT/MDBLIST/PUBLICMETADB/ANILIST/TMDB/TAUTULLI/PLEX/JELLYFIN/EMBY overrides
+        "apply_chunk_size_by_provider": {               # Provider-specific apply chunk overrides
             "SIMKL": 500,
             "MDBLIST": 500,
-            "PUBLICMETADB": 500
+            "PUBLICMETADB": 500,
+            "PLEX": 500,
+            "JELLYFIN": 500,
+            "EMBY": 500,
+            "FLOPPY": 500,
+            "SCROB": 500,
+            "STREMIO": 500,
+            "NUVIO": 500,
+            "KODI": 500
         },
         
         # suspect guard (shrinking inventories protection)
@@ -651,8 +753,8 @@ DEFAULT_CFG: dict[str, Any] = {
         "release_tag": "v3",                            # AniBridge release tag
         "refresh_hours": 24,                            # Minimum age before an automatic refresh is considered
         "stale_after_days": 14,                         # UI/status warning threshold
-        "use_for_pairs": ["anilist"],                   # Providers that activate anime mapping when present in a pair
-        "features": ["watchlist", "ratings"],           # Sync features where anime ID enrichment is applied
+        "use_for_pairs": ["anilist", "simkl"],          # Providers that activate anime mapping when present in a pair ("*" = any pair)
+        "features": ["watchlist", "ratings", "history"],  # Sync features where anime mapping may apply; history is opt-in per pair
     },
 
     # --- Scrobble ------------------------------------------------------------
@@ -711,6 +813,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "every_n_hours": 12,                            # When mode=every_n_hours, run every N hours (2+ recommended)
         "daily_time": "03:30",                          # When mode=daily_time, run at this time (HH:MM, 24h)
         "custom_interval_minutes": 60,                  # When mode=custom_interval, run every N minutes (minimum 15)
+        "webhooks": dict(DEFAULT_SCHEDULER_WEBHOOKS),    # Optional outbound scheduler lifecycle callbacks
         "advanced": {
             "enabled": False,                           # Advanced scheduler master toggle
             "jobs": [],
@@ -763,17 +866,18 @@ DEFAULT_CFG: dict[str, Any] = {
         },
         "sessions": [],
         "last_login_at": 0,
-        # External OIDC SSO (e.g. Authentik). Local credentials stay required
-        # as the break-glass login; OIDC only adds a second way in.
+        "users": {},
+        # External OIDC SSO (e.g. Authentik). Login requires a linked identity;
+        # allowed_groups additionally restricts which IdP accounts may sign in
+        # (empty = no group restriction).
         "oidc": {
             "enabled": False,
-            "issuer": "",                # e.g. https://auth.example.com/application/o/crosswatch/ (keep trailing slash)
+            "issuer": "",
             "client_id": "",
             "client_secret": "",
-            "public_base_url": "",       # External base URL of CrossWatch, e.g. https://cw.example.com
+            "scopes": "openid profile email",
             "groups_claim": "groups",
-            "allowed_groups": [],        # Empty list denies every OIDC login
-            "session_hours": 12,         # OIDC-minted session lifetime, 1-168
+            "allowed_groups": [],
         },
     },
 
@@ -864,17 +968,37 @@ def _redact_path(d: dict[str, Any], path: tuple[str, ...]) -> None:
 def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = copy.deepcopy(cfg or {})
 
-    for path in _SECRET_PATHS:
-        _redact_path(out, path)
-        # Also redact secrets in provider instances if they exist
-        prov = path[0]
-        p_cfg = out.get(prov)
-        if isinstance(p_cfg, dict):
-            instances = p_cfg.get("instances")
-            if isinstance(instances, dict):
-                for inst_cfg in instances.values():
-                    if isinstance(inst_cfg, dict):
-                        _redact_path(inst_cfg, path[1:])
+    # Provider-specific secret fields
+    provider_secret_keys: dict[str, set[str]] = {
+        "plex": {"account_token", "pms_token", "home_pin", "webhook_secret"},
+        "simkl": {"access_token", "client_secret", "_pending_pin"},
+        "anilist": {"access_token", "client_secret"},
+        "mdblist": {"api_key", "access_token", "refresh_token", "_pending_device"},
+        "publicmetadb": {"api_key"},
+        "punchplay": {"access_token", "refresh_token", "_pending_device"},
+        "nuvio": {"access_token", "refresh_token", "_pending_tv_login", "_pending_tv_caller"},
+        "stremio": {"auth_key", "authKey"},
+        "floppy": {"api_token"},
+        "scrob": {"api_key", "password", "access_token"},
+        "tautulli": {"api_key"},
+        "trakt": {"access_token", "refresh_token", "client_secret"},
+        "jellyfin": {"access_token", "api_key", "password", "webhook_secret"},
+        "emby": {"access_token", "api_key", "password", "webhook_secret"},
+        "kodi": {"password"},
+        "tmdb": {"api_key"},
+        "tmdb_sync": {"api_key", "session_id", "_pending_request_token"},
+    }
+
+    MASK = _REDACT
+
+    def _mask_leaf(d: dict[str, Any], key: str) -> None:
+        v = d.get(key)
+        if v is None:
+            return
+        s = str(v).strip()
+        if not s or s == MASK:
+            return
+        d[key] = MASK
 
     # Variable-length sessions array in app_auth
     sessions = (out.get("app_auth") or {}).get("sessions")
@@ -883,7 +1007,65 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
             if isinstance(s, dict) and s.get("token_hash"):
                 s["token_hash"] = _REDACT
 
-    # Webhook URL tokens (variable keys)
+    for provider, keys in provider_secret_keys.items():
+        blk = out.get(provider)
+        if not isinstance(blk, dict):
+            continue
+
+        for k in keys:
+            _mask_leaf(blk, k)
+
+        insts = blk.get("instances")
+        if isinstance(insts, dict):
+            for inst in insts.values():
+                if isinstance(inst, dict):
+                    for k in keys:
+                        _mask_leaf(inst, k)
+
+    # App UI auth secrets.
+    a = out.get("app_auth")
+    if isinstance(a, dict):
+        pwd = a.get("password")
+        if isinstance(pwd, dict):
+            if pwd.get("hash"):
+                pwd["hash"] = MASK
+            if pwd.get("salt"):
+                pwd["salt"] = MASK
+
+        sess = a.get("session")
+        if isinstance(sess, dict) and sess.get("token_hash"):
+            sess["token_hash"] = MASK
+
+        sessions = a.get("sessions")
+        if isinstance(sessions, list):
+            for s in sessions:
+                if isinstance(s, dict) and s.get("token_hash"):
+                    s["token_hash"] = MASK
+
+        totp = a.get("totp")
+        if isinstance(totp, dict):
+            _mask_leaf(totp, "secret")
+            _mask_leaf(totp, "pending_secret")
+
+        users = a.get("users")
+        if isinstance(users, dict):
+            for raw_user in users.values():
+                if not isinstance(raw_user, dict):
+                    continue
+                utotp = raw_user.get("totp")
+                if isinstance(utotp, dict):
+                    _mask_leaf(utotp, "secret")
+                    _mask_leaf(utotp, "pending_secret")
+
+        oidc = a.get("oidc")
+        if isinstance(oidc, dict):
+            _mask_leaf(oidc, "client_secret")
+
+    sec_blk = out.get("security")
+    if isinstance(sec_blk, dict):
+        _mask_leaf(sec_blk, "api_key")
+
+    # Webhook URL tokens
     sec = out.get("security")
     if isinstance(sec, dict):
         wh = sec.get("webhook_ids")
@@ -892,12 +1074,130 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 if wh.get(k):
                     wh[k] = _REDACT
 
+    scheduling = out.get("scheduling")
+    if isinstance(scheduling, dict):
+        hooks = scheduling.get("webhooks")
+        if isinstance(hooks, dict):
+            for key in ("url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url"):
+                _mask_leaf(hooks, key)
+
     return out
 
 
 # Helpers: paths, IO, merging, normalization
+CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
+    "version",
+    "security",
+    "app_auth",
+    "user_profiles",
+    "provider_instance_ids",
+    "plex",
+    "jellyfin",
+    "emby",
+    "kodi",
+    "tautulli",
+    "trakt",
+    "simkl",
+    "mdblist",
+    "anilist",
+    "tmdb_sync",
+    "publicmetadb",
+    "punchplay",
+    "nuvio",
+    "stremio",
+    "floppy",
+    "scrob",
+    "crosswatch",
+    "metadata",
+    "tmdb",
+    "anime_mapping",
+    "sync",
+    "pairs",
+    "scrobble",
+    "scheduling",
+    "playlists",
+    "playback_progress",
+    "runtime",
+    "features",
+    "ui",
+)
+
+OBSOLETE_CONFIG_KEYS: tuple[str, ...] = ("mobile_auth",)
+
+
+def cleanup_obsolete_config_keys(cfg: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    for key in OBSOLETE_CONFIG_KEYS:
+        if key in cfg:
+            cfg.pop(key, None)
+            changed.append(key)
+    return changed
+
+
+def _order_config_for_write(data: dict[str, Any]) -> dict[str, Any]:
+    ordered: dict[str, Any] = {}
+    for key in CONFIG_TOP_LEVEL_ORDER:
+        if key in data:
+            ordered[key] = data[key]
+    for key, value in data.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def _cfg_file() -> Path:
     return CONFIG / "config.json"
+
+
+@contextmanager
+def _config_file_lock() -> Iterator[None]:
+    depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0) or 0)
+    if depth > 0:
+        _CONFIG_FILE_LOCK_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_STATE.depth = depth
+        return
+    lock_path = CONFIG / "config.json.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as f:
+        _CONFIG_FILE_LOCK_STATE.depth = 1
+        try:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            _CONFIG_FILE_LOCK_STATE.depth = 0
+
+
+@contextmanager
+def _config_io_lock() -> Iterator[None]:
+    with _CONFIG_LOCK:
+        with _config_file_lock():
+            yield
 
 
 def config_path() -> Path:
@@ -923,21 +1223,23 @@ def backup_config_file() -> Path | None:
 
 
 def _read_json(p: Path) -> dict[str, Any]:
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    with _config_io_lock():
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def _write_json_atomic(p: Path, data: dict[str, Any]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    import os as _os, time as _time, secrets, threading
+    with _config_io_lock():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import os as _os, time as _time, secrets, threading
 
-    suffix = f".{_time.time_ns()}.{_os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
-    tmp = p.with_suffix(suffix)
+        suffix = f".{_time.time_ns()}.{_os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+        tmp = p.with_suffix(suffix)
 
-    with tmp.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    tmp.replace(p)
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        tmp.replace(p)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -981,6 +1283,60 @@ def _delete_nested_value(dst: dict[str, Any], path: str | Iterable[str]) -> None
         cur = cur[part]
     if isinstance(cur, dict):
         cur.pop(parts[-1], None)
+
+
+def _scheduler_webhook_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_scheduler_webhooks(value: Any) -> dict[str, Any]:
+    src = value if isinstance(value, dict) else {}
+    out = dict(DEFAULT_SCHEDULER_WEBHOOKS)
+    out["enabled"] = _scheduler_webhook_flag(src.get("enabled"))
+    out["alert_on_unresolved"] = _scheduler_webhook_flag(
+        src.get("alert_on_unresolved") if src.get("alert_on_unresolved") is not None else src.get("alertOnUnresolved")
+    )
+    out["url"] = _http_url_or_blank(src.get("url") or src.get("default_url"))
+    out["base_url"] = _http_url_or_blank(src.get("base_url") or src.get("healthchecks_base_url"))
+    for key in ("start_url", "success_url", "failure_url"):
+        out[key] = _http_url_or_blank(src.get(key))
+    out["payload_format"] = _scheduler_webhook_payload_format(src.get("payload_format") or src.get("format"))
+    out["notifiarr_channel_id"] = _digits_or_blank(src.get("notifiarr_channel_id") or src.get("notifiarrChannelId"))
+    try:
+        timeout = int(src.get("timeout_seconds", 10) or 10)
+    except Exception:
+        timeout = 10
+    out["timeout_seconds"] = max(1, min(60, timeout))
+    return out
+
+
+def _http_url_or_blank(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return ""
+    return url
+
+
+def _scheduler_webhook_payload_format(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"notifiarr", "notifiarr_passthrough"}:
+        return "notifiarr"
+    return "crosswatch"
+
+
+def _digits_or_blank(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text.isdigit() else ""
 
 
 def _set_nested_value(dst: dict[str, Any], path: str | Iterable[str], value: Any) -> None:
@@ -1346,6 +1702,150 @@ def _normalize_nuvio(cfg: dict[str, Any]) -> None:
                 _block(inst)
 
 
+def _normalize_stremio(cfg: dict[str, Any]) -> None:
+    s0 = cfg.get("stremio")
+    if isinstance(s0, dict):
+        s = s0
+    else:
+        s = {}
+        cfg["stremio"] = s
+    insts = s.get("instances") if isinstance(s.get("instances"), dict) else None
+
+    def _block(block: dict[str, Any]) -> None:
+        key = str(block.get("auth_key") or block.get("authKey") or "").strip()
+        raw_ratings = block.get("ratings") if isinstance(block.get("ratings"), dict) else {}
+        ratings = cast(dict[str, Any], raw_ratings)
+
+        def _rating_float(name: str, default: float) -> float:
+            try:
+                value = float(str(ratings.get(name, default)).strip())
+            except Exception:
+                value = default
+            return value if 0 <= value <= 10 else default
+
+        liked_min = _rating_float("liked_min", 6.0)
+        loved_min = _rating_float("loved_min", 8.0)
+        if loved_min < liked_min:
+            loved_min = liked_min
+        block.clear()
+        block["auth_key"] = key
+        block["ratings"] = {"liked_min": liked_min, "loved_min": loved_min}
+
+    _block(s)
+    if isinstance(insts, dict):
+        s["instances"] = insts
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
+def _normalize_floppy(cfg: dict[str, Any]) -> None:
+    f0 = cfg.get("floppy")
+    if isinstance(f0, dict):
+        f = f0
+    else:
+        f = {}
+        cfg["floppy"] = f
+    insts = f.get("instances") if isinstance(f.get("instances"), dict) else None
+
+    def _block(block: dict[str, Any]) -> None:
+        block["server_url"] = str(block.get("server_url") or "").strip().rstrip("/")
+        block["api_token"] = str(block.get("api_token") or "").strip()
+        block["verify_ssl"] = bool(block.get("verify_ssl", False))
+        try:
+            timeout = float(block.get("timeout", 12.0) or 12.0)
+        except Exception:
+            timeout = 12.0
+        block["timeout"] = max(1.0, min(timeout, 120.0))
+        block["watchlist_name"] = str(block.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
+        rl0 = block.get("rate_limit") if isinstance(block.get("rate_limit"), dict) else {}
+        rl = dict(rl0 or {})
+        def _rate(key: str, default: float) -> float:
+            try:
+                value = float(rl.get(key, default))
+            except Exception:
+                value = default
+            return max(0.0, min(value, 100.0))
+        get_rps = _rate("get_per_sec", 20.0)
+        post_rps = _rate("post_per_sec", 20.0)
+        block["rate_limit"] = {
+            "get_per_sec": int(get_rps) if float(get_rps).is_integer() else get_rps,
+            "post_per_sec": int(post_rps) if float(post_rps).is_integer() else post_rps,
+        }
+
+    _block(f)
+    if isinstance(insts, dict):
+        f["instances"] = insts
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
+def _normalize_scrob(cfg: dict[str, Any]) -> None:
+    s0 = cfg.get("scrob")
+    if isinstance(s0, dict):
+        s = s0
+    else:
+        s = {}
+        cfg["scrob"] = s
+    insts = s.get("instances") if isinstance(s.get("instances"), dict) else None
+
+    def _block(block: dict[str, Any]) -> None:
+        server = str(block.get("server_url") or "").strip().rstrip("/")
+        if server and not server.startswith(("http://", "https://")):
+            server = "http://" + server
+        block["server_url"] = server.rstrip("/")
+        block["api_key"] = str(block.get("api_key") or "").strip()
+        block["username"] = str(block.get("username") or "").strip()
+        block["password"] = str(block.get("password") or "")
+        prefix = str(block.get("api_prefix") or "").strip().strip("/")
+        block["api_prefix"] = f"/{prefix}" if prefix else ""
+        block["totp_enabled"] = bool(block.get("totp_enabled"))
+        block["reauth_required"] = bool(block.get("reauth_required"))
+        block["access_token"] = str(block.get("access_token") or "").strip()
+        try:
+            block["expires_at"] = int(block.get("expires_at") or 0)
+        except Exception:
+            block["expires_at"] = 0
+        block["verify_ssl"] = bool(block.get("verify_ssl", False))
+        try:
+            timeout = float(block.get("timeout", 12.0) or 12.0)
+        except Exception:
+            timeout = 12.0
+        block["timeout"] = max(1.0, min(timeout, 120.0))
+        block["watchlist_name"] = str(block.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
+        try:
+            pages = int(block.get("history_max_pages", 500) or 500)
+        except Exception:
+            pages = 500
+        block["history_max_pages"] = max(1, min(pages, 100000))
+        caps = block.get("capabilities")
+        block["capabilities"] = {str(k): bool(v) for k, v in caps.items()} if isinstance(caps, dict) else {}
+        rl0 = block.get("rate_limit") if isinstance(block.get("rate_limit"), dict) else {}
+        rl = dict(rl0 or {})
+
+        def _rate(key: str, default: float) -> float:
+            try:
+                value = float(rl.get(key, default))
+            except Exception:
+                value = default
+            return max(0.0, min(value, 100.0))
+
+        get_rps = _rate("get_per_sec", 10.0)
+        post_rps = _rate("post_per_sec", 5.0)
+        block["rate_limit"] = {
+            "get_per_sec": int(get_rps) if float(get_rps).is_integer() else get_rps,
+            "post_per_sec": int(post_rps) if float(post_rps).is_integer() else post_rps,
+        }
+
+    _block(s)
+    if isinstance(insts, dict):
+        s["instances"] = insts
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
 def _is_hhmm(v: str) -> bool:
     s = (v or "").strip()
     if len(s) != 5 or s[2] != ":":
@@ -1404,6 +1904,7 @@ def _normalize_scheduling(cfg: dict[str, Any]) -> None:
     if custom_minutes < 15:
         custom_minutes = 15
     s["custom_interval_minutes"] = custom_minutes
+    s["webhooks"] = _normalize_scheduler_webhooks(s.get("webhooks"))
 
     adv = _ensure_dict(s, "advanced")
     adv["enabled"] = bool(adv.get("enabled", False))
@@ -1439,8 +1940,6 @@ def _normalize_scheduling(cfg: dict[str, Any]) -> None:
             j["after"] = None
         else:
             a = str(after).strip()
-            if a and not _is_hhmm(a):
-                a = ""
             j["after"] = a or None
 
         days0 = j.get("days")
@@ -1461,6 +1960,62 @@ def _normalize_scheduling(cfg: dict[str, Any]) -> None:
         out.append(j)
 
     adv["jobs"] = out
+
+    workflows0 = adv.get("workflows")
+    workflows: list[dict[str, Any]] = []
+    if isinstance(workflows0, list):
+        for it in workflows0:
+            if isinstance(it, dict):
+                workflows.append(dict(it))
+
+    wf_out: list[dict[str, Any]] = []
+    for i, workflow in enumerate(workflows):
+        wid = str(workflow.get("id") or "").strip() or f"workflow_{i+1}"
+        workflow["id"] = wid
+        workflow["name"] = str(workflow.get("name") or "").strip()
+        wf_mode = str(workflow.get("mode") or "hourly").strip().lower()
+        if wf_mode not in {"hourly", "every_n_hours", "daily_time", "custom_interval"}:
+            wf_mode = "hourly"
+        workflow["mode"] = wf_mode
+
+        try:
+            wf_hours = int(workflow.get("every_n_hours", 1) or 1)
+        except Exception:
+            wf_hours = 1
+        workflow["every_n_hours"] = max(1, wf_hours)
+
+        wf_time = str(workflow.get("daily_time", "03:30") or "03:30").strip()
+        if not _is_hhmm(wf_time):
+            wf_time = "03:30"
+        workflow["daily_time"] = wf_time
+
+        try:
+            wf_minutes = int(workflow.get("custom_interval_minutes", 60) or 60)
+        except Exception:
+            wf_minutes = 60
+        workflow["custom_interval_minutes"] = max(15, wf_minutes)
+
+        steps0 = workflow.get("steps")
+        steps: list[dict[str, Any]] = []
+        if isinstance(steps0, list):
+            for si, raw_step in enumerate(steps0):
+                if not isinstance(raw_step, dict):
+                    continue
+                step = dict(raw_step)
+                step["id"] = str(step.get("id") or "").strip() or f"step_{si+1}"
+                pair_id = step.get("pair_id")
+                step["pair_id"] = None if pair_id is None else (str(pair_id).strip() or None)
+                step["active"] = bool(step.get("active", True))
+                steps.append(step)
+        workflow["steps"] = steps
+        workflow["active"] = bool(workflow.get("active", True))
+        wf_out.append(workflow)
+
+    adv["workflows"] = wf_out
+
+
+ANIME_MAPPING_PAIRS_DEFAULT: list[str] = ["anilist", "simkl"]
+ANIME_MAPPING_FEATURES_DEFAULT: list[str] = ["watchlist", "ratings", "history"]
 
 
 def _normalize_anime_mapping(cfg: dict[str, Any]) -> None:
@@ -1500,8 +2055,20 @@ def _normalize_anime_mapping(cfg: dict[str, Any]) -> None:
             out.append(name)
         return out or list(default)
 
-    am["use_for_pairs"] = _string_list(am.get("use_for_pairs"), ["anilist"])
-    am["features"] = _string_list(am.get("features"), ["watchlist", "ratings"])
+    def _string_list_union(value: Any, default: list[str]) -> list[str]:
+        raw = value if isinstance(value, list) else []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in list(raw) + list(default):
+            name = str(item or "").strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out or list(default)
+
+    am["use_for_pairs"] = _string_list_union(am.get("use_for_pairs"), ANIME_MAPPING_PAIRS_DEFAULT)
+    am["features"] = _string_list_union(am.get("features"), ANIME_MAPPING_FEATURES_DEFAULT)
 
 
 def _normalize_scrobble_webhook(cfg: dict[str, Any]) -> None:
@@ -1631,6 +2198,226 @@ def _normalize_ui(cfg: dict[str, Any]) -> None:
     tls["key_file"] = str(tls.get("key_file", "") or "").strip()
 
 
+def _normalize_pair_profile_ids(cfg: dict[str, Any]) -> None:
+    pairs = cfg.get("pairs")
+    if not isinstance(pairs, list):
+        return
+
+    def _normalize_user_profile_id(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    try:
+        from cw_platform.provider_instances import list_user_profiles
+
+        valid = {_normalize_user_profile_id(row.get("id")) for row in list_user_profiles(cfg) if _normalize_user_profile_id(row.get("id"))}
+    except Exception:
+        valid = set()
+
+    for it in pairs:
+        if not isinstance(it, dict):
+            continue
+        pid = _normalize_user_profile_id(it.get("profile_id"))
+        if pid and pid in valid:
+            it["profile_id"] = pid
+        else:
+            it.pop("profile_id", None)
+
+
+def _new_resource_id(prefix: str) -> str:
+    return f"{prefix}_{secrets.token_hex(6)}"
+
+
+def _clean_resource_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _unique_resource_id(prefix: str, used: set[str]) -> str:
+    for _ in range(100):
+        rid = _new_resource_id(prefix)
+        if rid not in used:
+            return rid
+    raise RuntimeError("unable to allocate config resource id")
+
+
+def _replace_string_ref(node: dict[str, Any], key: str, refs: dict[str, str]) -> bool:
+    raw = node.get(key)
+    value = _clean_resource_id(raw)
+    if value and value in refs:
+        node[key] = refs[value]
+        return True
+    return False
+
+
+def _rewrite_scheduler_resource_refs(cfg: dict[str, Any], pair_refs: dict[str, str], route_refs: dict[str, str]) -> list[str]:
+    if not pair_refs and not route_refs:
+        return []
+    changed: list[str] = []
+    scheduling = cfg.get("scheduling")
+    if not isinstance(scheduling, dict):
+        return changed
+    advanced = scheduling.get("advanced")
+    if not isinstance(advanced, dict):
+        return changed
+
+    jobs = advanced.get("jobs")
+    if isinstance(jobs, list):
+        for idx, job in enumerate(jobs):
+            if isinstance(job, dict) and _replace_string_ref(job, "pair_id", pair_refs):
+                changed.append(f"scheduling.advanced.jobs[{idx}].pair_id")
+
+    workflows = advanced.get("workflows")
+    if isinstance(workflows, list):
+        for wi, workflow in enumerate(workflows):
+            steps = workflow.get("steps") if isinstance(workflow, dict) else None
+            if not isinstance(steps, list):
+                continue
+            for si, step in enumerate(steps):
+                if isinstance(step, dict) and _replace_string_ref(step, "pair_id", pair_refs):
+                    changed.append(f"scheduling.advanced.workflows[{wi}].steps[{si}].pair_id")
+
+    event_rules = advanced.get("event_rules")
+    if not isinstance(event_rules, list):
+        event_rules = advanced.get("eventRules")
+    if isinstance(event_rules, list):
+        for ri, rule in enumerate(event_rules):
+            if not isinstance(rule, dict):
+                continue
+            action = rule.get("action")
+            if isinstance(action, dict):
+                if _replace_string_ref(action, "pair_id", pair_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].action.pair_id")
+                if _replace_string_ref(action, "pairId", pair_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].action.pairId")
+            elif _replace_string_ref(rule, "pair_id", pair_refs):
+                changed.append(f"scheduling.advanced.event_rules[{ri}].pair_id")
+            source = str(rule.get("source") or "watcher").strip().lower() or "watcher"
+            filters = rule.get("filters")
+            if source == "watcher" and isinstance(filters, dict):
+                if _replace_string_ref(filters, "route_id", route_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].filters.route_id")
+                if _replace_string_ref(filters, "routeId", route_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].filters.routeId")
+    return changed
+
+
+def ensure_config_resource_ids(cfg: dict[str, Any]) -> list[str]:
+    """Persist stable IDs for legacy resource rows that used positional fallbacks."""
+    changed: list[str] = []
+    pair_refs: dict[str, str] = {}
+    route_refs: dict[str, str] = {}
+
+    pairs = cfg.get("pairs")
+    if isinstance(pairs, list):
+        used: set[str] = set()
+        for idx, pair in enumerate(pairs):
+            if not isinstance(pair, dict):
+                continue
+            raw_id = _clean_resource_id(pair.get("id"))
+            raw_pair_id = _clean_resource_id(pair.get("pair_id"))
+            candidate = raw_id or raw_pair_id
+            if candidate and candidate not in used:
+                if pair.get("id") != candidate:
+                    pair["id"] = candidate
+                    changed.append(f"pairs[{idx}].id")
+                used.add(candidate)
+                continue
+            rid = _unique_resource_id("pair", used)
+            pair["id"] = rid
+            used.add(rid)
+            changed.append(f"pairs[{idx}].id")
+            legacy = f"pair-{idx + 1}"
+            if not candidate:
+                pair_refs[legacy] = rid
+
+    scrobble = cfg.get("scrobble")
+    watch = scrobble.get("watch") if isinstance(scrobble, dict) else None
+    routes = watch.get("routes") if isinstance(watch, dict) else None
+    if isinstance(routes, list):
+        used_routes: set[str] = set()
+        for idx, route in enumerate(routes):
+            if not isinstance(route, dict):
+                continue
+            raw_id = _clean_resource_id(route.get("id"))
+            raw_route_id = _clean_resource_id(route.get("route_id"))
+            candidate = raw_id or raw_route_id
+            if candidate and candidate not in used_routes:
+                if route.get("id") != candidate:
+                    route["id"] = candidate
+                    changed.append(f"scrobble.watch.routes[{idx}].id")
+                used_routes.add(candidate)
+                continue
+            rid = _unique_resource_id("route", used_routes)
+            route["id"] = rid
+            used_routes.add(rid)
+            changed.append(f"scrobble.watch.routes[{idx}].id")
+            legacy = f"R{idx + 1}"
+            if not candidate:
+                route_refs[legacy] = rid
+
+    changed.extend(_rewrite_scheduler_resource_refs(cfg, pair_refs, route_refs))
+    return changed
+
+
+def cleanup_invalid_resource_profile_ids(cfg: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    try:
+        from cw_platform.provider_instances import list_user_profiles, normalize_user_profile_id
+
+        valid = {normalize_user_profile_id(row.get("id")) for row in list_user_profiles(cfg)}
+        valid = {pid for pid in valid if pid}
+    except Exception:
+        return changed
+
+    def clean_pid(value: Any) -> str:
+        pid = normalize_user_profile_id(value)
+        return pid if pid and pid in valid else ""
+
+    scrobble = cfg.get("scrobble")
+    watch = scrobble.get("watch") if isinstance(scrobble, dict) else None
+    routes = watch.get("routes") if isinstance(watch, dict) else None
+    if isinstance(routes, list):
+        for idx, route in enumerate(routes):
+            if not isinstance(route, dict):
+                continue
+            raw = route.get("profile_id") if "profile_id" in route else route.get("profileId")
+            pid = clean_pid(raw)
+            if pid:
+                if route.get("profile_id") != pid:
+                    route["profile_id"] = pid
+                    changed.append(f"scrobble.watch.routes[{idx}].profile_id")
+                if "profileId" in route:
+                    route.pop("profileId", None)
+                    changed.append(f"scrobble.watch.routes[{idx}].profileId")
+            else:
+                if "profile_id" in route:
+                    route.pop("profile_id", None)
+                    changed.append(f"scrobble.watch.routes[{idx}].profile_id")
+                if "profileId" in route:
+                    route.pop("profileId", None)
+                    changed.append(f"scrobble.watch.routes[{idx}].profileId")
+
+    webhook = scrobble.get("webhook") if isinstance(scrobble, dict) else None
+    assignments = webhook.get("user_profile_assignments") if isinstance(webhook, dict) else None
+    if isinstance(webhook, dict) and isinstance(assignments, dict):
+        for resource_id, value in list(assignments.items()):
+            pid = clean_pid(value)
+            if pid:
+                if assignments.get(resource_id) != pid:
+                    assignments[resource_id] = pid
+                    changed.append(f"scrobble.webhook.user_profile_assignments.{resource_id}")
+            else:
+                assignments.pop(resource_id, None)
+                changed.append(f"scrobble.webhook.user_profile_assignments.{resource_id}")
+        if not assignments:
+            webhook.pop("user_profile_assignments", None)
+            changed.append("scrobble.webhook.user_profile_assignments")
+    elif isinstance(webhook, dict) and "user_profile_assignments" in webhook:
+        webhook.pop("user_profile_assignments", None)
+        changed.append("scrobble.webhook.user_profile_assignments")
+
+    return changed
+
+
 def _normalize_app_auth(cfg: dict[str, Any]) -> None:
     a = _ensure_dict(cfg, "app_auth")
     raw_enabled = bool(a.get("enabled", False))
@@ -1660,7 +2447,6 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
     except Exception:
         plex_sso["linked_at"] = 0
     if not plex_sso["linked_plex_account_id"]:
-        plex_sso["enabled"] = False
         plex_sso["linked_username"] = ""
         plex_sso["linked_email"] = ""
         plex_sso["linked_thumb"] = ""
@@ -1668,26 +2454,49 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
 
     oidc = _ensure_dict(a, "oidc")
     oidc["enabled"] = bool(oidc.get("enabled", False))
-    # Trailing slash is significant (Authentik issuers end with one) -- strip whitespace only.
-    oidc["issuer"] = str(oidc.get("issuer", "") or "").strip()
+    oidc["issuer"] = str(oidc.get("issuer", "") or "").strip().rstrip("/")
     oidc["client_id"] = str(oidc.get("client_id", "") or "").strip()
     oidc["client_secret"] = str(oidc.get("client_secret", "") or "").strip()
-    oidc["public_base_url"] = str(oidc.get("public_base_url", "") or "").strip().rstrip("/")
+    scopes = str(oidc.get("scopes", "openid profile email") or "openid profile email").strip()
+    scope_parts: list[str] = []
+    for scope in scopes.split():
+        if scope and scope not in scope_parts:
+            scope_parts.append(scope)
+    if "openid" not in scope_parts:
+        scope_parts.insert(0, "openid")
+    oidc["scopes"] = " ".join(scope_parts)
     oidc["groups_claim"] = str(oidc.get("groups_claim", "groups") or "").strip() or "groups"
     raw_groups = oidc.get("allowed_groups")
     if isinstance(raw_groups, list):
-        items: list[Any] = raw_groups
+        group_items: list[Any] = raw_groups
     elif raw_groups:
         # A single env var can only carry a string, so accept a comma-separated list.
-        items = str(raw_groups).split(",")
+        group_items = str(raw_groups).split(",")
     else:
-        items = []
-    oidc["allowed_groups"] = [s for s in (str(x or "").strip() for x in items) if s]
-    try:
-        hours = int(oidc.get("session_hours", 12) or 12)
-    except Exception:
-        hours = 12
-    oidc["session_hours"] = min(max(hours, 1), 168)
+        group_items = []
+    oidc["allowed_groups"] = [s for s in (str(x or "").strip() for x in group_items) if s]
+    if not oidc["issuer"] or not oidc["client_id"]:
+        oidc["enabled"] = False
+
+    oidc_identity = a.get("oidc_identity")
+    if isinstance(oidc_identity, dict):
+        clean_oidc_identity: dict[str, Any] = {
+            "iss": str(oidc_identity.get("iss", "") or "").strip().rstrip("/"),
+            "sub": str(oidc_identity.get("sub", "") or "").strip(),
+            "username": str(oidc_identity.get("username", "") or "").strip(),
+            "email": str(oidc_identity.get("email", "") or "").strip(),
+            "picture": str(oidc_identity.get("picture", "") or "").strip(),
+        }
+        try:
+            clean_oidc_identity["linked_at"] = int(oidc_identity.get("linked_at", 0) or 0)
+        except Exception:
+            clean_oidc_identity["linked_at"] = 0
+        if clean_oidc_identity["iss"] and clean_oidc_identity["sub"]:
+            a["oidc_identity"] = clean_oidc_identity
+        else:
+            a.pop("oidc_identity", None)
+    else:
+        a.pop("oidc_identity", None)
 
     pwd = _ensure_dict(a, "password")
     pwd["scheme"] = str(pwd.get("scheme", "pbkdf2_sha256") or "pbkdf2_sha256").strip() or "pbkdf2_sha256"
@@ -1697,6 +2506,17 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
         pwd["iterations"] = 260_000
     pwd["salt"] = str(pwd.get("salt", "") or "").strip()
     pwd["hash"] = str(pwd.get("hash", "") or "").strip()
+
+    atotp = _ensure_dict(a, "totp")
+    atotp["enabled"] = bool(atotp.get("enabled", False))
+    atotp["secret"] = str(atotp.get("secret", "") or "").strip()
+    atotp["pending_secret"] = str(atotp.get("pending_secret", "") or "").strip()
+    try:
+        atotp["pending_created_at"] = int(atotp.get("pending_created_at", 0) or 0)
+    except Exception:
+        atotp["pending_created_at"] = 0
+    if not atotp["secret"]:
+        atotp["enabled"] = False
 
     has_configured_credentials = bool(a["username"] and pwd["salt"] and pwd["hash"])
 
@@ -1720,6 +2540,184 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
         a["last_login_at"] = int(a.get("last_login_at", 0) or 0)
     except Exception:
         a["last_login_at"] = 0
+
+    raw_users = a.get("users")
+    clean_users: dict[str, Any] = {}
+
+    def _clean_managed_display_name(raw_user: dict[str, Any]) -> str:
+        return " ".join(str(raw_user.get("display_name", "") or "").strip().split())[:64]
+
+    def _clean_managed_recovery_codes(raw_user: dict[str, Any]) -> list[dict[str, Any]]:
+        codes = raw_user.get("recovery_codes")
+        if not isinstance(codes, list):
+            return []
+        return [dict(row) for row in codes if isinstance(row, dict)]
+
+    def _clean_managed_avatar(raw_user: dict[str, Any]) -> dict[str, Any]:
+        avatar = raw_user.get("avatar")
+        if not isinstance(avatar, dict):
+            return {}
+        raw_file = str(avatar.get("file") or "")
+        if "/" in raw_file or "\\" in raw_file:
+            return {}
+        name = os.path.basename(raw_file)
+        if not re.fullmatch(r"[a-f0-9]{32}\.(png|jpg|webp)", name):
+            return {}
+        content_type = str(avatar.get("content_type") or "").strip().lower()
+        if content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            return {}
+        try:
+            updated_at = int(avatar.get("updated_at", 0) or 0)
+        except Exception:
+            updated_at = 0
+        return {"file": name, "content_type": content_type, "updated_at": updated_at}
+
+    def _clean_managed_preferences(raw_user: dict[str, Any]) -> dict[str, bool]:
+        prefs = raw_user.get("preferences")
+        if not isinstance(prefs, dict):
+            return {}
+        return {
+            "playing_card": prefs.get("playing_card") is not False,
+            "quick_add": prefs.get("quick_add") is not False,
+        }
+
+    def _clean_managed_plex_sso(raw_user: dict[str, Any]) -> dict[str, Any]:
+        plex_sso_user = raw_user.get("plex_sso")
+        if not isinstance(plex_sso_user, dict):
+            return {}
+        account_id = str(plex_sso_user.get("account_id") or plex_sso_user.get("linked_plex_account_id") or "").strip()
+        if not account_id:
+            return {}
+        try:
+            linked_at = int(plex_sso_user.get("linked_at", 0) or 0)
+        except Exception:
+            linked_at = 0
+        return {
+            "account_id": account_id,
+            "username": str(plex_sso_user.get("username") or plex_sso_user.get("linked_username") or "").strip(),
+            "email": str(plex_sso_user.get("email") or plex_sso_user.get("linked_email") or "").strip(),
+            "thumb": str(plex_sso_user.get("thumb") or plex_sso_user.get("linked_thumb") or "").strip(),
+            "linked_at": linked_at,
+        }
+
+    def _clean_managed_oidc(raw_user: dict[str, Any]) -> dict[str, Any]:
+        oidc_user = raw_user.get("oidc")
+        if not isinstance(oidc_user, dict):
+            return {}
+        iss = str(oidc_user.get("iss") or "").strip().rstrip("/")
+        sub = str(oidc_user.get("sub") or "").strip()
+        if not iss or not sub:
+            return {}
+        try:
+            linked_at = int(oidc_user.get("linked_at", 0) or 0)
+        except Exception:
+            linked_at = 0
+        return {
+            "iss": iss,
+            "sub": sub,
+            "username": str(oidc_user.get("username") or "").strip(),
+            "email": str(oidc_user.get("email") or "").strip(),
+            "picture": str(oidc_user.get("picture") or "").strip(),
+            "linked_at": linked_at,
+        }
+
+    raw_admin_profile = dict(a)
+    a.pop("display_name", None)
+    a.pop("recovery_codes", None)
+    a.pop("avatar", None)
+    a.pop("preferences", None)
+    display_name = _clean_managed_display_name(raw_admin_profile)
+    if display_name:
+        a["display_name"] = display_name
+    recovery_codes = _clean_managed_recovery_codes(raw_admin_profile)
+    if recovery_codes:
+        a["recovery_codes"] = recovery_codes
+    avatar = _clean_managed_avatar(raw_admin_profile)
+    if avatar:
+        a["avatar"] = avatar
+    preferences = _clean_managed_preferences(raw_admin_profile)
+    if preferences:
+        a["preferences"] = preferences
+
+    if isinstance(raw_users, dict):
+        for raw_id, raw_user in raw_users.items():
+            uid_raw = str(raw_id or "").strip().lower()
+            uid_compact = uid_raw.replace("-", "")
+            if re.fullmatch(r"[a-f0-9]{32}", uid_compact):
+                uid = uid_compact
+            elif re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", uid_raw):
+                uid = uid_raw
+            else:
+                continue
+            if not isinstance(raw_user, dict):
+                continue
+            username = " ".join(str(raw_user.get("username", "") or "").strip().split())[:64]
+            if not username:
+                continue
+            upwd_raw = raw_user.get("password")
+            if not isinstance(upwd_raw, dict):
+                continue
+            try:
+                user_iters = int(upwd_raw.get("iterations", 260_000) or 260_000)
+            except Exception:
+                user_iters = 260_000
+            upwd = {
+                "scheme": str(upwd_raw.get("scheme", "pbkdf2_sha256") or "pbkdf2_sha256").strip() or "pbkdf2_sha256",
+                "iterations": user_iters,
+                "salt": str(upwd_raw.get("salt", "") or "").strip(),
+                "hash": str(upwd_raw.get("hash", "") or "").strip(),
+            }
+            if not upwd["salt"] or not upwd["hash"]:
+                continue
+            perms_raw = raw_user.get("permissions")
+            perms = perms_raw if isinstance(perms_raw, dict) else {}
+            raw_totp = raw_user.get("totp")
+            user_totp = raw_totp if isinstance(raw_totp, dict) else {}
+            clean_totp = {
+                "enabled": bool(user_totp.get("enabled", False)),
+                "secret": str(user_totp.get("secret", "") or "").strip(),
+                "pending_secret": str(user_totp.get("pending_secret", "") or "").strip(),
+            }
+            try:
+                clean_totp["pending_created_at"] = int(user_totp.get("pending_created_at", 0) or 0)
+            except Exception:
+                clean_totp["pending_created_at"] = 0
+            if not clean_totp["secret"]:
+                clean_totp["enabled"] = False
+            clean_user = {
+                "username": username,
+                "enabled": bool(raw_user.get("enabled", True)),
+                "role": "user",
+                "profile_id": str(raw_user.get("profile_id", "") or "").strip().lower(),
+                "permissions": {
+                    "dashboard": bool(perms.get("dashboard", True)),
+                    "watchlist": bool(perms.get("watchlist", True)),
+                    "playback": bool(perms.get("playback", True)),
+                    "write": bool(perms.get("write", False)),
+                },
+                "password": upwd,
+                "totp": clean_totp,
+            }
+            display_name = _clean_managed_display_name(raw_user)
+            if display_name:
+                clean_user["display_name"] = display_name
+            recovery_codes = _clean_managed_recovery_codes(raw_user)
+            if recovery_codes:
+                clean_user["recovery_codes"] = recovery_codes
+            avatar = _clean_managed_avatar(raw_user)
+            if avatar:
+                clean_user["avatar"] = avatar
+            preferences = _clean_managed_preferences(raw_user)
+            if preferences:
+                clean_user["preferences"] = preferences
+            plex_sso_user = _clean_managed_plex_sso(raw_user)
+            if plex_sso_user:
+                clean_user["plex_sso"] = plex_sso_user
+            oidc_user = _clean_managed_oidc(raw_user)
+            if oidc_user:
+                clean_user["oidc"] = oidc_user
+            clean_users[uid] = clean_user
+    a["users"] = clean_users
 
     if a["reset_required"]:
         sess = _ensure_dict(a, "session")
@@ -1798,22 +2796,56 @@ def load_config() -> dict[str, Any]:
     # Before the normalizers, so env values get the same clamping as file values.
     _log_env_locks(apply_env_overrides(cfg))
     cfg.setdefault("version", _current_version_norm())
+    try:
+        user_cw = user_cfg.get("crosswatch") if isinstance(user_cfg.get("crosswatch"), dict) else user_cfg.get("CrossWatch")
+        cw = cfg.get("crosswatch")
+        if isinstance(cw, dict):
+            if isinstance(user_cw, dict) and "connected" not in user_cw and user_cw.get("enabled") is not False:
+                cw["connected"] = True
+            elif not isinstance(user_cw, dict):
+                cw["connected"] = False
+            user_insts = user_cw.get("instances") if isinstance(user_cw, dict) else None
+            insts = cw.get("instances")
+            if isinstance(user_insts, dict) and isinstance(insts, dict):
+                for inst_id, inst_block in insts.items():
+                    user_inst = user_insts.get(inst_id)
+                    if (
+                        isinstance(inst_block, dict)
+                        and isinstance(user_inst, dict)
+                        and "connected" not in user_inst
+                        and user_inst.get("enabled") is not False
+                    ):
+                        inst_block["connected"] = True
+    except Exception:
+        pass
+    cleanup_obsolete_config_keys(cfg)
     _normalize_tmdb_sync(cfg)
     _normalize_trakt(cfg)
     _normalize_simkl(cfg)
     _normalize_mdblist(cfg)
     _normalize_publicmetadb(cfg)
     _normalize_nuvio(cfg)
+    _normalize_stremio(cfg)
+    _normalize_floppy(cfg)
+    _normalize_scrob(cfg)
     _normalize_anime_mapping(cfg)
     _normalize_scheduling(cfg)
     _normalize_app_auth(cfg)
     _normalize_scrobble_webhook(cfg)
+    _normalize_pair_profile_ids(cfg)
+    cleanup_invalid_resource_profile_ids(cfg)
     pairs = cfg.get("pairs")
     if isinstance(pairs, list):
         for it in pairs:
             if isinstance(it, dict):
                 it["features"] = _normalize_features_map(it.get("features"))  # type: ignore[arg-type]
     _normalize_ui(cfg)
+    try:
+        from cw_platform.provider_instances import ensure_provider_instance_uids
+
+        ensure_provider_instance_uids(cfg)
+    except Exception:
+        pass
 
     # First-run marker for welcome/setup
     if first_run:
@@ -1824,14 +2856,8 @@ def load_config() -> dict[str, Any]:
         except Exception:
             pass
 
-    # Ensure webhook URL tokens exist
     try:
-        cfg, wh_changed = _ensure_webhook_ids(cfg)
-        if wh_changed:
-            try:
-                save_config(cfg)
-            except Exception:
-                pass
+        cfg, _ = _ensure_webhook_ids(cfg)
     except Exception:
         pass
 
@@ -1871,17 +2897,30 @@ def save_config(cfg: dict[str, Any]) -> None:
     except Exception:
         pass
     data["version"] = _current_version_norm()
+    cleanup_obsolete_config_keys(data)
     _normalize_tmdb_sync(data)
     _normalize_trakt(data)
     _normalize_simkl(data)
     _normalize_mdblist(data)
     _normalize_publicmetadb(data)
     _normalize_nuvio(data)
+    _normalize_stremio(data)
+    _normalize_floppy(data)
+    _normalize_scrob(data)
     _normalize_anime_mapping(data)
+    ensure_config_resource_ids(data)
     _normalize_scheduling(data)
     _normalize_app_auth(data)
     _normalize_scrobble_webhook(data)
     _normalize_ui(data)
+    _normalize_pair_profile_ids(data)
+    cleanup_invalid_resource_profile_ids(data)
+    try:
+        from cw_platform.provider_instances import ensure_provider_instance_uids
+
+        ensure_provider_instance_uids(data)
+    except Exception:
+        pass
     pairs = data.get("pairs")
     if isinstance(pairs, list):
         for it in pairs:
@@ -1896,6 +2935,28 @@ def save_config(cfg: dict[str, Any]) -> None:
     except Exception:
         prev_raw = {}
 
-    payload = cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw))
-    _revert_env_paths(payload, prev_raw)
-    _write_json_atomic(_cfg_file(), payload)
+    if not bool(getattr(_CONFIG_FILE_LOCK_STATE, "atomic_update", False)):
+        try:
+            prev_cfg = cast(dict[str, Any], _transform_secret_tree(prev_raw, decrypt=True)) if isinstance(prev_raw, dict) else {}
+            prev_auth = prev_cfg.get("app_auth") if isinstance(prev_cfg, dict) else None
+            if isinstance(prev_auth, dict):
+                data["app_auth"] = prev_auth
+        except Exception:
+            pass
+
+    final_data = _order_config_for_write(cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw)))
+    _revert_env_paths(final_data, prev_raw)
+    _write_json_atomic(_cfg_file(), final_data)
+
+
+def update_config(mutator: Any) -> tuple[dict[str, Any], Any]:
+    with _config_io_lock():
+        cfg = load_config()
+        result = mutator(cfg)
+        prev_atomic = bool(getattr(_CONFIG_FILE_LOCK_STATE, "atomic_update", False))
+        _CONFIG_FILE_LOCK_STATE.atomic_update = True
+        try:
+            save_config(cfg)
+        finally:
+            _CONFIG_FILE_LOCK_STATE.atomic_update = prev_atomic
+        return cfg, result

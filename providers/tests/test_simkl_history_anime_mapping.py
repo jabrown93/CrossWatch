@@ -74,6 +74,7 @@ def _patch_fs(monkeypatch, m):
     monkeypatch.setattr(m, "_load_anime_episode_map_cache", lambda: {})
     monkeypatch.setattr(m, "_save_anime_episode_map_cache", lambda *a, **k: None)
     monkeypatch.setattr(m, "_load_anime_episode_alias_cache", lambda: {})
+    monkeypatch.setattr(m, "_offline_simkl_id", lambda *a, **k: None)
     monkeypatch.setattr(m, "_save_anime_episode_alias_cache", lambda *a, **k: None)
 
 
@@ -123,6 +124,12 @@ _DBZ_EPISODES = {"41487": [{"episode": n, "title": f"dbz{n}", "tvdb": {"season":
 # Attack on Titan's parent TVDB redirects to a cour whose native map only covers S1 (no S4).
 _AOT_REDIRECT = {"267440": "39687"}
 _AOT_EPISODES = {"39687": [{"episode": n, "title": f"aot{n}", "tvdb": {"season": 1, "episode": n}} for n in range(1, 26)]}
+_KAIJU_EPISODES = {
+    "2532478": [
+        {"episode": 1, "title": "Kaiju Weapon", "tvdb": {"season": 2, "episode": 1}},
+        {"episode": 2, "title": "The Next Generation's Trial", "tvdb": {"season": 2, "episode": 2}},
+    ]
+}
 
 
 def _shows_of(session, url):
@@ -327,6 +334,25 @@ def test_mixed_response_confirms_all_but_not_found(monkeypatch):
     assert len(unresolved) == 1
 
 
+def test_zero_reported_add_without_not_found_is_unconfirmed(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    injected = []
+    monkeypatch.setattr(m, "_inject_adds_into_cache", lambda items: injected.extend(items))
+    session = _Session(post_handler=lambda url, body: _Resp(200, _ok_add(episodes=0)))
+    adapter = _adapter(session)
+
+    item = _episode("11256175", "2190", 27, 6, "South Park")
+    ok, unresolved = m.add(adapter, [item])
+
+    assert ok == 0
+    assert len(unresolved) == 1
+    assert unresolved[0]["hint"] == "simkl_write_response_unconfirmed:add"
+    assert getattr(adapter, "_simkl_history_add_confirmed_keys") == []
+    assert injected == []
+
+
 def test_anime_like_s00_unmapped_is_unresolved(monkeypatch):
     import sync.simkl._history as m
 
@@ -472,6 +498,153 @@ def test_dbz_absolute_fallback_group_mapping(monkeypatch):
         episode_cache={},
     )
     assert mapped == {m._thaw_key(item): 40}
+
+
+def test_simkl_target_override_maps_split_target_native_episode(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    session = _Session(episodes_map=_KAIJU_EPISODES)
+    adapter = _adapter(session)
+    item = {
+        "type": "episode",
+        "season": 1,
+        "episode": 13,
+        "watched_at": "2024-01-01T00:00:00Z",
+        "show_ids": {"tmdb": "207468"},
+        "series_title": "Kaiju No. 8",
+        "_cw_anime_map": {
+            "absolute": 1,
+            "namespace": "simkl",
+            "target_id": "2532478",
+            "entry": "override:ovr_kaiju_s2n4p7",
+            "release_tag": "v3",
+        },
+    }
+
+    mapped = m._anime_retry_episode_numbers_for_group(
+        [item],
+        {"simkl": "2532478"},
+        session=session,
+        headers={},
+        timeout=5,
+        episode_cache={},
+    )
+    assert mapped == {m._thaw_key(item): 1}
+
+
+def test_simkl_target_override_refreshes_stale_episode_cache(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    saved: list[dict] = []
+    monkeypatch.setattr(m, "_save_anime_episode_map_cache", lambda rows: saved.append(dict(rows)))
+    session = _Session(episodes_map=_KAIJU_EPISODES)
+    item = {
+        "type": "episode",
+        "season": 1,
+        "episode": 13,
+        "watched_at": "2024-01-01T00:00:00Z",
+        "show_ids": {"tmdb": "207468"},
+        "series_title": "Kaiju No. 8",
+        "_cw_anime_map": {
+            "absolute": 1,
+            "namespace": "simkl",
+            "target_id": "2532478",
+            "entry": "override:ovr_kaiju_s2n4p7",
+            "release_tag": "v3",
+        },
+    }
+    stale_cache = {
+        "2532478": [
+            {"episode": 6, "title": "The Next Generation's Trial", "tvdb": {"season": 2, "episode": 6}}
+        ]
+    }
+
+    mapped = m._anime_retry_episode_numbers_for_group(
+        [item],
+        {"simkl": "2532478"},
+        session=session,
+        headers={},
+        timeout=5,
+        episode_cache=stale_cache,
+    )
+
+    assert mapped == {m._thaw_key(item): 1}
+    assert any("/anime/episodes/2532478" in call["url"] for call in session.gets)
+    assert saved and stale_cache["2532478"][0]["episode"] == 1
+
+
+def test_simkl_target_override_beats_source_tvdb_redirect(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    session = _Session(redirect_map={"424049": "1967108"}, episodes_map=_KAIJU_EPISODES)
+    state = m._AnimeResolveState({}, {})
+    item = {
+        "type": "episode",
+        "season": 1,
+        "episode": 13,
+        "watched_at": "2024-01-01T00:00:00Z",
+        "show_ids": {"tmdb": "207468", "tvdb": "424049"},
+        "series_title": "Kaiju No. 8",
+        "_cw_anime_map": {
+            "absolute": 1,
+            "namespace": "simkl",
+            "target_id": "2532478",
+            "entry": "override:ovr_kaiju_s2n4p7",
+            "release_tag": "v3",
+        },
+    }
+
+    ids = m._native_anime_ids_for_mismatched_show(session, {}, 5, item, state)
+    mapped = m._anime_retry_episode_number(
+        item,
+        ids,
+        session=session,
+        headers={},
+        timeout=5,
+        episode_cache={},
+        resolve_state=state,
+    )
+
+    assert ids == {"simkl": "2532478"}
+    assert mapped == 1
+    assert not any(call["url"] == m.URL_REDIRECT for call in session.gets)
+
+
+def test_simkl_target_override_is_authoritative_without_catalog_rows(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    session = _Session(episodes_map={"2532478": []})
+    item = {
+        "type": "episode",
+        "season": 1,
+        "episode": 13,
+        "watched_at": "2024-01-01T00:00:00Z",
+        "show_ids": {"tmdb": "207468"},
+        "series_title": "Kaiju No. 8",
+        "_cw_anime_map": {
+            "absolute": 1,
+            "namespace": "simkl",
+            "target_id": "2532478",
+            "entry": "override:ovr_kaiju_s2n4p7",
+            "release_tag": "v3",
+        },
+    }
+
+    mapped = m._anime_retry_episode_number(
+        item,
+        {"simkl": "2532478"},
+        session=session,
+        headers={},
+        timeout=5,
+        episode_cache={},
+        resolve_state=m._AnimeResolveState({}, {}),
+    )
+
+    assert mapped == 1
 
 
 def test_read_back_native_e01_maps_to_tvdb_s04e17():
@@ -1082,3 +1255,53 @@ def test_show_no_abs_or_title_mapping_applied(monkeypatch):
     assert len(eps) == 1
     assert (eps[0]["season"], eps[0]["episode"]) == (1, 7)
 
+
+def test_episodes_without_their_own_ids_do_not_inherit_show_ids(monkeypatch):
+    import sync.simkl._history as m
+
+    _set_source_aliases(monkeypatch, m, {})
+
+    show_row = {
+        "show": {"title": "Dragon Ball Z", "ids": {"simkl": 41487, "tmdb": "12971", "tvdb": "81472", "imdb": "tt0121220"}},
+        "seasons": [
+            {
+                "number": 1,
+                "episodes": [
+                    {"number": 1, "watched_at": "2024-05-05T00:00:00Z", "ids": {"tvdb": "355412"}},
+                    {"number": 2, "watched_at": "2024-05-05T00:00:00Z", "ids": {"tvdb": "355413"}},
+                    {"number": 100, "watched_at": "2024-05-05T00:00:00Z"},
+                    {"number": 101, "watched_at": "2024-05-05T00:00:00Z"},
+                ],
+            }
+        ],
+    }
+
+    out, *_ = m._parse_rows([], [show_row], [], limit=None)
+    eps = {v["episode"]: v for v in out.values() if str(v.get("type")) == "episode"}
+
+    assert eps[1]["ids"] == {"tvdb": "355412"}
+    assert eps[2]["ids"] == {"tvdb": "355413"}
+    assert eps[100]["ids"] == {}
+    assert eps[101]["ids"] == {}
+    assert all(e["show_ids"]["tvdb"] == "81472" for e in eps.values())
+
+
+def test_source_episode_id_aliases_survive_when_episode_ids_are_absent(monkeypatch):
+    import sync.simkl._history as m
+
+    aliases = {
+        f"k{n}": {
+            "season": 1,
+            "episode": n,
+            "ids": {} if n > 2 else {"tvdb": f"35541{n}"},
+            "show_ids": {"tmdb": "12971", "tvdb": "81472"},
+        }
+        for n in range(1, 6)
+    }
+    _set_source_aliases(monkeypatch, m, aliases)
+
+    out = m._source_episode_id_aliases()
+
+    assert ("tvdb", "355411") in out
+    assert ("tvdb", "355412") in out
+    assert ("tvdb", "81472") not in out

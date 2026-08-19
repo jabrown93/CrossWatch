@@ -57,7 +57,7 @@ class Orchestrator:
     debug: bool = field(init=False, default=False)
     emitter: Emitter = field(init=False)
     warn_thresholds: dict[str, int] = field(init=False, default_factory=dict)
-    snap_cache: dict[tuple[str, str, str], tuple[float, dict[str, dict[str, Any]]]] = field(
+    snap_cache: dict[tuple[str, ...], tuple[float, dict[str, dict[str, Any]]]] = field(
         init=False, default_factory=dict
     )
     snap_ttl_sec: int = field(init=False, default=0)
@@ -137,7 +137,7 @@ class Orchestrator:
             tomb_prune=self.prune_tombstones,
             only_feature=self.only_feature,
             write_state_json=self.write_state_json,
-            state_path=self.state_path or self.state_store.state,
+            state_path=self.state_path,
             snap_cache=self.snap_cache,
             snap_ttl_sec=self.snap_ttl_sec,
             apply_chunk_size=self.apply_chunk_size,
@@ -184,10 +184,11 @@ class Orchestrator:
             summary = _run_pairs(self.context)
 
 
-            try:
-                self._persist_state_wall(feature="watchlist")
-            except Exception:
-                pass
+            if self.write_state_json:
+                try:
+                    self._persist_state_wall(feature="watchlist")
+                except Exception:
+                    pass
 
             try:
                 self.state_store.clear_watchlist_hide()
@@ -208,7 +209,7 @@ class Orchestrator:
 
             try:
                 if hasattr(self.stats, "overview"):
-                    st = self.state_store.load_state()
+                    st = self.state_store.load_state_features({"watchlist"}) if self.write_state_json else {}
                     ov = self.stats.overview(st)
                     self.emit("stats:overview", overview=ov)
             except Exception:
@@ -267,7 +268,7 @@ class Orchestrator:
         return _module_cp(ops, self.cfg, feature) if ops else None
 
     def prev_checkpoint(self, provider_name: str, feature: str) -> str | None:
-        st = self.state_store.load_state()
+        st = self.state_store.load_state_features({feature})
         return _prev_cp(st, str(provider_name).upper(), feature)
 
     def coerce_suspect_snapshot(
@@ -390,14 +391,17 @@ class Orchestrator:
         import time as _t
         from typing import Mapping as _MappingType, Dict as _DictType
 
+        if not self.write_state_json:
+            return {}
+
         try:
             from ..id_map import minimal
         except Exception:
             def minimal(item: _MappingType[str, Any]) -> _DictType[str, Any]:  # type: ignore[no-redef]
                 return dict(item)
 
-        state: dict[str, Any] = self.state_store.load_state() or {}
-        providers = dict(state.get("providers") or {})
+        blocks: dict[tuple[str, str, str], dict[str, Any]] = {}
+        touched: set[str] = set()
 
         for feat in (features or ()):
             if str(feat).lower() == "watchlist":
@@ -412,25 +416,32 @@ class Orchestrator:
                 snaps = {}
             for prov, idx in (snaps or {}).items():
                 items_min = {k: minimal(v) for k, v in (idx or {}).items()}
-                prov_entry = providers.setdefault(str(prov).upper(), {})
-                prov_entry[feat] = {
+                prov_name = str(prov).upper()
+                feat_name = str(feat).lower()
+                touched.add(prov_name)
+                blocks[(prov_name, "default", feat_name)] = {
                     "baseline": {"items": items_min},
                     "checkpoint": None,
                 }
 
-        state["providers"] = providers
-        state["last_sync_epoch"] = int(_t.time())
-        self.state_store.save_state(state)
+        last_sync_epoch = int(_t.time())
+        if blocks:
+            self.state_store.save_feature_blocks(blocks, last_sync_epoch=last_sync_epoch)
+        else:
+            self.state_store.set_last_sync_epoch(last_sync_epoch)
         self.dbg(
             "state.persisted",
-            providers=len(providers),
-            wall=len(state.get("wall") or []),
+            providers=len(touched),
+            wall=0,
         )
-        return state
+        return {"providers": {name: {} for name in sorted(touched)}, "last_sync_epoch": last_sync_epoch}
 
     # Watchlist wall
     def _persist_state_wall(self, *, feature: str = "watchlist") -> dict[str, Any]:
-        state: dict[str, Any] = self.state_store.load_state() or {}
+        if not self.write_state_json:
+            return {}
+
+        state: dict[str, Any] = self.state_store.load_state_features({feature}) or {}
         providers = dict(state.get("providers") or {})
         wall: list[dict[str, Any]] = []
 
@@ -469,8 +480,9 @@ class Orchestrator:
         state["wall"] = uniq
         import time as _t
 
-        state["last_sync_epoch"] = int(_t.time())
-        self.state_store.save_state(state)
+        last_sync_epoch = int(_t.time())
+        state["last_sync_epoch"] = last_sync_epoch
+        self.state_store.set_last_sync_epoch(last_sync_epoch)
         self.dbg(
             "state.persisted",
             providers=len(providers),

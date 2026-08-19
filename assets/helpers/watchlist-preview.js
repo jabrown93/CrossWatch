@@ -44,7 +44,16 @@
   const getConfig = async () => {
     if (window.CW?.API?.Config?.load) return window.CW.API.Config.load(false);
     if (window._cfgCache) return window._cfgCache;
-    const cfg = await json("/api/config");
+    let cfg;
+    try {
+      cfg = document.documentElement?.dataset?.cwRole === "user" ? await json("/api/config/meta") : await json("/api/config");
+    } catch (e) {
+      const msg = String(e?.message || e || "");
+      if (!msg.includes("401") && !msg.includes("403")) throw e;
+      const meta = await json("/api/config/meta");
+      const ui = meta && typeof meta.ui === "object" ? meta.ui : {};
+      cfg = { ok: true, __public_meta: true, ui, user_interface: ui, tmdb_configured: meta?.tmdb_configured === true, tmdb: meta?.tmdb_configured === true ? { api_key: "configured" } : {} };
+    }
     window._cfgCache = cfg;
     return cfg;
   };
@@ -83,9 +92,12 @@
     try { localStorage.setItem("wl_hidden", JSON.stringify([...set])); } catch {}
   };
 
+  const overviewProfileId = () => String(window.CW?.OverviewProfile?.id || "").trim();
+  const wallCacheKey = () => `${WALL_PREVIEW_CACHE_KEY}.${overviewProfileId() || "all"}`;
+
   const readWallCache = () => {
     try {
-      const raw = localStorage.getItem(WALL_PREVIEW_CACHE_KEY);
+      const raw = localStorage.getItem(wallCacheKey());
       if (!raw) return null;
       const data = JSON.parse(raw);
       return Array.isArray(data?.items) ? data : null;
@@ -96,12 +108,12 @@
 
   const writeWallCache = (items, lastSyncEpoch, total = null) => {
     try {
-      localStorage.setItem(WALL_PREVIEW_CACHE_KEY, JSON.stringify({ items, last_sync_epoch: lastSyncEpoch || 0, total }));
+      localStorage.setItem(wallCacheKey(), JSON.stringify({ items, last_sync_epoch: lastSyncEpoch || 0, total }));
     } catch {}
   };
 
   const clearWallCache = () => {
-    try { localStorage.removeItem(WALL_PREVIEW_CACHE_KEY); } catch {}
+    try { localStorage.removeItem(wallCacheKey()); } catch {}
   };
 
   const hasRenderedWall = (row = document.getElementById("poster-row")) => !!(row?.childElementCount && !row.classList.contains("hidden"));
@@ -363,25 +375,16 @@
     return window.CW?.Meta?.get(item, "detail") || null;
   }
 
-  function ensurePosterCursorStyle() {
-    if (document.getElementById("cw-wall-preview-cursor-style")) return;
-    const style = document.createElement("style");
-    style.id = "cw-wall-preview-cursor-style";
-    style.textContent = "#placeholder-card .poster{cursor:pointer}";
-    document.head.appendChild(style);
-  }
-
   let previewCard = null;
   let previewItem = null;
   let previewMeta = null;
 
   function ensurePreviewCard() {
     if (previewCard) return previewCard;
-    ensurePosterCursorStyle();
     previewCard = window.CW.PlayingCard.mount({
       id: "cw-wall-preview-detail",
       variant: "watchlist",
-      tabScope: "main",
+      tabScope: document.documentElement?.dataset?.cwPage === "profile" ? "" : "main",
       label: "Watchlist preview details",
       width: "min(860px,calc(100vw - 32px))",
       onClose: closePreviewDrawer,
@@ -696,9 +699,13 @@
       const typeLabel = isTV(item.type || item.entity || item.media_type) ? (epLabel || "TV Series") : "Movie";
       const compactMeta = [typeLabel, item.year || "", timeLabel ? `updated ${timeLabel}` : ""].filter(Boolean).join(" - ");
       const horizontalMeta = [typeLabel, item.year || ""].filter(Boolean).join(" \u2022 ");
+      const stackedMeta = [typeLabel, item.year || ""].filter(Boolean).join(" - ");
+      const stackedUpdated = timeLabel ? `<small class="wl-meta-stacked-updated">${esc(`updated ${timeLabel}`)}</small>` : "";
       cap.innerHTML = `
         <strong>${esc(item.title || "")}</strong>
         <small class="wl-meta-compact">${esc(compactMeta)}</small>
+        <small class="wl-meta-stacked">${esc(stackedMeta)}</small>
+        ${stackedUpdated}
         <small class="wl-meta-horizontal">${esc(horizontalMeta)}</small>`;
       link.appendChild(cap);
 
@@ -732,6 +739,7 @@
     const row = document.getElementById("poster-row");
     if (!card || !msg || !row) return;
     if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return; }
+    if (profileWatchlistWidgetHidden()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
 
     const myReq = ++wallReqSeq;
     const refreshVersion = window.__cwWallPreviewDirtyVersion;
@@ -745,13 +753,17 @@
     }
 
     const limit = Number.isFinite(window.MAX_WALL_POSTERS) ? Math.max(1, Number(window.MAX_WALL_POSTERS)) : 20;
-    const wallDataPromise = json(`/api/state/wall?both_only=0&active_only=1&limit=${encodeURIComponent(limit)}`)
+    const params = new URLSearchParams({ both_only: "0", active_only: "1", limit: String(limit) });
+    const userProfile = overviewProfileId();
+    if (userProfile) params.set("user_profile", userProfile);
+    const wallDataPromise = json(`/api/state/wall?${params.toString()}`)
       .then((data) => ({ data }), (error) => ({ error }));
 
     try {
       const gate = await previewGate();
       if (myReq !== wallReqSeq) return false;
       if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
+      if (profileWatchlistWidgetHidden()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
       if (!gate.allowed) {
         clearWallCache();
         hidePreviewCard(card, row, msg);
@@ -764,6 +776,7 @@
       const data = wallResult.data;
       if (myReq !== wallReqSeq) return false;
       if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
+      if (profileWatchlistWidgetHidden()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
       if (data?.missing_tmdb_key) { clearWallCache(); hidePreviewCard(card, row, msg); return false; }
       if (!data?.ok) { msg.textContent = data?.error || "No state data found."; return false; }
 
@@ -796,6 +809,7 @@
 
   async function hasTmdbKey() {
     const pick = (cfg) => {
+      if (cfg?.tmdb_configured === true) return true;
       const fromBlock = (blk) => {
         if (!blk || typeof blk !== "object") return "";
         const direct = String(blk.api_key || "").trim();
@@ -819,9 +833,14 @@
   }
 
   function isOnMain() {
+    if (document.getElementById("profile-hero")) return true;
     const tab = String(document.documentElement.dataset.tab || "").toLowerCase();
     if (tab) return tab === "main";
     return !!document.getElementById("tab-main")?.classList.contains("active");
+  }
+
+  function profileWatchlistWidgetHidden() {
+    return !!document.getElementById("profile-hero");
   }
 
   async function isWatchlistPreviewAllowed() {
@@ -845,6 +864,10 @@
         hidePreviewCard(card, row, msg, { preserve: true });
         return false;
       }
+      if (profileWatchlistWidgetHidden()) {
+        hidePreviewCard(card, row, msg, { preserve: true });
+        return false;
+      }
       card?.classList.remove("hidden");
       const rendered = hasRenderedWall(row);
       if (!force && !previewNeedsRefresh() && (window.wallLoaded || rendered)) return true;
@@ -859,6 +882,10 @@
         }
       }
       if (!isOnMain()) {
+        hidePreviewCard(card, row, msg, { preserve: true });
+        return false;
+      }
+      if (profileWatchlistWidgetHidden()) {
         hidePreviewCard(card, row, msg, { preserve: true });
         return false;
       }
@@ -879,6 +906,7 @@
       if (!card) return false;
 
       if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
+      if (profileWatchlistWidgetHidden()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
       card.classList.remove("hidden");
       const rendered = hasRenderedWall(row);
       if (msg && !window.wallLoaded && !rendered) {
@@ -912,12 +940,16 @@
   });
   window.addEventListener("sync-complete", markWatchlistPreviewDirty);
   window.addEventListener("watchlist:refresh", markWatchlistPreviewDirty);
+  window.addEventListener("cw:overview-profile-changed", markWatchlistPreviewDirty);
 
   const WatchlistPreview = {
     updateEdges,
     scrollWall,
     initWallInteractions,
+    openPreviewDrawer,
+    closePreviewDrawer,
     artUrl,
+    gridArtUrl,
     applyWidgetView,
     prewarmWallImages,
     loadWall,

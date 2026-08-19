@@ -1,4 +1,4 @@
-﻿# SIMKL Module for history sync
+# SIMKL Module for history sync
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
@@ -10,12 +10,21 @@ from difflib import SequenceMatcher
 from itertools import chain
 from typing import Any, Iterable, Mapping, cast
 
+from cw_platform.anime_mapping.episodes import SourceCoordinate, resolve_absolute, resolve_source_coordinate
+from cw_platform.anime_mapping.service import (
+    PAIR_FEATURE_OPTIONS_KEY,
+    mapping_enabled_for_feature,
+    runtime_pair_feature_options,
+)
+from cw_platform.anime_mapping.storage import query_native_identity
 from cw_platform.id_map import minimal as id_minimal
 
 from .._log import log as cw_log
 from .._mod_common import _chunk_items
 from ._common import (
     SIMKLFetchError,
+    REWATCH_ACCOUNT_TYPES,
+    account_type,
     adapter_headers,
     cache_anime_mappings,
     fetch_activities,
@@ -65,6 +74,59 @@ def _source_alias_path() -> str:
 ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb")
 _MOVIE_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl")  # anime IDs excluded to prevent SIMKL misrouting to anime bucket
 _EPISODE_LOOKUP_ID_KEYS = ("tvdb", "anidb")
+
+
+_REWATCH_ACCOUNT_WARNED: set[str] = set()
+
+
+def _rewatch_account_ok(adapter: Any) -> bool:
+    try:
+        session = adapter.client.session
+        headers = adapter_headers(adapter)
+        timeout = float(getattr(adapter.cfg, "timeout", 15.0) or 15.0)
+        tier = account_type(session, headers, timeout=timeout)
+    except Exception:
+        tier = ""
+    if tier in REWATCH_ACCOUNT_TYPES:
+        return True
+    marker = tier or "unknown"
+    if marker not in _REWATCH_ACCOUNT_WARNED:
+        _REWATCH_ACCOUNT_WARNED.add(marker)
+        _warn("rewatch_disabled", reason="simkl_account_not_pro_vip", account_type=marker)
+    return False
+
+
+def _rewatches_enabled(adapter: Any) -> bool:
+    cfg = getattr(adapter, "config", None)
+    if not (isinstance(cfg, Mapping) and cfg.get("_cw_history_rewatches")):
+        return False
+    return _rewatch_account_ok(adapter)
+
+
+def _params(headers: Mapping[str, str], *, rewatches: bool = False, **extra: Any) -> dict[str, Any]:
+    params = simkl_api_params_from_headers(headers, **extra)
+    if rewatches:
+        params["allow_rewatch"] = "yes"
+    return params
+
+
+def _copy_rewatch_fields(dst: dict[str, Any], src: Mapping[str, Any]) -> None:
+    for key in ("rewatch_id", "rewatch_status", "is_rewatch", "history_id"):
+        value = src.get(key)
+        if value not in (None, ""):
+            dst[key] = value
+    if src.get("rewatch_id") not in (None, ""):
+        dst["_simkl_rewatch_id"] = src.get("rewatch_id")
+    if src.get("history_id") not in (None, ""):
+        dst["_simkl_history_id"] = src.get("history_id")
+
+
+def _add_rewatch_payload_fields(dst: dict[str, Any], src: Mapping[str, Any]) -> None:
+    for key in ("rewatch_id", "_simkl_rewatch_id", "history_id", "_simkl_history_id"):
+        value = src.get(key)
+        if value not in (None, ""):
+            dst["rewatch_id" if "rewatch" in key else "history_id"] = value
+            return
 
 def _maybe_map_tvdb(adapter: Any, ids: Mapping[str, Any]) -> dict[str, str]:
     def _fetch_rows() -> Iterable[Mapping[str, Any]]:
@@ -268,6 +330,9 @@ def _raw_show_ids(item: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _thaw_key(item: Mapping[str, Any]) -> str:
+    event_key = str(item.get("_cw_event_key") or "").strip() if item.get("_cw_rewatch_sync") is True else ""
+    if event_key:
+        return event_key
     typ = str(item.get("type") or "").lower()
     return simkl_key_of(item) if typ == "episode" else simkl_key_of(id_minimal(item))
 
@@ -372,15 +437,26 @@ def _cache_load() -> dict[str, dict[str, Any]]:
     return out
 
 
-def _cache_doc_is_stale() -> bool:
+def _cache_doc_mode() -> bool:
+    data = _load_json(_cache_path())
+    return bool(data.get("rewatches")) if isinstance(data, dict) else False
+
+
+def _cache_doc_is_stale(rewatches: bool | None = None) -> bool:
     data = _load_json(_cache_path())
     if not isinstance(data, dict) or not data:
         return False
-    return int(data.get("schema") or 0) != _CACHE_SCHEMA
+    if int(data.get("schema") or 0) != _CACHE_SCHEMA:
+        return True
+    return rewatches is not None and bool(data.get("rewatches")) != bool(rewatches)
 
 
-def _cache_save(items: Mapping[str, Any]) -> None:
-    _save_json(_cache_path(), {"schema": _CACHE_SCHEMA, "generated_at": _as_iso(_now_epoch()), "items": dict(items)})
+def _cache_save(items: Mapping[str, Any], *, rewatches: bool | None = None) -> None:
+    mode = _cache_doc_mode() if rewatches is None else bool(rewatches)
+    _save_json(
+        _cache_path(),
+        {"schema": _CACHE_SCHEMA, "generated_at": _as_iso(_now_epoch()), "rewatches": mode, "items": dict(items)},
+    )
 
 
 def _with_native_identity(item: Mapping[str, Any], info: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -469,6 +545,9 @@ def _inject_adds_into_cache(items_list: list[Mapping[str, Any]]) -> None:
             anime_type = str(item.get("anime_type") or "").strip().lower()
             if anime_type:
                 entry["anime_type"] = anime_type
+        scope = _history_scope(entry, event_key=event_key)
+        if scope:
+            entry["_cw_scope"] = scope
         entry["_cw_injected_at"] = int(time.time())
         to_inject[event_key] = entry
 
@@ -564,9 +643,11 @@ def _fetch_all_items(
     *,
     since_iso: str | None,
     timeout: float,
+    rewatches: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
-    params = simkl_api_params_from_headers(
+    params = _params(
         headers,
+        rewatches=rewatches,
         extended="full_anime_seasons",
         episode_watched_at="yes",
         include_all_episodes="yes",
@@ -818,6 +899,42 @@ def _source_episode_id_aliases() -> dict[tuple[str, str], dict[str, Any]]:
     return out
 
 
+_AIRED_ID_KEYS = ("tmdb", "tvdb", "imdb")
+
+
+def _anime_source_coordinate(
+    show_ids: Mapping[str, Any],
+    native_number: int,
+    release_tag: str,
+    cache: dict[tuple[str, int], SourceCoordinate | None],
+) -> SourceCoordinate | None:
+    if not release_tag:
+        return None
+    key = (_show_identity_key(show_ids), int(native_number))
+    if key in cache:
+        return cache[key]
+    try:
+        found = resolve_source_coordinate(show_ids, native_number, release_tag=release_tag)
+    except Exception as exc:
+        _dbg("anibridge_reverse_failed", error=exc.__class__.__name__)
+        found = None
+    cache[key] = found
+    return found
+
+
+def _source_coordinate_show_ids(show_ids: Mapping[str, Any], coord: SourceCoordinate) -> dict[str, Any]:
+    provider = str(coord.provider or "").strip().lower()
+    ident = str(coord.ident or "").strip()
+    out = dict(show_ids)
+    if not provider or not ident or str(out.get(provider) or "").strip() == ident:
+        return out
+    out[provider] = ident
+    for other in _AIRED_ID_KEYS:
+        if other != provider:
+            out.pop(other, None)
+    return out
+
+
 def _apply_since_limit(
     out: dict[str, dict[str, Any]],
     *,
@@ -853,6 +970,115 @@ def _apply_since_limit(
 
 def _show_identity_key(show_ids: Mapping[str, Any]) -> str:
     return json.dumps({str(k): str(v) for k, v in show_ids.items() if v not in (None, "")}, sort_keys=True)
+
+
+_SCOPE_ID_PRIORITY = ("simkl", "anidb", "mal", "anilist", "kitsu", "tmdb", "imdb", "trakt", "tvdb")
+_SCOPE_ID_PRIORITY_ANIME = tuple(k for k in _SCOPE_ID_PRIORITY if k != "tvdb")
+
+
+def _scope_id(value: Any) -> str:
+    if value in (None, "", True, False):
+        return ""
+    text = str(value).strip()
+    return text.lower() if text.lower().startswith("tt") else text
+
+
+def _scope_ids(item: Mapping[str, Any], field: str) -> Mapping[str, Any]:
+    value = item.get(field)
+    return value if isinstance(value, Mapping) else {}
+
+
+def _scope_priority(item: Mapping[str, Any]) -> tuple[str, ...]:
+    bucket = str(item.get("simkl_bucket") or "").strip().lower()
+    if bucket == "anime" or str(item.get("anime_type") or "").strip():
+        return _SCOPE_ID_PRIORITY_ANIME
+    return _SCOPE_ID_PRIORITY
+
+
+def _scope_tokens(prefix: str, ids: Mapping[str, Any], priority: tuple[str, ...]) -> set[str]:
+    out: set[str] = set()
+    for key in priority:
+        value = _scope_id((ids or {}).get(key))
+        if value:
+            out.add(f"{prefix}:{key}:{value}")
+    return out
+
+
+def _primary_scope(prefix: str, ids: Mapping[str, Any], priority: tuple[str, ...]) -> str:
+    for key in priority:
+        value = _scope_id((ids or {}).get(key))
+        if value:
+            return f"{prefix}:{key}:{value}"
+    return ""
+
+
+def _history_scope(item: Mapping[str, Any], *, event_key: str | None = None) -> str:
+    typ = str(item.get("type") or "").strip().lower()
+    priority = _scope_priority(item)
+    if typ == "episode":
+        scope = _primary_scope("show", _scope_ids(item, "show_ids"), priority)
+        if scope:
+            return scope
+        if event_key and "#" in event_key:
+            return f"show:key:{str(event_key).split('@', 1)[0].split('#', 1)[0]}"
+        return ""
+    return _primary_scope(typ or "item", _scope_ids(item, "ids"), priority) or (str(event_key).split("@", 1)[0] if event_key else "")
+
+
+_SCOPE_FALLBACK_NS = "key"
+
+
+def _history_scope_map(item: Mapping[str, Any], *, event_key: str | None = None) -> dict[str, str]:
+    typ = str(item.get("type") or "").strip().lower()
+    priority = _scope_priority(item)
+    out: dict[str, str] = {}
+    if typ == "episode":
+        for token in _scope_tokens("show", _scope_ids(item, "show_ids"), priority):
+            out[token.split(":", 2)[1]] = token
+        if event_key and "#" in event_key:
+            out[_SCOPE_FALLBACK_NS] = f"show:key:{str(event_key).split('@', 1)[0].split('#', 1)[0]}"
+    else:
+        for token in _scope_tokens(typ or "item", _scope_ids(item, "ids"), priority):
+            out[token.split(":", 2)[1]] = token
+        if event_key:
+            out[_SCOPE_FALLBACK_NS] = str(event_key).split("@", 1)[0]
+    stored = str(item.get("_cw_scope") or "").strip()
+    if stored:
+        parts = stored.split(":", 2)
+        if len(parts) == 3:
+            out.setdefault(parts[1], stored)
+    return {ns: token for ns, token in out.items() if token}
+
+
+def _delta_replace_cache(
+    cached: Mapping[str, Any],
+    fetched: Mapping[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    touched: dict[str, set[str]] = {}
+    for key, value in fetched.items():
+        if not isinstance(value, Mapping):
+            continue
+        for ns, token in _history_scope_map(value, event_key=str(key)).items():
+            touched.setdefault(ns, set()).add(token)
+    if not touched:
+        return {str(k): dict(v) for k, v in cached.items() if isinstance(v, Mapping)}
+
+    final: dict[str, dict[str, Any]] = {}
+    for key, value in cached.items():
+        if not isinstance(value, Mapping):
+            continue
+        scope = _history_scope_map(value, event_key=str(key))
+        replaced = False
+        for ns in (*_scope_priority(value), _SCOPE_FALLBACK_NS):
+            token = scope.get(ns)
+            if token is None or ns not in touched:
+                continue
+            replaced = token in touched[ns]
+            break
+        if not replaced:
+            final[str(key)] = dict(value)
+    final.update({str(k): dict(v) for k, v in fetched.items() if isinstance(v, Mapping)})
+    return final
 
 
 def _watched_raw_coordinates(row: Mapping[str, Any]) -> set[tuple[int, int]]:
@@ -919,6 +1145,7 @@ def _parse_rows(
     headers: Mapping[str, str] | None = None,
     timeout: float | None = None,
     limit: int | None,
+    bridge_tag: str = "",
 ) -> tuple[dict[str, dict[str, Any]], set[str], int | None, int | None, int | None, int, int]:
     """Parse raw API rows into history event dicts. Returns (out, thaw, latest_movies, latest_shows, latest_anime, movies_cnt, eps_cnt)."""
     out: dict[str, dict[str, Any]] = {}
@@ -934,11 +1161,14 @@ def _parse_rows(
     source_title_alias_cache: dict[str, dict[str, dict[str, Any]]] = {}
     source_abs_alias_cache: dict[str, dict[int, dict[str, Any]]] = {}
     source_ep_id_alias_cache: dict[tuple[str, str], dict[str, Any]] | None = None
+    source_coord_cache: dict[tuple[str, int], SourceCoordinate | None] = {}
     watched_coords_by_show = _watched_coordinates_by_show(show_rows)
     stat_with_ids = 0
     stat_no_ids = 0
     stat_exact_hit = 0
     stat_collision = 0
+    stat_coord_override = 0
+    stat_coord_bridge = 0
 
     for row in movie_rows:
         if not isinstance(row, Mapping):
@@ -954,10 +1184,14 @@ def _parse_rows(
         movie_norm["watched"] = True
         movie_norm["watched_at"] = watched_at
         movie_norm["simkl_bucket"] = "movies"
+        _copy_rewatch_fields(movie_norm, row)
         bucket_key = simkl_key_of(movie_norm)
         event_key = f"{bucket_key}@{ts}"
         if event_key in out:
             continue
+        scope = _history_scope(movie_norm, event_key=event_key)
+        if scope:
+            movie_norm["_cw_scope"] = scope
         out[event_key] = movie_norm
         thaw.add(bucket_key)
         movies_cnt += 1
@@ -1020,9 +1254,13 @@ def _parse_rows(
                         "watched": True,
                         "watched_at": watched_at,
                     }
+                    _copy_rewatch_fields(movie_item, row)
                     bucket_key = simkl_key_of(movie_item)
                     event_key = f"{bucket_key}@{ts}"
                     if event_key not in out:
+                        scope = _history_scope(movie_item, event_key=event_key)
+                        if scope:
+                            movie_item["_cw_scope"] = scope
                         out[event_key] = movie_item
                         thaw.add(bucket_key)
                         added += 1
@@ -1046,6 +1284,7 @@ def _parse_rows(
                 e_num = e_num_internal
                 alias: Mapping[str, Any] | None = None
                 show_key = ""
+                ep_show_ids: Mapping[str, Any] = show_ids
                 src_ep_ids = _episode_exact_ids(episode)
                 if src_ep_ids:
                     if source_ep_id_alias_cache is None:
@@ -1107,7 +1346,13 @@ def _parse_rows(
                                     e_num_internal,
                                 )
                     tvdb_map = episode.get("tvdb")
-                    if alias is not None:
+                    coord = _anime_source_coordinate(show_ids, e_num_internal, bridge_tag, source_coord_cache)
+                    if coord is not None and coord.basis == "user_override":
+                        s_num = coord.season
+                        e_num = coord.episode
+                        ep_show_ids = _source_coordinate_show_ids(show_ids, coord)
+                        stat_coord_override += 1
+                    elif alias is not None:
                         s_m = _int_or_none(alias.get("season"))
                         e_m = _int_or_none(alias.get("episode"))
                         if s_m is not None and s_m >= 0 and e_m is not None and e_m > 0:
@@ -1119,6 +1364,11 @@ def _parse_rows(
                         if s_m is not None and s_m >= 0 and e_m is not None and e_m >= 1:
                             s_num = s_m
                             e_num = e_m
+                    elif coord is not None:
+                        s_num = coord.season
+                        e_num = coord.episode
+                        ep_show_ids = _source_coordinate_show_ids(show_ids, coord)
+                        stat_coord_bridge += 1
                     elif session is not None and headers is not None and timeout is not None:
                         mapped = _anime_tvdb_season_episode_for_number(
                             session,
@@ -1150,16 +1400,17 @@ def _parse_rows(
                     "type": "episode",
                     "season": s_num,
                     "episode": e_num,
-                    "ids": dict(alias_ids or episode_ids or alias_show_ids or show_ids),
+                    "ids": dict(alias_ids or episode_ids or {}),
                     "title": alias_title if isinstance(alias_title, str) and alias_title.strip() else f"S{s_num:02d}E{e_num:02d}",
                     "year": None,
                     "series_title": alias_series_title if isinstance(alias_series_title, str) and alias_series_title.strip() else series_name,
                     "series_year": alias_series_year if alias_series_year not in (None, "") else show_year,
-                    "show_ids": dict(alias_show_ids or show_ids),
+                    "show_ids": dict(alias_show_ids or ep_show_ids),
                     "watched": True,
                     "watched_at": watched_at,
                     "simkl_bucket": row_kind,
                 }
+                _copy_rewatch_fields(ep, episode)
                 if row_kind == "anime":
                     simkl_record = str(show_ids.get("simkl") or "").strip()
                     if simkl_record:
@@ -1169,6 +1420,9 @@ def _parse_rows(
                 event_key = f"{bucket_key}@{ts}"
                 if event_key in out:
                     continue
+                scope = _history_scope(ep, event_key=event_key)
+                if scope:
+                    ep["_cw_scope"] = scope
                 out[event_key] = ep
                 thaw.add(bucket_key)
                 eps_cnt += 1
@@ -1188,6 +1442,8 @@ def _parse_rows(
         alias_rejected_collision=stat_collision,
         alias_table_size=len(source_ep_id_alias_cache or {}),
     )
+    if stat_coord_override or stat_coord_bridge:
+        _info("anibridge_readback", overrides=stat_coord_override, reverse=stat_coord_bridge)
     return out, thaw, latest_ts_movies, latest_ts_shows, latest_ts_anime, movies_cnt, eps_cnt
 
 
@@ -1195,11 +1451,13 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
     session = adapter.client.session
     timeout = adapter.cfg.timeout
     normalize_flat_watermarks()
+    rewatches = _rewatches_enabled(adapter)
 
     cached = _cache_load()
-    cache_stale = _cache_doc_is_stale()
+    cache_stale = _cache_doc_is_stale(rewatches)
     wm = "" if cache_stale else (get_watermark("history") or "")
     removed_wm = get_watermark("history_removed") or ""
+    expired_injection = bool(cached and _has_expired_injection(cached))
 
     acts, _ = fetch_activities(session, _headers(adapter, force_refresh=True), timeout=timeout)
 
@@ -1218,9 +1476,8 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         removal_changed = bool(removed_wm) and any(t > removed_wm for t in removal_candidates)
 
         unchanged = bool(wm) and (not act_latest or act_latest <= wm) and not removal_changed
-        if unchanged and cached and _has_expired_injection(cached):
+        if unchanged and expired_injection:
             unchanged = False
-            _dbg("index_reconcile", reason="injected_grace_expired", strategy="full_replace")
         if unchanged and cached:
             _dbg("index_cache_hit", source="cache", reason="activities_unchanged", watermark=wm, count=len(cached))
             _info("index_done", count=len(cached), source="cache")
@@ -1241,16 +1498,20 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         date_from: str | None = None
         strategy = "full"
         reason = "cold_start"
-    else:
+    elif removal_changed or expired_injection:
         date_from = None
         strategy = "full_replace"
-        reason = "removed_from_list_changed" if removal_changed else "activities_changed"
+        reason = "removed_from_list_changed" if removal_changed else "injected_grace_expired"
+    else:
+        date_from = wm
+        strategy = "delta_replace"
+        reason = "activities_changed"
 
     _dbg("index_reconcile", reason=reason, strategy=strategy, date_from=date_from or "-", watermark=wm or "-")
 
     headers = _headers(adapter, force_refresh=True)
     try:
-        rows_by_kind = _fetch_all_items(session, headers, since_iso=date_from, timeout=timeout)
+        rows_by_kind = _fetch_all_items(session, headers, since_iso=date_from, timeout=timeout, rewatches=rewatches)
     except SIMKLFetchError:
         if not cached:
             raise
@@ -1271,11 +1532,20 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         headers=headers,
         timeout=timeout,
         limit=None,  # apply limit to final result only
+        bridge_tag=_anibridge_release_tag(adapter),
     )
-    _dedupe_history_movies(fetched)
+    if not rewatches:
+        _dedupe_history_movies(fetched)
     _dbg("index_fetch_counts", movies=movies_cnt, episodes=eps_cnt, from_date=date_from or "")
 
-    final = fetched
+    if strategy == "delta_replace":
+        final = _delta_replace_cache(cached, fetched)
+        if not rewatches:
+            _dedupe_history_movies(final)
+        if not fetched and movies_cnt == 0 and eps_cnt == 0:
+            _dbg("index_reconcile", reason="incremental_empty", strategy="delta_keep_cache", watermark=wm or "-")
+    else:
+        final = fetched
     carried = 0
     now_epoch = int(time.time())
     for k, v in cached.items():
@@ -1289,21 +1559,20 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
     if carried:
         _dbg("index_reconcile", reason="injected_write_grace", carried=carried, strategy=strategy)
 
-    _cache_save(final)
+    _cache_save(final, rewatches=rewatches)
 
-    # Update watermarks
     latest_any = max([t for t in (latest_ts_movies, latest_ts_shows, latest_ts_anime) if isinstance(t, int)], default=None)
     if act_latest:
         update_watermark_if_new("history", act_latest)
     elif latest_any is not None:
         update_watermark_if_new("history", _as_iso(latest_any))
 
-    # Initialize watermark
     removal_candidates = [t for t in (rm_m, rm_s, rm_a) if isinstance(t, str) and t]
     if removal_candidates:
         update_watermark_if_new("history_removed", max(removal_candidates))
 
-    _unfreeze(thaw)
+    if not rewatches:
+        _unfreeze(thaw)
     _info("index_done", count=len(final), strategy=strategy, source="live")
 
     result = dict(final)
@@ -1337,7 +1606,11 @@ def _show_add_entry(adapter: Any, item: Mapping[str, Any]) -> dict[str, Any] | N
         return None
     if _is_anime_like(item, ids):
         ids = _maybe_map_tvdb(adapter, ids)
-    return {"ids": ids, "use_tvdb_anime_seasons": True}
+    entry: dict[str, Any] = {"ids": ids, "use_tvdb_anime_seasons": True}
+    watched_at = str(item.get("watched_at") or item.get("watchedAt") or "").strip()
+    if watched_at:
+        entry["watched_at"] = watched_at
+    return entry
 
 
 def _show_scope_entry(
@@ -1583,6 +1856,179 @@ def _save_anime_resolve_cache(state: _AnimeResolveState) -> None:
     )
 
 
+def _anibridge_config(adapter: Any) -> Mapping[str, Any] | None:
+    cfg = getattr(adapter, "raw_cfg", None)
+    if not isinstance(cfg, Mapping):
+        return None
+    block = cfg.get("anime_mapping")
+    if not isinstance(block, Mapping) or not bool(block.get("enabled", False)):
+        return None
+    if not mapping_enabled_for_feature(cfg, "history"):
+        return None
+    if PAIR_FEATURE_OPTIONS_KEY in cfg:
+        opts = runtime_pair_feature_options(cfg, "history")
+        if opts.get("use_anime_mapping") is False:
+            return None
+    return block
+
+
+def _anibridge_release_tag(adapter: Any) -> str:
+    block = _anibridge_config(adapter)
+    if block is None:
+        return ""
+    return str(block.get("release_tag") or "v3")
+
+
+def _with_anibridge_map(adapter: Any, item: Mapping[str, Any], block: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if block is None or str(item.get("type") or "").strip().lower() != "episode":
+        return item
+    if item.get("_cw_anime_map") or _int_or_none(item.get("_trakt_number_abs")):
+        return item
+    try:
+        res = resolve_absolute(item, release_tag=str(block.get("release_tag") or "v3"))
+    except Exception as exc:
+        _dbg("anibridge_resolve_failed", error=exc.__class__.__name__)
+        return item
+    if res is None:
+        return item
+    out = dict(item)
+    out["_cw_anime_map"] = {
+        "absolute": res.absolute,
+        "namespace": res.namespace,
+        "target_id": res.target_id,
+        "entry": res.entry,
+        "release_tag": str(block.get("release_tag") or "v3"),
+    }
+    return out
+
+
+def _apply_anibridge_maps(adapter: Any, items: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    block = _anibridge_config(adapter)
+    if block is None:
+        return items
+    out = [_with_anibridge_map(adapter, it, block) for it in items]
+    mapped = sum(1 for it in out if it.get("_cw_anime_map"))
+    if mapped:
+        _info("anibridge_mapped", episodes=mapped, candidates=len(out))
+    return out
+
+
+def _offline_simkl_id(namespace: str, ident: str, release_tag: str) -> str | None:
+    try:
+        found = query_native_identity(release_tag, namespace, ident)
+    except Exception:
+        return None
+    value = str((found or {}).get("simkl") or "").strip()
+    return value or None
+
+
+def _redirect_simkl_id(
+    session: Any,
+    headers: Mapping[str, str],
+    timeout: float,
+    namespace: str,
+    ident: str,
+    state: _AnimeResolveState,
+    release_tag: str = "v3",
+    allow_offline: bool = False,
+) -> str | None:
+    ns = str(namespace or "").strip().lower()
+    value = str(ident or "").strip()
+    if ns not in ("anidb", "mal", "anilist", "kitsu") or not value:
+        return None
+    cache_key = f"{ns}:{value}"
+    cached = state.resolved.get(cache_key)
+    if cached:
+        return cached
+    if allow_offline:
+        offline = _offline_simkl_id(ns, value, release_tag)
+        if offline:
+            state.resolved[cache_key] = offline
+            state.misses.pop(cache_key, None)
+            _dbg("anime_identity_offline", namespace=ns, target=value, simkl=offline)
+            return offline
+    miss_ts = state.misses.get(cache_key)
+    if miss_ts is not None and _now_epoch() - int(miss_ts) < _ANIME_RESOLVE_MISS_TTL:
+        return None
+    try:
+        resp = session.get(
+            URL_REDIRECT,
+            headers=headers,
+            params=simkl_api_params_from_headers(headers, **{"to": "simkl", ns: value}),
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        _dbg("anibridge_redirect_failed", namespace=ns, error=exc.__class__.__name__)
+        return None
+    status = _int_or_none(getattr(resp, "status_code", None))
+    resp_headers = getattr(resp, "headers", {})
+    location = ""
+    if status is not None and 300 <= status < 400 and isinstance(resp_headers, Mapping):
+        location = str(resp_headers.get("Location") or resp_headers.get("location") or "")
+    marker = "/anime/"
+    if not location or marker not in location:
+        state.misses[cache_key] = _now_epoch()
+        _save_anime_resolve_cache(state)
+        return None
+    simkl_id = location.split(marker, 1)[1].split("/", 1)[0].strip()
+    if not simkl_id.isdigit():
+        return None
+    state.resolved[cache_key] = simkl_id
+    state.misses.pop(cache_key, None)
+    _save_anime_resolve_cache(state)
+    return simkl_id
+
+
+def _anibridge_absolute(
+    item: Mapping[str, Any],
+    ids: Mapping[str, str],
+    *,
+    session: Any,
+    headers: Mapping[str, str],
+    timeout: float,
+    resolve_state: _AnimeResolveState | None,
+) -> int | None:
+    raw = item.get("_cw_anime_map")
+    if not isinstance(raw, Mapping) or resolve_state is None:
+        return None
+    absolute = _int_or_none(raw.get("absolute"))
+    simkl_id = str(ids.get("simkl") or "").strip()
+    if absolute is None or absolute <= 0 or not simkl_id:
+        return None
+    namespace = str(raw.get("namespace") or "")
+    target_id = str(raw.get("target_id") or "")
+    if str(namespace).strip().lower() == "simkl":
+        return absolute if target_id == simkl_id else None
+    release_tag = str(raw.get("release_tag") or "v3")
+    resolved = _redirect_simkl_id(session, headers, timeout, namespace, target_id, resolve_state, release_tag)
+    if resolved != simkl_id:
+        _dbg(
+            "anibridge_entity_rejected",
+            namespace=namespace,
+            target=target_id,
+            expected=simkl_id,
+            resolved=resolved,
+        )
+        return None
+    return absolute
+
+
+def _simkl_override_absolute(item: Mapping[str, Any], ids: Mapping[str, str]) -> int | None:
+    raw = item.get("_cw_anime_map")
+    if not isinstance(raw, Mapping):
+        return None
+    namespace = str(raw.get("namespace") or "").strip().lower()
+    if namespace != "simkl":
+        return None
+    target_id = str(raw.get("target_id") or "").strip()
+    simkl_id = str(ids.get("simkl") or "").strip()
+    if not target_id or target_id != simkl_id:
+        return None
+    absolute = _int_or_none(raw.get("absolute"))
+    return absolute if absolute is not None and absolute > 0 else None
+
+
 def _log_anime_resolve_summary(state: _AnimeResolveState) -> None:
     if state.checked <= 0:
         return
@@ -1760,12 +2206,14 @@ def _anime_episode_rows(
     timeout: float,
     simkl_id: str,
     cache: dict[str, list[dict[str, Any]]],
+    *,
+    force_refresh: bool = False,
 ) -> list[dict[str, Any]]:
     simkl_id = str(simkl_id or "").strip()
     if not simkl_id:
         return []
     cached = cache.get(simkl_id)
-    if isinstance(cached, list):
+    if isinstance(cached, list) and not force_refresh:
         return cached
     try:
         resp = session.get(
@@ -1776,17 +2224,17 @@ def _anime_episode_rows(
         )
     except Exception as exc:
         _dbg("anime_episode_map_failed", simkl=simkl_id, error=exc.__class__.__name__)
-        return []
+        return cached if isinstance(cached, list) else []
     if not (200 <= getattr(resp, "status_code", 0) < 300):
         _dbg("anime_episode_map_miss", simkl=simkl_id, status=getattr(resp, "status_code", None))
-        return []
+        return cached if isinstance(cached, list) else []
     try:
         payload = resp.json() if (getattr(resp, "text", "") or "").strip() else []
     except Exception as exc:
         _dbg("anime_episode_map_malformed", simkl=simkl_id, error=exc.__class__.__name__)
         return []
     if not isinstance(payload, list):
-        return []
+        return cached if isinstance(cached, list) else []
     rows: list[dict[str, Any]] = []
     for row in payload:
         if not isinstance(row, Mapping):
@@ -1808,6 +2256,8 @@ def _anime_episode_rows(
     if rows:
         cache[simkl_id] = rows
         _save_anime_episode_map_cache(cache)
+    elif isinstance(cached, list):
+        return cached
     return rows
 
 
@@ -1964,6 +2414,7 @@ def _anime_retry_episode_number(
     timeout: float,
     episode_cache: dict[str, list[dict[str, Any]]],
     alias_cache: Mapping[str, Mapping[str, Any]] | None = None,
+    resolve_state: _AnimeResolveState | None = None,
 ) -> int | None:
     raw_season = item.get("season") if item.get("season") is not None else item.get("season_number")
     raw_episode = item.get("episode") if item.get("episode") is not None else item.get("episode_number")
@@ -1986,8 +2437,29 @@ def _anime_retry_episode_number(
         alias_native = _confirmed_alias_native_number(ids, item, s_num, e_num, alias_cache)
         if alias_native is not None:
             return alias_native
+    override_absolute = _simkl_override_absolute(item, ids)
     rows = _anime_episode_rows(session, headers, timeout, str(ids.get("simkl") or ""), episode_cache)
+    if override_absolute is not None and not rows:
+        return override_absolute
     if rows:
+        if override_absolute is not None:
+            abs_hits = [row for row in rows if _row_anime_episode_number(row) == override_absolute]
+            if len(abs_hits) == 1:
+                return override_absolute
+            refreshed = _anime_episode_rows(
+                session,
+                headers,
+                timeout,
+                str(ids.get("simkl") or ""),
+                episode_cache,
+                force_refresh=True,
+            )
+            if refreshed is not rows:
+                abs_hits = [row for row in refreshed if _row_anime_episode_number(row) == override_absolute]
+                if len(abs_hits) == 1:
+                    return override_absolute
+                rows = refreshed
+            return override_absolute
         direct = [
             row for row in rows
             if isinstance(row.get("tvdb"), Mapping)
@@ -1998,8 +2470,20 @@ def _anime_retry_episode_number(
             mapped = _row_anime_episode_number(direct[0])
             if mapped:
                 return mapped
-        abs_num = _int_or_none(item.get("_trakt_number_abs"))
-        if abs_num is not None and abs_num > 0:
+        abs_candidates = [_int_or_none(item.get("_trakt_number_abs"))]
+        abs_candidates.append(
+            _anibridge_absolute(
+                item,
+                ids,
+                session=session,
+                headers=headers,
+                timeout=timeout,
+                resolve_state=resolve_state,
+            )
+        )
+        for abs_num in abs_candidates:
+            if abs_num is None or abs_num <= 0:
+                continue
             abs_hits = [row for row in rows if _row_anime_episode_number(row) == abs_num]
             if len(abs_hits) == 1:
                 mapped = _row_anime_episode_number(abs_hits[0])
@@ -2036,6 +2520,7 @@ def _anime_retry_episode_numbers_for_group(
     headers: Mapping[str, str],
     timeout: float,
     episode_cache: dict[str, list[dict[str, Any]]],
+    resolve_state: _AnimeResolveState | None = None,
 ) -> dict[str, int]:
     mapped: dict[str, int] = {}
     anchors_by_season: dict[int, list[tuple[int, int]]] = {}
@@ -2053,6 +2538,7 @@ def _anime_retry_episode_numbers_for_group(
             timeout=timeout,
             episode_cache=episode_cache,
             alias_cache=alias_cache,
+            resolve_state=resolve_state,
         )
         if ep_num is None:
             continue
@@ -2135,6 +2621,31 @@ def _resolved_anime_ids_for_tvdb(session: Any, headers: Mapping[str, str], timeo
     return {"simkl": simkl_id, "tvdb": tvdb}
 
 
+def _anibridge_native_simkl_ids(
+    session: Any,
+    headers: Mapping[str, str],
+    timeout: float,
+    item: Mapping[str, Any],
+    state: _AnimeResolveState,
+) -> dict[str, str]:
+    raw = item.get("_cw_anime_map")
+    if not isinstance(raw, Mapping):
+        return {}
+    namespace = str(raw.get("namespace") or "").strip().lower()
+    target_id = str(raw.get("target_id") or "").strip()
+    if not namespace or not target_id:
+        return {}
+    if namespace == "simkl":
+        _dbg("anime_identity_override", target=target_id)
+        return {"simkl": target_id}
+    release_tag = str(raw.get("release_tag") or "v3")
+    simkl_id = _redirect_simkl_id(session, headers, timeout, namespace, target_id, state, release_tag, allow_offline=True)
+    if not simkl_id:
+        return {}
+    _dbg("anibridge_native_entry", namespace=namespace, target=target_id, simkl=simkl_id)
+    return {"simkl": simkl_id}
+
+
 def _native_anime_ids_for_mismatched_show(
     session: Any,
     headers: Mapping[str, str],
@@ -2142,13 +2653,15 @@ def _native_anime_ids_for_mismatched_show(
     item: Mapping[str, Any],
     state: _AnimeResolveState,
 ) -> dict[str, str]:
+    mapped = _anibridge_native_simkl_ids(session, headers, timeout, item, state)
+    if str(mapped.get("simkl") or "").strip():
+        return mapped
     show_ids = _show_ids_of_episode(item)
     tvdb = str(show_ids.get("tvdb") or "").strip()
-    if not tvdb:
-        return {}
-    resolved = _resolved_anime_ids_for_tvdb(session, headers, timeout, tvdb, state)
-    if str(resolved.get("simkl") or "").strip():
-        return resolved
+    if tvdb:
+        resolved = _resolved_anime_ids_for_tvdb(session, headers, timeout, tvdb, state)
+        if str(resolved.get("simkl") or "").strip():
+            return resolved
     return {}
 
 
@@ -2160,13 +2673,15 @@ def _build_anime_retry_payload(
     timeout: float,
     confirmed_keys: set[str] | None = None,
     response_ids_by_key: Mapping[str, Mapping[str, str]] | None = None,
+    resolve_state: _AnimeResolveState | None = None,
 ) -> tuple[dict[str, Any], dict[tuple[str, int], Mapping[str, Any]], list[Mapping[str, Any]]]:
     groups: dict[str, dict[str, Any]] = {}
     index: dict[tuple[str, int], Mapping[str, Any]] = {}
     retry_items: list[Mapping[str, Any]] = []
     confirmed = set(confirmed_keys or set())
     response_ids = dict(response_ids_by_key or {})
-    resolve_state = _load_anime_resolve_cache()
+    if resolve_state is None:
+        resolve_state = _load_anime_resolve_cache()
     episode_cache = _load_anime_episode_map_cache()
     eligible_by_group: dict[str, tuple[dict[str, str], list[Mapping[str, Any]]]] = {}
     for item in items_list:
@@ -2191,6 +2706,7 @@ def _build_anime_retry_payload(
             headers=headers,
             timeout=timeout,
             episode_cache=episode_cache,
+            resolve_state=resolve_state,
         )
         for item in grouped_items:
             item_key = _thaw_key(item)
@@ -2239,6 +2755,8 @@ def _retry_anime_not_found(
     confirmed_keys: set[str] | None = None,
     response_ids_by_key: Mapping[str, Mapping[str, str]] | None = None,
     native_identity: dict[str, dict[str, Any]] | None = None,
+    rewatches: bool = False,
+    resolve_state: _AnimeResolveState | None = None,
 ) -> tuple[set[str], set[str], set[str], list[dict[str, Any]]]:
     body, retry_index, retry_items = _build_anime_retry_payload(
         retry_candidates,
@@ -2247,6 +2765,7 @@ def _retry_anime_not_found(
         timeout=timeout,
         confirmed_keys=confirmed_keys,
         response_ids_by_key=response_ids_by_key,
+        resolve_state=resolve_state,
     )
     confirmed = set(confirmed_keys or set())
     retry_item_keys = {_thaw_key(item) for item in retry_items}
@@ -2266,7 +2785,7 @@ def _retry_anime_not_found(
         resp = session.post(
             URL_ADD,
             headers=headers,
-            params=simkl_api_params_from_headers(headers),
+            params=_params(headers, rewatches=rewatches),
             json=body,
             timeout=timeout,
         )
@@ -2370,6 +2889,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     session = adapter.client.session
     headers = _headers(adapter)
     timeout = adapter.cfg.timeout
+    rewatches = _rewatches_enabled(adapter)
     setattr(adapter, "_simkl_history_add_confirmed_keys", [])
     setattr(adapter, "_simkl_history_add_skipped_keys", [])
     movies: list[dict[str, Any]] = []
@@ -2384,7 +2904,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     thaw_keys: list[str] = []
     main_thaw_keys: list[str] = []
     main_items_list: list[Mapping[str, Any]] = []
-    items_list: list[Mapping[str, Any]] = list(items or [])
+    items_list: list[Mapping[str, Any]] = _apply_anibridge_maps(adapter, list(items or []))
     native_retry_candidates: list[Mapping[str, Any]] = []
     native_retry_confirmed_keys: set[str] = set()
     native_retry_response_ids: dict[str, dict[str, str]] = {}
@@ -2416,9 +2936,6 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         bucket = str(item.get("simkl_bucket") or "").strip().lower()
         if typ == "movie" and bucket == "anime":
             entry = _show_add_entry(adapter, item)
-            watched_at = str(item.get("watched_at") or "").strip()
-            if entry and watched_at:
-                entry["watched_at"] = watched_at
             if entry:
                 shows_whole.append(entry)
                 key = _thaw_key(item)
@@ -2471,6 +2988,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                     timeout=timeout,
                     episode_cache=native_episode_cache,
                     alias_cache=native_alias_cache,
+                    resolve_state=native_resolve_state,
                 )
             if native_ids and native_num is not None:
                 key = _thaw_key(item)
@@ -2555,6 +3073,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             confirmed_keys=native_retry_confirmed_keys,
             response_ids_by_key=native_retry_response_ids,
             native_identity=native_identity,
+            rewatches=rewatches,
+            resolve_state=native_resolve_state,
         )
         unresolved.extend(native_unresolved)
         failed_thaw_keys.update(native_failed)
@@ -2571,7 +3091,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         ]
         setattr(adapter, "_simkl_history_add_confirmed_keys", confirmed_keys)
         setattr(adapter, "_simkl_history_add_skipped_keys", skipped_keys)
-        if confirmed_keys:
+        if confirmed_keys and not rewatches:
             _items_to_inject = [it for it in items_list if _thaw_key(it) in confirmed_key_set]
             _inject_adds_into_cache([_with_native_identity(it, native_identity.get(_thaw_key(it))) for it in _items_to_inject])
             _remember_source_aliases(_items_to_inject)
@@ -2582,7 +3102,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         resp = session.post(
             URL_ADD,
             headers=headers,
-            params=simkl_api_params_from_headers(headers),
+            params=_params(headers, rewatches=rewatches),
             json=body,
             timeout=timeout,
         )
@@ -2611,6 +3131,36 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 _apply_response_classification(items_list, payload)
 
             unknown_failed = len(not_found["movies"])
+            reported_total = (
+                int(added_new.get("movies") or 0)
+                + int(added_new.get("shows") or 0)
+                + int(added_new.get("episodes") or 0)
+            )
+            has_not_found = bool(not_found["shows"] or not_found["movies"] or not_found["episodes"])
+            if main_items_list and reported_total == 0 and not has_not_found:
+                hint = "simkl_write_response_unconfirmed:add"
+                _freeze_failed_adds(main_items_list, hint)
+                unresolved.extend(_unresolved_for_items(main_items_list, hint))
+                setattr(adapter, "_simkl_history_add_confirmed_keys", [])
+                setattr(adapter, "_simkl_history_add_skipped_keys", [])
+                _info(
+                    "write_done",
+                    op="add",
+                    ok=False,
+                    applied=0,
+                    unresolved=len(unresolved),
+                    movies=len(movies),
+                    shows_payload=len(shows_payload),
+                    seasons=seasons_count,
+                    episodes=eps_count,
+                    not_found=0,
+                    anime_retry=0,
+                    reported_movies=0,
+                    reported_shows=0,
+                    reported_episodes=0,
+                    reason=hint,
+                )
+                return 0, unresolved
             if not_found["shows"] or not_found["movies"] or not_found["episodes"]:
                 _dbg("resolve_miss", op="add", movies=len(not_found["movies"]), shows=len(not_found["shows"]), episodes=len(not_found["episodes"]))
 
@@ -2698,6 +3248,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 confirmed_keys=retry_confirmed_keys,
                 response_ids_by_key=retry_response_ids,
                 native_identity=native_identity,
+                rewatches=rewatches,
+                resolve_state=native_resolve_state,
             )
             if retry_candidates:
                 _dbg(
@@ -2743,7 +3295,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             ok = len(confirmed_keys)
             setattr(adapter, "_simkl_history_add_confirmed_keys", confirmed_keys)
             setattr(adapter, "_simkl_history_add_skipped_keys", skipped_keys)
-            if ok > 0:
+            if ok > 0 and not rewatches:
                 _items_to_inject = [it for it in items_list if _thaw_key(it) in confirmed_key_set]
                 _inject_adds_into_cache([_with_native_identity(it, native_identity.get(_thaw_key(it))) for it in _items_to_inject])
                 _remember_source_aliases(_items_to_inject)
@@ -2783,6 +3335,7 @@ def _native_anime_remove_body(
     headers: Mapping[str, str],
     timeout: float,
     state: _AnimeResolveState,
+    rewatches: bool = False,
 ) -> tuple[dict[str, Any], list[str], set[int], set[int], set[int]]:
     episode_cache = _load_anime_episode_map_cache()
     alias_cache = _load_anime_episode_alias_cache()
@@ -2828,13 +3381,25 @@ def _native_anime_remove_body(
     thaw: list[str] = []
     mapped_ids: set[int] = set()
     for record_id, item in movie_records.items():
-        anime_out.append({"ids": {"simkl": record_id}})
+        row: dict[str, Any] = {"ids": {"simkl": record_id}}
+        if rewatches:
+            watched_at = str(item.get("watched_at") or item.get("watchedAt") or "").strip()
+            if watched_at:
+                row["watched_at"] = watched_at
+            _add_rewatch_payload_fields(row, item)
+        anime_out.append(row)
         thaw.append(_thaw_key(item))
         mapped_ids.add(id(item))
     for record_id, pairs in native_groups.items():
         episodes: list[dict[str, Any]] = []
         for item, number in pairs:
-            episodes.append({"number": number})
+            episode_row: dict[str, Any] = {"number": number}
+            if rewatches:
+                watched_at = str(item.get("watched_at") or item.get("watchedAt") or "").strip()
+                if watched_at:
+                    episode_row["watched_at"] = watched_at
+                _add_rewatch_payload_fields(episode_row, item)
+            episodes.append(episode_row)
             thaw.append(_thaw_key(item))
             mapped_ids.add(id(item))
         anime_out.append({"ids": {"simkl": record_id}, "episodes": episodes})
@@ -2851,11 +3416,18 @@ def _native_anime_remove_body(
                 timeout=timeout,
                 episode_cache=episode_cache,
                 alias_cache=alias_cache,
+                resolve_state=state,
             )
             if number is None:
                 unmapped_ids.add(id(item))
                 continue
-            episodes.append({"number": number})
+            episode_row: dict[str, Any] = {"number": number}
+            if rewatches:
+                watched_at = str(item.get("watched_at") or item.get("watchedAt") or "").strip()
+                if watched_at:
+                    episode_row["watched_at"] = watched_at
+                _add_rewatch_payload_fields(episode_row, item)
+            episodes.append(episode_row)
             thaw.append(_thaw_key(item))
             mapped_ids.add(id(item))
         if episodes:
@@ -2869,7 +3441,14 @@ def _live_history_base_keys(adapter: Any) -> set[str] | None:
     try:
         session = adapter.client.session
         timeout = adapter.cfg.timeout
-        rows_by_kind = _fetch_all_items(session, _headers(adapter, force_refresh=True), since_iso=None, timeout=timeout)
+        rewatches = _rewatches_enabled(adapter)
+        rows_by_kind = _fetch_all_items(
+            session,
+            _headers(adapter, force_refresh=True),
+            since_iso=None,
+            timeout=timeout,
+            rewatches=rewatches,
+        )
         fetched, *_ = _parse_rows(
             list(rows_by_kind.get("movies") or []),
             list(rows_by_kind.get("shows") or []),
@@ -2879,9 +3458,11 @@ def _live_history_base_keys(adapter: Any) -> set[str] | None:
             timeout=timeout,
             limit=None,
         )
-        _dedupe_history_movies(fetched)
-        _cache_save(fetched)
-        return {str(k).split("@", 1)[0] for k in fetched}
+        if not rewatches:
+            _dedupe_history_movies(fetched)
+            _cache_save(fetched)
+            return {str(k).split("@", 1)[0] for k in fetched}
+        return {str(k) for k in fetched}
     except Exception as exc:
         _warn("remove_verify_failed", error=str(exc), error_type=exc.__class__.__name__)
         return None
@@ -2909,8 +3490,9 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     session = adapter.client.session
     headers = _headers(adapter)
     timeout = adapter.cfg.timeout
+    rewatches = _rewatches_enabled(adapter)
     unresolved: list[dict[str, Any]] = []
-    items_list: list[Mapping[str, Any]] = list(items or [])
+    items_list: list[Mapping[str, Any]] = _apply_anibridge_maps(adapter, list(items or []))
     setattr(adapter, "_simkl_history_remove_confirmed_keys", [])
     setattr(adapter, "_simkl_history_remove_skipped_keys", [])
     if not items_list:
@@ -2927,6 +3509,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
             headers=headers,
             timeout=timeout,
             state=native_resolve_state,
+            rewatches=rewatches,
         )
         anime_unmapped_s00: set[int] = set()
         for item in part:
@@ -2949,7 +3532,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 resp = session.post(
                     URL_REMOVE,
                     headers=headers,
-                    params=simkl_api_params_from_headers(headers),
+                    params=_params(headers, rewatches=rewatches),
                     json=native_body,
                     timeout=timeout,
                 )
@@ -2987,7 +3570,13 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 if not ids:
                     unresolved.append({"item": id_minimal(item), "hint": "missing_ids"})
                     continue
-                movies.append({"ids": ids})
+                movie_row: dict[str, Any] = {"ids": ids}
+                if rewatches:
+                    watched_at = str(item.get("watched_at") or item.get("watchedAt") or "").strip()
+                    if watched_at:
+                        movie_row["watched_at"] = watched_at
+                    _add_rewatch_payload_fields(movie_row, item)
+                movies.append(movie_row)
                 thaw_keys.append(_thaw_key(item))
                 submitted.append(item)
                 continue
@@ -3026,6 +3615,11 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 group = _merge_show_group(shows_scoped, show_entry)
                 season = _merge_show_season(group, s_num)
                 episode_payload: dict[str, Any] = {"number": e_num}
+                if rewatches:
+                    watched_at = str(item.get("watched_at") or item.get("watchedAt") or "").strip()
+                    if watched_at:
+                        episode_payload["watched_at"] = watched_at
+                    _add_rewatch_payload_fields(episode_payload, item)
                 if episode_ids:
                     episode_payload["ids"] = dict(episode_ids)
                 season.setdefault("episodes", []).append(episode_payload)
@@ -3056,7 +3650,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
             resp = session.post(
                 URL_REMOVE,
                 headers=headers,
-                params=simkl_api_params_from_headers(headers),
+                params=_params(headers, rewatches=rewatches),
                 json=body,
                 timeout=timeout,
             )
@@ -3099,4 +3693,3 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     ok = len(confirmed_keys)
     _info("write_done", op="remove", ok=len(unresolved) == 0 and ok > 0, applied=ok, unresolved=len(unresolved))
     return ok, unresolved
-

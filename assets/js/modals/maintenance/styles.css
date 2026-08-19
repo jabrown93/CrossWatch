@@ -25,13 +25,13 @@
 .cw-maint .sidebar-label { margin: 10px 9px 4px; color: var(--maint-muted); font-size: 10px; font-weight: 850; letter-spacing: .1em; text-transform: uppercase; }
 .cw-maint .side-nav { --nav-accent: var(--maint-accent); display: grid; gap: 3px; }
 .cw-maint .side-nav-item { --nav-accent: var(--maint-accent); min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0; }
-.cw-maint .side-nav-item:is([data-group="archive"], [data-group="events"], [data-group="captures"]) { --nav-accent: var(--maint-good); }
+.cw-maint .side-nav-item:is([data-group="archive"], [data-group="events"], [data-group="state-file"], [data-group="captures"]) { --nav-accent: var(--maint-good); }
 .cw-maint .side-nav-item[data-group="danger"] { --nav-accent: var(--maint-danger); }
 .cw-maint .side-nav-btn { position: relative; width: 100%; min-height: 46px; gap: 10px; padding: 0 12px; border: 1px solid transparent; border-radius: 8px; color: var(--maint-muted); background: transparent; cursor: pointer; text-align: left; font-size: 13px; font-weight: 700; transition: background .14s ease, border-color .14s ease, color .14s ease; }
 .cw-maint .side-nav-btn .material-symbols-rounded { width: 23px; flex: 0 0 23px; font-size: 23px; font-variation-settings: "FILL" 0, "wght" 500, "GRAD" 0, "opsz" 20; }
 .cw-maint .side-nav-btn:hover, .cw-maint .side-nav-btn.active { color: var(--maint-text); border-color: color-mix(in srgb, var(--nav-accent) 38%, var(--maint-border)); background: color-mix(in srgb, var(--nav-accent) 9%, var(--maint-card)); }
 .cw-maint .side-nav-btn.active .material-symbols-rounded { color: var(--nav-accent); }
-.cw-maint .side-nav-btn:is([data-target="cxm-group-archive"], [data-target="cxm-group-events"], [data-target="cxm-group-captures"]) { --nav-accent: var(--maint-good); }
+.cw-maint .side-nav-btn:is([data-target="cxm-group-archive"], [data-target="cxm-group-events"], [data-target="cxm-group-state-file"], [data-target="cxm-group-captures"]) { --nav-accent: var(--maint-good); }
 .cw-maint .side-nav-btn[data-target="cxm-group-danger"] { --nav-accent: var(--maint-danger); }
 .cw-maint .side-nav-btn.danger, .cw-maint .side-nav-btn.danger .material-symbols-rounded { color: var(--maint-danger); }
 .cw-maint .category-run-btn {
@@ -111,7 +111,7 @@
 /* Action cards and feedback */
 .cw-maint .action-row { --inspect-accent: var(--maint-accent); position: relative; overflow: hidden; min-width: 0; min-height: 92px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px 12px; border: 1px solid var(--maint-border); border-radius: 8px; background: var(--maint-card); box-shadow: none; cursor: pointer; transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .14s ease; }
 .cw-maint .action-row.has-side-actions { grid-template-columns: minmax(0, 1fr) auto auto; }
-.cw-maint .action-row[data-kind="tracker"] { --inspect-accent: var(--maint-good); }
+.cw-maint .action-row[data-kind="tracker"], .cw-maint .action-row[data-kind="state-file"], .cw-maint .action-row[data-kind="state-file-prune"] { --inspect-accent: var(--maint-good); }
 .cw-maint .action-row[data-kind="defaults"] { --inspect-accent: var(--maint-danger); }
 .cw-maint .action-row::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 3px; border-radius: 0 999px 999px 0; background: var(--inspect-accent); opacity: 0; transform: scaleY(.35); transition: opacity .16s ease, transform .2s ease; }
 .cw-maint .action-row.is-inspected { border-color: color-mix(in srgb, var(--inspect-accent) 58%, var(--maint-border)); background: color-mix(in srgb, var(--inspect-accent) 8%, var(--maint-card)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--inspect-accent) 15%, transparent); }
@@ -151,8 +151,21 @@
 .cw-maint .archive-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin: 0; }
 .cw-maint .archive-actions .archive-btn { min-height: 34px; min-width: 118px; }
 .cw-maint .archive-actions .archive-btn.secondary { color: var(--maint-text); }
-.cw-maint :is(.action-group.archive, .action-group.events, .action-group.captures) .group-icon, .cw-maint .action-row[data-op="tracker"] .action-icon { color: var(--maint-good); }
-.cw-maint :is(.action-group.archive, .action-group.events, .action-group.captures) { --group-accent: var(--maint-good); }
+.cw-maint .archive-actions .archive-btn.icon-only { width: 46px; min-width: 46px; height: 46px; min-height: 46px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border-radius: 11px; }
+.cw-maint .archive-actions .archive-btn.icon-only .material-symbols-rounded { font-size: 21px; font-variation-settings: "FILL" 0, "wght" 650, "GRAD" 0, "opsz" 22; }
+.cw-maint .action-row[data-op="tracker"] { grid-template-columns: minmax(500px, 1fr) minmax(0, max-content) auto; }
+.cw-maint .tracker-archive-options { align-items: center; flex-wrap: nowrap; gap: 9px; margin-top: 10px; }
+.cw-maint .tracker-profile-control, .cw-maint .tracker-archive-check { min-width: 0; display: inline-flex; align-items: center; gap: 6px; color: var(--maint-muted); font-size: 10.5px; font-weight: 760; white-space: nowrap; }
+.cw-maint .tracker-profile-control > span { color: var(--maint-muted); font-size: 10px; font-weight: 850; letter-spacing: .06em; text-transform: uppercase; }
+.cw-maint .tracker-profile-control .cxm-tracker-profile-select { width: 96px; min-width: 96px; flex: 0 0 96px; }
+.cw-maint .tracker-profile-control .cw-icon-select-btn { min-height: 34px; padding: 0 10px; gap: 5px; border-radius: 11px; border-color: var(--maint-border); background: var(--maint-panel); color: var(--maint-text); box-shadow: none; }
+.cw-maint .tracker-profile-control .cw-icon-select-icons { display: none; }
+.cw-maint .tracker-profile-control .cw-icon-select-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 820; }
+.cw-maint .tracker-profile-control .cw-icon-select-caret { flex: 0 0 9px; width: 9px; opacity: .72; }
+.cw-maint .tracker-archive-check input { width: 17px; height: 17px; margin: 0; accent-color: var(--maint-accent); }
+.cxm-tracker-profile-menu .cw-icon-select-label { overflow: visible; text-overflow: clip; white-space: nowrap; }
+.cw-maint :is(.action-group.archive, .action-group.events, .action-group.state-file, .action-group.captures) .group-icon, .cw-maint .action-row[data-op="tracker"] .action-icon, .cw-maint .action-row[data-op="state-file"] .action-icon, .cw-maint .action-row[data-op="state-file-prune"] .action-icon { color: var(--maint-good); }
+.cw-maint :is(.action-group.archive, .action-group.events, .action-group.state-file, .action-group.captures) { --group-accent: var(--maint-good); }
 .cw-maint :is(.action-group.playback, .action-group.reports) .group-icon { color: var(--maint-accent); }
 .cw-maint .action-group.danger { --group-accent: var(--maint-danger); border-color: color-mix(in srgb, var(--maint-danger) 38%, var(--maint-border)); background: color-mix(in srgb, var(--maint-danger) 6%, var(--maint-panel)); }
 .cw-maint .action-group.danger .group-icon, .cw-maint .action-group.danger .group-title { color: var(--maint-danger); }
@@ -171,6 +184,7 @@ html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint :is(.head-icon
 html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .category-run-btn { color: var(--nav-accent) !important; -webkit-text-fill-color: currentColor !important; border-color: color-mix(in srgb, var(--nav-accent) 38%, var(--maint-border)) !important; border-left: 0 !important; background: color-mix(in srgb, var(--nav-accent) 13%, var(--maint-card)) !important; box-shadow: none !important; }
 html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .category-run-btn.busy { color: transparent !important; -webkit-text-fill-color: transparent !important; }
 html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint :is(.header-action, .run-btn, .archive-btn, .storage-details summary) { border-color: var(--maint-border) !important; background: var(--maint-card) !important; box-shadow: none !important; }
+html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .tracker-profile-control .cw-icon-select-btn { border-color: var(--maint-border) !important; background: var(--maint-panel) !important; color: var(--maint-text) !important; -webkit-text-fill-color: var(--maint-text) !important; box-shadow: none !important; }
 html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .action-group.danger { border-color: color-mix(in srgb, var(--maint-danger) 38%, var(--maint-border)) !important; background: color-mix(in srgb, var(--maint-danger) 6%, var(--maint-panel)) !important; }
 html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .action-group.danger .action-row { border-color: color-mix(in srgb, var(--maint-danger) 30%, var(--maint-border)) !important; background: color-mix(in srgb, var(--maint-danger) 8%, var(--maint-card)) !important; }
 html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .action-group.danger .group-title, html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .action-row[data-op="defaults"] :is(.action-icon, .run-btn) { color: var(--maint-danger) !important; -webkit-text-fill-color: var(--maint-danger) !important; }
@@ -192,6 +206,9 @@ html[data-cw-theme] body .cx-modal-shell.cw-maint-shell .cw-maint .run-btn.resul
   .cw-maint .maint-layout { grid-template-columns: 240px minmax(0, 1fr); }
   .cw-maint .action-group { grid-template-columns: 125px minmax(0, 1fr); }
   .cw-maint .group-desc { margin-left: 0; }
+  .cw-maint .action-row[data-op="tracker"] { grid-template-columns: 1fr auto; }
+  .cw-maint .action-row[data-op="tracker"] .action-side-actions { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; }
+  .cw-maint .tracker-archive-options { flex-wrap: wrap; justify-content: flex-start; }
 }
 @media (max-width: 820px) {
   .cx-modal-shell.cw-maint-shell { width: calc(100vw - 20px) !important; max-width: calc(100vw - 20px) !important; height: calc(100vh - 8px) !important; max-height: calc(100vh - 8px) !important; }

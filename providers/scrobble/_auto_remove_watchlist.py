@@ -3,37 +3,11 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import json
-import time
-from pathlib import Path
 from typing import Any
 
+from cw_platform.local_db.ttl_dedupe import once_per_ttl
 
-_TTL_PATH = Path("/config/.cw_state/watchlist_wl_autoremove.json")
 _TTL_SECONDS = 120
-
-
-def _now() -> float:
-    return time.time()
-
-
-def _read_json(p: Path) -> dict[str, float]:
-    try:
-        if not p.exists():
-            return {}
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _write_json_atomic(p: Path, data: dict[str, float]) -> None:
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
-        tmp.replace(p)
-    except Exception:
-        pass
 
 
 def _norm_ids(ids: dict[str, Any] | None) -> dict[str, str]:
@@ -62,19 +36,7 @@ def _dedupe_key(ids: dict[str, str], media_type: str | None, scope: str | None =
 
 
 def _once_per_ttl(key: str) -> bool:
-    if not key:
-        return True
-    data = _read_json(_TTL_PATH)
-    ts = float(data.get(key, 0.0) or 0.0)
-    if _now() - ts < _TTL_SECONDS:
-        return False
-    now = _now()
-    data[key] = now
-    cutoff = now - _TTL_SECONDS
-    if len(data) > 2000:
-        data = {k: v for k, v in data.items() if v >= cutoff}
-    _write_json_atomic(_TTL_PATH, data)
-    return True
+    return once_per_ttl(None, "watchlist_auto_remove", key, ttl_seconds=_TTL_SECONDS)
 
 
 def _log(msg: str, level: str = "INFO") -> None:
@@ -118,7 +80,7 @@ def remove_across_providers_by_ids(
     try:
         import api.watchlistAPI as WLAPI
 
-        res = WLAPI.remove_across_providers_by_ids(norm, media_type or "")
+        res = WLAPI.remove_across_providers_by_ids(norm, media_type or "", origin=scope)
         ok = bool(res.get("ok")) if isinstance(res, dict) else bool(res)
         if ok:
             _log(f"auto-remove OK ids={norm} media={media_type}")
@@ -128,12 +90,12 @@ def remove_across_providers_by_ids(
     except Exception as e:
         _log(f"auto-remove failed via _watchlistAPI: {e}", "WARN")
         try:
-            from cw_platform.config_base import load_config
-            from api.syncAPI import _load_state
+            from cw_platform.config_base import CONFIG, load_config
+            from cw_platform.orchestrator._state_store import StateStore
             from services.watchlist import delete_watchlist_batch
 
             cfg = load_config()
-            st = _load_state() or {}
+            st = StateStore(CONFIG).load_state_features({"watchlist"}) or {}
             keys: list[str] = []
             for k in ("tmdb", "imdb", "tvdb", "trakt"):
                 v = norm.get(k)
@@ -142,7 +104,14 @@ def remove_across_providers_by_ids(
             keys = list(dict.fromkeys(keys))
             if not keys:
                 return {"ok": False, "error": "no-keys"}
-            res2 = delete_watchlist_batch(keys=keys, prov="ALL", state=st, cfg=cfg) or {}
+            allowed = None
+            if scope:
+                from cw_platform.access_policy import origin_owner_instances
+
+                prov_raw, _, inst_raw = str(scope).partition(":")
+                if str(prov_raw or "").strip():
+                    allowed = origin_owner_instances(cfg, prov_raw, inst_raw)
+            res2 = delete_watchlist_batch(keys=keys, prov="ALL", state=st, cfg=cfg, allowed_instances=allowed) or {}
             ok2 = bool(res2.get("ok"))
             if ok2:
                 _log(f"fallback delete_watchlist_batch OK ids={norm}")
@@ -182,6 +151,7 @@ def _extract_evt(evt: Any) -> dict[str, Any]:
 def auto_remove_if_config_allows(
     evt: Any,
     cfg: dict[str, Any] | None = None,
+    scope: str | None = None,
 ) -> dict[str, Any] | None:
     try:
         if cfg is None:
@@ -224,10 +194,10 @@ def auto_remove_if_config_allows(
         return None
 
     _log(f"auto-remove (WL-AUTO) executing for movie ids={ids}", "INFO")
-    return remove_across_providers_by_ids(ids, "movie")
+    return remove_across_providers_by_ids(ids, "movie", scope=scope)
 
 
-def remove_by_ids(ids: dict[str, Any] | None, media_type: str | None = None) -> dict[str, Any]:
+def remove_by_ids(ids: dict[str, Any] | None, media_type: str | None = None, scope: str | None = None) -> dict[str, Any]:
     mt = str(media_type or "").strip().lower()
     if mt != "movie":
         _log(
@@ -235,4 +205,4 @@ def remove_by_ids(ids: dict[str, Any] | None, media_type: str | None = None) -> 
             "DEBUG",
         )
         return {"ok": False, "skipped": True, "reason": "not_movie"}
-    return remove_across_providers_by_ids(ids or {}, "movie")
+    return remove_across_providers_by_ids(ids or {}, "movie", scope=scope)

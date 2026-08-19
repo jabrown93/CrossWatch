@@ -21,7 +21,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from api.provider_guard import usage_conflict_response
 from cw_platform.config_base import DEFAULT_CFG, load_config, save_config
-from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id
+from cw_platform.provider_instances import apply_instance_defaults, ensure_instance_block, ensure_provider_block, normalize_instance_id
+from cw_platform.tracker_storage import remove_crosswatch_storage
 from cw_platform.url_validation import assert_server_url_safe, guarded_request
 from cw_platform.value_coercion import coerce_bool
 from providers.sync.emby._utils import (
@@ -36,6 +37,7 @@ from providers.sync.jellyfin._utils import (
 )
 from providers.sync.jellyfin._auth_http import JellyfinAuthError
 from providers.auth._auth_KODI import KodiAuthError
+from providers.auth._auth_STREMIO import StremioAuthError, StremioClient
 from providers.sync.kodi._common import (
     ensure_whitelist_defaults as kodi_ensure_whitelist_defaults,
     fetch_libraries_from_cfg as kodi_fetch_libraries_from_cfg,
@@ -56,7 +58,12 @@ def _apply_media_overrides(cfg: Any, provider: str, inst: str, server: str | Non
     block = ensure_instance_block(cfg, provider, inst)
     s = str(server or "").strip()
     if s:
-        block["server_url" if provider == "plex" else "server"] = s
+        key = "server_url" if provider == "plex" else "server"
+        if provider == "plex" and plex_utils._norm_base(s) != plex_utils._norm_base(block.get(key)):
+            block.pop("pms_token", None)
+            block.pop("pms_token_server", None)
+            block.pop("machine_id", None)
+        block[key] = s
     if verify_ssl is not None:
         block["verify_ssl"] = coerce_bool(verify_ssl)
     return block
@@ -386,6 +393,59 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
     def api_auth_providers_html():
         return HTMLResponse(auth_providers_html())
 
+    @app.post("/api/crosswatch/connect", tags=["auth"])
+    def api_crosswatch_connect(instance: str | None = Query(None)) -> dict[str, Any]:
+        try:
+            cfg = load_config() or {}
+            if not isinstance(cfg, dict):
+                cfg = dict(cfg)
+            inst = normalize_instance_id(instance)
+            base = ensure_provider_block(cfg, "crosswatch")
+            base["connected"] = True
+            base.setdefault("root_dir", "/config/.cw_provider")
+            base.setdefault("retention_days", 30)
+            base.setdefault("auto_snapshot", True)
+            base.setdefault("max_snapshots", 64)
+            if inst != "default":
+                block = ensure_instance_block(cfg, "crosswatch", inst)
+                block["connected"] = True
+                apply_instance_defaults(cfg, "crosswatch", inst)
+            save_config(cfg)
+            _safe_log(log_fn, "CROSSWATCH", f"[CROSSWATCH:{inst}] connected")
+            _probe_bust("crosswatch")
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "CROSSWATCH", f"[CROSSWATCH] ERROR connect: {e}")
+            return {"ok": False, "error": "connect_failed", "instance": normalize_instance_id(instance)}
+
+    @app.post("/api/crosswatch/disconnect", tags=["auth"])
+    def api_crosswatch_disconnect() -> Any:
+        try:
+            cfg = load_config() or {}
+            if not isinstance(cfg, dict):
+                cfg = dict(cfg)
+            cw = cfg.get("crosswatch") if isinstance(cfg.get("crosswatch"), dict) else cfg.get("CrossWatch")
+            if not isinstance(cw, dict):
+                return {"ok": False, "error": "not_found", "instance": "default"}
+            insts = cw.get("instances")
+            if isinstance(insts, dict) and insts:
+                return {"ok": False, "error": "profiles_exist"}
+            conflict = usage_conflict_response(cfg, "crosswatch", "default")
+            if conflict is not None:
+                return conflict
+            cleanup = remove_crosswatch_storage(cfg, "default")
+            if cleanup.get("ok") is False:
+                return cleanup
+            cfg.pop("crosswatch", None)
+            cfg.pop("CrossWatch", None)
+            save_config(cfg)
+            _safe_log(log_fn, "CROSSWATCH", "[CROSSWATCH] disconnected")
+            _probe_bust("crosswatch")
+            return {"ok": True, "instance": "default", "storage": cleanup}
+        except Exception as e:
+            _safe_log(log_fn, "CROSSWATCH", f"[CROSSWATCH] ERROR disconnect: {e}")
+            return {"ok": False, "error": "disconnect_failed", "instance": "default"}
+
     # PLEX
     def plex_request_pin(instance_id: Any) -> dict[str, Any]:
         cfg = load_config()
@@ -544,9 +604,11 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
     def plex_libraries(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         cfg = load_config()
+        override = bool(str(server or "").strip())
         _apply_media_overrides(cfg, "plex", inst, server, verify_ssl)
-        ensure_whitelist_defaults(cfg, instance_id=inst)
-        return {"libraries": fetch_libraries_from_cfg(cfg, instance_id=inst), "instance": inst}
+        ensure_whitelist_defaults(cfg, instance_id=inst, persist=not override)
+        libs = fetch_libraries_from_cfg(cfg, instance_id=inst, persist=not override)
+        return {"libraries": libs, "instance": inst}
 
     
     @app.get("/api/plex/pms/probe", tags=["media providers"])
@@ -584,20 +646,38 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
         try:
             verify = plex_utils._resolve_verify_from_cfg(cfg, base, instance_id=inst)
-            s = plex_utils._build_session(token, verify)
-            r = plex_utils._try_get(s, base, "/identity", timeout=float(timeout))
-            if r is None:
+            pms_token, _mid, changed = plex_utils.ensure_pms_token_bound(plex, base)
+            if changed and not str(server or "").strip():
+                try:
+                    save_config(cfg)
+                except Exception:
+                    pass
+            candidates: list[tuple[str, str]] = []
+            if pms_token:
+                candidates.append(("pms_token", pms_token))
+            if token and token != pms_token:
+                candidates.append(("account_token", token))
+
+            last: Any = None
+            for label, candidate in candidates:
+                for use_verify in ((True, False) if verify else (False,)):
+                    session = plex_utils._build_session(candidate, use_verify)
+                    resp = plex_utils._try_get(session, base, "/identity", timeout=float(timeout))
+                    if resp is None:
+                        continue
+                    last = resp
+                    if getattr(resp, "ok", False):
+                        out["status"] = int(resp.status_code)
+                        out["reachable"] = True
+                        out["token_source"] = label
+                        if not use_verify:
+                            out["verify_ssl"] = False
+                        return out
+
+            if last is None:
                 out["error"] = "No response"
                 return out
-            out["status"] = int(r.status_code)
-            out["reachable"] = bool(getattr(r, "ok", False))
-            if not out["reachable"] and verify:
-                s2 = plex_utils._build_session(token, False)
-                r2 = plex_utils._try_get(s2, base, "/identity", timeout=float(timeout))
-                if r2 is not None and getattr(r2, "ok", False):
-                    out["reachable"] = True
-                    out["status"] = int(r2.status_code)
-                    out["verify_ssl"] = False
+            out["status"] = int(last.status_code)
         except Exception:
             _LOG.exception("plex PMS probe failed")
             out["error"] = "probe_failed"
@@ -633,23 +713,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         pms_rows = []
         if base:
             verify = plex_utils._resolve_verify_from_cfg(cfg, base, instance_id=inst)
-            pms_token = (plex.get("pms_token") or "").strip()
-            if not pms_token:
+            pms_token, _mid, changed = plex_utils.ensure_pms_token_bound(plex, base)
+            if changed and not override:
                 try:
-                    tok2, mid2, url2 = plex_utils.discover_pms_access_from_cloud(token, base_url=base, machine_id=(plex.get("machine_id") or ""), timeout=8.0)
-                    if tok2:
-                        plex["pms_token"] = tok2
-                        pms_token = tok2
-                    if mid2 and not (plex.get("machine_id") or "").strip():
-                        plex["machine_id"] = mid2
-                    if url2 and not (plex.get("server_url") or "").strip():
-                        plex["server_url"] = url2
-                        base = url2
-                    if not override:
-                        try:
-                            save_config(cfg)
-                        except Exception:
-                            pass
+                    save_config(cfg)
                 except Exception:
                     pass
             sess_tok = pms_token or token
@@ -1283,6 +1350,92 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         _safe_log(log_fn, "KODI", f"[KODI:{inst}] disconnected")
         return {"ok": True, "instance": inst}
 
+    @app.post("/api/stremio/connect", tags=["auth"])
+    def api_stremio_connect(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> JSONResponse:
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "Malformed request"}, 400)
+
+        inst = normalize_instance_id(instance)
+        email = str(payload.get("email") or "").strip()
+        password = str(payload.get("password") or "")
+        try:
+            prov = _import_provider("providers.auth._auth_STREMIO")
+            if not prov:
+                return JSONResponse({"ok": False, "error": "Provider missing", "instance": inst}, 500)
+
+            cfg = load_config()
+            ensure_provider_block(cfg, "stremio")
+            prov.connect(cfg, email=email, password=password, instance_id=inst)
+            StremioClient(cfg, instance_id=inst).validate()
+            save_config(cfg)
+            _probe_bust("stremio")
+            _safe_log(log_fn, "STREMIO", f"[STREMIO:{inst}] connected")
+            return JSONResponse({"ok": True, "instance": inst}, 200)
+        except StremioAuthError as exc:
+            reason = str(getattr(exc, "reason", "connect_failed"))
+            _safe_log(log_fn, "STREMIO", f"[STREMIO:{inst}] connect failed reason={reason}")
+            status_by_reason = {
+                "missing_credentials": 400,
+                "invalid_credentials": 401,
+                "unreachable": 502,
+                "service_unavailable": 502,
+                "request_failed": 502,
+                "invalid_response": 502,
+            }
+            error_by_reason = {
+                "missing_credentials": "Enter your Stremio email and password",
+                "invalid_credentials": "Stremio rejected the credentials",
+                "unreachable": "Stremio API is unreachable",
+                "service_unavailable": "Stremio API is unavailable",
+                "request_failed": "Stremio request failed",
+                "invalid_response": "Stremio returned an unexpected response",
+            }
+            http_status = 200 if reason in {"missing_credentials", "invalid_credentials"} else status_by_reason.get(reason, 500)
+            return JSONResponse(
+                {"ok": False, "error": error_by_reason.get(reason, "Stremio connection failed"), "reason": reason, "instance": inst},
+                http_status,
+            )
+        except Exception as exc:
+            _safe_log(log_fn, "STREMIO", f"[STREMIO:{inst}] connect failed error_type={type(exc).__name__}")
+            return JSONResponse({"ok": False, "error": "Stremio connection failed", "instance": inst}, 500)
+
+    @app.get("/api/stremio/status", tags=["auth"])
+    def api_stremio_status(instance: str | None = Query(None), verify: int | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        block = ensure_instance_block(cfg, "stremio", inst)
+        out = _provider_auth().status_for_block("stremio", block)
+        if verify and out.get("connected"):
+            try:
+                out["connected"] = bool(StremioClient(cfg, instance_id=inst).validate())
+            except StremioAuthError as exc:
+                out["connected"] = False
+                out["authenticated"] = False
+                out["reason"] = str(getattr(exc, "reason", "auth_failed") or "auth_failed")
+            except Exception:
+                out["connected"] = False
+                out["authenticated"] = False
+                out["reason"] = "service_unavailable"
+        out["instance"] = inst
+        return out
+
+    @app.post("/api/stremio/disconnect", tags=["auth"])
+    def api_stremio_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        conflict = usage_conflict_response(cfg, "stremio", inst)
+        if conflict is not None:
+            return conflict
+
+        prov = _import_provider("providers.auth._auth_STREMIO")
+        if not prov:
+            return JSONResponse({"ok": False, "error": "Provider missing", "instance": inst}, 500)
+        prov.disconnect(cfg, instance_id=inst)
+        save_config(cfg)
+        _probe_bust("stremio")
+        _safe_log(log_fn, "STREMIO", f"[STREMIO:{inst}] disconnected")
+        return {"ok": True, "instance": inst}
+
     @app.get("/api/emby/inspect", tags=["media providers"])
     def emby_inspect(instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
@@ -1839,6 +1992,90 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
+    @app.post("/api/punchplay/device/start", tags=["auth"])
+    def api_punchplay_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().start_device_code("punchplay", cfg, instance_id=inst)
+            if isinstance(probe_cache, dict):
+                probe_cache["punchplay"] = (0.0, False)
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] device start instance={inst} ok={bool(res.get('ok'))}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR device start: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/punchplay/device/poll", tags=["auth"])
+    def api_punchplay_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code(
+                "punchplay",
+                cfg,
+                instance_id=inst,
+                device_code=str((payload or {}).get("device_code") or "").strip() or None,
+            )
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["punchplay"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR device poll: {e}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.post("/api/punchplay/device/cancel", tags=["auth"])
+    def api_punchplay_device_cancel(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_PUNCHPLAY as punchplay_auth
+
+            return punchplay_auth.cancel_device_code(load_config(), instance_id=inst)
+        except Exception as e:
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR device cancel: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/punchplay/refresh", tags=["auth"])
+    def api_punchplay_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("punchplay", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["punchplay"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR refresh: {e}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.get("/api/punchplay/status", tags=["auth"])
+    def api_punchplay_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        p = ensure_instance_block(cfg, "punchplay", inst)
+        out = _provider_auth().status_for_block("punchplay", p)
+        out["instance"] = inst
+        return out
+
+    @app.post("/api/punchplay/disconnect", tags=["auth"])
+    def api_punchplay_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "punchplay", inst)
+            if conflict is not None:
+                return conflict
+            from providers.auth import _auth_PUNCHPLAY as punchplay_auth
+
+            punchplay_auth.PROVIDER.disconnect(cfg, instance_id=inst)
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["punchplay"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR disconnect: {e}")
+            return {"ok": False, "error": "internal"}
+
     @app.post("/api/publicmetadb/save", tags=["auth"])
     def api_publicmetadb_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
         try:
@@ -2134,6 +2371,241 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] ERROR disconnect: {e}")
             return {"ok": False, "error": "disconnect_failed", "instance": inst}
 
+
+    # FLOPPY
+    @app.post("/api/floppy/save", tags=["auth"])
+    def api_floppy_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_FLOPPY as floppy_auth
+
+        inst = normalize_instance_id(instance)
+        raw = payload or {}
+        server_in = floppy_auth.normalize_server_url(raw.get("server_url") or raw.get("server") or "")
+        token_in = str(raw.get("api_token") or raw.get("token") or "").strip()
+        token_masked = token_in in ("••••••••", "********", "**********") or bool(token_in and set(token_in) <= {"*"})
+
+        cfg = load_config()
+        current = ensure_instance_block(cfg, "floppy", inst)
+        final_server = server_in or floppy_auth.normalize_server_url(current.get("server_url"))
+        final_token = str(current.get("api_token") or "").strip() if token_masked or not token_in else token_in
+        verify_ssl = coerce_bool(raw.get("verify_ssl", current.get("verify_ssl", False)), False)
+
+        if not final_server:
+            return {"ok": False, "error": "server_url_required", "instance": inst}
+        if not final_token:
+            return {"ok": False, "error": "api_token_required", "instance": inst}
+
+        ok, reason = floppy_auth.validate_credentials(
+            final_server,
+            final_token,
+            timeout=float(current.get("timeout", 12.0) or 12.0),
+            verify_ssl=verify_ssl,
+        )
+        if not ok:
+            _safe_log(log_fn, "FLOPPY", f"[FLOPPY] validation failed reason={reason} instance={inst}")
+            return {"ok": False, "error": reason, "instance": inst}
+
+        current["server_url"] = final_server
+        current["api_token"] = final_token
+        current["verify_ssl"] = verify_ssl
+        save_config(cfg)
+        _safe_log(log_fn, "FLOPPY", f"[FLOPPY] saved instance={inst}")
+        if isinstance(probe_cache, dict):
+            probe_cache["floppy"] = (0.0, False)
+        return {"ok": True, "server_url": final_server, "has_token": True, "verify_ssl": verify_ssl, "instance": inst}
+
+    @app.get("/api/floppy/status", tags=["auth"])
+    def api_floppy_status(instance: str | None = Query(None), verify: int | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_FLOPPY as floppy_auth
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        f = ensure_instance_block(cfg, "floppy", inst)
+        server = floppy_auth.normalize_server_url(f.get("server_url"))
+        token = str(f.get("api_token") or "").strip()
+        if not server or not token:
+            return {"connected": False, "instance": inst}
+        if not verify:
+            return {"connected": True, "server_url": server, "has_token": True, "verify_ssl": coerce_bool(f.get("verify_ssl", False), False), "instance": inst}
+        ok, reason = floppy_auth.validate_credentials(
+            server,
+            token,
+            timeout=float(f.get("timeout", 12.0) or 12.0),
+            verify_ssl=coerce_bool(f.get("verify_ssl", False), False),
+        )
+        return {"connected": bool(ok), "server_url": server, "has_token": True, "verify_ssl": coerce_bool(f.get("verify_ssl", False), False), "instance": inst, **({} if ok else {"reason": reason})}
+
+    @app.post("/api/floppy/disconnect", tags=["auth"])
+    def api_floppy_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            f = ensure_instance_block(cfg, "floppy", inst)
+            f["server_url"] = ""
+            f["api_token"] = ""
+            save_config(cfg)
+            _safe_log(log_fn, "FLOPPY", f"[FLOPPY] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["floppy"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "FLOPPY", f"[FLOPPY] ERROR disconnect: {e}")
+            return {"ok": False, "error": "disconnect_failed", "instance": inst}
+
+
+
+    # SCROB
+    @app.post("/api/scrob/save", tags=["auth"])
+    def api_scrob_save(
+        payload: dict[str, Any] = Body(...),
+        instance: str | None = Query(None),
+        validate_only: bool = Query(False),
+    ) -> dict[str, Any]:
+        from providers.auth import _auth_SCROB as scrob_auth
+
+        inst = normalize_instance_id(instance)
+        raw = payload or {}
+        validate_only = bool(validate_only or raw.get("validate_only") or raw.get("dry_run"))
+        server_in = scrob_auth.normalize_server_url(raw.get("server_url") or raw.get("server") or "")
+        key_in = str(raw.get("api_key") or raw.get("key") or "").strip()
+        user_in = str(raw.get("username") or "").strip()
+        pass_in = str(raw.get("password") or "")
+        totp_in = str(raw.get("totp_code") or "").strip()
+
+        def _masked(value: str) -> bool:
+            return value in ("\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", "********", "**********") or bool(value and set(value) <= {"*"})
+
+        cfg = load_config()
+        current = ensure_instance_block(cfg, "scrob", inst)
+        final_server = server_in or scrob_auth.normalize_server_url(current.get("server_url"))
+        final_key = str(current.get("api_key") or "").strip() if _masked(key_in) or not key_in else key_in
+        final_user = user_in or str(current.get("username") or "").strip()
+        final_pass = str(current.get("password") or "") if _masked(pass_in) or not pass_in else pass_in
+        verify_ssl = coerce_bool(raw.get("verify_ssl", current.get("verify_ssl", False)), False)
+
+        if not final_server:
+            return {"ok": False, "error": "server_url_required", "instance": inst}
+        if not final_key:
+            return {"ok": False, "error": "api_key_required", "instance": inst}
+        if not final_user:
+            return {"ok": False, "error": "username_required", "instance": inst}
+        if not final_pass:
+            return {"ok": False, "error": "password_required", "instance": inst}
+
+        ok, reason, detail = scrob_auth.validate_credentials(
+            final_server,
+            final_key,
+            final_user,
+            final_pass,
+            totp_code=totp_in,
+            timeout=float(current.get("timeout", 12.0) or 12.0),
+            verify_ssl=verify_ssl,
+        )
+        if not ok:
+            _safe_log(log_fn, "SCROB", f"[SCROB] validation failed reason={reason} instance={inst}")
+            return {"ok": False, "error": reason, "instance": inst, "requires_2fa": reason in ("totp_required", "invalid_totp_code")}
+
+        result = {
+            "ok": True,
+            "server_url": final_server,
+            "api_key": final_key,
+            "has_key": True,
+            "username": final_user,
+            "password": final_pass,
+            "has_password": True,
+            "verify_ssl": verify_ssl,
+            "instance": inst,
+            "api_prefix": str(detail.get("api_prefix") or ""),
+            "access_token": str(detail.get("access_token") or ""),
+            "expires_at": int(detail.get("expires_at") or 0),
+            "capabilities": dict(detail.get("capabilities") or {}),
+            "totp_enabled": bool(detail.get("totp_enabled")),
+            "reauth_required": False,
+        }
+        if validate_only:
+            _safe_log(log_fn, "SCROB", f"[SCROB] validated instance={inst} prefix={result['api_prefix'] or '/'}")
+            return result
+
+        current["server_url"] = final_server
+        current["api_key"] = final_key
+        current["username"] = final_user
+        current["password"] = final_pass
+        current["verify_ssl"] = verify_ssl
+        current["api_prefix"] = str(detail.get("api_prefix") or "")
+        current["access_token"] = str(detail.get("access_token") or "")
+        current["expires_at"] = int(detail.get("expires_at") or 0)
+        current["capabilities"] = dict(detail.get("capabilities") or {})
+        current["totp_enabled"] = bool(detail.get("totp_enabled"))
+        current["reauth_required"] = False
+        save_config(cfg)
+        _safe_log(log_fn, "SCROB", f"[SCROB] saved instance={inst} prefix={current['api_prefix'] or '/'}")
+        if isinstance(probe_cache, dict):
+            probe_cache["scrob"] = (0.0, False)
+        return {k: v for k, v in result.items() if k not in ("api_key", "password", "access_token")}
+
+    @app.get("/api/scrob/status", tags=["auth"])
+    def api_scrob_status(instance: str | None = Query(None), verify: int | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_SCROB as scrob_auth
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        s = ensure_instance_block(cfg, "scrob", inst)
+        server = scrob_auth.normalize_server_url(s.get("server_url"))
+        if not scrob_auth.is_configured(s):
+            return {"connected": False, "instance": inst}
+        base = {
+            "connected": True,
+            "server_url": server,
+            "has_key": True,
+            "username": str(s.get("username") or ""),
+            "verify_ssl": coerce_bool(s.get("verify_ssl", False), False),
+            "instance": inst,
+            "capabilities": dict(s.get("capabilities") or {}),
+            "totp_enabled": bool(s.get("totp_enabled")),
+            "reauth_required": bool(s.get("reauth_required")),
+        }
+        if not verify:
+            return base
+        ok, reason, detail = scrob_auth.validate_credentials(
+            server,
+            str(s.get("api_key") or ""),
+            str(s.get("username") or ""),
+            str(s.get("password") or ""),
+            timeout=float(s.get("timeout", 12.0) or 12.0),
+            verify_ssl=coerce_bool(s.get("verify_ssl", False), False),
+        )
+        if ok:
+            s["api_prefix"] = str(detail.get("api_prefix") or "")
+            s["access_token"] = str(detail.get("access_token") or "")
+            s["expires_at"] = int(detail.get("expires_at") or 0)
+            s["capabilities"] = dict(detail.get("capabilities") or {})
+            save_config(cfg)
+            base["capabilities"] = s["capabilities"]
+        return {**base, "connected": bool(ok), **({} if ok else {"reason": reason})}
+
+    @app.post("/api/scrob/disconnect", tags=["auth"])
+    def api_scrob_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            s = ensure_instance_block(cfg, "scrob", inst)
+            s["server_url"] = ""
+            s["api_key"] = ""
+            s["username"] = ""
+            s["password"] = ""
+            s["api_prefix"] = ""
+            s["access_token"] = ""
+            s["expires_at"] = 0
+            s["capabilities"] = {}
+            s["totp_enabled"] = False
+            s["reauth_required"] = False
+            save_config(cfg)
+            _safe_log(log_fn, "SCROB", f"[SCROB] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["scrob"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "SCROB", f"[SCROB] ERROR disconnect: {e}")
+            return {"ok": False, "error": "disconnect_failed", "instance": inst}
 
 
     # TRAKT

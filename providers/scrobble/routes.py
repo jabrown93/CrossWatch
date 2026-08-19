@@ -3,13 +3,14 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 from typing import Any
-from cw_platform.provider_instances import normalize_instance_id
+from cw_platform.provider_instances import get_provider_block, normalize_instance_id, normalize_user_profile_id
 
 
 
 DEFAULT_INSTANCE_ID = "default"
-ROUTE_PROVIDERS = {"plex", "emby", "jellyfin", "kodi"}
-ROUTE_SINKS = {"trakt", "simkl", "mdblist"}
+ROUTE_PROVIDERS = {"plex", "emby", "jellyfin", "kodi", "scrob"}
+ROUTE_SINKS = {"trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "scrob"}
+ROUTE_RATING_SINKS = {"trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "scrob"}
 ROUTE_OPTION_STATES = {"inherit", "on", "off"}
 ROUTE_RATINGS_MODES = {"off", "custom"}
 ROUTE_SCROBBLE_POLICY_RANGES = {
@@ -73,7 +74,7 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
     seen: set[str] = set()
     for item in targets_in:
         target = str(item or "").strip().lower()
-        if not target or target not in ROUTE_SINKS or target in seen:
+        if not target or target not in ROUTE_RATING_SINKS or target in seen:
             continue
         seen.add(target)
         targets.append(target)
@@ -146,8 +147,9 @@ def normalize_route(route: dict[str, Any], fallback_id: str) -> dict[str, Any]:
     if not isinstance(filters, dict):
         filters = {}
     options = normalize_route_options(r.get("options"))
+    profile_id = normalize_user_profile_id(r.get("profile_id") or r.get("profileId"))
 
-    return {
+    out = {
         "id": rid,
         "enabled": enabled,
         "provider": prov,
@@ -157,6 +159,9 @@ def normalize_route(route: dict[str, Any], fallback_id: str) -> dict[str, Any]:
         "filters": filters,
         "options": options,
     }
+    if profile_id:
+        out["profile_id"] = profile_id
+    return out
 
 
 def normalize_routes(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -172,6 +177,34 @@ def normalize_routes(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def route_profile_id(cfg: dict[str, Any], route: dict[str, Any]) -> str:
+    try:
+        from cw_platform.access_policy import route_effective_profile_id
+
+        return route_effective_profile_id(cfg, route)
+    except Exception:
+        return normalize_user_profile_id((route or {}).get("profile_id"))
+
+
+def route_assigned_profile_id(cfg: dict[str, Any], route: dict[str, Any]) -> str:
+    raw = (route or {}).get("profile_id") or (route or {}).get("profileId")
+    try:
+        from cw_platform.access_policy import valid_user_profile_id
+
+        return valid_user_profile_id(cfg, raw)
+    except Exception:
+        return normalize_user_profile_id(raw)
+
+
+def route_needs_account_filter(cfg: dict[str, Any], route: dict[str, Any]) -> bool:
+    if not route_assigned_profile_id(cfg, route):
+        return False
+    filters = (route or {}).get("filters")
+    raw = filters.get("username_whitelist") if isinstance(filters, dict) else None
+    values = raw if isinstance(raw, list) else ([raw] if raw else [])
+    return not any(str(value or "").strip() for value in values)
+
+
 def find_route(cfg: dict[str, Any], route_id: str | None) -> dict[str, Any] | None:
     rid = str(route_id or "").strip()
     if not rid:
@@ -183,6 +216,15 @@ def find_route(cfg: dict[str, Any], route_id: str | None) -> dict[str, Any] | No
 
 
 def _provider_view(cfg: dict[str, Any], provider: str, instance_id: str) -> dict[str, Any]:
+    try:
+        merged = get_provider_block(cfg, provider, instance_id)
+        if merged:
+            base = cfg.get(provider) if isinstance(cfg.get(provider), dict) else {}
+            if isinstance(base, dict) and "instances" in base:
+                merged["instances"] = base.get("instances")
+            return merged
+    except Exception:
+        pass
     base = cfg.get(provider) if isinstance(cfg.get(provider), dict) else {}
     inst = {}
     if isinstance(base, dict):
@@ -208,11 +250,13 @@ def build_route_cfg(cfg: dict[str, Any], route: dict[str, Any]) -> dict[str, Any
     rating_targets = ratings.get("targets") if isinstance(ratings, dict) else []
     for target in rating_targets if isinstance(rating_targets, list) else []:
         target_key = str(target or "").strip().lower()
-        if target_key in ROUTE_SINKS:
+        if target_key in ROUTE_RATING_SINKS:
             out[target_key] = _provider_view(out, target_key, r["sink_instance"])
 
     w["filters"] = _deep_clone(r.get("filters") or {})
     w["route_id"] = r["id"]
+    w["route_profile_id"] = route_assigned_profile_id(out, r)
+    w["route_effective_profile_id"] = route_profile_id(out, r)
     w["route_provider"] = r["provider"]
     w["route_provider_instance"] = r["provider_instance"]
     w["route_sink"] = r["sink"]

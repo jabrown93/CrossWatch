@@ -14,12 +14,15 @@
   let dirtyVersion = 1;
   let lastLoadedAt = 0;
   let lastSettings = null;
+  let currentConfig = null;
   let scrobbleStopRefreshTimer = null;
   const PAGE_STEP = 9;
   const RATING_PAGE_STEP = 9;
   const MEDIA_PAGE_STEP = 4;
   const GRID_PAGE_STEP = 6;
   const MAX_WIDGET_ITEMS = 24;
+  const UNITS = 2;
+  const WIDE_UNITS = 3;
   const WIDGET_REFRESH_TTL_MS = 60 * 1000;
   const WIDGET_FETCH_RETRY_DELAYS = [350, 900, 1800];
   const IMAGE_PREWARM_MAX = 12;
@@ -34,9 +37,10 @@
     watchlist: { title: "No watchlist items yet", copy: "Synced watchlist titles will appear here." },
     error: { title: "Could not load this widget", copy: "Try refreshing again in a moment." },
   };
-  const LAYOUT_KEY = "cw.dashboardWidgets.layout.v3";
+  const ON_PROFILE_PAGE = !!document.getElementById("profile-hero");
+  const LAYOUT_KEY = ON_PROFILE_PAGE ? "cw.profileWidgets.layout.v3" : "cw.dashboardWidgets.layout.v3";
   const SETTINGS_KEY = "cw.dashboardWidgets.settings.v1";
-  const WIDGETS = [
+  const ALL_WIDGETS = [
     { key: "watchlist", id: "placeholder-card", label: "Watchlist" },
     { key: "history", id: "recent-history-widget", label: "Recent History" },
     { key: "ratings", id: "latest-ratings-widget", label: "Latest Ratings" },
@@ -44,14 +48,15 @@
     { key: "progress", id: "recent-progress-widget", label: "Recent Progress" },
     { key: "playlists", id: "recent-playlists-widget", label: "Recent Playlists" },
   ];
+  const WIDGETS = ON_PROFILE_PAGE ? ALL_WIDGETS.filter((widget) => widget.key !== "watchlist") : ALL_WIDGETS;
   const WIDGET_KEYS = WIDGETS.map((widget) => widget.key);
   const DEFAULT_LAYOUT = {
-    watchlist: { order: 0, size: "large", view: "icon", horizontalView: "media", hidden: false },
-    history: { order: 1, size: "small", view: "grid", horizontalView: "media", hidden: false },
-    ratings: { order: 2, size: "small", view: "icon", horizontalView: "media", hidden: false },
-    scrobble: { order: 3, size: "small", view: "grid", horizontalView: "media", hidden: false },
-    playlists: { order: 4, size: "small", view: "grid", horizontalView: "poster", hidden: false },
-    progress: { order: 5, size: "small", view: "grid", horizontalView: "media", hidden: false },
+    watchlist: { order: 0, size: "large", span: 1, view: "icon", horizontalView: "media", hidden: false },
+    history: { order: 1, size: "small", span: 1, view: "grid", horizontalView: "media", hidden: false },
+    ratings: { order: 2, size: "small", span: 1, view: "grid", horizontalView: "media", hidden: false },
+    scrobble: { order: 3, size: "small", span: 1, view: "grid", horizontalView: "media", hidden: false },
+    playlists: { order: 4, size: "small", span: 1, view: "grid", horizontalView: "poster", hidden: false },
+    progress: { order: 5, size: "small", span: 1, view: "grid", horizontalView: "media", hidden: false },
   };
   let widgetLayout = readLayout();
   let customizeOpen = false;
@@ -59,6 +64,7 @@
   let dragScrollFrame = 0;
   let dragScrollDelta = 0;
   let masonryFrame = 0;
+  let masonryObserver = null;
   let detailCard = null;
   let detailItem = null;
   let detailMeta = null;
@@ -77,6 +83,7 @@
       out[widget.key] = {
         order: Number.isFinite(+row.order) ? +row.order : base.order,
         size: allowedSizes.includes(row.size) ? row.size : base.size,
+        span: +row.span === 2 ? 2 : 1,
         view: ["grid", "icon"].includes(row.view) ? row.view : base.view,
         horizontalView: ["media", "poster"].includes(row.horizontalView) ? row.horizontalView : base.horizontalView,
         hidden: row.hidden === true,
@@ -148,7 +155,7 @@
   }
 
   function widgetNode(key) {
-    const id = WIDGETS.find((widget) => widget.key === key)?.id;
+    const id = ALL_WIDGETS.find((widget) => widget.key === key)?.id;
     return id ? document.getElementById(id) : null;
   }
 
@@ -180,6 +187,11 @@
     return size === "large" ? "large" : "small";
   }
 
+  function effectiveSpan(key) {
+    if (effectiveSize(key) === "large") return 1;
+    return widgetLayout[key]?.span === 2 ? 2 : 1;
+  }
+
   function widgetView(key) {
     if (effectiveSize(key) === "large") {
       if (key === "playlists") return "icon";
@@ -192,7 +204,8 @@
 
   function widgetPageStep(key) {
     if (effectiveSize(key) === "large") return widgetView(key) === "media" ? MEDIA_PAGE_STEP : (key === "ratings" ? RATING_PAGE_STEP : PAGE_STEP);
-    return widgetView(key) === "grid" ? GRID_PAGE_STEP : (key === "ratings" ? RATING_PAGE_STEP : PAGE_STEP);
+    const step = widgetView(key) === "grid" ? GRID_PAGE_STEP : (key === "ratings" ? RATING_PAGE_STEP : PAGE_STEP);
+    return effectiveSpan(key) === 2 ? step * 2 : step;
   }
 
   function resetVisibleCount(key) {
@@ -223,14 +236,61 @@
     scheduleMasonry();
   }
 
+  function inlineWidgetSpans() {
+    const spans = [];
+    for (const widget of WIDGETS) {
+      const node = widgetNode(widget.key);
+      if (!node || node.classList.contains("hidden")) continue;
+      if (node.dataset.widgetSize === "large") continue;
+      spans.push(node.dataset.widgetSpan === "2" ? WIDE_UNITS : UNITS);
+    }
+    return spans;
+  }
+
+  function widgetColumnCount(maxColumns) {
+    const spans = inlineWidgetSpans();
+    if (!spans.length) return 1;
+    const total = spans.reduce((sum, span) => sum + span, 0);
+    const widest = Math.max(...spans);
+    const tracks = maxColumns * UNITS;
+    if (spans.length === 1) return Math.max(widest, tracks);
+    return Math.max(1, Math.min(total, Math.max(tracks, widest * 2)));
+  }
+
+  function assignWidgetColumns(cols, singleColumn) {
+    let used = 0;
+    for (const widget of orderedWidgets(true)) {
+      const node = widgetNode(widget.key);
+      if (!node) continue;
+      if (singleColumn || node.classList.contains("hidden")) {
+        node.style.gridColumn = "";
+        continue;
+      }
+      if (node.dataset.widgetSize === "large") {
+        node.style.gridColumn = "";
+        used = 0;
+        continue;
+      }
+      const span = Math.min(node.dataset.widgetSpan === "2" ? WIDE_UNITS : UNITS, cols);
+      if (used + span > cols) used = 0;
+      node.style.gridColumn = `${used + 1} / span ${span}`;
+      used = (used + span) % cols;
+    }
+  }
+
   function updateMasonry() {
     masonryFrame = 0;
     const card = $("#dashboard-widgets-card");
     if (!card || card.classList.contains("hidden")) return;
-    const styles = getComputedStyle(card);
-    const row = Number.parseFloat(styles.getPropertyValue("--cw-widget-masonry-row")) || 8;
-    const gap = Number.parseFloat(styles.rowGap || styles.gap) || 14;
     const singleColumn = window.matchMedia?.("(max-width: 1180px)")?.matches;
+    const maxColumns = singleColumn ? 1 : window.matchMedia?.("(max-width: 1280px)")?.matches ? 2 : 3;
+    const cols = widgetColumnCount(maxColumns);
+    card.style.setProperty("--cw-widget-cols", String(cols));
+    assignWidgetColumns(cols, singleColumn);
+    const styles = getComputedStyle(card);
+    const row = Number.parseFloat(styles.getPropertyValue("--cw-widget-masonry-row")) || 1;
+    const rowGap = Number.parseFloat(styles.rowGap) || 0;
+    const gutter = Number.parseFloat(styles.columnGap) || 14;
     for (const widget of WIDGETS) {
       const node = widgetNode(widget.key);
       if (!node) continue;
@@ -240,8 +300,15 @@
       }
       node.style.gridRowEnd = "span 1";
       const height = node.getBoundingClientRect().height;
-      node.style.gridRowEnd = `span ${Math.max(1, Math.ceil((height + gap) / (row + gap)))}`;
+      node.style.gridRowEnd = `span ${Math.max(1, Math.ceil((height + gutter) / (row + rowGap)))}`;
     }
+  }
+
+  function observeWidgetHeight(node) {
+    if (!node || node.__cwMasonryObserved || typeof ResizeObserver !== "function") return;
+    masonryObserver = masonryObserver || new ResizeObserver(() => scheduleMasonry());
+    masonryObserver.observe(node);
+    node.__cwMasonryObserved = true;
   }
 
   function scheduleMasonry() {
@@ -326,12 +393,29 @@
     throw lastError || new Error("dashboard_widgets_failed");
   }
 
+  function overviewProfileId() {
+    return String(window.CW?.OverviewProfile?.id || "").trim();
+  }
+
   async function getConfig(force = false) {
     if (cfgPromise) return cfgPromise;
     cfgPromise = (async () => {
       try {
         if (window.CW?.API?.Config?.load) return window.CW.API.Config.load(!!force);
-        return await fetchJSON("/api/config");
+        try {
+          if (document.documentElement?.dataset?.cwRole === "user") {
+            const meta = await fetchJSON("/api/config/meta");
+            const ui = meta && typeof meta.ui === "object" ? meta.ui : {};
+            return { ok: true, __public_meta: true, ui, user_interface: ui, tmdb_configured: meta?.tmdb_configured === true, tmdb: meta?.tmdb_configured === true ? { api_key: "configured" } : {} };
+          }
+          return await fetchJSON("/api/config");
+        } catch (e) {
+          const msg = String(e?.message || e || "");
+          if (!msg.includes("401") && !msg.includes("403")) throw e;
+          const meta = await fetchJSON("/api/config/meta");
+          const ui = meta && typeof meta.ui === "object" ? meta.ui : {};
+          return { ok: true, __public_meta: true, ui, user_interface: ui, tmdb_configured: meta?.tmdb_configured === true, tmdb: meta?.tmdb_configured === true ? { api_key: "configured" } : {} };
+        }
       } finally {
         window.setTimeout(() => { cfgPromise = null; }, 1500);
       }
@@ -340,6 +424,7 @@
   }
 
   function isOnMain() {
+    if (ON_PROFILE_PAGE) return true;
     const tab = String(document.documentElement.dataset.tab || "").toLowerCase();
     if (tab) return tab === "main";
     return !!document.getElementById("tab-main")?.classList.contains("active");
@@ -357,6 +442,7 @@
   }
 
   function hasTmdbKeyInConfig(cfg) {
+    if (cfg?.tmdb_configured === true) return true;
     const pickFromBlock = (block) => {
       if (!block || typeof block !== "object") return "";
       const direct = String(block.api_key || "").trim();
@@ -372,18 +458,57 @@
     return !!pickFromBlock(cfg?.tmdb);
   }
 
+  function configProviderBlock(provider) {
+    const key = String(provider || "").trim().toLowerCase();
+    if (!key || !currentConfig || typeof currentConfig !== "object") return null;
+    const keys = key === "crosswatch" ? ["crosswatch", "cw"] : key === "tmdb" ? ["tmdb_sync", "tmdb"] : [key];
+    for (const item of keys) {
+      const block = currentConfig[item];
+      if (block && typeof block === "object") return block;
+    }
+    return null;
+  }
+
+  function configuredInstanceLabel(provider, instance) {
+    const inst = String(instance || "default").trim() || "default";
+    const block = configProviderBlock(provider);
+    const node = inst.toLowerCase() === "default"
+      ? block
+      : (block?.instances && typeof block.instances === "object" ? block.instances[inst] : null);
+    const friendly = String(node?.label || "").trim();
+    if (friendly) return friendly;
+    return inst.toLowerCase() === "default" ? "Default" : inst;
+  }
+
   function hideDashboardWidgets() {
     $("#dashboard-widgets-card")?.classList.add("hidden");
   }
 
+  const LAYOUT_TOOLS = [
+    ["customize", "tune", "Customize widgets"],
+    ["show-all", "visibility", "Show all widgets"],
+    ["reset", "restart_alt", "Reset widget layout"],
+  ];
+
   function updateLayoutToolbar() {
     const card = $("#dashboard-widgets-card");
-    card?.classList.toggle("is-customizing", customizeOpen);
+    if (!card) return;
+    card.classList.toggle("is-customizing", customizeOpen);
+    let bar = card.querySelector(".cw-dashboard-layout-toolbar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "cw-dashboard-layout-toolbar";
+      bar.innerHTML = `<div class="cw-dashboard-layout-tools">${LAYOUT_TOOLS.map(([action, icon, label]) => `
+        <button type="button" class="cw-dashboard-layout-btn" data-cw-dashboard-layout="${action}" title="${label}" aria-label="${label}"><span class="material-symbols-rounded" aria-hidden="true">${icon}</span></button>`).join("")}</div>`;
+      card.prepend(bar);
+    }
+    let hidden = 0;
+    try { hidden = hiddenWidgetCount(); } catch { hidden = 0; }
+    bar.classList.toggle("has-hidden", hidden > 0);
+    bar.querySelector('[data-cw-dashboard-layout="show-all"]')?.toggleAttribute("disabled", hidden === 0);
   }
 
   function ensureLayoutToolbar() {
-    const card = $("#dashboard-widgets-card");
-    card?.querySelector(".cw-dashboard-layout-toolbar")?.remove();
     updateLayoutToolbar();
   }
 
@@ -408,6 +533,9 @@
       </button>
       <button type="button" class="cw-dash-layout-control cw-dash-widget-view-toggle" data-cw-widget-action="view" data-cw-widget-key="${esc(key)}" title="Toggle ${esc(label)} view" aria-label="Toggle ${esc(label)} view">
         <span class="material-symbols-rounded" aria-hidden="true">grid_view</span>
+      </button>
+      <button type="button" class="cw-dash-layout-control cw-dash-widget-span-toggle" data-cw-widget-action="span" data-cw-widget-key="${esc(key)}" title="Enlarge ${esc(label)}" aria-label="Enlarge ${esc(label)}">
+        <span class="material-symbols-rounded" aria-hidden="true">open_in_full</span>
       </button>
       <button type="button" class="cw-dash-layout-control" data-cw-widget-action="hide" data-cw-widget-key="${esc(key)}" title="Hide ${esc(label)}" aria-label="Hide ${esc(label)}">
         <span class="material-symbols-rounded" aria-hidden="true">visibility_off</span>
@@ -532,6 +660,7 @@
       const node = widgetNode(widget.key);
       if (!node) continue;
       node.dataset.widgetKey = widget.key;
+      observeWidgetHeight(node);
       if (!node.querySelector(".cw-dash-layout-controls")) {
         node.appendChild(createWidgetControls(widget.key, widget.label));
       }
@@ -568,7 +697,16 @@
       const viewIcon = viewBtn?.querySelector(".material-symbols-rounded");
       const hideBtn = node?.querySelector("[data-cw-widget-action='hide']");
       const hideIcon = hideBtn?.querySelector(".material-symbols-rounded");
+      const spanBtn = node?.querySelector("[data-cw-widget-action='span']");
+      const spanIcon = spanBtn?.querySelector(".material-symbols-rounded");
       const size = effectiveSize(widget.key);
+      if (spanBtn && spanIcon) {
+        spanBtn.hidden = size === "large";
+        const wide = effectiveSpan(widget.key) === 2;
+        spanIcon.textContent = wide ? "close_fullscreen" : "open_in_full";
+        spanBtn.title = `${wide ? "Shrink" : "Enlarge"} ${widget.label}`;
+        spanBtn.setAttribute("aria-label", spanBtn.title);
+      }
       if (sizeBtn) {
         sizeBtn.textContent = size === "large" ? "view_compact" : "view_agenda";
         const sizeButton = sizeBtn.closest("button");
@@ -626,17 +764,19 @@
     for (const src of Array.isArray(sources) ? sources : []) {
       const provider = String(src?.provider || "").trim().toUpperCase();
       const instance = String(src?.instance || "default").trim() || "default";
+      const instanceLabel = String(src?.instance_label || src?.profile_label || src?.label || "").trim();
       const key = `${provider}:${instance}`;
       if (!provider || seen.has(key)) continue;
       seen.add(key);
-      rows.push({ provider, instance });
+      rows.push({ provider, instance, instanceLabel });
       if (rows.length >= max) break;
     }
     return rows;
   }
 
-  function sourceLabel({ provider, instance }) {
-    return instance.toLowerCase() === "default" ? providerLabel(provider) : `${providerLabel(provider)} (${instance})`;
+  function sourceLabel({ provider, instance, instanceLabel }) {
+    const label = String(instanceLabel || configuredInstanceLabel(provider, instance)).trim();
+    return instance.toLowerCase() === "default" && label === "Default" ? providerLabel(provider) : `${providerLabel(provider)} (${label})`;
   }
 
   function sourceRouteTitle(sources) {
@@ -647,9 +787,9 @@
   }
 
   function sourceIcons(sources, max = 4) {
-    return sourceRows(sources, max).map(({ provider, instance }) => {
+    return sourceRows(sources, max).map(({ provider, instance, instanceLabel }) => {
       const logo = providerLogo(provider);
-      const label = sourceLabel({ provider, instance });
+      const label = sourceLabel({ provider, instance, instanceLabel });
       return logo
         ? `<span class="cw-dash-source"><img src="${esc(logo)}" alt="${esc(label)} logo"></span>`
         : `<span class="cw-dash-source cw-dash-source--text" aria-label="${esc(label)}">${esc(providerShort(provider).slice(0, 3))}</span>`;
@@ -661,9 +801,9 @@
   }
 
   function ratingSourceIcons(sources, max = 3) {
-    return sourceRows(sources, max).map(({ provider, instance }) => {
+    return sourceRows(sources, max).map(({ provider, instance, instanceLabel }) => {
       const logo = providerLogo(provider);
-      const label = sourceLabel({ provider, instance });
+      const label = sourceLabel({ provider, instance, instanceLabel });
       return logo
         ? `<span class="cw-rating-provider-icon" title="${esc(label)}" aria-label="${esc(label)}"><img src="${esc(logo)}" alt=""></span>`
         : `<span class="cw-rating-provider-icon cw-rating-provider-icon--text" title="${esc(label)}" aria-label="${esc(label)}">${esc(providerShort(provider).slice(0, 3))}</span>`;
@@ -681,7 +821,7 @@
     const provider = String(source?.provider || "").trim().toUpperCase();
     if (!provider) return "";
     const instance = String(source?.instance || "default").trim() || "default";
-    const profile = scrobbleProfileLabel(instance);
+    const profile = String(source?.instanceLabel || source?.instance_label || source?.profile_label || "").trim() || scrobbleProfileLabel(instance);
     const providerName = providerLabel(provider);
     const logo = providerMeta().logLogoPath?.(provider) || providerLogo(provider);
     const providerIcon = logo
@@ -704,10 +844,11 @@
     const add = (row) => {
       const provider = String(row?.provider || "").trim().toUpperCase();
       const instance = String(row?.instance || "default").trim() || "default";
+      const instanceLabel = String(row?.instanceLabel || row?.instance_label || row?.profile_label || row?.label || "").trim();
       const key = `${provider}:${instance}`;
       if (!provider || seen.has(key)) return;
       seen.add(key);
-      rows.push({ provider, instance });
+      rows.push({ provider, instance, instanceLabel });
     };
     add(scrobbleSourceRow(item));
     sourceRows(item?.targets, 8)
@@ -888,8 +1029,8 @@
   }
 
   function detailSources(item) {
-    return sourceRows(item?.sources, 6).map(({ provider, instance }) => ({
-      label: sourceLabel({ provider, instance }),
+    return sourceRows(item?.sources, 6).map(({ provider, instance, instanceLabel }) => ({
+      label: sourceLabel({ provider, instance, instanceLabel }),
       short: providerShort(provider),
       logo: providerLogo(provider),
     }));
@@ -969,6 +1110,15 @@
     const meta = await getDetailMeta(item);
     if (!detailCard?.isVisible?.() || detailKey !== key) return true;
     renderDetailCard(item, meta || null, false);
+    return true;
+  }
+
+  function openProfileWidgetPreview(kind, index) {
+    if (!ON_PROFILE_PAGE || !["history", "ratings", "scrobble", "progress"].includes(kind)) return false;
+    const item = latestItems[kind]?.[Number(index)];
+    const open = window.CW?.WatchlistPreview?.openPreviewDrawer || window.openPreviewDrawer;
+    if (!item || !open) return false;
+    void open(item);
     return true;
   }
 
@@ -1333,7 +1483,7 @@
     renderPagedList(
       def.host,
       latestItems[kind] || [],
-      visibleCounts[kind] || widgetPageStep(kind),
+      Math.max(visibleCounts[kind] || 0, widgetPageStep(kind)),
       cardFn,
       "",
       kind,
@@ -1362,6 +1512,7 @@
       node.classList.toggle("cw-dash-widget--compact", size === "small");
       node.classList.toggle("is-layout-hidden", !!layout.hidden);
       node.dataset.widgetSize = size;
+      node.dataset.widgetSpan = String(effectiveSpan(widget.key));
       node.dataset.widgetView = widgetView(widget.key);
       if (widget.key === "watchlist") window.CW?.WatchlistPreview?.applyWidgetView?.(node.dataset.widgetView);
       node.style.order = String(layout.order);
@@ -1390,6 +1541,7 @@
     if (forceConfig) cfgPromise = null;
     const seq = ++loadSeq;
     const refreshVersion = dirtyVersion;
+    try { await window.CW?.OverviewProfile?.ready; } catch {}
     let cfg;
     try {
       cfg = await getConfig(forceConfig);
@@ -1406,6 +1558,7 @@
       return;
     }
     const settings = widgetSettings(cfg?.ui || cfg?.user_interface || {});
+    currentConfig = cfg;
     lastSettings = settings;
     if (seq !== loadSeq || !isOnMain()) return;
     if (!preserve || !hasLoaded) {
@@ -1451,6 +1604,8 @@
         progress_limit: String(MAX_WIDGET_ITEMS),
         playlists_limit: String(MAX_WIDGET_ITEMS),
       });
+      const userProfile = overviewProfileId();
+      if (userProfile) params.set("user_profile", userProfile);
       const data = await fetchWidgetPayload(`/api/dashboard/widgets?${params.toString()}`);
       if (seq !== loadSeq || !isOnMain()) return;
 
@@ -1511,6 +1666,7 @@
     ensureLayoutToolbar();
     ensureWidgetControls();
     revealFromCache();
+    window.dispatchEvent(new CustomEvent("cw:dashboard-widgets-layout-changed"));
     $("#recent-history-refresh")?.addEventListener("click", (e) => refreshFromButton(e.currentTarget));
     $("#latest-ratings-refresh")?.addEventListener("click", (e) => refreshFromButton(e.currentTarget));
     $("#recent-scrobble-refresh")?.addEventListener("click", (e) => refreshFromButton(e.currentTarget));
@@ -1529,6 +1685,7 @@
           saveLayout(Object.fromEntries(WIDGET_KEYS.map((key) => [key, { ...widgetLayout[key], hidden: false }])));
           markWidgetsDirty(0);
         } else if (action === "reset") {
+          customizeOpen = false;
           resetLayout();
           markWidgetsDirty(0);
         }
@@ -1546,6 +1703,11 @@
         } else if (action === "size") {
           const current = effectiveSize(key);
           patchLayout(key, { size: current === "large" ? "small" : "large" });
+          resetVisibleCount(key);
+          if (key !== "watchlist") renderWidget(key);
+        } else if (action === "span") {
+          if (effectiveSize(key) === "large") return;
+          patchLayout(key, { span: effectiveSpan(key) === 2 ? 1 : 2 });
           resetVisibleCount(key);
           if (key !== "watchlist") renderWidget(key);
         } else if (action === "view") {
@@ -1592,6 +1754,7 @@
         const index = Number(itemLink.getAttribute("data-cw-widget-index") || -1);
         if (["history", "ratings", "scrobble", "progress"].includes(kind) && Number.isInteger(index) && index >= 0) {
           event.preventDefault();
+          if (openProfileWidgetPreview(kind, index)) return;
           void openDetailCard(kind, index);
           return;
         }
@@ -1612,6 +1775,8 @@
       } else hideDashboardWidgets();
     });
     window.addEventListener("settings-changed", () => markWidgetsDirty(300, { forceConfig: true }));
+    window.addEventListener("cw-user-profiles-changed", () => markWidgetsDirty(150, { forceConfig: true, preserve: hasLoaded }));
+    window.addEventListener("cw:overview-profile-changed", () => markWidgetsDirty(0, { preserve: hasLoaded }));
     window.addEventListener("activity-log-cleared", () => markWidgetsDirty(100));
     window.addEventListener("sync-complete", () => markWidgetsDirty(250));
     window.addEventListener("cw:scrobble-stopped", scheduleScrobbleStopRefresh);

@@ -56,7 +56,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.4"
+__VERSION__ = "1.5"
 __all__ = ["get_manifest", "TRAKTModule", "OPS"]
 
 os.environ.setdefault("CW_TRAKT_UA", f"CrossWatch TRAKT/{__VERSION__}")
@@ -137,10 +137,22 @@ def get_manifest() -> Mapping[str, Any]:
                 "unrate": True,
                 "from_date": True,
             },
+            "history": {
+                "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+                "upsert": True,
+                "remove": True,
+                "from_date": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": False},
+            },
             "progress": {
                 "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
                 "upsert": True,
                 "remove": True,
+                "completion_policy": {
+                    "progress_write": {"mode": "none"},
+                    "stop_scrobble": {"marks_watched_percent": 80, "comparison": "above"},
+                },
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         },
@@ -695,10 +707,22 @@ class _TraktOPS:
                 "unrate": True,
                 "from_date": True,
             },
+            "history": {
+                "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+                "upsert": True,
+                "remove": True,
+                "from_date": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": False},
+            },
             "progress": {
                 "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
                 "upsert": True,
                 "remove": True,
+                "completion_policy": {
+                    "progress_write": {"mode": "none"},
+                    "stop_scrobble": {"marks_watched_percent": 80, "comparison": "above"},
+                },
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         }

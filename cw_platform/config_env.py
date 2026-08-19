@@ -17,10 +17,9 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "CW_OIDC_ISSUER": ("app_auth", "oidc", "issuer"),
     "CW_OIDC_CLIENT_ID": ("app_auth", "oidc", "client_id"),
     "CW_OIDC_CLIENT_SECRET": ("app_auth", "oidc", "client_secret"),
-    "CW_OIDC_PUBLIC_BASE_URL": ("app_auth", "oidc", "public_base_url"),
+    "CW_OIDC_SCOPES": ("app_auth", "oidc", "scopes"),
     "CW_OIDC_GROUPS_CLAIM": ("app_auth", "oidc", "groups_claim"),
     "CW_OIDC_ALLOWED_GROUPS": ("app_auth", "oidc", "allowed_groups"),
-    "CW_OIDC_SESSION_HOURS": ("app_auth", "oidc", "session_hours"),
     "CW_API_KEY": ("security", "api_key"),
 }
 

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 
 from services import activity, dashboard_widgets
+
+
+def _loads_body(body: bytes | memoryview[int]) -> Any:
+    return json.loads(bytes(body))
 
 
 FLATTENED_PROVIDERS = (
@@ -20,11 +27,12 @@ FLATTENED_PROVIDERS = (
 
 class FakeMetadataManager:
     def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[dict[str, Any]] = []
 
     def resolve(self, **kwargs):
         self.calls.append(dict(kwargs))
-        ids = kwargs.get("ids") if isinstance(kwargs.get("ids"), dict) else {}
+        raw_ids = kwargs.get("ids")
+        ids: dict[str, Any] = raw_ids if isinstance(raw_ids, dict) else {}
         if ids.get("title") == "Behind the Attraction":
             return {"ids": {"tmdb": 100, "trakt": ids.get("trakt")}, "title": "Behind the Attraction"}
         if ids.get("title") == "Heat":
@@ -557,6 +565,54 @@ def test_latest_ratings_widget_merges_provider_local_movie_ids_and_inherits_art(
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"SIMKL", "TRAKT"}
 
 
+def test_latest_ratings_widget_keeps_original_provider_time_over_same_rating_sync_echo() -> None:
+    state = {
+        "providers": {
+            "SCROB": {
+                "ratings": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:1151272": {
+                                "type": "movie",
+                                "title": "Sirat",
+                                "year": 2025,
+                                "ids": {"tmdb": 1151272},
+                                "rating": 6,
+                                "rated_at": "2026-08-17T00:13:57.000Z",
+                            }
+                        }
+                    }
+                }
+            },
+            "TRAKT": {
+                "ratings": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:1151272": {
+                                "type": "movie",
+                                "title": "Sirat",
+                                "year": 2025,
+                                "ids": {"tmdb": 1151272},
+                                "rating": 6,
+                                "rated_at": "2026-04-03T21:03:13.000Z",
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    payload = dashboard_widgets.latest_ratings_widget(state, limit=5)
+
+    assert payload["total"] == 1
+    item = payload["items"][0]
+    assert item["rating"] == 6
+    assert item["rated_at"] == "2026-04-03T21:03:13.000Z"
+    assert item["sort_epoch"] == 1775250193
+    assert {source["provider"] for source in item["sources"]} == {"SCROB", "TRAKT"}
+
+
 def test_latest_ratings_widget_keeps_tracker_rated_at_over_destination_sync_time() -> None:
     tracker_items = {
         "movie|imdb:tt0113277": {
@@ -883,6 +939,74 @@ def test_recent_scrobble_widget_uses_nested_history_sync_item_art(tmp_path, monk
         {"provider": "TRAKT", "instance": "default"},
         {"provider": "CROSSWATCH", "instance": "default"},
     ]
+    assert payload["scrobble_total"] == 0
+    assert payload["scrobble_hours"] == 0.0
+
+
+def test_recent_scrobble_widget_reports_scrobble_total_separately(monkeypatch) -> None:
+    def fake_list_events(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("kind") == "scrobble":
+            return {"ok": True, "total": 5, "items": []}
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "id": "history-1",
+                    "kind": "history_sync",
+                    "status": "ok",
+                    "source": "trakt",
+                    "target": "crosswatch",
+                    "media_type": "movie",
+                    "title": "Imported Movie",
+                    "watched_at": 1767225600,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(dashboard_widgets, "list_events", fake_list_events)
+
+    payload = dashboard_widgets.recent_scrobble_widget(limit=3)
+
+    assert payload["total"] == 1
+    assert payload["scrobble_total"] == 5
+    assert payload["scrobble_hours"] == 0.0
+
+
+def test_recent_scrobble_widget_reports_scrobble_hours(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {
+            "ok": True,
+            "total": 2,
+            "items": [
+                {
+                    "id": "movie-1",
+                    "kind": "scrobble",
+                    "status": "ok",
+                    "source": "plex",
+                    "media_type": "movie",
+                    "title": "Short Movie",
+                    "duration_minutes": 100,
+                    "watched_at": 1767225600,
+                },
+                {
+                    "id": "episode-1",
+                    "kind": "scrobble",
+                    "status": "ok",
+                    "source": "plex",
+                    "media_type": "episode",
+                    "title": "Pilot",
+                    "watched_at": 1767312000,
+                },
+            ],
+        },
+    )
+
+    payload = dashboard_widgets.recent_scrobble_widget(limit=3)
+
+    assert payload["scrobble_total"] == 2
+    assert payload["scrobble_hours"] == 2.4
 
 
 def test_recent_progress_widget_uses_sync_state_not_live_provider_endpoints() -> None:
@@ -947,6 +1071,57 @@ def test_recent_playlists_widget_uses_playlist_activity(monkeypatch) -> None:
     }
 
 
+def _many_movie_items(feature: str, count: int) -> dict:
+    time_key = "rated_at" if feature == "ratings" else "watched_at"
+    return {
+        "providers": {
+            "PLEX": {
+                feature: {
+                    "baseline": {
+                        "items": {
+                            f"tmdb:{n}@17672292{n:02d}": {
+                                "type": "movie",
+                                "title": f"Movie {n}",
+                                "year": 2000 + n,
+                                "ids": {"tmdb": n},
+                                "rating": 8,
+                                time_key: f"2026-01-01T00:00:{n:02d}Z",
+                            }
+                            for n in range(1, count + 1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("feature", "widget", "per_row"),
+    [("history", "recent_history_widget", 2), ("ratings", "latest_ratings_widget", 3), ("progress", "recent_progress_widget", 2)],
+)
+def test_widgets_resolve_art_namespace_only_for_returned_rows(monkeypatch, feature, widget, per_row) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {"ok": True, "total": 0, "items": []},
+    )
+    calls: list[object] = []
+    real = dashboard_widgets._resolved_art_type
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "_resolved_art_type",
+        lambda item, tmdb: (calls.append(tmdb), real(item, tmdb))[1],
+    )
+
+    payload = getattr(dashboard_widgets, widget)(_many_movie_items(feature, 60), limit=5)
+
+    assert payload["total"] == 60
+    assert len(payload["items"]) == 5
+    assert len(calls) <= 5 * per_row
+    assert len(set(calls)) == 5
+
+
 def test_dashboard_widgets_payload_only_builds_included_widgets(monkeypatch) -> None:
     calls: list[str] = []
 
@@ -985,3 +1160,151 @@ def test_dashboard_widgets_payload_only_builds_included_widgets(monkeypatch) -> 
         "recent_playlists": {"ok": True, "items": [], "total": 0},
     }
     assert calls == ["tracker:ratings", "ratings", "playlists"]
+
+
+def test_dashboard_widgets_api_reads_state_widgets_from_db(monkeypatch, tmp_path) -> None:
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+    from cw_platform.orchestrator._state_store import StateStore
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+    store = StateStore(tmp_path)
+    store.save_feature_baseline(
+        provider="TRAKT",
+        feature="history",
+        items={"movie:tmdb:949@1767225600": {"type": "movie", "title": "Heat", "ids": {"tmdb": 949}, "watched_at": "2026-01-01T01:00:00Z"}},
+        last_sync_epoch=1767225600,
+    )
+    store.save_feature_baseline(
+        provider="TRAKT",
+        feature="ratings",
+        items={"movie:tmdb:550": {"type": "movie", "title": "Fight Club", "ids": {"tmdb": 550}, "rating": 9, "rated_at": "2026-01-02T01:00:00Z"}},
+        last_sync_epoch=1767225600,
+    )
+    store.save_feature_baseline(
+        provider="TRAKT",
+        feature="progress",
+        items={"movie:tmdb:40": {"type": "movie", "title": "Arrival", "ids": {"tmdb": 40}, "progress_ms": 900000, "duration_ms": 1800000, "progress_at": "2026-01-03T01:00:00Z"}},
+        last_sync_epoch=1767225600,
+    )
+
+    response = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history,ratings,progress",
+    )
+    payload = _loads_body(response.body)
+
+    assert payload["ok"] is True
+    assert payload["recent_history"]["items"][0]["tmdb"] == "949"
+    assert payload["latest_ratings"]["items"][0]["tmdb"] == "550"
+    assert payload["recent_progress"]["items"][0]["tmdb"] == "40"
+
+
+def test_dashboard_widgets_api_reads_scrobble_from_activity_db(monkeypatch, tmp_path) -> None:
+    from api import dashboardAPI
+
+    monkeypatch.setattr(activity, "state_dir", lambda: tmp_path / ".cw_state")
+    activity.clear_events()
+    activity.add_event(
+        {
+            "kind": "scrobble",
+            "method": "webhook",
+            "event": "scrobble_stop",
+            "status": "ok",
+            "source": "plex",
+            "target": "trakt",
+            "media_type": "movie",
+            "title": "Heat",
+            "year": 1995,
+            "watched_at": 1767225600,
+            "captured_at": 1767229200,
+            "ids": {"tmdb": 949},
+        }
+    )
+
+    response = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="scrobble",
+    )
+    payload = _loads_body(response.body)
+
+    assert payload["ok"] is True
+    assert payload["recent_scrobble"]["items"][0]["tmdb"] == "949"
+
+
+def test_recent_history_widget_filters_by_user_profile_instances() -> None:
+    state = {
+        "providers": {
+            "PLEX": {
+                "history": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:1@1": {"type": "movie", "title": "Alice Movie", "ids": {"tmdb": 1}, "watched_at": 1767225600}
+                        }
+                    }
+                },
+                "instances": {
+                    "PLEX-P02": {
+                        "history": {
+                            "baseline": {
+                                "items": {
+                                    "tmdb:2@2": {"type": "movie", "title": "Bob Movie", "ids": {"tmdb": 2}, "watched_at": 1767312000}
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    payload = dashboard_widgets.recent_history_widget(state, user_filter={"PLEX": ["PLEX-P02"]})
+
+    assert payload["total"] == 1
+    assert payload["items"][0]["title"] == "Bob Movie"
+
+
+def test_recent_scrobble_widget_filters_by_user_profile_instances(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {
+            "ok": True,
+            "items": [
+                {
+                    "id": "a",
+                    "kind": "scrobble",
+                    "status": "ok",
+                    "source": "plex",
+                    "source_instance": "default",
+                    "media_type": "movie",
+                    "title": "Alice Movie",
+                    "watched_at": 1767225600,
+                },
+                {
+                    "id": "b",
+                    "kind": "scrobble",
+                    "status": "ok",
+                    "source": "plex",
+                    "source_instance": "PLEX-P02",
+                    "media_type": "movie",
+                    "title": "Bob Movie",
+                    "watched_at": 1767312000,
+                },
+            ],
+        },
+    )
+
+    payload = dashboard_widgets.recent_scrobble_widget(user_filter={"PLEX": "PLEX-P02"})
+
+    assert payload["total"] == 1
+    assert payload["items"][0]["title"] == "Bob Movie"

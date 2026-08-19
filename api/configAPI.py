@@ -108,6 +108,92 @@ def _log_scrobble_source_state(env: dict[str, Any], cfg: dict[str, Any]) -> None
         pass
 
 
+def _is_sensitive_config_path(path: tuple[str, ...]) -> bool:
+    clean = [str(part or "").strip().lower() for part in path if str(part or "").strip()]
+    if len(clean) >= 3 and clean[0] == "scheduling" and clean[1] == "webhooks":
+        return clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url"}
+    return False
+
+
+def _preserve_sensitive_config_values(
+    current: Any,
+    incoming: Any,
+    merged: Any,
+    is_blank: Any,
+    is_sensitive_key: Any,
+    path: tuple[str, ...] = (),
+) -> None:
+    if isinstance(incoming, dict) and isinstance(merged, dict):
+        current_d = current if isinstance(current, dict) else {}
+        for key, incoming_value in incoming.items():
+            if key not in merged:
+                continue
+
+            next_path = path + (str(key),)
+            current_value = current_d.get(key) if isinstance(current_d, dict) else None
+            merged_value = merged.get(key)
+
+            if isinstance(incoming_value, dict) and isinstance(merged_value, dict):
+                _preserve_sensitive_config_values(current_value, incoming_value, merged_value, is_blank, is_sensitive_key, next_path)
+                continue
+
+            if isinstance(incoming_value, list) and isinstance(merged_value, list):
+                if isinstance(current_value, list):
+                    for idx in range(min(len(incoming_value), len(merged_value), len(current_value))):
+                        _preserve_sensitive_config_values(
+                            current_value[idx],
+                            incoming_value[idx],
+                            merged_value[idx],
+                            is_blank,
+                            is_sensitive_key,
+                            next_path + (str(idx),),
+                        )
+                continue
+
+            if (is_sensitive_key(key) or _is_sensitive_config_path(next_path)) and is_blank(incoming_value):
+                if isinstance(current_d, dict) and key in current_d:
+                    merged[key] = current_value
+                else:
+                    merged[key] = ""
+        return
+
+    if isinstance(incoming, list) and isinstance(current, list) and isinstance(merged, list):
+        for idx in range(min(len(incoming), len(current), len(merged))):
+            _preserve_sensitive_config_values(current[idx], incoming[idx], merged[idx], is_blank, is_sensitive_key, path + (str(idx),))
+
+
+def _public_ui_config(raw: dict[str, Any]) -> dict[str, Any]:
+    raw_ui = raw.get("ui")
+    ui: dict[str, Any] = raw_ui if isinstance(raw_ui, dict) else {}
+    keys = (
+        "show_watchlist_preview",
+        "show_recent_activity",
+        "show_recent_history_widget",
+        "show_latest_ratings_widget",
+        "show_recent_scrobble_widget",
+        "show_recent_progress_widget",
+        "show_recent_playlists_widget",
+        "recent_activity_display",
+        "recent_activity_limit",
+    )
+    return {key: ui[key] for key in keys if key in ui}
+
+
+def _public_block_configured(raw: dict[str, Any], *names: str) -> bool:
+    for name in names:
+        block = raw.get(name)
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("api_key") or block.get("token") or block.get("access_token") or "").strip():
+            return True
+        instances = block.get("instances")
+        if isinstance(instances, dict):
+            for value in instances.values():
+                if isinstance(value, dict) and str(value.get("api_key") or value.get("token") or value.get("access_token") or "").strip():
+                    return True
+    return False
+
+
 def _after_config_save(env: dict[str, Any], cfg: dict[str, Any]) -> None:
     _log_scrobble_source_state(env, cfg)
 
@@ -352,13 +438,16 @@ def api_config_meta(request: Request) -> JSONResponse:
             pass
 
     authenticated = False
+    is_admin = False
     try:
         from . import appAuthAPI as app_auth
 
         token = request.cookies.get(app_auth.COOKIE_NAME)
         authenticated = app_auth.auth_required(raw) and app_auth.is_authenticated(raw, token)
+        is_admin = authenticated and app_auth.is_admin_authenticated(raw, token)
     except Exception:
         authenticated = False
+        is_admin = False
 
     payload = {
         "exists": exists,
@@ -376,7 +465,14 @@ def api_config_meta(request: Request) -> JSONResponse:
         "needs_upgrade": needs_upgrade,
         "legacy_pre_070": is_legacy_pre_070,
     }
-    if authenticated:
+    if authenticated or not auth_reset_required:
+        payload.update(
+            {
+                "ui": _public_ui_config(raw),
+                "tmdb_configured": _public_block_configured(raw, "tmdb", "tmdb_sync"),
+            }
+        )
+    if is_admin:
         payload.update(
             {
                 "path": str(p) if p is not None else None,
@@ -501,6 +597,7 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
             "client_secret",
             "account_token", "pms_token", "home_pin",
             "session_id",
+            "auth_key", "authkey",
             "token_hash", "salt", "hash",
             "device_code",
             "_pending_request_token",
@@ -521,44 +618,14 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
             "access_token", "refresh_token", "client_secret",
             "api_key", "apikey",
             "token_hash", "session_id",
+            "auth_key", "authkey",
             "account_token", "pms_token", "home_pin",
             "device_code", "request_token",
             "password", "secret",
         )
         return any(s in k for s in subs)
 
-    def _preserve_sensitive(cur: Any, inc: Any, dst: Any) -> None:
-        if isinstance(inc, dict) and isinstance(dst, dict):
-            cur_d = cur if isinstance(cur, dict) else {}
-            for k, inc_v in inc.items():
-                if k not in dst:
-                    continue
-
-                cur_v = cur_d.get(k) if isinstance(cur_d, dict) else None
-                dst_v = dst.get(k)
-
-                if isinstance(inc_v, dict) and isinstance(dst_v, dict):
-                    _preserve_sensitive(cur_v, inc_v, dst_v)
-                    continue
-
-                if isinstance(inc_v, list) and isinstance(dst_v, list):
-                    if isinstance(cur_v, list):
-                        for i in range(min(len(inc_v), len(dst_v), len(cur_v))):
-                            _preserve_sensitive(cur_v[i], inc_v[i], dst_v[i])
-                    continue
-
-                if _is_sensitive_key(k) and _blank(inc_v):
-                    if isinstance(cur_d, dict) and k in cur_d:
-                        dst[k] = cur_v
-                    else:
-                        dst[k] = ""
-            return
-
-        if isinstance(inc, list) and isinstance(cur, list) and isinstance(dst, list):
-            for i in range(min(len(inc), len(cur), len(dst))):
-                _preserve_sensitive(cur[i], inc[i], dst[i])
-
-    _preserve_sensitive(current, incoming, merged)
+    _preserve_sensitive_config_values(current, incoming, merged, _blank, _is_sensitive_key)
 
     try:
         inc_a = incoming.get("app_auth")
@@ -621,6 +688,24 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
 
     env["save"](cfg)
 
+    try:
+        from api.schedulingAPI import _log_scheduler_webhook_status
+
+        cw = env.get("CW")
+        logger = getattr(cw, "_UIHostLogger", None) if cw is not None else None
+        if callable(logger):
+            prev_raw = current.get("scheduling")
+            next_raw = cfg.get("scheduling")
+            prev_scheduling: dict[str, Any] = prev_raw if isinstance(prev_raw, dict) else {}
+            next_scheduling: dict[str, Any] = next_raw if isinstance(next_raw, dict) else {}
+            _log_scheduler_webhook_status(
+                prev_scheduling,
+                next_scheduling,
+                logger,
+            )
+    except Exception:
+        pass
+
     _after_config_save(env, cfg)
 
     result: dict[str, Any] = {"ok": True}
@@ -644,6 +729,9 @@ def api_config_migrate() -> dict[str, Any]:
     current = dict(env["load"]() or {})
     backup_path = None
     forced_paths: list[str] = []
+    resource_id_paths: list[str] = []
+    profile_cleanup_paths: list[str] = []
+    obsolete_paths: list[str] = []
 
     try:
         try:
@@ -689,6 +777,25 @@ def api_config_migrate() -> dict[str, Any]:
     _finalize_config(env, cfg, ensure=True)
 
     try:
+        ensure_resource_ids = getattr(base, "ensure_config_resource_ids", None)
+        if callable(ensure_resource_ids):
+            result = ensure_resource_ids(cfg)
+            if isinstance(result, list):
+                resource_id_paths = [str(path) for path in result]
+        cleanup_profiles = getattr(base, "cleanup_invalid_resource_profile_ids", None)
+        if callable(cleanup_profiles):
+            result = cleanup_profiles(cfg)
+            if isinstance(result, list):
+                profile_cleanup_paths = [str(path) for path in result]
+        cleanup_obsolete = getattr(base, "cleanup_obsolete_config_keys", None)
+        if callable(cleanup_obsolete):
+            result = cleanup_obsolete(cfg)
+            if isinstance(result, list):
+                obsolete_paths = [str(path) for path in result]
+    except Exception:
+        return {"ok": False, "error": "resource_id_migration_failed"}
+
+    try:
         env["save"](cfg)
     except Exception:
         return {"ok": False, "error": "config_save_failed"}
@@ -699,4 +806,7 @@ def api_config_migrate() -> dict[str, Any]:
         "ok": True,
         "backup": backup_path,
         "forced_paths": forced_paths,
+        "resource_id_paths": resource_id_paths,
+        "profile_cleanup_paths": profile_cleanup_paths,
+        "obsolete_paths": obsolete_paths,
     }

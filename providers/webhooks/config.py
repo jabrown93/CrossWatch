@@ -9,12 +9,15 @@ from typing import Any
 
 from cw_platform.provider_instances import get_provider_block, normalize_instance_id
 
-_SINKS = {"trakt", "simkl", "mdblist"}
+_SINKS = {"trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "scrob"}
 
 _SINK_CREDENTIALS: dict[str, tuple[str, ...]] = {
     "trakt": ("access_token",),
     "simkl": ("access_token",),
     "mdblist": ("api_key", "access_token"),
+    "floppy": ("server_url", "api_token"),
+    "punchplay": ("access_token",),
+    "scrob": ("api_key",),
 }
 
 _MEDIA_CREDENTIALS: dict[str, tuple[str, ...]] = {
@@ -81,8 +84,24 @@ def webhook_sink_instance(settings: Mapping[str, Any] | None, sink: str) -> str:
     return normalize_instance_id(str(instances.get(str(sink or "").strip().lower()) or "default"))
 
 
+def profile_scoped_webhook(cfg: Mapping[str, Any] | None, provider: str, provider_instance: Any = None) -> bool:
+    try:
+        from cw_platform.user_profile_resources import webhook_profile_scoped
+    except Exception:
+        return False
+    return webhook_profile_scoped(_dict(cfg), provider, provider_instance)
+
+
 def sink_configured(cfg: Mapping[str, Any] | None, sink: str, instance_id: Any = None) -> bool:
     key = str(sink or "").strip().lower()
+    if key == "crosswatch":
+        block = get_provider_block(_dict(cfg), key, normalize_instance_id(instance_id))
+        value = block.get("enabled")
+        if value is None:
+            return True
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in {"0", "false", "no", "off", "disabled"}
     fields = _SINK_CREDENTIALS.get(key)
     if not fields:
         return False

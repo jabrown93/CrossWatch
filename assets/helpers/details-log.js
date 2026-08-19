@@ -26,11 +26,12 @@ if (typeof window.debugBuf === "undefined") window.debugBuf = [];
 if (typeof window._debugFlushRAF === "undefined") window._debugFlushRAF = null;
 if (typeof window._detailsTabsWired === "undefined") window._detailsTabsWired = false;
 if (typeof window._detailsTab === "undefined") window._detailsTab = "sync";
-if (typeof window.DETAILS_MAX_LINES === "undefined") window.DETAILS_MAX_LINES = 600;
-if (typeof window.DETAILS_STREAM_TAIL === "undefined") window.DETAILS_STREAM_TAIL = 400;
-if (typeof window.DETAILS_QUEUE_MAX === "undefined") window.DETAILS_QUEUE_MAX = 1200;
-if (typeof window.DETAILS_BATCH_ROWS === "undefined") window.DETAILS_BATCH_ROWS = 80;
-if (typeof window.DETAILS_FRAME_BUDGET_MS === "undefined") window.DETAILS_FRAME_BUDGET_MS = 8;
+if (typeof window.DETAILS_MAX_LINES === "undefined") window.DETAILS_MAX_LINES = 300;
+if (typeof window.DETAILS_STREAM_TAIL === "undefined") window.DETAILS_STREAM_TAIL = 120;
+if (typeof window.DETAILS_STREAM_BACKLOG === "undefined") window.DETAILS_STREAM_BACKLOG = 160;
+if (typeof window.DETAILS_QUEUE_MAX === "undefined") window.DETAILS_QUEUE_MAX = 300;
+if (typeof window.DETAILS_BATCH_ROWS === "undefined") window.DETAILS_BATCH_ROWS = 24;
+if (typeof window.DETAILS_FRAME_BUDGET_MS === "undefined") window.DETAILS_FRAME_BUDGET_MS = 3;
 if (typeof window._detOpenSeq === "undefined") window._detOpenSeq = 0;
 if (typeof window.syncBuf === "undefined") window.syncBuf = [];
 if (typeof window._syncFlushRAF === "undefined") window._syncFlushRAF = null;
@@ -40,8 +41,15 @@ if (typeof window._detReplayCursor === "undefined") window._detReplayCursor = 0;
 if (typeof window._detDidConnectOnce === "undefined") window._detDidConnectOnce = false;
 if (typeof window._detLastSeq === "undefined") window._detLastSeq = 0;
 if (typeof window._debugLastSeq === "undefined") window._debugLastSeq = 0;
+if (typeof window._detClearSeq === "undefined") window._detClearSeq = 0;
+if (typeof window._debugClearSeq === "undefined") window._debugClearSeq = 0;
+if (typeof window._watchSkipBacklog === "undefined") window._watchSkipBacklog = false;
 if (typeof window._detailsDropped === "undefined") window._detailsDropped = { sync: 0, watcher: 0, debug: 0 };
 if (typeof window._detailsStatusRAF === "undefined") window._detailsStatusRAF = null;
+if (typeof window._detailsOpenRAF === "undefined") window._detailsOpenRAF = null;
+if (typeof window._detailsOpenTO === "undefined") window._detailsOpenTO = null;
+if (typeof window._detailsProgrammaticScrollUntil === "undefined") window._detailsProgrammaticScrollUntil = 0;
+if (typeof window._detailsProgrammaticScrollTO === "undefined") window._detailsProgrammaticScrollTO = null;
 
 function _activeDetailsLogEl() {
   if (window._detailsTab === "watcher") return document.getElementById("det-watch-log");
@@ -49,9 +57,90 @@ function _activeDetailsLogEl() {
   return document.getElementById("det-log");
 }
 
+function _detailsManagedUser() {
+  try {
+    const state = window.CW?.AuthState?.read?.() || {};
+    if (state.is_admin || state.isAdmin) return false;
+    if (state.managed || state.is_managed || state.isManaged) return true;
+    const role = String(state.role || document.documentElement?.dataset?.cwRole || "").toLowerCase();
+    return role === "user" || role === "managed";
+  } catch {
+    return false;
+  }
+}
+
+function _syncManagedDetailsTabs() {
+  const managed = _detailsManagedUser();
+  const tabWatch = document.getElementById("det-tab-watcher");
+  const tabDebug = document.getElementById("det-tab-debug");
+  const watchPanel = document.getElementById("det-panel-watcher");
+  const debugPanel = document.getElementById("det-panel-debug");
+  [tabWatch, tabDebug, watchPanel, debugPanel].forEach((el) => {
+    if (!el) return;
+    el.hidden = managed;
+    el.setAttribute("aria-hidden", String(managed));
+  });
+  if (managed && (window._detailsTab === "watcher" || window._detailsTab === "debug")) {
+    window._detailsTab = "sync";
+  }
+  if (managed) {
+    try { closeWatcherLog(); } catch {}
+    try { closeDebugLog(); } catch {}
+  }
+  return managed;
+}
+
 function _pruneDetailsLog(el) {
   const max = Number(window.DETAILS_MAX_LINES || 0) || 600;
-  while (el && el.childNodes && el.childNodes.length > max) el.removeChild(el.firstChild);
+  if (!el || !el.childNodes || el.childNodes.length <= max) return;
+  const drop = el.childNodes.length - max;
+  const removed = document.createDocumentFragment();
+  for (let i = 0; i < drop && el.firstChild; i++) {
+    removed.appendChild(el.firstChild);
+  }
+}
+
+function _isDetailsProgrammaticScroll() {
+  return Date.now() < Number(window._detailsProgrammaticScrollUntil || 0);
+}
+
+function _markDetailsProgrammaticScroll(ms = 180) {
+  window._detailsProgrammaticScrollUntil = Date.now() + ms;
+  if (window._detailsProgrammaticScrollTO) clearTimeout(window._detailsProgrammaticScrollTO);
+  window._detailsProgrammaticScrollTO = setTimeout(() => {
+    window._detailsProgrammaticScrollTO = null;
+    window._detailsProgrammaticScrollUntil = 0;
+  }, ms + 40);
+}
+
+function _setDetailsStickBottom(tab, value) {
+  const on = !!value;
+  if (tab === "watcher") window.watchStickBottom = on;
+  else if (tab === "debug") window.debugStickBottom = on;
+  else window.detStickBottom = on;
+}
+
+function _scrollDetailsToBottom(el, tab, afterScroll) {
+  if (!el) return;
+  _setDetailsStickBottom(tab, true);
+  _markDetailsProgrammaticScroll();
+  el.scrollTop = el.scrollHeight;
+  afterScroll?.();
+  requestAnimationFrame(() => {
+    _setDetailsStickBottom(tab, true);
+    _markDetailsProgrammaticScroll();
+    el.scrollTop = el.scrollHeight;
+    afterScroll?.();
+    _scheduleDetailsConsoleStatus();
+  });
+}
+
+function _followDetailsLog(el, tab, afterScroll) {
+  if (!el) return;
+  _setDetailsStickBottom(tab, true);
+  _markDetailsProgrammaticScroll(90);
+  el.scrollTop = el.scrollHeight;
+  afterScroll?.();
 }
 
 function _pruneSeenDetailLines() {
@@ -145,6 +234,7 @@ function _watchLogKnownTags() {
     "PLEX-WATCH",
     "JELLYFIN-WATCH",
     "EMBY-WATCH",
+    "KODI-WATCH",
     "TRAKT-SCROBBLE",
     "SIMKL-SCROBBLE",
     "MDBLIST-SCROBBLE",
@@ -157,6 +247,13 @@ function _watchLogTagsFromConfig(cfg) {
 
 function _isAppDebugMode(cfg) {
   return !!(cfg?.runtime?.debug || cfg?.runtime?.debug_mods);
+}
+
+function _isDetailsDebugExcluded(raw) {
+  const provider = String(_parseLogParts(raw).provider || "").toUpperCase();
+  if (["WATCH", "WATCHM", "WEBHOOK", "SCROBBLE"].includes(provider)) return true;
+  if (provider.endsWith("-WATCH") || provider.endsWith("-WATCHER") || provider.endsWith("-SCROBBLE")) return true;
+  return false;
 }
 
 function _decodeLogLine(line) {
@@ -255,38 +352,7 @@ function _renderUnresolvedList(items) {
   return head + html;
 }
 
-function _ensureUnresolvedStyles() {
-  if (document.getElementById("cw-unres-css")) return;
-  const css = `
-  .cw-unres-modal{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center}
-  .cw-unres-modal.hidden{display:none}
-  .cw-unres-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
-  .cw-unres-card{position:relative;max-width:720px;width:calc(100% - 32px);max-height:80vh;display:flex;flex-direction:column;
-    background:var(--card,#1b1d22);color:var(--text,#e8eaed);border:1px solid rgba(255,255,255,.1);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
-  .cw-unres-h{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.08)}
-  .cw-unres-title{font-weight:600}
-  .cw-unres-close{background:transparent;border:0;color:inherit;font-size:16px;cursor:pointer;opacity:.7}
-  .cw-unres-close:hover{opacity:1}
-  .cw-unres-body{padding:0 16px 16px;overflow:auto}
-  .cw-unres-summary{position:sticky;top:0;z-index:1;background:var(--card,#1b1d22);display:flex;flex-wrap:wrap;gap:6px;
-    padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}
-  .cw-unres-chip{font-size:11px;background:rgba(255,255,255,.08);border-radius:10px;padding:2px 9px}
-  .cw-unres-chip b{font-weight:600}
-  .cw-unres-list{list-style:none;margin:0;padding:0}
-  .cw-unres-item{display:flex;align-items:center;gap:12px;padding:5px 0;font-size:13px;border-bottom:1px solid rgba(255,255,255,.05)}
-  .cw-unres-item-t{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .cw-unres-item-r{flex:0 0 auto;font-size:11px;opacity:.6;white-space:nowrap}
-  .cw-unres-loading,.cw-unres-empty,.cw-unres-error{padding:24px 0;text-align:center;opacity:.7}
-  .cw-unres-link{color:#8ea2ff;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
-  .cw-unres-link:hover{color:#b8c6ff}`;
-  const style = document.createElement("style");
-  style.id = "cw-unres-css";
-  style.textContent = css;
-  document.head.appendChild(style);
-}
-
 async function _showUnresolvedModal() {
-  _ensureUnresolvedStyles();
   let modal = document.getElementById("cw-unresolved-modal");
   if (!modal) {
     modal = document.createElement("div");
@@ -419,12 +485,6 @@ function _scheduleDetailsConsoleStatus() {
 }
 
 function _wireDetailsConsoleStatus() {
-  for (const id of ["det-log", "det-watch-log", "det-debug-log"]) {
-    const el = document.getElementById(id);
-    if (!el || el.__cwStatusObserver) continue;
-    el.__cwStatusObserver = new MutationObserver(_scheduleDetailsConsoleStatus);
-    el.__cwStatusObserver.observe(el, { childList: true });
-  }
   _updateDetailsConsoleStatus();
 }
 
@@ -483,7 +543,8 @@ async function _copyDetailsLog(btn) {
 }
 
 function setDetailsTab(tab) {
-  const t = (tab === "watcher" || tab === "debug") ? tab : "sync";
+  const managed = _syncManagedDetailsTabs();
+  const t = managed ? "sync" : ((tab === "watcher" || tab === "debug") ? tab : "sync");
   window._detailsTab = t;
 
   const syncPanel  = document.getElementById("det-panel-sync");
@@ -524,6 +585,7 @@ function setDetailsTab(tab) {
 }
 
 function initDetailsTabs() {
+  _syncManagedDetailsTabs();
   if (window._detailsTabsWired) return;
   const tabSync  = document.getElementById("det-tab-sync");
   const tabWatch = document.getElementById("det-tab-watcher");
@@ -533,8 +595,8 @@ function initDetailsTabs() {
   _wireDetailsConsoleStatus();
 
   tabSync.addEventListener("click", () => setDetailsTab("sync"));
-  tabWatch.addEventListener("click", () => setDetailsTab("watcher"));
-  tabDebug.addEventListener("click", () => setDetailsTab("debug"));
+  tabWatch.addEventListener("click", () => { if (!_detailsManagedUser()) setDetailsTab("watcher"); });
+  tabDebug.addEventListener("click", () => { if (!_detailsManagedUser()) setDetailsTab("debug"); });
 
   const btnCopy = document.getElementById("det-copy");
   if (btnCopy) {
@@ -548,9 +610,19 @@ function initDetailsTabs() {
     btnClear.addEventListener("click", () => {
       const el = _activeDetailsLogEl();
       if (el) el.innerHTML = "";
-      if (window._detailsTab === "watcher") window.watchBuf.length = 0;
-      if (window._detailsTab === "debug") window.debugBuf.length = 0;
-      if (window._detailsTab === "sync") window.syncBuf.length = 0;
+      if (window._detailsTab === "watcher") {
+        window.watchBuf.length = 0;
+        window._watchSkipBacklog = true;
+      }
+      if (window._detailsTab === "debug") {
+        window.debugBuf.length = 0;
+        window._debugClearSeq = Math.max(Number(window._debugClearSeq || 0) || 0, Number(window._debugLastSeq || 0) || 0);
+      }
+      if (window._detailsTab === "sync") {
+        window.syncBuf.length = 0;
+        window._detSeenLines = [];
+        window._detClearSeq = Math.max(Number(window._detClearSeq || 0) || 0, Number(window._detLastSeq || 0) || 0);
+      }
       _resetDetailsDropped(window._detailsTab || "sync");
       _updateDetailsConsoleStatus();
     });
@@ -562,15 +634,15 @@ function initDetailsTabs() {
       if (window._detailsTab === "watcher") {
         window.watchStickBottom = !window.watchStickBottom;
         const el = document.getElementById("det-watch-log");
-        if (window.watchStickBottom && el) el.scrollTop = el.scrollHeight;
+        if (window.watchStickBottom && el) _scrollDetailsToBottom(el, "watcher");
       } else if (window._detailsTab === "debug") {
         window.debugStickBottom = !window.debugStickBottom;
         const el = document.getElementById("det-debug-log");
-        if (window.debugStickBottom && el) el.scrollTop = el.scrollHeight;
+        if (window.debugStickBottom && el) _scrollDetailsToBottom(el, "debug");
       } else {
         window.detStickBottom = !window.detStickBottom;
         const el = document.getElementById("det-log");
-        if (window.detStickBottom && el) el.scrollTop = el.scrollHeight;
+        if (window.detStickBottom && el) _scrollDetailsToBottom(el, "sync");
       }
       _updateDetailsConsoleStatus();
     });
@@ -631,6 +703,7 @@ function closeDebugLog() {
 }
 
 function openDebugLog() {
+  if (_detailsManagedUser()) return;
   const el = document.getElementById("det-debug-log");
   const details = document.getElementById("details");
   const tabDebug = document.getElementById("det-tab-debug");
@@ -641,6 +714,7 @@ function openDebugLog() {
   try {
     if (!el.__cwScrollWired) {
       el.addEventListener("scroll", () => {
+        if (_isDetailsProgrammaticScroll()) return;
         const pad = 12;
         window.debugStickBottom = el.scrollTop >= el.scrollHeight - el.clientHeight - pad;
         _updateDetailsConsoleStatus();
@@ -648,8 +722,9 @@ function openDebugLog() {
       el.__cwScrollWired = true;
     }
 
-    const debugSince = Math.max(0, Number(window._debugLastSeq || 0) || 0);
-    const debugReconnect = debugSince > 0 && el.childElementCount > 0;
+    const debugClearSeq = Math.max(0, Number(window._debugClearSeq || 0) || 0);
+    const debugSince = Math.max(Number(window._debugLastSeq || 0) || 0, debugClearSeq);
+    const debugReconnect = debugSince > 0 && (el.childElementCount > 0 || debugClearSeq > 0);
     if (!debugReconnect) {
       el.innerHTML = "";
       window.debugStickBottom = true;
@@ -668,9 +743,10 @@ function openDebugLog() {
           row.classList.add("det-debug-line");
           frag.appendChild(row);
         }, () => {
+          const shouldFollow = !!window.debugStickBottom;
           el.appendChild(frag);
           _pruneDetailsLog(el);
-          if (window.debugStickBottom) el.scrollTop = el.scrollHeight;
+          if (shouldFollow) _followDetailsLog(el, "debug");
           _scheduleDetailsConsoleStatus();
         }, scheduleFlush);
       });
@@ -680,6 +756,7 @@ function openDebugLog() {
     url.searchParams.set("tag", "DEBUG");
     if (debugReconnect) url.searchParams.set("since", String(debugSince));
     else url.searchParams.set("tail", String(_detailsLimit("DETAILS_STREAM_TAIL", 400)));
+    url.searchParams.set("max_backlog", String(_detailsLimit("DETAILS_STREAM_BACKLOG", 160)));
     url.searchParams.set("plain", "1");
     url.searchParams.set("_ts", String(Date.now()));
 
@@ -698,6 +775,7 @@ function openDebugLog() {
       lastMsgAt = Date.now();
       const seq = Number(ev?.lastEventId || 0) || 0;
       if (seq > 0) window._debugLastSeq = seq;
+      if (_isDetailsDebugExcluded(ev.data)) return;
       _enqueueDetailsItem(window.debugBuf, ev.data, "debug");
       scheduleFlush();
     };
@@ -736,7 +814,13 @@ function openDebugLog() {
       document.removeEventListener("visibilitychange", window._debugVisibilityHandler);
     }
     window._debugVisibilityHandler = () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible") {
+        try { window.esDebug?.close?.(); } catch {}
+        window.esDebug = null;
+        tabDebug?.classList.remove("connected");
+        _updateDetailsConsoleStatus();
+        return;
+      }
       if (_detailsVisible() && window._detailsTab === "debug") { try { openDebugLog(); } catch {} }
     };
     document.addEventListener("visibilitychange", window._debugVisibilityHandler);
@@ -746,6 +830,7 @@ function openDebugLog() {
 }
 
 async function openWatcherLog() {
+  if (_detailsManagedUser()) return;
   const el = document.getElementById("det-watch-log");
   const details = document.getElementById("details");
   const tabWatch = document.getElementById("det-tab-watcher");
@@ -766,12 +851,15 @@ async function openWatcherLog() {
     const uniq = _watchLogTagsFromConfig(cfg);
 
     const url = new URL("/api/logs/watcher", document.baseURI);
-    url.searchParams.set("tail", "200");
+    url.searchParams.set("tail", "120");
+    url.searchParams.set("max_backlog", "80");
+    if (window._watchSkipBacklog) url.searchParams.set("skip_backlog", "1");
     url.searchParams.set("plain", "1");
     if (uniq.length) url.searchParams.set("tags", uniq.join(","));
 
     if (!el.__cwScrollWired) {
       el.addEventListener("scroll", () => {
+        if (_isDetailsProgrammaticScroll()) return;
         const pad = 12;
         window.watchStickBottom = el.scrollTop >= el.scrollHeight - el.clientHeight - pad;
         _updateDetailsConsoleStatus();
@@ -800,9 +888,10 @@ async function openWatcherLog() {
         _runDetailsBatch(window.watchBuf, (it) => {
           frag.appendChild(_structuredLogRow(it.html, it.tag));
         }, () => {
+          const shouldFollow = !!window.watchStickBottom;
           el.appendChild(frag);
           _pruneDetailsLog(el);
-          if (window.watchStickBottom) el.scrollTop = el.scrollHeight;
+          if (shouldFollow) _followDetailsLog(el, "watcher");
           _scheduleDetailsConsoleStatus();
         }, scheduleFlush);
       });
@@ -851,7 +940,13 @@ async function openWatcherLog() {
       document.removeEventListener("visibilitychange", window._watchVisibilityHandler);
     }
     window._watchVisibilityHandler = () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible") {
+        try { window.esWatch?.close?.(); } catch {}
+        window.esWatch = null;
+        tabWatch?.classList.remove("connected");
+        _updateDetailsConsoleStatus();
+        return;
+      }
       if (_detailsVisible() && window._detailsTab === "watcher") { try { openWatcherLog(); } catch {} }
     };
     document.addEventListener("visibilitychange", window._watchVisibilityHandler);
@@ -887,8 +982,9 @@ async function openDetailsLog() {
   window._detSeenLines = [];
   window._detReplayActive = false;
   window._detReplayCursor = 0;
-  window._detDidConnectOnce = false;
-  window._detLastSeq = 0;
+  const detClearSeq = Math.max(0, Number(window._detClearSeq || 0) || 0);
+  window._detDidConnectOnce = detClearSeq > 0;
+  window._detLastSeq = detClearSeq;
 
   try { window.esDet?.close(); } catch {}
   try { window.esDetSummary?.close(); } catch {}
@@ -906,6 +1002,7 @@ async function openDetailsLog() {
 
   const updateStick = () => {
     const pad = 6;
+    if (_isDetailsProgrammaticScroll()) return;
     window.detStickBottom = el.scrollTop >= el.scrollHeight - el.clientHeight - pad;
   };
 
@@ -922,13 +1019,13 @@ async function openDetailsLog() {
     });
   }
 
-  const appendRaw = (s) => {
+  const appendRaw = (s, target = el) => {
     const lines = String(s).replace(/\r\n/g, "\n").split("\n");
     for (const line of lines) {
       if (!line) continue;
       const row = _structuredLogRow(_decodeLogLine(line), "SYNC");
       row.classList.add("det-plain-line");
-      el.appendChild(row);
+      target.appendChild(row);
     }
   };
 
@@ -940,12 +1037,15 @@ async function openDetailsLog() {
     if (window._syncFlushRAF || window._detailsTab !== "sync") return;
     window._syncFlushRAF = requestAnimationFrame(() => {
       window._syncFlushRAF = null;
+      const frag = document.createDocumentFragment();
       _runDetailsBatch(window.syncBuf, (line) => {
-        appendRaw(line);
+        appendRaw(line, frag);
       }, () => {
+        const shouldFollow = !!window.detStickBottom;
+        el.appendChild(frag);
         _pruneDetailsLog(el);
-        if (window.detStickBottom) el.scrollTop = el.scrollHeight;
-        updateSlider();
+        if (shouldFollow) _followDetailsLog(el, "sync", updateSlider);
+        else updateSlider();
         _scheduleDetailsConsoleStatus();
       }, scheduleFlush);
     });
@@ -961,6 +1061,7 @@ async function openDetailsLog() {
     url.searchParams.set("tag", "SYNC");
     if (!initialConnect && since > 0) url.searchParams.set("since", String(since));
     else url.searchParams.set("tail", String(_detailsLimit("DETAILS_STREAM_TAIL", 400)));
+    url.searchParams.set("max_backlog", String(_detailsLimit("DETAILS_STREAM_BACKLOG", 160)));
     url.searchParams.set("plain", "1");
     url.searchParams.set("_ts", String(Date.now()));
     window.esDet = new EventSource(url.toString());
@@ -1042,7 +1143,13 @@ async function openDetailsLog() {
   }, STALE_MS);
 
   window._detVisibilityHandler = () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== "visible") {
+      try { window.esDet?.close?.(); } catch {}
+      window.esDet = null;
+      tabSync?.classList.remove("connected");
+      _updateDetailsConsoleStatus();
+      return;
+    }
     if (window._detailsTab === "sync" && (!window.esDet || (Date.now() - lastMsgAt > STALE_MS))) connect();
   };
   document.addEventListener("visibilitychange", window._detVisibilityHandler);
@@ -1051,14 +1158,16 @@ async function openDetailsLog() {
   window.esDetSummary = null;
 
   requestAnimationFrame(() => {
-    el.scrollTop = el.scrollHeight;
-    updateSlider();
+    _scrollDetailsToBottom(el, "sync", updateSlider);
   });
 }
 
 function closeDetailsLog() {
   window._detReplayActive = false;
   window._detReplayCursor = 0;
+  window._detClearSeq = 0;
+  window._debugClearSeq = 0;
+  window._watchSkipBacklog = false;
   try { closeSyncLog(); } catch {}
   try { closeWatcherLog(); } catch {}
   try { closeDebugLog(); } catch {}
@@ -1070,11 +1179,27 @@ function toggleDetails() {
   const isOpen = d.classList.contains("hidden");
   const layout = document.getElementById("layout");
 
+  if (window._detailsOpenRAF) {
+    cancelAnimationFrame(window._detailsOpenRAF);
+    window._detailsOpenRAF = null;
+  }
+  if (window._detailsOpenTO) {
+    clearTimeout(window._detailsOpenTO);
+    window._detailsOpenTO = null;
+  }
+
   d.classList.toggle("hidden", !isOpen);
   layout?.classList.toggle("details-open", isOpen);
   if (isOpen) {
-    try { initDetailsTabs(); } catch {}
-    try { setDetailsTab(window._detailsTab || "sync"); } catch {}
+    window._detailsOpenRAF = requestAnimationFrame(() => {
+      window._detailsOpenRAF = null;
+      window._detailsOpenTO = setTimeout(() => {
+        window._detailsOpenTO = null;
+        if (!_detailsVisible()) return;
+        try { initDetailsTabs(); } catch {}
+        try { setDetailsTab(window._detailsTab || "sync"); } catch {}
+      }, 0);
+    });
   } else {
     closeDetailsLog();
   }

@@ -10,3 +10,4 @@ packaging
 cryptography
 defusedxml
 authlib
+qrcode

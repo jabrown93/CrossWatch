@@ -10,6 +10,7 @@ from typing import Any
 # Global module registry
 MODULES: dict[str, dict[str, str]] = {
     "AUTH": {
+        "_auth_CROSSWATCH": "providers.auth._auth_CROSSWATCH",
         "_auth_PLEX":     "providers.auth._auth_PLEX",
         "_auth_SIMKL":    "providers.auth._auth_SIMKL",
         "_auth_TRAKT":    "providers.auth._auth_TRAKT",
@@ -20,8 +21,12 @@ MODULES: dict[str, dict[str, str]] = {
         "_auth_PUBLICMETADB": "providers.auth._auth_PUBLICMETADB",
         "_auth_TAUTULLI": "providers.auth._auth_TAUTULLI",
         "_auth_NUVIO":    "providers.auth._auth_NUVIO",
+        "_auth_STREMIO":  "providers.auth._auth_STREMIO",
+        "_auth_FLOPPY":   "providers.auth._auth_FLOPPY",
         "_auth_ANILIST":  "providers.auth._auth_ANILIST",
         "_auth_TMDB":     "providers.auth._auth_TMDB",
+        "_auth_PUNCHPLAY": "providers.auth._auth_PUNCHPLAY",
+        "_auth_SCROB":    "providers.auth._auth_SCROB",
     },
     "SYNC": {
         "_mod_PLEX":       "providers.sync._mod_PLEX",
@@ -33,10 +38,14 @@ MODULES: dict[str, dict[str, str]] = {
         "_mod_MDBLIST":    "providers.sync._mod_MDBLIST",
         "_mod_PUBLICMETADB": "providers.sync._mod_PUBLICMETADB",
         "_mod_NUVIO":      "providers.sync._mod_NUVIO",
+        "_mod_STREMIO":    "providers.sync._mod_STREMIO",
+        "_mod_FLOPPY":     "providers.sync._mod_FLOPPY",
         "_mod_CROSSWATCH": "providers.sync._mod_CROSSWATCH",
         "_mod_TAUTULLI":   "providers.sync._mod_TAUTULLI",
         "_mod_ANILIST":    "providers.sync._mod_ANILIST",
         "_mod_TMDB":       "providers.sync._mod_TMDB",
+        "_mod_PUNCHPLAY":  "providers.sync._mod_PUNCHPLAY",
+        "_mod_SCROB":      "providers.sync._mod_SCROB",
     },
 }
 

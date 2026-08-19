@@ -18,8 +18,8 @@ from cw_platform.event_archive import recorder as ea_recorder
 
 @pytest.fixture
 def archive(tmp_path, monkeypatch):
-    path = tmp_path / "events.sqlite3"
-    monkeypatch.setenv("CROSSWATCH_EVENTS_DB", str(path))
+    path = tmp_path / "crosswatch.sqlite3"
+    monkeypatch.setenv("CROSSWATCH_DB", str(path))
     ea_db.close_conn()
     yield path
     ea_db.close_conn()

@@ -25,7 +25,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.0"
+__VERSION__ = "1.1"
 __all__ = ["get_manifest", "PUBLICMETADBModule", "OPS"]
 
 
@@ -42,12 +42,16 @@ def _label_publicmetadb(method: str, url: str, kw: Mapping[str, Any]) -> str:
 
 
 def _confirmed_keys(items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
-    attempted = [canonical_key(id_minimal(it)) for it in items or [] if isinstance(it, Mapping)]
+    attempted = [
+        str((it.get("_cw_event_key") if it.get("_cw_rewatch_sync") is True else None) or canonical_key(id_minimal(it)) or "").strip()
+        for it in items or []
+        if isinstance(it, Mapping)
+    ]
     unresolved_keys: set[str] = set()
     for u in unresolved or []:
         obj = u.get("item") if isinstance(u, Mapping) else u
         if isinstance(obj, Mapping):
-            unresolved_keys.add(canonical_key(id_minimal(obj)))
+            unresolved_keys.add(str((obj.get("_cw_event_key") if obj.get("_cw_rewatch_sync") is True else None) or canonical_key(id_minimal(obj)) or "").strip())
     out: list[str] = []
     seen: set[str] = set()
     for k in attempted:
@@ -103,6 +107,8 @@ def get_manifest() -> Mapping[str, Any]:
                 "remove": True,
                 "observed_deletes": True,
                 "requires_ids": ["tmdb"],
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": False},
             },
             "ratings": {
                 "types": {"movies": True, "shows": True, "seasons": False, "episodes": True},
@@ -120,6 +126,9 @@ def get_manifest() -> Mapping[str, Any]:
                 "requires_ids": ["tmdb"],
                 "requires_duration": True,
                 "server_completion_percent": 80,
+                "completion_policy": {
+                    "progress_write": {"mode": "auto_complete", "percent": 80},
+                },
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         },
@@ -362,7 +371,20 @@ class PUBLICMETADBModule:
             cnt, unresolved = feat_ratings.add(self, lst)
         else:
             cnt, unresolved = feat_watchlist.add(self, lst)
-        return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": _confirmed_keys(lst, unresolved)}
+        skipped_keys = (
+            [str(k) for k in getattr(self, "_publicmetadb_rating_skipped_keys", []) if k]
+            if feature == "ratings"
+            else []
+        )
+        skipped_set = set(skipped_keys)
+        confirmed_keys = [k for k in _confirmed_keys(lst, unresolved) if k not in skipped_set]
+        return {
+            "ok": True,
+            "count": int(cnt),
+            "unresolved": unresolved,
+            "confirmed_keys": confirmed_keys,
+            "skipped_keys": skipped_keys,
+        }
 
     def remove(self, feature: str, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
         lst = list(items or [])
