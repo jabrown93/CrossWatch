@@ -1034,8 +1034,7 @@ def _issue_session(cfg: dict[str, Any], request: Request, user: dict[str, Any] |
     if not isinstance(a, dict):
         a = {}
         cfg["app_auth"] = a
-    ttl = int(ttl_sec) if ttl_sec and int(ttl_sec) > 0 else _session_ttl_sec(a)
-    exp = _now() + ttl
+    exp = _now() + _session_ttl_sec(a)
 
     sessions = _prune_sessions(_iter_sessions(a))
     ip = getattr(getattr(request, "client", None), "host", "") or ""

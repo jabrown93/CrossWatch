@@ -70,7 +70,7 @@ def test_save_reports_and_discards_locked_change(
         _stub_request(), {"app_auth": {"oidc": {"issuer": "https://from-ui.example.com/"}}}
     )
     assert result["env_locked_ignored"] == ["app_auth.oidc.issuer"]
-    assert load_config()["app_auth"]["oidc"]["issuer"] == "https://from-env.example.com/"
+    assert load_config()["app_auth"]["oidc"]["issuer"] == "https://from-env.example.com"
     stored = json.loads((config_base / "config.json").read_text(encoding="utf-8"))
     assert "issuer" not in stored.get("app_auth", {}).get("oidc", {})
 

@@ -14,6 +14,7 @@ import pytest
 
 from cw_platform.event_archive import db as ea_db
 from cw_platform.event_archive import recorder as ea_recorder
+from cw_platform.local_db import db as local_db
 
 
 @pytest.fixture
@@ -253,7 +254,7 @@ def test_dead_threads_do_not_leak_connections(archive):
         t.join()
 
     ea_db.get_conn()  # registration prunes entries for threads that exited
-    assert len(ea_db._CONNS) == 1
+    assert len(local_db._CONNS) == 1
 
 
 def test_hash_separates_destination_instances():

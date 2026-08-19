@@ -710,21 +710,21 @@ def html() -> str:
             <div class="grid2">
               <div>
                 <label for="scrob_server">Server URL</label>
-                <input id="scrob_server" name="scrob_server" type="text" placeholder="http://localhost:7330" autocomplete="off" spellcheck="false" autocapitalize="off">
+                <input id="scrob_server" data-cfg-path="scrob.server_url" data-cfg-instance-root="scrob" name="scrob_server" type="text" placeholder="http://localhost:7330" autocomplete="off" spellcheck="false" autocapitalize="off">
               </div>
               <div>
                 <label for="scrob_key">API key</label>
-                <input id="scrob_key" name="scrob_key" type="password" placeholder="********" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
+                <input id="scrob_key" data-cfg-path="scrob.api_key" data-cfg-instance-root="scrob" name="scrob_key" type="password" placeholder="********" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
               </div>
             </div>
             <div class="grid2" style="margin-top:10px">
               <div>
                 <label for="scrob_username">Username</label>
-                <input id="scrob_username" name="scrob_username" type="text" placeholder="scrob" autocomplete="off" spellcheck="false" autocapitalize="off">
+                <input id="scrob_username" data-cfg-path="scrob.username" data-cfg-instance-root="scrob" name="scrob_username" type="text" placeholder="scrob" autocomplete="off" spellcheck="false" autocapitalize="off">
               </div>
               <div>
                 <label for="scrob_password">Password</label>
-                <input id="scrob_password" name="scrob_password" type="password" placeholder="********" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
+                <input id="scrob_password" data-cfg-path="scrob.password" data-cfg-instance-root="scrob" name="scrob_password" type="password" placeholder="********" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
               </div>
             </div>
             <div id="scrob_totp_row" class="hidden" style="margin-top:10px;max-width:240px">
@@ -735,7 +735,7 @@ def html() -> str:
             <div id="scrob_reauth" class="msg warn hidden" style="margin-top:8px;margin-left:0">
               Two factor session expired. Reads and scrobbling are still running - enter a new code to resume history, ratings and watchlist writes.
             </div>
-            <label class="verify"><input id="scrob_verify_ssl" type="checkbox"> Verify SSL</label>
+            <label class="verify"><input id="scrob_verify_ssl" data-cfg-path="scrob.verify_ssl" data-cfg-instance-root="scrob" type="checkbox"> Verify SSL</label>
             <div id="scrob_actions_row" class="inline" style="margin-top:10px">
               <button id="scrob_connect" class="btn" type="button">Connect Scrob</button>
               <button id="scrob_disconnect" type="button" hidden aria-hidden="true" tabindex="-1"></button>

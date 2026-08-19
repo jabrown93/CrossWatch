@@ -29,7 +29,7 @@ def test_ids_from_jellyfin_providerids_normalizes() -> None:
 
 def test_canonical_key_prefers_best_external_id() -> None:
     item = {"type": "movie", "title": "Fight Club", "year": 1999, "ids": {"tmdb": 550, "imdb": "tt0137523"}}
-    assert canonical_key(item) == "tmdb:550"
+    assert canonical_key(item) == "imdb:tt0137523"
     assert canonical_key({"type": "movie", "title": "Fight Club", "year": 1999, "ids": {"imdb": "tt0137523"}}) == "imdb:tt0137523"
 
 

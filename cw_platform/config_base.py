@@ -1007,6 +1007,18 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
             if isinstance(s, dict) and s.get("token_hash"):
                 s["token_hash"] = _REDACT
 
+    for path in _SECRET_PATHS:
+        _redact_path(out, path)
+        # Also redact secrets in provider instances if they exist
+        prov = path[0]
+        p_cfg = out.get(prov)
+        if isinstance(p_cfg, dict):
+            instances = p_cfg.get("instances")
+            if isinstance(instances, dict):
+                for inst_cfg in instances.values():
+                    if isinstance(inst_cfg, dict):
+                        _redact_path(inst_cfg, path[1:])
+
     for provider, keys in provider_secret_keys.items():
         blk = out.get(provider)
         if not isinstance(blk, dict):

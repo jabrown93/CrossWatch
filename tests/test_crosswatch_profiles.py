@@ -2696,9 +2696,10 @@ def test_version_stamp_file_beats_stale_env(tmp_path, monkeypatch) -> None:
 def test_dockerfile_stamps_version_into_the_image() -> None:
     dockerfile = Path("Dockerfile").read_text("utf-8")
 
-    assert 'RUN printf \'%s\' "${APP_VERSION}" > /app/VERSION' in dockerfile
-    # the stamp must be written in the runtime stage, after the app is copied
-    assert dockerfile.index("COPY --from=appsrc") < dockerfile.index("/app/VERSION")
+    # The stamp is baked in the builder stage (the hardened runtime stage has no
+    # shell to run printf) and copied into the runtime stage after the app code.
+    assert 'RUN printf \'%s\' "${APP_VERSION}" > /VERSION' in dockerfile
+    assert dockerfile.index("COPY . /app") < dockerfile.index("COPY --from=builder /VERSION /app/VERSION")
     assert "VERSION" in Path(".gitignore").read_text("utf-8")
 
 

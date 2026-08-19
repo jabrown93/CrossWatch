@@ -1380,14 +1380,14 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                           </div>
                           <div class="sub" id="app_auth_oidc_state">Not configured</div>
                           <div class="cw-app-oidc-grid">
-                            <select id="app_auth_oidc_enabled" aria-label="OIDC enabled">
+                            <select id="app_auth_oidc_enabled" data-cfg-path="app_auth.oidc.enabled" aria-label="OIDC enabled">
                               <option value="false">Disabled</option>
                               <option value="true">Enabled</option>
                             </select>
-                            <input id="app_auth_oidc_issuer" type="url" autocomplete="off" placeholder="Issuer URL">
-                            <input id="app_auth_oidc_client_id" type="text" autocomplete="off" placeholder="Client ID">
-                            <input id="app_auth_oidc_client_secret" type="password" autocomplete="new-password" placeholder="Client secret">
-                            <input id="app_auth_oidc_scopes" type="text" autocomplete="off" placeholder="openid profile email">
+                            <input id="app_auth_oidc_issuer" data-cfg-path="app_auth.oidc.issuer" type="url" autocomplete="off" placeholder="Issuer URL">
+                            <input id="app_auth_oidc_client_id" data-cfg-path="app_auth.oidc.client_id" type="text" autocomplete="off" placeholder="Client ID">
+                            <input id="app_auth_oidc_client_secret" data-cfg-path="app_auth.oidc.client_secret" type="password" autocomplete="new-password" placeholder="Client secret">
+                            <input id="app_auth_oidc_scopes" data-cfg-path="app_auth.oidc.scopes" type="text" autocomplete="off" placeholder="openid profile email">
                           </div>
                           <div class="cw-app-oidc-actions">
                             <button class="btn primary" type="button" id="btn-app-auth-oidc-save" onclick="cwAppAuthOidcSaveConfig?.()">Save OIDC</button>
@@ -1429,7 +1429,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                             <label for="app_auth_oidc_enabled">Enable OIDC</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Enable OIDC: Offers single sign-on on the login screen once the issuer, client, and public base URL are set." aria-label="Enable OIDC help">help</button>
                           </div>
-                          <select id="app_auth_oidc_enabled" data-cfg-path="app_auth.oidc.enabled" name="app_auth_oidc_enabled">
+                          <select id="app_auth_oidc_enabled" data-cfg-path="app_auth.oidc.enabled" data-cfg-path="app_auth.oidc.enabled" name="app_auth_oidc_enabled">
                             <option value="false">Disabled</option>
                             <option value="true">Enabled</option>
                           </select>
@@ -1439,7 +1439,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                             <label for="app_auth_oidc_issuer">Issuer URL</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Issuer URL: The provider's issuer, used to fetch its discovery document. Must match the issuer in that document exactly, trailing slash included." aria-label="Issuer URL help">help</button>
                           </div>
-                          <input id="app_auth_oidc_issuer" data-cfg-path="app_auth.oidc.issuer" name="app_auth_oidc_issuer" type="text" placeholder="https://auth.example.com/application/o/crosswatch/">
+                          <input id="app_auth_oidc_issuer" data-cfg-path="app_auth.oidc.issuer" data-cfg-path="app_auth.oidc.issuer" name="app_auth_oidc_issuer" type="text" placeholder="https://auth.example.com/application/o/crosswatch/">
                           <div class="sub" style="margin-top:0.35rem">A trailing slash is significant. Copy it exactly as the provider shows it.</div>
                         </div>
                         <div>
@@ -1447,14 +1447,14 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                             <label for="app_auth_oidc_client_id">Client ID</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Client ID: The application identifier issued by the provider." aria-label="Client ID help">help</button>
                           </div>
-                          <input id="app_auth_oidc_client_id" data-cfg-path="app_auth.oidc.client_id" name="app_auth_oidc_client_id" type="text" autocomplete="off">
+                          <input id="app_auth_oidc_client_id" data-cfg-path="app_auth.oidc.client_id" data-cfg-path="app_auth.oidc.client_id" name="app_auth_oidc_client_id" type="text" autocomplete="off">
                         </div>
                         <div>
                           <div class="cw-field-label-row">
                             <label for="app_auth_oidc_client_secret">Client secret</label>
                             <button type="button" class="cw-field-help material-symbols-rounded" title="Client secret: The application secret issued by the provider. Leave it untouched to keep the stored value." aria-label="Client secret help">help</button>
                           </div>
-                          <input id="app_auth_oidc_client_secret" data-cfg-path="app_auth.oidc.client_secret" name="app_auth_oidc_client_secret" type="password" autocomplete="new-password">
+                          <input id="app_auth_oidc_client_secret" data-cfg-path="app_auth.oidc.client_secret" data-cfg-path="app_auth.oidc.client_secret" name="app_auth_oidc_client_secret" type="password" autocomplete="new-password">
                         </div>
                         <div>
                           <div class="cw-field-label-row">

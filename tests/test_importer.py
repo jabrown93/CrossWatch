@@ -211,7 +211,7 @@ def test_trakt_episode_history_preview_title_and_ids_are_episode_specific(monkey
     public = importer._public_rows(rows, 100, 0)
 
     assert rows[0]["title"] == "Severance - S02E10 - Cold Harbor"
-    assert rows[0]["key"].startswith("tmdb:95396#s02e10@")
+    assert rows[0]["key"].startswith("imdb:tt11280740#s02e10@")
     assert public[0]["ids"] == {"tmdb": "5469142", "imdb": "tt15242998", "tvdb": "10592768", "trakt": "12103036"}
     assert public[0]["show_ids"]["tmdb"] == "95396"
 
@@ -343,8 +343,8 @@ def test_simkl_backup_episode_rows_keep_show_identity(monkeypatch: pytest.Monkey
 
     assert [row["feature"] for row in raw] == ["history", "history", "ratings"]
     assert [row["title"] for row in rows[:2]] == ["Shark Tank - S12E01", "Shark Tank - S12E02"]
-    assert rows[0]["key"].startswith("tmdb:30703#s12e01@")
-    assert rows[1]["key"].startswith("tmdb:30703#s12e02@")
+    assert rows[0]["key"].startswith("imdb:tt1442550#s12e01@")
+    assert rows[1]["key"].startswith("imdb:tt1442550#s12e02@")
     assert [row["status"] for row in rows[:2]] == ["ready", "ready"]
     assert rows[2]["feature"] == "ratings"
     assert rows[2]["media_type"] == "show"

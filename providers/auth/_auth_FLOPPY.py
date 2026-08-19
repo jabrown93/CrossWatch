@@ -207,14 +207,14 @@ def html() -> str:
             <div class="grid2">
               <div>
                 <label for="floppy_server">Server URL</label>
-                <input id="floppy_server" name="floppy_server" type="text" placeholder="http://localhost:8000" autocomplete="off" spellcheck="false" autocapitalize="off">
+                <input id="floppy_server" data-cfg-path="floppy.server_url" data-cfg-instance-root="floppy" name="floppy_server" type="text" placeholder="http://localhost:8000" autocomplete="off" spellcheck="false" autocapitalize="off">
               </div>
               <div>
                 <label for="floppy_token">API token</label>
-                <input id="floppy_token" name="floppy_token" type="password" placeholder="********" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
+                <input id="floppy_token" data-cfg-path="floppy.api_token" data-cfg-instance-root="floppy" name="floppy_token" type="password" placeholder="********" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
               </div>
             </div>
-            <label class="verify"><input id="floppy_verify_ssl" type="checkbox"> Verify SSL</label>
+            <label class="verify"><input id="floppy_verify_ssl" data-cfg-path="floppy.verify_ssl" data-cfg-instance-root="floppy" type="checkbox"> Verify SSL</label>
             <div id="floppy_actions_row" class="inline" style="margin-top:12px">
               <button id="floppy_connect" class="btn" type="button">Connect Floppy</button>
               <button id="floppy_disconnect" type="button" hidden aria-hidden="true" tabindex="-1"></button>

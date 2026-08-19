@@ -31,3 +31,36 @@ providers/auth/_auth_SIMKL.py:simkl_pin_code
 providers/auth/_auth_TRAKT.py:trakt_pin
 providers/auth/_auth_MDBLIST.py:mdblist_device_code
 providers/auth/_auth_NUVIO.py:nuvio_code_input
+
+# Transient 2FA setup/verify codes; never stored in config.
+ui_frontend.py:app_auth_totp_code
+ui_frontend.py:app_auth_totp_secret
+
+# Managed-user creation form; posted to the app-auth users endpoint.
+ui_frontend.py:app_user_username
+ui_frontend.py:app_user_password
+ui_frontend.py:app_user_profile
+
+# Profile self-service modal; posted to profile endpoints, not config save.
+ui_frontend.py:profile-avatar-input
+ui_frontend.py:profile-current-password
+ui_frontend.py:profile-new-password
+ui_frontend.py:profile-display-input
+ui_frontend.py:profile-pref-playing-card
+ui_frontend.py:profile-pref-quick-add
+
+# Admin view-as switcher over already-loaded data.
+ui_frontend.py:cw-view-as-select
+
+# Hidden template/carrier elements without ids.
+ui_frontend.py:(no id)
+
+# Device-flow carrier, transient.
+providers/auth/_auth_PUNCHPLAY.py:punchplay_device_code
+
+# Transient login TOTP code; never stored in config.
+providers/auth/_auth_SCROB.py:scrob_totp
+
+# Login credentials posted to a connect endpoint; never stored in config.
+providers/auth/_auth_STREMIO.py:stremio_email
+providers/auth/_auth_STREMIO.py:stremio_password

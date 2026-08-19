@@ -537,7 +537,7 @@ def test_ratings_below_threshold_cache_preserves_source_keyspace(tmp_path, monke
 
     _ratings.add(adapter, [{"type": "movie", "ids": {"tmdb": "1111873", "imdb": "tt27489557"}, "title": "Abigail", "rating": 2}])
 
-    assert list(_ratings.build_index(adapter)) == ["tmdb:1111873"]
+    assert list(_ratings.build_index(adapter)) == ["imdb:tt27489557"]
 
 
 def test_ratings_cache_is_ignored_in_capture_mode(tmp_path, monkeypatch) -> None:

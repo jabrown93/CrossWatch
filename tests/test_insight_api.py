@@ -46,6 +46,13 @@ def _endpoint(app: FastAPI, path: str):
     return next(r.endpoint for r in app.routes if getattr(r, "path", "") == path)
 
 
+def _stub_request():
+    """api_insights only touches request.cookies for profile scoping."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(cookies={}, headers={}, query_params={})
+
+
 def _install_env(monkeypatch, cw, cfg: dict[str, Any] | None = None, save_config=None) -> None:
     env = (cw, lambda: (cfg if cfg is not None else {}), save_config or (lambda _c: None), lambda *a, **k: None)
     monkeypatch.setattr(insightAPI, "_env", lambda env=env: env)
@@ -135,8 +142,8 @@ def test_select_snapshot_success_writes_restore_key(monkeypatch):
         pass
 
     _install_env(monkeypatch, CW, cfg={"crosswatch": {}}, save_config=saved.update)
-    out = _endpoint(app, "/api/crosswatch/select-snapshot")(feature="history", snapshot="2026-01-01.json")
-    assert out == {"ok": True, "feature": "history", "snapshot": "2026-01-01.json"}
+    out = _endpoint(app, "/api/crosswatch/select-snapshot")(feature="history", snapshot="2026-01-01.json", provider_instance="default")
+    assert {k: out.get(k) for k in ("ok", "feature", "snapshot")} == {"ok": True, "feature": "history", "snapshot": "2026-01-01.json"}
     assert saved["crosswatch"]["restore_history"] == "2026-01-01.json"
 
 
@@ -186,7 +193,7 @@ def test_insights_with_no_stats_or_state_returns_safe_defaults(monkeypatch):
             return {}
 
     _install_env(monkeypatch, CW)
-    resp = _endpoint(app, "/api/insights")(limit_samples=60, history=3, runtime=0)
+    resp = _endpoint(app, "/api/insights")(_stub_request(), limit_samples=60, history=3, runtime=0, include_events=1, user_profile="")
     payload = json.loads(resp.body)
 
     assert payload["now"] == 0
@@ -213,7 +220,8 @@ def test_insights_with_no_stats_or_state_returns_safe_defaults(monkeypatch):
     # Backfilled 12-point hourly grid since fewer than 2 real samples exist.
     assert len(payload["series_by_feature"]["history"]) == 12
     assert payload["series_by_feature"]["watchlist"] == []
-    assert payload["crosswatch_snapshots"]["history"] == {
+    snap = payload["crosswatch_snapshots"]["history"]
+    assert {k: snap.get(k) for k in ("selected", "actual", "human", "ts", "has_snapshots")} == {
         "selected": "latest", "actual": None, "human": None, "ts": None, "has_snapshots": False,
     }
 
@@ -296,7 +304,8 @@ def test_insights_with_history_event_and_state_computes_breakdown_and_lanes(monk
             return state
 
     _install_env(monkeypatch, CW, cfg={"tmdb": {}, "crosswatch": {}})
-    resp = _endpoint(app, "/api/insights")(limit_samples=60, history=3, runtime=0)
+    monkeypatch.setattr(insightAPI, "_load_state_features", lambda _feats: state)
+    resp = _endpoint(app, "/api/insights")(_stub_request(), limit_samples=60, history=3, runtime=0, include_events=1, user_profile="")
     payload = json.loads(resp.body)
 
     assert payload["generated_at"] == "2026-01-01T00:00:00Z"
