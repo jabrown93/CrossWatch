@@ -1,3 +1,10 @@
+## [1.3.4](https://github.com/jabrown93/CrossWatch/compare/v1.3.3...v1.3.4) (2026-08-19)
+
+
+### Bug Fixes
+
+* **punchplay:** do not throttle the first forced token refresh after boot ([#84](https://github.com/jabrown93/CrossWatch/issues/84)) ([32a27d1](https://github.com/jabrown93/CrossWatch/commit/32a27d12a2cbb96202599933897daf756d0aba57))
+
 ## [1.3.3](https://github.com/jabrown93/CrossWatch/compare/v1.3.2...v1.3.3) (2026-08-17)
 
 
