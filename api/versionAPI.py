@@ -42,7 +42,9 @@ def resolve_current_version() -> str:
 
 
 CURRENT_VERSION = resolve_current_version()
-REPO = os.getenv("GITHUB_REPO", "cenodude/CrossWatch")
+# This fork cuts its own releases (v1.x), so the update check must compare
+# against the fork's tags — upstream's v0.x line would never register as newer.
+REPO = os.getenv("GITHUB_REPO", "jabrown93/CrossWatch")
 
 
 def _github_api() -> str:
