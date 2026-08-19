@@ -333,6 +333,17 @@ def test_forced_refresh_is_throttled_so_401s_cannot_storm(monkeypatch: pytest.Mo
     assert pp._allow_forced_refresh("other") is True
 
 
+def test_forced_refresh_allows_first_call_even_with_low_monotonic_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """time.monotonic() counts from boot; a freshly booted machine must not have
+    its first forced refresh swallowed by the throttle (fails on CI runners with
+    less than FORCED_REFRESH_MIN_INTERVAL of uptime)."""
+    import providers.auth._auth_PUNCHPLAY as pp
+
+    monkeypatch.setattr(pp.time, "monotonic", lambda: 5.0)
+    assert pp._allow_forced_refresh("default") is True
+    assert pp._allow_forced_refresh("default") is False
+
+
 
 def test_request_with_auth_does_not_refresh_on_every_401(monkeypatch: pytest.MonkeyPatch) -> None:
     import providers.auth._auth_PUNCHPLAY as pp

@@ -636,8 +636,11 @@ def _allow_forced_refresh(instance_id: Any) -> bool:
     inst = normalize_instance_id(instance_id)
     now = time.monotonic()
     with _FORCED_REFRESH_GUARD:
-        last = _LAST_FORCED_REFRESH.get(inst, 0.0)
-        if now - last < FORCED_REFRESH_MIN_INTERVAL:
+        # A missing entry must mean "never refreshed", not "refreshed at monotonic
+        # zero": time.monotonic() counts from boot, so a 0.0 default throttles the
+        # first refresh on any machine with less than the interval of uptime.
+        last = _LAST_FORCED_REFRESH.get(inst)
+        if last is not None and now - last < FORCED_REFRESH_MIN_INTERVAL:
             return False
         _LAST_FORCED_REFRESH[inst] = now
         return True
