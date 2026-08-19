@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import re
+import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -15,6 +16,47 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from cw_platform.modules_registry import sync_provider_names
+from cw_platform.provider_instances import (
+    ensure_instance_block,
+    get_provider_block,
+    instances_for_user_profile,
+    list_instance_ids,
+    normalize_instance_id,
+    provider_display_key,
+    sanitize_instance_label,
+)
+
+_SHADOW_CACHE_LOCK = threading.Lock()
+_SHADOW_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any] | None]] = {}
+_SHADOW_CACHE_MAX = 64
+
+
+def _load_shadow_state(path: Path) -> dict[str, Any] | None:
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return None
+
+    key = str(path)
+    with _SHADOW_CACHE_LOCK:
+        cached = _SHADOW_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, dict):
+        parsed = None
+
+    with _SHADOW_CACHE_LOCK:
+        if len(_SHADOW_CACHE) >= _SHADOW_CACHE_MAX:
+            _SHADOW_CACHE.clear()
+        _SHADOW_CACHE[key] = (signature, parsed)
+    return parsed
+
 
 def _env() -> tuple[
     Any | None,
@@ -29,6 +71,17 @@ def _env() -> tuple[
         return CW, _load_cfg, _save_cfg, _get_runtime
     except Exception:
         return None, (lambda: {}), (lambda _cfg: None), (lambda *a, **k: None)
+
+
+def _load_state_features(features: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.orchestrator._state_store import StateStore
+
+        state = StateStore(CONFIG).load_state_features(features)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
 
 
 _AUTH_KEYS = {
@@ -247,13 +300,9 @@ def register_insights(app: FastAPI) -> None:
     def api_stats() -> dict[str, Any]:
         CW, _, _, _ = _env()
         STATS = getattr(CW, "STATS", None)
-        _load_state = getattr(CW, "_load_state", lambda: None)
         StatsClass = getattr(CW, "Stats", None)
 
-        try:
-            state = _load_state()
-        except Exception:
-            state = None
+        state = _load_state_features({"watchlist"})
 
         base: dict[str, Any] = {}
         try:
@@ -274,38 +323,41 @@ def register_insights(app: FastAPI) -> None:
     def api_select_snapshot(
         feature: str = Query(..., pattern="^(watchlist|history|ratings|progress)$"),
         snapshot: str = Query(...),
+        provider_instance: str = Query("default"),
     ) -> dict[str, Any]:
         _, load_config, save_config, _ = _env()
         try:
             cfg = load_config() or {}
         except Exception:
             cfg = {}
-        cw = (cfg.get("crosswatch") or cfg.get("CrossWatch") or {}) or {}
+
+        inst = normalize_instance_id(provider_instance)
         key = f"restore_{feature}"
-        cw[key] = snapshot
-        cfg["crosswatch"] = cw
+        block = ensure_instance_block(cfg, "crosswatch", inst)
+        block[key] = snapshot
 
         try:
             save_config(cfg)
         except Exception:
             return {"ok": False, "error": "save_config_failed"}
 
-        return {"ok": True, "feature": feature, "snapshot": snapshot}
+        return {"ok": True, "feature": feature, "snapshot": snapshot, "provider_instance": inst}
 
     @app.get("/api/insights", tags=["insight"])
     def api_insights(
+        request: Request,
         limit_samples: int = Query(60),
         history: int = Query(3),
         runtime: int = Query(0),
+        include_events: int = Query(1),
+        user_profile: str = Query(""),
     ) -> JSONResponse:
         CW, load_config, _, get_runtime = _env()
         STATS = getattr(CW, "STATS", None)
         REPORT_DIR = getattr(CW, "REPORT_DIR", None)
         CACHE_DIR = getattr(CW, "CACHE_DIR", None)
         _load_wall_snapshot = getattr(CW, "_load_wall_snapshot", lambda: [])
-        _get_orchestrator = getattr(CW, "_get_orchestrator", None)
         _append_log = getattr(CW, "_append_log", lambda *a, **k: None)
-        _load_state = getattr(CW, "_load_state", lambda: {})
         
         def _series_title_for_event(e: dict[str, Any]) -> str:
             series_title = (
@@ -711,11 +763,8 @@ def register_insights(app: FastAPI) -> None:
 
                 for p in files:
                     prio = _prio_for_file(p.name)
-                    try:
-                        raw = json.loads(p.read_text(encoding="utf-8") or "{}")
-                    except Exception:
-                        continue
-                    if not isinstance(raw, dict):
+                    raw = _load_shadow_state(p)
+                    if raw is None:
                         continue
 
                     for dict_key, rec in _iter_items(raw.get("items")):
@@ -809,6 +858,25 @@ def register_insights(app: FastAPI) -> None:
 
             return out
 
+        def _extend_title_maps_from_db(
+            show_key_map: dict[str, str],
+            show_id_map: dict[str, str],
+            movie_key_map: dict[str, tuple[str, int | None]],
+            movie_id_map: dict[str, tuple[str, int | None]],
+        ) -> None:
+            try:
+                from cw_platform.local_db.title_index import history_title_maps
+
+                db_movie_key, db_movie_id, db_show_id = history_title_maps()
+            except Exception:
+                return
+            for key, value in db_movie_key.items():
+                movie_key_map.setdefault(key, value)
+            for key, value in db_movie_id.items():
+                movie_id_map.setdefault(key, value)
+            for key, value in db_show_id.items():
+                show_id_map.setdefault(key, value)
+
         def _extend_show_title_maps_from_cw_state(id_map: dict[str, str]) -> None:
             try:
                 cw_state_dir = getattr(CW, "CW_STATE_DIR", None) or Path("/config/.cw_state")
@@ -863,12 +931,8 @@ def register_insights(app: FastAPI) -> None:
                     return ""
 
                 for p in files:
-                    try:
-                        raw = json.loads(p.read_text(encoding="utf-8") or "{}")
-                    except Exception:
-                        continue
-
-                    if not isinstance(raw, dict):
+                    raw = _load_shadow_state(p)
+                    if raw is None:
                         continue
 
                     for rec in _iter_items(raw.get("items")):
@@ -1003,8 +1067,110 @@ def register_insights(app: FastAPI) -> None:
             return merged or list(base_feats)
 
         feature_keys = _features_from(getattr(STATS, "data", {}) or {})
+        state_features = set(feature_keys)
+        state_features.update(base_feats)
+        state: dict[str, Any] | None = _load_state_features(state_features)
         events_raw: list[dict[str, Any]] = []
         _lane_cache: dict[tuple[int, int, int], tuple[dict[str, dict[str, Any]], dict[str, bool]]] = {}
+        cfg = load_config() or {}
+        scoped_profile = ""
+        user_filter: dict[str, list[str]] = {}
+
+        try:
+            from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
+
+            token = request.cookies.get(COOKIE_NAME)
+            scoped_profile = effective_user_profile_id(cfg, token, user_profile)
+        except Exception:
+            scoped_profile = "__none__"
+
+        if str(scoped_profile or "").strip():
+            user_filter = instances_for_user_profile(cfg, scoped_profile)
+            if not user_filter:
+                user_filter = {"__NONE__": ["__NONE__"]}
+
+        wanted_instances: dict[str, set[str]] = {}
+        for provider, instances in user_filter.items():
+            prov = provider_display_key(provider)
+            vals = {
+                normalize_instance_id(inst)
+                for inst in (instances if isinstance(instances, list) else [instances])
+                if normalize_instance_id(inst)
+            }
+            if prov and vals:
+                wanted_instances[prov] = vals
+
+        def _allows_instance(provider: Any, instance: Any) -> bool:
+            if not wanted_instances:
+                return True
+            prov = provider_display_key(provider)
+            inst = normalize_instance_id(instance)
+            return bool(prov and inst and inst in wanted_instances.get(prov, set()))
+
+        def _item_matches_scope(item: dict[str, Any]) -> bool:
+            if not wanted_instances:
+                return True
+            sources = item.get("sources_by_provider") or item.get("sourcesByProvider")
+            if isinstance(sources, dict):
+                for provider, raw_instances in sources.items():
+                    values = raw_instances if isinstance(raw_instances, list) else [raw_instances]
+                    if any(_allows_instance(provider, inst) for inst in values):
+                        return True
+            return _allows_instance(
+                item.get("provider") or item.get("source") or item.get("added_src"),
+                item.get("provider_instance") or item.get("source_instance") or item.get("added_instance") or item.get("instance"),
+            )
+
+        def _event_matches_scope(item: dict[str, Any]) -> bool:
+            if not wanted_instances:
+                return True
+            checks = (
+                (item.get("provider"), item.get("provider_instance") or item.get("instance")),
+                (item.get("source"), item.get("source_instance")),
+                (item.get("target"), item.get("target_instance")),
+            )
+            if any(_allows_instance(provider, instance) for provider, instance in checks):
+                return True
+            targets = item.get("targets")
+            if isinstance(targets, list):
+                for target in targets:
+                    if isinstance(target, dict) and _allows_instance(target.get("target") or target.get("provider"), target.get("target_instance") or target.get("instance")):
+                        return True
+            return False
+
+        def _scope_state(src: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not wanted_instances or not isinstance(src, dict):
+                return src
+            out = dict(src)
+            providers = src.get("providers")
+            if isinstance(providers, dict):
+                scoped_providers: dict[str, Any] = {}
+                for provider, pdata in providers.items():
+                    prov = provider_display_key(provider)
+                    allowed = wanted_instances.get(prov)
+                    if not allowed or not isinstance(pdata, dict):
+                        continue
+                    next_data: dict[str, Any] = {}
+                    if "default" in allowed:
+                        next_data.update({k: v for k, v in pdata.items() if k != "instances"})
+                    insts = pdata.get("instances")
+                    if isinstance(insts, dict):
+                        keep = {
+                            str(iid): idata
+                            for iid, idata in insts.items()
+                            if normalize_instance_id(iid) in allowed and isinstance(idata, dict)
+                        }
+                        if keep:
+                            next_data["instances"] = keep
+                    if next_data:
+                        scoped_providers[str(provider)] = next_data
+                out["providers"] = scoped_providers
+            wall_items = src.get("wall")
+            if isinstance(wall_items, list):
+                out["wall"] = [item for item in wall_items if isinstance(item, dict) and _item_matches_scope(item)]
+            return out
+
+        state = _scope_state(state)
 
         def _safe_parse_epoch(v: Any) -> int:
             try:
@@ -1425,37 +1591,43 @@ def register_insights(app: FastAPI) -> None:
             try:
                 with lock:
                     data = STATS.data or {}
-                samples_raw = list((data or {}).get("samples") or [])
+                samples_raw = [] if wanted_instances else list((data or {}).get("samples") or [])
                 
                 events_raw = list((data or {}).get("events") or [])
-                try:
-                    state = _load_state() or {}
-                except Exception:
-                    state = {}
-                key_map, id_map = _build_show_title_maps(state)
-                movie_key_map, movie_id_map = _build_movie_title_maps(state)
-                _extend_show_title_maps_from_cw_state(id_map)
-                _extend_movie_title_maps_from_cw_state(movie_key_map, movie_id_map)
+                if wanted_instances:
+                    events_raw = [e for e in events_raw if isinstance(e, dict) and _event_matches_scope(e)]
+                if int(include_events):
+                    state_for_maps = state or {}
+                    key_map, id_map = _build_show_title_maps(state_for_maps)
+                    movie_key_map, movie_id_map = _build_movie_title_maps(state_for_maps)
+                    _extend_show_title_maps_from_cw_state(id_map)
+                    _extend_movie_title_maps_from_cw_state(movie_key_map, movie_id_map)
+                    _extend_title_maps_from_db(key_map, id_map, movie_key_map, movie_id_map)
 
-                events = [
-                    _format_event_title(
-                        _enrich_event_from_state(
-                            _enrich_movie_event_from_state(e, movie_key_map, movie_id_map),
-                            key_map,
-                            id_map,
+                    events = [
+                        _format_event_title(
+                            _enrich_event_from_state(
+                                _enrich_movie_event_from_state(e, movie_key_map, movie_id_map),
+                                key_map,
+                                id_map,
+                            )
                         )
-                    )
-                    for e in events_raw
-                    if isinstance(e, dict) and not str(e.get("key", "")).startswith("agg:")
-                ]
-                events = _sort_events(events)
-                http_block = dict((data or {}).get("http") or {})
+                        for e in events_raw
+                        if isinstance(e, dict) and not str(e.get("key", "")).startswith("agg:")
+                    ]
+                    events = _sort_events(events)
+                else:
+                    events = []
+                http_block = {} if wanted_instances else dict((data or {}).get("http") or {})
                 generated_at = (data or {}).get("generated_at")
 
                 samples: list[dict[str, Any]] = [r for r in samples_raw if isinstance(r, dict)]
                 samples.sort(key=lambda r: int(r.get("ts") or 0))
-                if int(limit_samples) > 0:
-                    samples = samples[-int(limit_samples):]
+                sample_limit = max(0, int(limit_samples))
+                if sample_limit > 0:
+                    samples = samples[-sample_limit:]
+                else:
+                    samples = []
                 series = [
                     {"ts": int(r.get("ts") or 0), "count": int(r.get("count") or 0)}
                     for r in samples
@@ -1469,110 +1641,17 @@ def register_insights(app: FastAPI) -> None:
 
         rows: list[dict[str, Any]] = []
         try:
-            files: list[Path] = []
-            if REPORT_DIR is not None:
-                try:
-                    files = sorted(
-                        REPORT_DIR.glob("sync-*.json"),
-                        key=lambda p: p.stat().st_mtime,
-                        reverse=True,
-                    )[: max(1, int(history))]
-                except Exception as e:
-                    _append_log("INSIGHTS", f"[!] report glob failed: {e}")
-                    files = []
+            history_limit = max(0, int(history))
+            if history_limit > 0 and not wanted_instances:
+                from cw_platform.local_db.sync_reports import base_path_from_report_dir, list_reports
 
-            for p in files:
-                try:
-                    d = json.loads(p.read_text(encoding="utf-8"))
-                    if not isinstance(d, dict):
-                        continue
-
-                    lanes_raw = d.get("features")
-                    lanes_in: dict[str, Any] = lanes_raw if isinstance(lanes_raw, dict) else {}
-                    lanes: dict[str, dict[str, Any]] = {}
-                    for name in feature_keys:
-                        lane_val = lanes_in.get(name)
-                        lanes[name] = lane_val if isinstance(lane_val, dict) else _zero_lane()
-
-                    since = _safe_parse_epoch(d.get("raw_started_ts") or d.get("started_at"))
-                    until = _safe_parse_epoch(d.get("finished_at")) or int(p.stat().st_mtime)
-
-                    stats_feats, stats_enabled = _safe_compute_lanes(since, until)
-                    for name in feature_keys:
-                        lane_in = lanes_in.get(name)
-                        if not isinstance(lane_in, dict):
-                            lanes[name] = stats_feats.get(name) or _zero_lane()
-
-                    enabled_raw = d.get("features_enabled") or d.get("enabled") or {}
-                    enabled: dict[str, bool] = (
-                        enabled_raw if isinstance(enabled_raw, dict) else dict(stats_enabled)
-                    )
-
-                    provider_posts = {
-                        str(k[:-5]).strip().lower(): v
-                        for k, v in d.items()
-                        if isinstance(k, str) and k.endswith("_post")
-                    }
-                    pc = d.get("provider_counts") or d.get("provider_counts_post") or d.get("provider_counts_pre")
-                    if isinstance(pc, dict):
-                        for k0, v0 in pc.items():
-                            kk = str(k0 or "").strip().lower()
-                            if kk and kk not in provider_posts:
-                                provider_posts[kk] = v0
-                    plex_post = d.get("plex_post")
-                    simkl_post = d.get("simkl_post")
-                    trakt_post = d.get("trakt_post")
-                    tmdb_post = d.get("tmdb_post")
-                    jellyfin_post = d.get("jellyfin_post")
-                    emby_post = d.get("emby_post")
-                    mdblist_post = d.get("mdblist_post")
-                    crosswatch_post = d.get("crosswatch_post")
-
-                    if plex_post is None:
-                        plex_post = provider_posts.get("plex")
-                    if simkl_post is None:
-                        simkl_post = provider_posts.get("simkl")
-                    if trakt_post is None:
-                        trakt_post = provider_posts.get("trakt")
-                    if tmdb_post is None:
-                        tmdb_post = provider_posts.get("tmdb")
-                    if jellyfin_post is None:
-                        jellyfin_post = provider_posts.get("jellyfin")
-                    if emby_post is None:
-                        emby_post = provider_posts.get("emby")
-                    if mdblist_post is None:
-                        mdblist_post = provider_posts.get("mdblist")
-                    if crosswatch_post is None:
-                        crosswatch_post = provider_posts.get("crosswatch")
-
-
-                    rows.append(
-                        {
-                            "started_at": d.get("started_at"),
-                            "finished_at": d.get("finished_at"),
-                            "duration_sec": d.get("duration_sec"),
-                            "result": d.get("result") or "",
-                            "exit_code": d.get("exit_code"),
-                            "added": _as_int(d.get("added_last")),
-                            "removed": _as_int(d.get("removed_last")),
-                            "features": lanes,
-                            "features_enabled": enabled,
-                            "updated_total": _as_int(d.get("updated_last")),
-                            "provider_posts": provider_posts,
-                            "plex_post": plex_post,
-                            "simkl_post": simkl_post,
-                            "trakt_post": trakt_post,
-                            "tmdb_post": tmdb_post,
-                            "jellyfin_post": jellyfin_post,
-                            "emby_post": emby_post,
-                            "mdblist_post": mdblist_post,
-                            "crosswatch_post": crosswatch_post,
-                        }
-                    )
-                except Exception as e:
-                    _append_log("INSIGHTS", f"[!] report parse failed {p.name}: {e}")
+                rows = list_reports(
+                    base_path_from_report_dir(REPORT_DIR),
+                    limit=history_limit,
+                    feature_keys=feature_keys,
+                )
         except Exception as e:
-            _append_log("INSIGHTS", f"[!] report scan failed: {e}")
+            _append_log("INSIGHTS", f"[!] report load failed: {e}")
 
         wall_raw = _load_wall_snapshot()
         wall: list[Any]
@@ -1581,80 +1660,95 @@ def register_insights(app: FastAPI) -> None:
         else:
             wall = []
 
-        state: dict[str, Any] | None = None
-        if not wall and callable(_get_orchestrator):
-            try:
-                orc = _get_orchestrator()
-                files_obj = getattr(orc, "files", None)
-                if files_obj is not None and hasattr(files_obj, "load_state"):
-                    state_candidate = files_obj.load_state()
-                    if isinstance(state_candidate, dict):
-                        state = state_candidate
-                        wall = list(state.get("wall") or [])
-            except Exception as e:
-                _append_log("SYNC", f"[!] insights: orchestrator init failed: {e}")
-                wall = []
+        if not wall and state:
+            wall = list(state.get("wall") or [])
+        if wanted_instances:
+            wall = [item for item in wall if isinstance(item, dict) and _item_matches_scope(item)]
 
-        cfg = load_config() or {}
         api_key = str(((cfg.get("tmdb") or {}).get("api_key") or "")).strip()
         use_tmdb = bool(api_key) and bool(int(runtime)) and CACHE_DIR is not None
 
         def _build_crosswatch_snapshot_info() -> dict[str, Any]:
             info: dict[str, Any] = {}
             try:
-                cw_cfg = (cfg.get("crosswatch") or cfg.get("CrossWatch") or {}) or {}
-                root_dir = str(cw_cfg.get("root_dir") or "/config/.cw_provider").strip() or "/config/.cw_provider"
-                snap_dir = Path(root_dir).joinpath("snapshots")
+                def _label(inst: str, block: dict[str, Any]) -> str:
+                    if inst == "default":
+                        return "Default"
+                    label = sanitize_instance_label(block.get("label") if isinstance(block, dict) else "")
+                    return f"{inst} - {label}" if label else inst
 
-                selected: dict[str, str] = {
-                    "watchlist": str(cw_cfg.get("restore_watchlist") or "latest").strip() or "latest",
-                    "history": str(cw_cfg.get("restore_history") or "latest").strip() or "latest",
-                    "ratings": str(cw_cfg.get("restore_ratings") or "latest").strip() or "latest",
-                }
-
-                files: list[Path] = []
-                if snap_dir.is_dir():
-                    files = list(snap_dir.glob("*.json"))
-
-                by_feat: dict[str, list[str]] = {"watchlist": [], "history": [], "ratings": [], "progress": [], "playlists": []}
-                for p in files:
-                    name = p.name
-                    for feat in by_feat.keys():
-                        if name.endswith(f"-{feat}.json"):
-                            by_feat[feat].append(name)
-
-                for feat, arr in by_feat.items():
-                    arr.sort()
-                    sel = selected.get(feat, "latest")
-                    actual: str | None = None
-                    if arr:
-                        if sel == "latest":
-                            actual = arr[-1]
-                        elif sel in arr:
-                            actual = sel
-                        else:
-                            actual = arr[-1]
-
-                    human: str | None = None
-                    iso_ts: str | None = None
-                    if actual:
-                        try:
-                            stem = actual.split("-", 1)[0]
-                            dt = _dt.datetime.strptime(stem, "%Y%m%dT%H%M%SZ").replace(
-                                tzinfo=_dt.timezone.utc
-                            )
-                            iso_ts = dt.isoformat()
-                            human = dt.strftime("%d-%b-%y")
-                        except Exception:
-                            pass
-
-                    info[feat] = {
-                        "selected": sel,
-                        "actual": actual,
-                        "human": human,
-                        "ts": iso_ts,
-                        "has_snapshots": bool(arr),
+                def _profile_snapshot_info(inst: str, block: dict[str, Any]) -> dict[str, Any]:
+                    root_dir = str((block or {}).get("root_dir") or "/config/.cw_provider").strip() or "/config/.cw_provider"
+                    snap_dir = Path(root_dir).joinpath("snapshots")
+                    selected: dict[str, str] = {
+                        feat: str((block or {}).get(f"restore_{feat}") or "latest").strip() or "latest"
+                        for feat in ("watchlist", "history", "ratings", "progress")
                     }
+
+                    files: list[Path] = []
+                    if snap_dir.is_dir():
+                        files = list(snap_dir.glob("*.json"))
+
+                    by_feat: dict[str, list[str]] = {"watchlist": [], "history": [], "ratings": [], "progress": [], "playlists": []}
+                    for p in files:
+                        name = p.name
+                        for feat in by_feat.keys():
+                            if name.endswith(f"-{feat}.json"):
+                                by_feat[feat].append(name)
+
+                    profile_info: dict[str, Any] = {}
+                    for feat, arr in by_feat.items():
+                        arr.sort()
+                        sel = selected.get(feat, "latest")
+                        actual: str | None = None
+                        if arr:
+                            if sel == "latest":
+                                actual = arr[-1]
+                            elif sel in arr:
+                                actual = sel
+                            else:
+                                actual = arr[-1]
+
+                        human: str | None = None
+                        iso_ts: str | None = None
+                        if actual:
+                            try:
+                                stem = actual.split("-", 1)[0]
+                                dt = _dt.datetime.strptime(stem, "%Y%m%dT%H%M%SZ").replace(
+                                    tzinfo=_dt.timezone.utc
+                                )
+                                iso_ts = dt.isoformat()
+                                human = dt.strftime("%d-%b-%y")
+                            except Exception:
+                                pass
+
+                        profile_info[feat] = {
+                            "selected": sel,
+                            "actual": actual,
+                            "human": human,
+                            "ts": iso_ts,
+                            "has_snapshots": bool(arr),
+                            "root_dir": root_dir,
+                            "provider_instance": inst,
+                        }
+                    return profile_info
+
+                by_profile: dict[str, Any] = {}
+                profiles: list[dict[str, str]] = []
+                for inst in list_instance_ids(cfg, "crosswatch"):
+                    norm = normalize_instance_id(inst)
+                    if wanted_instances and not _allows_instance("crosswatch", norm):
+                        continue
+                    block = get_provider_block(cfg, "crosswatch", norm)
+                    if not block and norm != "default":
+                        continue
+                    root_dir = str((block or {}).get("root_dir") or "/config/.cw_provider").strip() or "/config/.cw_provider"
+                    profiles.append({"id": norm, "label": _label(norm, block), "root_dir": root_dir})
+                    by_profile[norm] = _profile_snapshot_info(norm, block)
+
+                info["_profiles"] = profiles
+                info["_by_profile"] = by_profile
+                info.update(by_profile.get("default") or (by_profile.get(profiles[0]["id"]) if profiles else {}) or {})
             except Exception:
                 pass
             return info
@@ -1711,19 +1805,8 @@ def register_insights(app: FastAPI) -> None:
             "method": "tmdb" if tmdb_hits and not tmdb_misses else ("mixed" if tmdb_hits else "estimate"),
         }
 
-        if state is None and callable(_get_orchestrator):
-            try:
-                orc = _get_orchestrator()
-                files_obj = getattr(orc, "files", None)
-                if files_obj is not None and hasattr(files_obj, "load_state"):
-                    st2 = files_obj.load_state()
-                    if isinstance(st2, dict):
-                        state = st2
-            except Exception:
-                state = None
-
         prov_block: dict[str, Any] = (state or {}).get("providers") or {}
-        providers_set: set[str] = set(sync_provider_names(upper=False))
+        providers_set: set[str] = {provider.lower() for provider in wanted_instances} if wanted_instances else set(sync_provider_names(upper=False))
         try:
             providers_set.update(
                 str(k).strip().lower()
@@ -1736,6 +1819,10 @@ def register_insights(app: FastAPI) -> None:
         try:
             raw_pairs = (cfg.get("pairs") or cfg.get("connections") or [])
             cfg_pairs: list[Any] = raw_pairs if isinstance(raw_pairs, list) else []
+            if wanted_instances:
+                from cw_platform.access_policy import profile_allows_pair
+
+                cfg_pairs = [p for p in cfg_pairs if isinstance(p, dict) and profile_allows_pair(user_filter, p)]
             for p in cfg_pairs:
                 if not isinstance(p, dict):
                     continue
@@ -1748,7 +1835,7 @@ def register_insights(app: FastAPI) -> None:
         except Exception:
             cfg_pairs = []
 
-        active: dict[str, bool] = {k: False for k in providers_set}
+        active: dict[str, bool] = {k: bool(wanted_instances) for k in providers_set}
         try:
             for p in (cfg_pairs or []):
                 if not isinstance(p, dict):
@@ -1879,6 +1966,11 @@ def register_insights(app: FastAPI) -> None:
                 instances_by_provider[key] = insts
         except Exception:
             pass
+        if wanted_instances:
+            instances_by_provider = {
+                provider.lower(): sorted(instances)
+                for provider, instances in wanted_instances.items()
+            }
 
         providers_instances_by_feature: dict[str, dict[str, dict[str, int]]] = {
             feat: {k: {"default": 0} for k in providers_set} for feat in feature_keys
@@ -1896,7 +1988,7 @@ def register_insights(app: FastAPI) -> None:
                     inst_counts: dict[str, int] = {}
                     for inst_id, node in _iter_provider_feature_nodes(pdata, feat):
                         inst_counts[inst_id] = _count_items(node, feat)
-                    if "default" not in inst_counts:
+                    if "default" not in inst_counts and not wanted_instances:
                         inst_counts["default"] = 0
                     providers_instances_by_feature[feat][key] = inst_counts
                     providers_by_feature[feat][key] = sum(int(v or 0) for v in inst_counts.values())
@@ -1956,7 +2048,7 @@ def register_insights(app: FastAPI) -> None:
                             "episodes": int(per_counts.get("episodes") or 0),
                         }
 
-                    if "default" not in inst_mse:
+                    if "default" not in inst_mse and not wanted_instances:
                         inst_mse["default"] = {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}
 
                     providers_instances_mse_by_feature[feat][key] = inst_mse
@@ -2130,4 +2222,6 @@ def register_insights(app: FastAPI) -> None:
             "added": int(wl.get("added", 0) or 0),
             "removed": int(wl.get("removed", 0) or 0),
         }
+        if scoped_profile:
+            payload["user_profile"] = str(scoped_profile or "").strip()
         return JSONResponse(payload)

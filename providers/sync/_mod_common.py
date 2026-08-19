@@ -34,6 +34,7 @@ __all__ = [
     "label_emby",
     "SimpleRateLimiter",
     "_confirmed_keys",
+    "_unresolved_keys",
     "_pair_scope",
     "_safe_scope",
     "_is_capture_mode",
@@ -720,41 +721,56 @@ def request_with_retries(
     raise requests.RequestException(msg)
 
 
+def _unresolved_keys(key_of, unresolved: Any) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        key = str(value or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                add(u.get("key"))
+                if isinstance(u.get("unresolved_key"), str):
+                    add(u.get("unresolved_key"))
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                if obj.get("_cw_rewatch_sync") is True:
+                    add(obj.get("_cw_event_key"))
+                try:
+                    add(key_of(obj))
+                except Exception:
+                    pass
+    return keys
+
+
 def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
     attempted: list[str] = []
     for it in items or []:
         try:
-            k = str(key_of(it) or "").strip()
+            k = str(it.get("_cw_event_key") or "").strip() if isinstance(it, Mapping) and it.get("_cw_rewatch_sync") is True else ""
+            if not k:
+                k = str(key_of(it) or "").strip()
         except Exception:
             k = ""
         if k:
             attempted.append(k)
 
-    unresolved_keys: set[str] = set()
-    if unresolved:
-        for u in unresolved:
-            obj: Any = u
-            if isinstance(u, Mapping):
-                if isinstance(u.get("key"), str) and u.get("key"):
-                    unresolved_keys.add(str(u.get("key")))
-                    continue
-                if "item" in u:
-                    obj = u.get("item")
-            if isinstance(obj, str) and obj:
-                unresolved_keys.add(obj)
-                continue
-            if isinstance(obj, Mapping):
-                try:
-                    k = str(key_of(obj) or "").strip()
-                except Exception:
-                    k = ""
-                if k:
-                    unresolved_keys.add(k)
+    unresolved_key_set = set(_unresolved_keys(key_of, unresolved))
 
     out: list[str] = []
     seen: set[str] = set()
     for k in attempted:
-        if k in unresolved_keys or k in seen:
+        if k in unresolved_key_set or k in seen:
             continue
         out.append(k)
         seen.add(k)

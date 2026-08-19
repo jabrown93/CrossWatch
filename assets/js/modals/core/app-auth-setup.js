@@ -143,22 +143,6 @@ export function setModalDismissible(flag) {
   try { window.cxSetModalDismissible?.(flag !== false); } catch {}
 }
 
-export function appAuthFormCss(scope) {
-  return `
-${scope} .authPanel{display:grid;gap:12px;margin-top:12px}
-${scope} .authCard{padding:14px;border-radius:16px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 30px rgba(0,0,0,.30)}
-${scope} .authGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px;row-gap:18px}
-${scope} .field.full{grid-column:1 / -1}
-@media (max-width:780px){${scope} .authGrid{grid-template-columns:1fr}}
-${scope} label{display:block;font-weight:800;font-size:12px;opacity:.86;margin-bottom:6px}
-${scope} .field input{width:100%;min-height:42px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(8,10,16,.88);color:#eaf0ff;padding:10px 12px;font:inherit}
-${scope} .field input:focus{outline:2px solid rgba(150,70,255,.35);outline-offset:1px}
-${scope} .field .subtxt{opacity:.68;font-size:12px;margin-top:6px;line-height:1.4}
-${scope} .err{display:none;margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,120,120,.22);background:linear-gradient(180deg,rgba(255,77,79,.12),rgba(255,77,79,.04));color:#ffd8d8;font-size:12.5px}
-${scope} .err.show{display:block}
-  `;
-}
-
 export function renderAppAuthFields({
   idPrefix,
   state,
@@ -168,7 +152,7 @@ export function renderAppAuthFields({
   const errCls = state?.error ? "err show" : "err";
   const errAttr = errorId ? ` id="${escapeHtml(errorId)}"` : "";
   const body = `
-    <div class="authGrid">
+    <form class="authGrid" autocomplete="off" onsubmit="return false">
       <div class="field full">
         <label for="${escapeHtml(idPrefix)}-user">Username</label>
         <input id="${escapeHtml(idPrefix)}-user" data-field="username" type="text" autocomplete="username" placeholder="admin" value="${escapeHtml(state?.username)}">
@@ -187,7 +171,7 @@ export function renderAppAuthFields({
         <input id="${escapeHtml(idPrefix)}-setup-token" data-field="setup_token" type="text" autocomplete="off" placeholder="Paste the one-time setup token" value="${escapeHtml(state?.setup_token)}">
         <div class="subtxt">Printed in the server's boot logs and saved to a <code>.setup_token</code> file in your config directory.</div>
       </div>
-    </div>
+    </form>
     <div class="${errCls}"${errAttr}>${escapeHtml(state?.error)}</div>
   `;
   if (wrap === false) return body;

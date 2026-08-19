@@ -19,17 +19,19 @@ export const HELP_TEXT = {
   "cx-wl-enable": "Watchlist: Enable\nCompare watchlists and write missing items to the target.",
   "cx-wl-add": "Watchlist: Add\nAdds missing items to the target watchlist.",
   "cx-wl-remove": "Watchlist: Remove\nRemoves items from the target.",
-  "cx-wl-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database for this AniList watchlist pair. When enabled from here, global Anime ID Mapping is enabled too.",
-  "cx-wl-anime-only": "Anime-only sync\nOnly sync items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before AniList title search.",
+  "cx-wl-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database to match anime for this watchlist pair. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-wl-anime-only": "Anime-only sync\nOnly sync items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before falling back to a title search.",
   "cx-rt-enable": "Ratings: Enable\nCompare and write ratings to the target.",
   "cx-rt-add": "Ratings: Add / Update\nWrites ratings/updates to the target.",
   "cx-rt-remove": "Ratings: Remove\nClears ratings on the target (destructive and only for very specific needs).",
-  "cx-rt-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database for this AniList ratings pair. When enabled from here, global Anime ID Mapping is enabled too.",
-  "cx-rt-anime-only": "Anime-only sync\nOnly sync ratings for items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before AniList title search.",
+  "cx-rt-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database to match anime for this ratings pair. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-hs-anime-map": "Anime episode mapping\nTranslate anime episode numbering when this history pair writes to an anime tracker, using the local AniBridge dataset. Requires a TMDB metadata key. Syncing from SIMKL to Trakt already maps episodes on its own and does not need this. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-rt-anime-only": "Anime-only sync\nOnly sync ratings for items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before falling back to a title search.",
 
   "cx-hs-enable": "History: Enable\nCompare and write watch history to the target.",
   "cx-hs-add": "History: Add\nAdds plays/watched items to the target history.",
   "cx-hs-remove": "History: Remove\nRemoving history is discouraged (destructive and only for very specific needs).",
+  "cx-hs-rewatches": "History: Rewatches\nSync separate play events when both providers support it. SIMKL requires Pro/VIP.",
   "cx-tr-hs-col": "Trakt: Add to library\nAlso add items to your Trakt library when writing history (if enabled).",
   "cx-tr-hs-ignore-dropped": "Trakt: Ignore dropped shows\nWhen enabled, shows marked as dropped on Trakt are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
   "cx-md-hs-ignore-dropped": "MDBList: Ignore dropped shows\nWhen enabled, shows marked as dropped on MDBList are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
@@ -40,7 +42,7 @@ export const HELP_TEXT = {
   "cx-pr-remove": "Progress: Remove\nClear resume position on the target (rare; Plex may not support).",
   "cx-pr-min": "Progress: Minimum seconds\nIgnore tiny offsets (scrubbing).",
   "cx-pr-delta": "Progress: Change threshold\nOnly write when the difference is large enough.",
-  "cx-pr-maxp": "Progress: Ignore near complete (%)\nWhen near completion, history sync should handle watched state.",
+  "cx-pr-maxp": "Progress: Ignore near complete (%)\nOne-way defaults to the target recommendation. Two-way keeps one shared limit and shows per-target recommendations below.",
   "cx-pr-replay": "Replay watched items\nUnwatch the target, then apply resume progress.",
   "cx-pr-tolerance": "Timestamp tolerance\nProtect targets newer by more than this many seconds.",
 
@@ -112,6 +114,21 @@ export function injectHelpIcons(root, { QA } = {}) {
 
     wrap.insertBefore(btn, sw);
   }
+
+  (QA ? QA("label[data-tip-id]", root) : Array.from(root.querySelectorAll("label[data-tip-id]"))).forEach(label => {
+    const key = label.dataset.tipId;
+    if (!key || !HELP_TEXT[key] || label.querySelector(".cx-help")) return;
+    const inputId = label.getAttribute("for") || "";
+    const input = inputId ? root.querySelector(`#${CSS.escape(inputId)}`) : null;
+    if (input?.closest("label.switch")) return;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cx-help material-symbols-rounded";
+    btn.textContent = "help";
+    btn.dataset.tipId = key;
+    label.appendChild(btn);
+  });
 
   (QA ? QA(".cx-help[data-tip-id]", root) : Array.from(root.querySelectorAll(".cx-help[data-tip-id]"))).forEach(btn => {
     if (btn.__wired) return;

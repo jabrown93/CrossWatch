@@ -37,9 +37,8 @@ FIELDS = (
 # since dedup only needs to hold within a run.
 _HASH_FIELDS = (
     "source_file", "source_mtime", "event_type", "item_key",
-    "source_provider", "source_instance",
-    "destination_provider", "destination_instance",
-    "origin_provider", "origin_instance",
+    "source_provider", "destination_provider", "origin_provider",
+    "source_instance", "destination_instance", "origin_instance",
     "feature", "pair_key", "operation", "reason_code",
     "old_value", "new_value", "run_id",
 )
@@ -302,6 +301,8 @@ class RunRecorder:
                 operation="plan",
                 source_provider=src or None,
                 destination_provider=dst or None,
+                source_instance=self._si or None,
+                destination_instance=self._di or None,
                 detail={k: f.get(k) for k in ("adds", "removes", "updates", "src_count", "dst_count")},
             )
             self._flush()
@@ -346,6 +347,8 @@ class RunRecorder:
                 severity="warn" if errors else "info",
                 source_provider=src_eff or None,
                 destination_provider=dst or None,
+                source_instance=self._si or None,
+                destination_instance=self._di or None,
                 reason_code="errors" if errors else None,
                 detail={k: f.get(k) for k in ("attempted", "count", "added", "removed", "updated", "skipped", "unresolved", "errors") if k in f},
             )
@@ -356,6 +359,8 @@ class RunRecorder:
                     severity="error",
                     source_provider=src_eff or None,
                     destination_provider=dst or None,
+                    source_instance=self._si or None,
+                    destination_instance=self._di or None,
                     reason_code="errors",
                 )
             self._flush()
@@ -421,6 +426,8 @@ class RunRecorder:
                     event_type="blackbox_blocked",
                     severity="warn",
                     destination_provider=dst_p,
+                    source_instance=self._si or None,
+                    destination_instance=self._di or None,
                     pair_key=pair_k,
                     reason_code="blackbox",
                     detail={"blocked": bb},
@@ -435,7 +442,8 @@ class RunRecorder:
                 it: Mapping[str, Any] = raw_it if isinstance(raw_it, Mapping) else {}
                 self._add(
                     event_type="blackbox_blocked", operation="add", severity="warn",
-                    destination_provider=dst_p, pair_key=pair_k, item_key=k,
+                    destination_provider=dst_p, source_instance=self._si or None,
+                    destination_instance=self._di or None, pair_key=pair_k, item_key=k,
                     reason_code="blackbox", reason="blackbox", **_item_fields(it),
                 )
             if bb > 0 or rows:

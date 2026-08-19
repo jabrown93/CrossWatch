@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, cast
@@ -12,8 +12,12 @@ from urllib.parse import urlencode
 import requests
 
 from cw_platform.config_base import CONFIG
+from cw_platform.local_db import watchlist_hide as sqlite_watchlist_hide
 from cw_platform.modules_registry import load_sync_ops, sync_provider_names
+from cw_platform.orchestrator._state_store import StateStore
 from cw_platform.provider_instances import build_config_view, list_instance_ids, normalize_instance_id
+
+_LOG = logging.getLogger("crosswatch.services.watchlist")
 
 try:
     from plexapi.myplex import MyPlexAccount
@@ -24,47 +28,44 @@ except Exception:
     _HAVE_PLEXAPI = False
 
 
-# path helpers
-def _state_path() -> Path:
-    return CONFIG / "state.json"
-
-
-HIDE_PATH: Path = CONFIG / "watchlist_hide.json"
+def _sync_state_base(state_path: Path | None = None) -> Path:
+    return state_path.parent if state_path is not None else CONFIG
 
 
 def _load_hide_set() -> set[str]:
     try:
-        if HIDE_PATH.exists():
-            data = json.loads(HIDE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                return {str(x) for x in data}
+        return sqlite_watchlist_hide.load_hidden(CONFIG)
     except Exception:
         pass
     return set()
 
 
-def _save_hide_set(hide: set[str]) -> None:
-    try:
-        HIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        HIDE_PATH.write_text(json.dumps(sorted(hide)), encoding="utf-8")
-    except Exception:
-        pass
+def _load_sync_state(base_path: Path = CONFIG) -> dict[str, Any]:
+    raw = StateStore(base_path).load_state_features({"watchlist"})
+    return raw if isinstance(raw, dict) else {}
 
 
-def _load_state_dict(path: Path) -> dict[str, Any]:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
-def _save_state_dict(path: Path, state: dict[str, Any]) -> None:
-    try:
-        path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+def _save_sync_state(base_path: Path, state: dict[str, Any]) -> None:
+    providers = state.get("providers") if isinstance(state, dict) else {}
+    if not isinstance(providers, Mapping):
+        return
+    blocks: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for provider, node in providers.items():
+        if not isinstance(node, Mapping):
+            continue
+        feature = node.get("watchlist")
+        if isinstance(feature, Mapping):
+            blocks[(str(provider).upper(), _DEFAULT_INSTANCE, "watchlist")] = feature
+        insts = node.get("instances")
+        if isinstance(insts, Mapping):
+            for inst, inst_node in insts.items():
+                if not isinstance(inst_node, Mapping):
+                    continue
+                feature = inst_node.get("watchlist")
+                if isinstance(feature, Mapping):
+                    blocks[(str(provider).upper(), normalize_instance_id(inst), "watchlist")] = feature
+    if blocks:
+        StateStore(base_path).save_feature_blocks(blocks, last_sync_epoch=state.get("last_sync_epoch"))
 
 
 # Registry and provider helpers
@@ -301,7 +302,7 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
     if len(parts) >= 2:
         k = parts[-2].lower().strip()
         v = parts[-1].strip()
-        if k in {"tmdb", "imdb", "tvdb", "trakt", "slug", "jellyfin", "emby", "anilist", "mal"} and v:
+        if k in {"tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "slug", "jellyfin", "emby", "anilist", "mal"} and v:
             ids.setdefault(k, v)
     if "thetvdb" in ids and "tvdb" not in ids:
         ids["tvdb"] = ids.get("thetvdb")
@@ -315,6 +316,7 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
         "tvdb",
         "trakt",
         "simkl",
+        "mdblist",
         "slug",
         "jellyfin",
         "emby",
@@ -330,7 +332,7 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-_WATCHLIST_ALIAS_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "slug", "anilist", "mal")
+_WATCHLIST_ALIAS_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "slug", "anilist", "mal")
 
 
 def _watchlist_alias_tokens(key: str, item: dict[str, Any]) -> set[str]:
@@ -385,7 +387,7 @@ def _group_watchlist_refs(
 
 def _preferred_watchlist_key(alias_keys: list[str], info: dict[str, Any], typ: str) -> str:
     ids = _ids_from_key_or_item("", info)
-    ordered = ("tmdb", "imdb", "tvdb", "trakt", "slug", "anilist", "mal")
+    ordered = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "slug", "anilist", "mal")
 
     for name in ordered:
         value = ids.get(name)
@@ -442,6 +444,16 @@ def _iso_to_epoch(iso: str | None) -> int:
     try:
         s = str(iso).strip().replace("Z", "+00:00")
         return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return 0
+
+
+def _year_sort_value(value: Any) -> int:
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        return int(text[:4]) if text[:4].isdigit() else int(text)
     except Exception:
         return 0
 
@@ -857,29 +869,46 @@ def _jf_index_watchlist(
 def _jf_lookup_by_provider_ids(
     cfg: dict[str, Any],
     headers: dict[str, str],
-    tokens: list[str],
+    ids: dict[str, Any],
 ) -> str | None:
-    if not tokens:
-        return None
-    for tok in tokens:
-        try:
-            j = _jf_get(
-                _jf_base(cfg),
-                f"Users/{_jf_require_user(cfg)}/Items",
-                headers,
-                {
-                    "Recursive": "true",
-                    "IncludeItemTypes": "Movie,Series",
-                    "AnyProviderIdEquals": tok,
-                    "Limit": 1,
-                    "Fields": "ProviderIds",
-                },
-            )
-            items = (j.get("Items") or []) if isinstance(j, dict) else []
-            if items and items[0].get("Id"):
-                return str(items[0]["Id"])
-        except Exception:
+    wanted: dict[str, str] = {}
+    for k in ("tmdb", "imdb", "tvdb"):
+        v = ids.get(k)
+        if v in (None, "", 0):
             continue
+        wanted[k] = str(v).strip().lower()
+    if not wanted:
+        return None
+    try:
+        j = _jf_get(
+            _jf_base(cfg),
+            f"Users/{_jf_require_user(cfg)}/Items",
+            headers,
+            {
+                "Recursive": "true",
+                "IncludeItemTypes": "Movie,Series",
+                "AnyProviderIdEquals": ",".join(f"{k}.{v}" for k, v in wanted.items()),
+                "Limit": 500,
+                "Fields": "ProviderIds",
+            },
+        )
+    except Exception:
+        return None
+    for it in (j.get("Items") or []) if isinstance(j, dict) else []:
+        iid = str((it or {}).get("Id") or "")
+        if not iid:
+            continue
+        prov = it.get("ProviderIds") or {}
+        low = {str(pk).strip().lower(): pv for pk, pv in prov.items() if pv}
+        for k, v in wanted.items():
+            have = low.get(k)
+            if isinstance(have, list):
+                have = have[0] if have else None
+            have = str(have or "").strip().lower()
+            if not have:
+                continue
+            if have == v or (have.isdigit() and v.isdigit() and int(have) == int(v)):
+                return iid
     return None
 
 
@@ -972,6 +1001,18 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
 
         tmdb_str = str(tmdb_id)
         tmdb_value = int(tmdb_str) if tmdb_str.isdigit() else tmdb_id
+        extra_meta = {
+            k: info.get(k)
+            for k in (
+                "genres",
+                "genre",
+                "release_date",
+                "first_air_date",
+                "released",
+                "release",
+            )
+            if info.get(k) not in (None, "", [], {})
+        }
 
         out.append(
             {
@@ -993,11 +1034,12 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
                 "added_instance": added_instance,
                 "categories": [],
                 "ids": _ids_from_key_or_item(key, info),
+                **extra_meta,
             }
         )
 
     out.sort(
-        key=lambda x: (x.get("added_epoch") or 0, x.get("year") or 0),
+        key=lambda x: (x.get("added_epoch") or 0, _year_sort_value(x.get("year"))),
         reverse=True,
     )
     return out
@@ -1296,11 +1338,7 @@ def _delete_on_jellyfin_batch(
                 (by_token.get(t) for t in _jf_provider_tokens(ids) if by_token.get(t)),
                 None,
             )
-            or _jf_lookup_by_provider_ids(
-                cfg,
-                hdr,
-                _jf_provider_tokens(ids),
-            )
+            or _jf_lookup_by_provider_ids(cfg, hdr, ids)
         )
         if jf_id:
             jf_ids.append(str(jf_id))
@@ -1498,23 +1536,35 @@ def delete_watchlist_batch(
     cfg: dict[str, Any],
     provider_instance: str | None = None,
     state_path: Path | None = None,
+    allowed_instances: Mapping[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     prov = (prov or "").upper().strip()
     keys = [k for k in (keys or []) if isinstance(k, str) and k.strip()]
     if not keys:
         return {"ok": False, "deleted": 0, "provider": prov, "status": "noop", "note": "no-keys"}
 
-    state_path = state_path or _state_path()
+    state_base = _sync_state_base(state_path)
     inst_raw = str(provider_instance or "").strip()
     inst_lc = inst_raw.lower()
     inst_sel = None if not inst_raw or inst_lc in {"all", "any", "*", "auto"} else normalize_instance_id(inst_raw)
     if prov == "ALL":
         inst_sel = None
 
+    def _allowed_for(p: str) -> set[str] | None:
+        if allowed_instances is None:
+            return None
+        raw = allowed_instances.get(str(p or "").upper()) or []
+        return {normalize_instance_id(v) for v in (raw if isinstance(raw, list) else [raw]) if normalize_instance_id(v)}
+
     def _instance_targets(p: str) -> list[str]:
+        allow = _allowed_for(p)
+        if allow is not None and not allow:
+            return []
         hits: set[str] = set()
         for inst_id, blk in _iter_provider_instance_blocks(state, p):
             if inst_sel and inst_id != inst_sel:
+                continue
+            if allow is not None and normalize_instance_id(inst_id) not in allow:
                 continue
             items = _items_from_block(blk)
             if not isinstance(items, dict) or not items:
@@ -1522,9 +1572,9 @@ def delete_watchlist_batch(
             for k in keys:
                 if k in items:
                     hits.add(inst_id)
-        if not hits and inst_sel:
+        if not hits and inst_sel and (allow is None or inst_sel in allow):
             hits.add(inst_sel)
-        if not hits:
+        if not hits and allow is None:
             hits.add(_DEFAULT_INSTANCE)
         return sorted(hits, key=lambda x: (x != _DEFAULT_INSTANCE, x))
 
@@ -1584,8 +1634,9 @@ def delete_watchlist_batch(
                     if _del_key_from_provider_items(state, p, k, instance_id=inst):
                         removed.add(k)
                 per_instance[inst] = {"ok": True, "removed": len(removed)}
-            except Exception as e:
-                per_instance[inst] = {"ok": False, "error": str(e)}
+            except Exception:
+                _LOG.warning("watchlist batch delete failed for %s/%s", p, inst, exc_info=True)
+                per_instance[inst] = {"ok": False, "error": "delete_failed"}
         return {"ok": any(v.get("ok") for v in per_instance.values()), "per_instance": per_instance, "removed": len(removed)}
 
     if prov == "ALL":
@@ -1594,13 +1645,15 @@ def delete_watchlist_batch(
         deleted_sum = 0
 
         for p in _registry_sync_providers():
+            if allowed_instances is not None and not _allowed_for(p):
+                continue
             res = _delete_for_provider(p)
             details[p] = res
             ok_any |= bool(res.get("ok"))
             deleted_sum += int(res.get("removed") or 0)
 
         if deleted_sum:
-            _save_state_dict(state_path, state)
+            _save_sync_state(state_base, state)
 
         return {"ok": ok_any, "deleted": deleted_sum, "provider": "ALL", "details": details, "status": "ok" if ok_any else "error"}
 
@@ -1609,30 +1662,33 @@ def delete_watchlist_batch(
 
     res = _delete_for_provider(prov)
     if int(res.get("removed") or 0) > 0:
-        _save_state_dict(state_path, state)
+        _save_sync_state(state_base, state)
 
     return {"ok": bool(res.get("ok")), "deleted": int(res.get("removed") or 0), "provider": prov, "details": res.get("per_instance"), "status": "ok" if res.get("ok") else "error"}
 
 def delete_watchlist_item(
     key: str,
-    state_path: Path,
+    state_path: Path | None,
     cfg: dict[str, Any],
     log: Any = None,
     provider: str | None = None,
     provider_instance: str | None = None,
+    allowed_instances: Mapping[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     prov = (provider or "ALL").upper().strip()
-    try:
-        state = _load_state_dict(state_path)
-    except Exception as e:
-        return {"ok": False, "status": "error", "provider": prov, "key": key, "error": str(e)}
-
     def _log(level: str, msg: str) -> None:
         try:
             if callable(log):
                 log(level, msg)
         except Exception:
             pass
+
+    try:
+        state = _load_sync_state(_sync_state_base(state_path))
+    except Exception:
+        _LOG.warning("watchlist delete failed while loading state", exc_info=True)
+        _log("SYNC", f"[WL] delete {key} on {prov} failed")
+        return {"ok": False, "status": "error", "provider": prov, "key": key, "error": "delete_failed"}
 
     try:
         res = delete_watchlist_batch(
@@ -1642,13 +1698,15 @@ def delete_watchlist_item(
             cfg=cfg,
             provider_instance=provider_instance,
             state_path=state_path,
+            allowed_instances=allowed_instances,
         ) or {}
         _log("SYNC", f"[WL] delete {key} on {prov}: {'OK' if res.get('ok') else 'NOOP'}")
         res.setdefault("key", key)
         return res
-    except Exception as e:
-        _log("SYNC", f"[WL] delete {key} on {prov} failed: {e}")
-        return {"ok": False, "status": "error", "provider": prov, "key": key, "error": str(e)}
+    except Exception:
+        _LOG.warning("watchlist delete failed for provider %s", prov, exc_info=True)
+        _log("SYNC", f"[WL] delete {key} on {prov} failed")
+        return {"ok": False, "status": "error", "provider": prov, "key": key, "error": "delete_failed"}
 
 def detect_available_watchlist_providers(
     cfg: dict[str, Any],
@@ -1657,25 +1715,7 @@ def detect_available_watchlist_providers(
     counts: dict[str, int] = {pid: 0 for pid in providers}
 
     try:
-        from api.syncAPI import _load_state
-
-        st = _load_state() or {}
-        P = st.get("providers") or {}
-        for pid in providers:
-            pblk = P.get(pid) or {}
-            keys: set[str] = set()
-            base = (((pblk.get("watchlist") or {}).get("baseline") or {}).get("items") or {})
-            if isinstance(base, dict):
-                keys |= set(base.keys())
-            insts = pblk.get("instances") or {}
-            if isinstance(insts, dict):
-                for blk in insts.values():
-                    if not isinstance(blk, dict):
-                        continue
-                    items = (((blk.get("watchlist") or {}).get("baseline") or {}).get("items") or {})
-                    if isinstance(items, dict):
-                        keys |= set(items.keys())
-            counts[pid] = len(keys)
+        counts.update(StateStore(CONFIG).provider_feature_counts("watchlist"))
     except Exception:
         pass
 

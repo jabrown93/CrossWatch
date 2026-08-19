@@ -29,21 +29,28 @@
   document.head.appendChild(Object.assign(el("style"), { id: "sch-css", textContent: `
 #sec-scheduling{--sch-shell-bg:#171a22;--sch-card-bg:#20242d;--sch-card-bg-soft:#242936;--sch-input-bg:#252b36;--sch-input-bg-hover:#2a303d;--sch-border:rgba(255,255,255,.14);--sch-border-soft:rgba(255,255,255,.12);--sch-shadow:none;--sch-fg:#f3f7ff;--sch-fg-soft:rgba(215,222,235,.76)}
 #sec-scheduling .cw-subpanel[data-sub]{padding-top:6px}
-#sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card,#schAdv{position:relative;border:1px solid var(--sch-border);border-radius:22px;background:var(--sch-shell-bg);box-shadow:var(--sch-shadow);overflow:hidden}
-#sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card::before,#schAdv::before{content:none;display:none}
+#sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card,#schAdv,#schWebhooks{position:relative;border:1px solid var(--sch-border);border-radius:22px;background:var(--sch-shell-bg);box-shadow:var(--sch-shadow);overflow:hidden}
+#sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card::before,#schAdv::before,#schWebhooks::before{content:none;display:none}
 #sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card-fields{position:relative;z-index:1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:16px}
 #sec-scheduling .cw-subpanel[data-sub="basic"] .field{display:grid;gap:8px;padding:14px 16px;border:1px solid var(--sch-border-soft);border-radius:14px;background:var(--sch-card-bg);box-shadow:none}
 #sec-scheduling .cw-subpanel[data-sub="basic"] .field:first-child{grid-column:1 / -1}
 #sec-scheduling .cw-subpanel[data-sub="basic"] .field>.muted{margin:0!important;font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:rgba(214,223,238,.58)}
-#sec-scheduling .cw-subpanel[data-sub="basic"] .field>.muted .th-help{display:inline-flex;align-items:center;gap:8px}
-#sec-scheduling .cw-subpanel[data-sub="basic"] .sch-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:#2b313d;color:#edf4ff;cursor:help;box-shadow:none}
-#sec-scheduling .cw-subpanel[data-sub="basic"] .sch-help::before{content:"help";font-family:"Material Symbols Rounded","Material Symbols Outlined","Segoe UI Symbol",sans-serif;font-size:18px;line-height:1}
+#sec-scheduling .cw-subpanel[data-sub="basic"] .field>.muted .th-help{display:inline-flex;align-items:center;gap:8px;line-height:1.15;vertical-align:middle}
+#sec-scheduling .cw-subpanel[data-sub="basic"] .sch-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;min-width:30px;padding:0;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:#2b313d;color:#edf4ff;cursor:help;box-shadow:none;vertical-align:middle}
+#sec-scheduling .cw-subpanel[data-sub="basic"] .sch-help::before{content:"help";font-family:"Material Symbols Rounded","Material Symbols Outlined","Segoe UI Symbol",sans-serif;font-size:22px;line-height:1}
 #sec-scheduling .cw-subpanel[data-sub="basic"] .sch-help:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(125,134,201,.16)}
 #sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card-notes{margin-top:0;color:var(--sch-fg-soft);font-size:12px;line-height:1.45}
-#sec-scheduling .cw-subpanel[data-sub="basic"] select,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=time],#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=number],.sch-adv select,.sch-adv input[type=time],.sch-adv input[type=number],.sch-adv input[type=text]{width:100%;min-height:46px;padding:0 14px;border:1px solid rgba(136,151,190,.22);border-radius:12px;background:var(--sch-input-bg);color:var(--sch-fg);box-shadow:inset 0 1px 0 rgba(255,255,255,.035);transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}
-#sec-scheduling .cw-subpanel[data-sub="basic"] select:hover,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=time]:hover,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=number]:hover,.sch-adv select:hover,.sch-adv input[type=time]:hover,.sch-adv input[type=number]:hover,.sch-adv input[type=text]:hover{border-color:rgba(160,176,220,.30);background:var(--sch-input-bg-hover)}
-#sec-scheduling .cw-subpanel[data-sub="basic"] select:focus,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=time]:focus,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=number]:focus,.sch-adv select:focus,.sch-adv input[type=time]:focus,.sch-adv input[type=number]:focus,.sch-adv input[type=text]:focus{outline:none;border-color:rgba(125,134,201,.52);box-shadow:0 0 0 3px rgba(125,134,201,.16)}
+#sec-scheduling .cw-subpanel[data-sub="basic"] select,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=time],#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=number],.sch-adv select,.sch-adv input[type=time],.sch-adv input[type=number],.sch-adv input[type=text],.sch-adv input[type=url]{width:100%;min-height:46px;padding:0 14px;border:1px solid rgba(136,151,190,.22);border-radius:12px;background:var(--sch-input-bg);color:var(--sch-fg);box-shadow:inset 0 1px 0 rgba(255,255,255,.035);transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}
+#sec-scheduling .cw-subpanel[data-sub="basic"] select:hover,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=time]:hover,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=number]:hover,.sch-adv select:hover,.sch-adv input[type=time]:hover,.sch-adv input[type=number]:hover,.sch-adv input[type=text]:hover,.sch-adv input[type=url]:hover{border-color:rgba(160,176,220,.30);background:var(--sch-input-bg-hover)}
+#sec-scheduling .cw-subpanel[data-sub="basic"] select:focus,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=time]:focus,#sec-scheduling .cw-subpanel[data-sub="basic"] input[type=number]:focus,.sch-adv select:focus,.sch-adv input[type=time]:focus,.sch-adv input[type=number]:focus,.sch-adv input[type=text]:focus,.sch-adv input[type=url]:focus{outline:none;border-color:rgba(125,134,201,.52);box-shadow:0 0 0 3px rgba(125,134,201,.16)}
 .sch-adv{padding:16px}
+.sch-webhooks{margin-top:14px}
+.sch-webhooks [data-webhook-format-for]{display:none!important}
+.sch-webhooks[data-payload-format="crosswatch"] [data-webhook-format-for~="crosswatch"],.sch-webhooks[data-payload-format="notifiarr"] [data-webhook-format-for~="notifiarr"]{display:grid!important}
+.sch-webhooks .cx-toggle[data-checked="true"] .cx-toggle-ui{background:linear-gradient(180deg,rgba(42,202,126,0.34),rgba(28,136,87,0.28));border-color:rgba(34,197,94,0.42)}
+.sch-webhooks .cx-toggle[data-checked="true"] .cx-toggle-ui:after{transform:translateX(20px)}
+.sch-webhooks .cx-toggle[data-checked="true"] .cx-toggle-state{color:#d9fff0;border-color:rgba(34,197,94,0.26);background:rgba(34,197,94,0.12)}
+.sch-webhooks .cx-toggle[data-checked="true"] .cx-toggle-state:before{content:"On"}
 .sch-adv .cw-panel-head{position:relative;z-index:1;display:flex;align-items:center;min-height:104px;margin:0 0 14px;padding:14px 16px;border:none;border-radius:0;background:transparent;box-shadow:none}
 .sch-adv .cw-panel-head .cx-toggle{margin-top:20px}
 .sch-adv .mini,.sch-adv .status{position:relative;z-index:1}
@@ -55,11 +62,12 @@
 .sch-adv-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .sch-adv-section-title{font-size:12px;font-weight:900;letter-spacing:.12em;text-transform:uppercase;color:#f7f9ff}
 .sch-adv-section-copy{max-width:70ch;font-size:12px;line-height:1.45;color:var(--sch-fg-soft)}
+.sch-adv-section-copy.sch-workflow-intro{max-width:none;white-space:nowrap}
 .sch-adv table{position:relative;z-index:1;width:100%;border-collapse:separate;border-spacing:0 10px;margin-top:0;table-layout:fixed}
 .sch-adv thead th{padding:0 10px 6px;text-align:left;font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:rgba(214,223,238,.56);border-bottom:none}
-.sch-adv .th-help{display:inline-flex;align-items:center;gap:8px}
-.sch-adv .sch-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:#2b313d;color:#edf4ff;cursor:help;box-shadow:none}
-.sch-adv .sch-help::before{content:"help";font-family:"Material Symbols Rounded","Material Symbols Outlined","Segoe UI Symbol",sans-serif;font-size:18px;line-height:1}
+.sch-adv .th-help{display:inline-flex;align-items:center;gap:8px;line-height:1.15;vertical-align:middle}
+.sch-adv .sch-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;min-width:30px;padding:0;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:#2b313d;color:#edf4ff;cursor:help;box-shadow:none;vertical-align:middle}
+.sch-adv .sch-help::before{content:"help";font-family:"Material Symbols Rounded","Material Symbols Outlined","Segoe UI Symbol",sans-serif;font-size:22px;line-height:1}
 .sch-adv .sch-help:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(125,134,201,.16)}
 .sch-adv tbody tr{background:var(--sch-card-bg);box-shadow:none}
 .sch-adv tbody td{position:relative;overflow:visible;padding:12px 10px;vertical-align:middle;border-top:1px solid var(--sch-border-soft);border-bottom:1px solid var(--sch-border-soft)}
@@ -89,7 +97,8 @@
 .sch-adv .stack{display:grid;gap:8px}
 .sch-adv .stack.two{grid-template-columns:repeat(2,minmax(0,1fr))}
 .sch-adv .stack.three{grid-template-columns:repeat(3,minmax(0,1fr))}
-.sch-adv .subnote{font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:rgba(214,223,238,.5)}
+.sch-adv .subnote{font-size:10px;font-weight:800;letter-spacing:.1em;line-height:1.15;text-transform:uppercase;color:rgba(214,223,238,.5)}
+.sch-adv .field-mini .subnote{display:flex;align-items:center;min-height:30px}
 .sch-adv .field-mini{display:grid;gap:6px;min-width:0}
 .sch-adv .capture-provider-stack{grid-template-columns:minmax(190px,1.4fr) minmax(150px,1fr)}
 .sch-adv td[data-label="Feature"]{min-width:150px}
@@ -103,6 +112,38 @@
 .sch-adv td[data-label="Action"] .cw-icon-select-text{display:flex;align-items:center;min-width:0}
 .sch-adv td[data-label="Action"] .cw-icon-select-badges{flex-wrap:nowrap;white-space:nowrap}
 .sch-adv td[data-label="Source"] select,.sch-adv td[data-label="Event"] select{min-width:146px}
+.sch-adv .sch-workflow-table{width:min(760px,100%);table-layout:fixed}
+.sch-adv .sch-workflow-table td[data-label="Sync pair"] .cw-icon-select,.sch-adv .sch-workflow-table td[data-label="Sync pair"] select{max-width:520px}
+.sch-workflow-card{display:grid;gap:12px;padding:14px 16px;border:1px solid rgba(255,255,255,.13);border-radius:18px;background:linear-gradient(180deg,rgba(31,37,51,.9),rgba(24,29,41,.96));box-shadow:inset 0 1px 0 rgba(255,255,255,.035)}
+.sch-workflow-top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px}
+.sch-workflow-titleline{display:flex;align-items:center;gap:12px;min-width:0}
+.sch-workflow-state-pill{display:inline-flex;align-items:center;gap:8px;min-height:30px;padding:0 12px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.045);color:rgba(238,243,255,.88);font-size:13px;font-weight:800}
+.sch-workflow-state-pill::before{content:"";width:8px;height:8px;border-radius:999px;background:#6ee49b;box-shadow:0 0 10px rgba(110,228,155,.34)}
+.sch-workflow-state-pill.is-paused::before{background:#f2a949;box-shadow:0 0 10px rgba(242,169,73,.34)}
+.sch-workflow-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:nowrap}
+.sch-workflow-controls{display:flex;align-items:center;gap:10px}
+.sch-workflow-controls{position:relative}
+.sch-workflow-controls::before{content:"schedule";font-family:"Material Symbols Rounded","Material Symbols Outlined","Segoe UI Symbol",sans-serif;position:absolute;left:18px;top:50%;transform:translateY(-50%);font-size:20px;color:rgba(216,225,243,.68);pointer-events:none;z-index:2}
+.sch-workflow-controls select,.sch-workflow-controls input{box-sizing:border-box;width:220px!important;min-height:38px!important;padding-left:52px!important;padding-right:36px!important;border-radius:14px!important;background:#202636!important;font-weight:800}
+.sch-workflow-controls .cw-icon-select{width:220px!important}
+.sch-workflow-controls .cw-icon-select-btn{min-height:38px!important;padding-left:52px!important;padding-right:14px!important;border-radius:14px!important;background:#202636!important}
+.sch-workflow-controls .cw-icon-select-main{min-width:0}
+.sch-workflow-controls .cw-icon-select-label{font-weight:800}
+.sch-workflow-controls .sch-workflow-number{width:96px!important;padding-left:14px!important;padding-right:12px!important;text-align:center}
+.sch-workflow-unit{display:inline-flex;align-items:center;min-height:38px;padding:0 10px;border:1px solid rgba(255,255,255,.13);border-radius:14px;background:#202636;color:rgba(226,234,250,.78);font-size:11px;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+.sch-workflow-toggle{flex:0 0 auto}
+.sch-workflow-steps{display:grid;gap:8px;max-width:820px}
+.sch-workflow-step{display:grid;grid-template-columns:26px 32px minmax(260px,520px) auto auto;align-items:center;gap:9px;width:max-content;max-width:100%;padding:8px 10px;border:1px solid rgba(255,255,255,.12);border-radius:15px;background:#20242d}
+.sch-workflow-step.dragging{opacity:.55;border-color:rgba(133,139,216,.55);background:#272d3d}
+.sch-workflow-grip{display:inline-flex;align-items:center;justify-content:center;width:26px;height:34px;border:0;background:transparent;color:rgba(214,223,238,.54);cursor:grab;padding:0}
+.sch-workflow-grip:active{cursor:grabbing}
+.sch-workflow-grip .material-symbols-rounded{font-size:22px;line-height:1}
+.sch-workflow-step-index{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;border:1px solid rgba(142,150,224,.34);background:rgba(133,139,216,.14);color:#f5f7ff;font-size:12px;font-weight:900}
+.sch-workflow-step .cw-icon-select,.sch-workflow-step select{width:100%!important;min-width:0!important}
+.sch-workflow-step input[id^="sched_workflow_active_"]{appearance:none;-webkit-appearance:none;display:inline-grid;place-items:center;width:30px;height:30px;border-radius:9px;background:#858bd8;border:1px solid rgba(168,176,240,.70);box-shadow:none}
+.sch-workflow-step input[id^="sched_workflow_active_"]:checked::after{content:"";width:12px;height:6px;border:3px solid #fff;border-top:0;border-right:0;transform:rotate(-45deg) translate(1px,-1px)}
+.sch-workflow-card>div:last-child{margin-top:0}
+.sch-workflow-card .sch-adv-actions{margin-top:4px}
 .sch-adv .event-filter-stack{width:100%}
 .sch-adv .event-filter-stack select,.sch-adv .event-filter-stack input{width:100%!important;min-width:0!important}
 .sch-adv .checkline{display:flex;align-items:center;gap:8px;min-height:18px;font-size:12px;color:var(--sch-fg-soft)}
@@ -159,7 +200,8 @@ html[data-cw-theme="flat-light"] .sch-adv .chipdays label:has(input:checked){
   document.head.appendChild(Object.assign(el("style"), { id: "sch-css-refine", textContent: `
 #sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card{display:grid;gap:10px;padding:0!important}
 #sec-scheduling #sched-provider-panel,#sec-scheduling #sched-provider-panel .cw-subpanels,#sec-scheduling #sched-provider-panel .cw-subpanel.active{width:100%;box-sizing:border-box}
-#sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card,#sec-scheduling #schAdv{width:100%;max-width:none;margin:0!important;box-sizing:border-box}
+#sec-scheduling .cw-subpanel[data-sub="basic"] .auth-card,#sec-scheduling #schAdv,#sec-scheduling #schWebhooks{width:100%;max-width:none;margin:0!important;box-sizing:border-box}
+#sec-scheduling #schWebhooks{margin-top:14px!important}
 #sec-scheduling .sch-std-head{position:relative;z-index:1;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:16px;padding:18px 18px 8px!important}
 #sec-scheduling .sch-std-head-copy{display:grid;gap:6px}
 #sec-scheduling .sch-card-head{display:flex;align-items:flex-start;gap:14px;min-width:0}
@@ -209,6 +251,9 @@ html[data-cw-theme="flat-light"] .sch-adv .chipdays label:has(input:checked){
 .sch-adv .cw-panel-head .cx-toggle{margin-top:16px;justify-self:end}
 .sch-adv-summary{margin:0 18px 4px!important}
 .sch-adv-section{gap:12px;margin-left:18px!important;margin-right:18px!important;padding:16px}
+.sch-workflow-card{margin:0;padding:14px 16px}
+.sch-workflow-top{grid-template-columns:minmax(220px,1fr) auto}
+.sch-workflow-steps{margin-top:2px}
 .sch-adv-summary + .sch-adv-section{margin-top:0!important}
 .sch-adv-section:last-of-type{margin-bottom:18px!important}
 .sch-adv-section-head{align-items:center}
@@ -218,7 +263,7 @@ html[data-cw-theme="flat-light"] .sch-adv .chipdays label:has(input:checked){
 .sch-adv tbody td{padding:10px 8px}
 .sch-adv tbody td:first-child{border-radius:16px 0 0 16px}
 .sch-adv tbody td:last-child{border-radius:0 16px 16px 0}
-.sch-adv select,.sch-adv input[type=time],.sch-adv input[type=number],.sch-adv input[type=text]{min-height:42px;padding:0 12px;border-radius:14px}
+.sch-adv select,.sch-adv input[type=time],.sch-adv input[type=number],.sch-adv input[type=text],.sch-adv input[type=url]{min-height:42px;padding:0 12px;border-radius:14px}
 .sch-adv .stack{gap:7px}
 .sch-adv .stack.two{grid-template-columns:minmax(0,1fr) minmax(118px,.92fr)}
 .sch-adv .stack.three{grid-template-columns:repeat(3,minmax(0,1fr))}
@@ -234,11 +279,24 @@ html[data-cw-theme="flat-light"] .sch-adv .chipdays label:has(input:checked){
 html[data-cw-theme="flat-light"] #sec-scheduling .sch-card-icon{background:#eef2ff;border-color:rgba(65,92,160,.22);color:#3157c8}
 @media (max-width:1180px){.sch-adv .stack.two{grid-template-columns:1fr}}
 @media (max-width:980px){#sec-scheduling .sch-std-head{grid-template-columns:1fr;padding-bottom:4px}#sec-scheduling .sch-std-head .cx-toggle{justify-self:start}#sec-scheduling .sch-std-inline{grid-template-columns:1fr}.sch-adv .cw-panel-head{grid-template-columns:1fr}.sch-adv .cw-panel-head .cx-toggle{justify-self:start}}
-@media (max-width:760px){#sec-scheduling .sch-std-title{font-size:22px}#sec-scheduling .sch-std-wizard{padding:0 16px 16px}.sch-adv .cw-panel-head{padding:16px}.sch-adv-head-title{font-size:22px}.sch-adv .cw-panel-head .cx-toggle{margin-top:10px}}
+@media (max-width:760px){#sec-scheduling .sch-std-title{font-size:22px}#sec-scheduling .sch-std-wizard{padding:0 16px 16px}.sch-adv .cw-panel-head{padding:16px}.sch-adv-head-title{font-size:22px}.sch-adv .cw-panel-head .cx-toggle{margin-top:10px}.sch-workflow-top{grid-template-columns:1fr}.sch-workflow-actions{justify-content:flex-start}.sch-workflow-controls{justify-content:flex-start}.sch-workflow-controls select,.sch-workflow-controls input{width:100%!important}.sch-workflow-step{grid-template-columns:24px 30px minmax(0,1fr) auto auto;width:auto}}
 ` }));
 
   // state
-  let _pairs = [], _jobs = [], _captureJobs = [], _eventRules = [], _advEnabled = false, _loading = false;
+  let _pairs = [], _jobs = [], _workflows = [], _captureJobs = [], _eventRules = [], _advEnabled = false, _loading = false;
+  let _webhooks = {
+    enabled: false,
+    url: "",
+    base_url: "",
+    start_url: "",
+    success_url: "",
+    failure_url: "",
+    payload_format: "crosswatch",
+    notifiarr_channel_id: "",
+    timeout_seconds: 10,
+    alert_on_unresolved: false
+  };
+  let _webhooksHydrated = false;
   let _captureProviders = [];
   let _eventRoutes = { watcher: [], webhook: [] }, _eventRouteError = "";
   const DAY = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
@@ -251,10 +309,12 @@ html[data-cw-theme="flat-light"] #sec-scheduling .sch-card-icon{background:#eef2
     std_every_n_hours: "Every N hours:\nSet how many hours to wait between runs when Frequency is set to Every N hours.",
     std_time: "Time:\nChoose the local time to run each day when Frequency is set to Daily at a fixed time.",
     std_custom_interval: "Custom interval:\nSet a custom repeat interval in minutes or hours.\nCustom schedules are clamped to a minimum of 15 minutes.",
-    time_pair: "Pair:\nChoose which enabled sync pair this timed step should run.",
+    time_pair: "Sync pair:\nChoose which enabled source-to-target sync pair this step should run.",
     time_time: "Time:\nChoose the local time when this step becomes due.",
     time_days: "Days:\nSelect which weekdays this step may run on.\nLeave all days unchecked to allow every day.",
     time_after: "After:\nOptional dependency.\nUse this to run the step only after another earlier step has completed.",
+    workflow_recurrence: "Recurrence:\nChoose how often the full ordered workflow runs.",
+    workflow_steps: "Sync steps:\nEach step runs one configured source-to-target sync pair.",
     capture_target: "Provider:\nChoose the provider profile to capture from.\nOnly configured snapshot-capable profiles are listed.",
     capture_feature: "Feature:\nPick one feature or All to store a full provider capture bundle.",
     capture_label: "Label template:\nOptional template for automated capture labels.\nUse placeholders like {provider}, {instance}, {feature}, {date}, {time}, {datetime}, or {stamp}.",
@@ -265,9 +325,29 @@ html[data-cw-theme="flat-light"] #sec-scheduling .sch-card-icon{background:#eef2
     event: "Event:\nChoose which playback activity should trigger the rule.\nStart: playback begins or resumes.\nPause: playback is paused.\nStop: playback ends or stops.",
     filters: "Filters:\nMedia: only movies or episodes.\nMin %: require minimum playback progress.",
     action: "Action:\nChoose what happens when the rule matches.\nSync pair:\nRun one specific enabled sync pair immediately.",
-    guardrails: "Mute (min):\nIgnore new triggers for this rule after it runs.\nDedupe (sec):\nSuppress identical repeated events for a short window.\nMax / hour:\nHard safety cap for this rule in one hour."
+    guardrails: "Mute (min):\nIgnore new triggers for this rule after it runs.\nDedupe (sec):\nSuppress identical repeated events for a short window.\nMax / hour:\nHard safety cap for this rule in one hour.",
+    webhook_url: "All events URL:\nUse this when one endpoint receives every scheduler event.\nCrossWatch sends start, success, and failure to this same http:// or https:// URL with the event in the JSON payload.",
+    webhook_notifiarr_url: "Notifiarr passthrough URL:\nPaste the Notifiarr Passthrough endpoint.\nCrossWatch sends start, success, and failure notifications to this same URL.",
+    webhook_format: "Payload format:\nCrossWatch JSON sends the raw scheduler payload.\nNotifiarr Passthrough sends the notification/discord JSON shape expected by Notifiarr.",
+    webhook_base: "Compatible base URL:\nUse this for Healthchecks.io-style ping.\nPaste the base ping URL. CrossWatch sends start to /start, success to the base URL, and failure to /fail.",
+    webhook_notifiarr_channel: "Notifiarr channel ID:\nOptional Discord channel id for Notifiarr Passthrough payloads.\nIf your Notifiarr setup requires a channel, enter the numeric Discord channel id here.",
+    webhook_timeout: "Timeout seconds:\nHow long CrossWatch waits for a callback request before logging it as failed.\nCallback failures do not fail the sync.",
+    webhook_start: "Start callback URL:\nOptional explicit http:// or https:// POST destination when a scheduled sync starts.\nThis overrides the compatible base URL for start events.",
+    webhook_success: "Success callback URL:\nOptional explicit http:// or https:// POST destination when a scheduled sync finishes successfully.\nThis overrides the compatible base URL for success events.",
+    webhook_failure: "Failure callback URL:\nOptional explicit http:// or https:// POST destination when a scheduled sync fails.\nThis overrides the compatible base URL for failure events.",
+    webhook_alert_unresolved: "Alert on unresolved items:\nOff means only a crashed or aborted run sends the failure callback.\nOn also sends failure when a run finishes with unresolved items or provider errors, such as a destination rejecting a write. The run itself still counts as successful in CrossWatch."
   };
   const defaultJob = () => ({ id: genId(), pair_id: null, at: null, days: [], after: null, active: true });
+  const defaultWorkflowStep = () => ({ id: genId(), pair_id: null, active: true });
+  const defaultWorkflow = () => ({
+    id: genId(),
+    mode: "hourly",
+    every_n_hours: 1,
+    daily_time: "03:30",
+    custom_interval_minutes: 60,
+    steps: [defaultWorkflowStep()],
+    active: true
+  });
   const defaultCaptureJob = () => ({
     id: genId(),
     provider: "",
@@ -303,6 +383,28 @@ html[data-cw-theme="flat-light"] #sec-scheduling .sch-card-icon{background:#eef2
     },
     active: true
   });
+  const normalizeWebhooks = (raw = {}) => ({
+    enabled: raw.enabled === true,
+    url: String(raw.url || raw.default_url || raw.defaultUrl || "").trim(),
+    base_url: String(raw.base_url || raw.baseUrl || raw.healthchecks_base_url || raw.healthchecksBaseUrl || "").trim(),
+    start_url: String(raw.start_url || raw.startUrl || "").trim(),
+    success_url: String(raw.success_url || raw.successUrl || "").trim(),
+    failure_url: String(raw.failure_url || raw.failureUrl || "").trim(),
+    payload_format: ["notifiarr", "notifiarr_passthrough"].includes(String(raw.payload_format || raw.payloadFormat || raw.format || "").trim().toLowerCase().replace("-", "_")) ? "notifiarr" : "crosswatch",
+    notifiarr_channel_id: String(raw.notifiarr_channel_id || raw.notifiarrChannelId || "").trim(),
+    timeout_seconds: Math.max(1, Math.min(60, parseInt(raw.timeout_seconds || raw.timeoutSeconds || 10, 10) || 10)),
+    alert_on_unresolved: (raw.alert_on_unresolved ?? raw.alertOnUnresolved) === true
+  });
+  const isHttpUrl = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return true;
+    try {
+      const url = new URL(text);
+      return url.protocol === "http:" || url.protocol === "https:";
+    } catch {
+      return false;
+    }
+  };
   const setBooleanSelect = (sel, v) => {
     if (!sel) return;
     const want = v ? "true" : "false";
@@ -881,6 +983,113 @@ const ensureStdEnabledToggle = () => {
     head.appendChild(wrap);
     return stackWrap("field-mini", head, control);
   };
+  const setWebhookToggleState = (input, on) => {
+    const toggle = input?.closest(".cx-toggle");
+    if (!toggle) return;
+    toggle.dataset.checked = on ? "true" : "false";
+    toggle.setAttribute("aria-checked", on ? "true" : "false");
+  };
+  const syncWebhooksFromFields = () => {
+    if (!_webhooksHydrated) {
+      applyWebhookVisibility();
+      return;
+    }
+    const enabledInput = $("#schWebhookEnabled");
+    _webhooks = normalizeWebhooks({
+      enabled: !!enabledInput?.checked,
+      url: $("#schWebhookUrl")?.value || "",
+      base_url: $("#schWebhookBase")?.value || "",
+      start_url: $("#schWebhookStart")?.value || "",
+      success_url: $("#schWebhookSuccess")?.value || "",
+      failure_url: $("#schWebhookFailure")?.value || "",
+      payload_format: $("#schWebhookFormat")?.value || "crosswatch",
+      notifiarr_channel_id: $("#schWebhookNotifiarrChannel")?.value || "",
+      timeout_seconds: $("#schWebhookTimeout")?.value || 10,
+      alert_on_unresolved: !!$("#schWebhookAlertUnresolved")?.checked
+    });
+    setWebhookToggleState(enabledInput, _webhooks.enabled);
+    setWebhookToggleState($("#schWebhookAlertUnresolved"), _webhooks.alert_on_unresolved);
+    applyWebhookVisibility();
+  };
+  const webhookFormat = () => _webhooks.payload_format === "notifiarr" ? "notifiarr" : "crosswatch";
+  const applyWebhookVisibility = () => {
+    const root = $("#schWebhooks");
+    if (!root) return;
+    const format = webhookFormat();
+    root.dataset.payloadFormat = format;
+    const urlLabel = $("#schWebhookUrlLabel", root);
+    const urlHelp = $("#schWebhookUrlHelp", root);
+    const urlInput = $("#schWebhookUrl", root);
+    if (urlLabel) urlLabel.textContent = format === "notifiarr" ? "Notifiarr passthrough URL" : "All events URL";
+    if (urlHelp) {
+      urlHelp.setAttribute("aria-label", `${urlLabel?.textContent || "All events URL"} help`);
+      urlHelp.dataset.helpKey = format === "notifiarr" ? "webhook_notifiarr_url" : "webhook_url";
+      urlHelp.title = HELP_TIPS[urlHelp.dataset.helpKey] || "";
+    }
+    if (urlInput) {
+      urlInput.placeholder = format === "notifiarr"
+        ? "https://notifiarr.com/api/v1/notification/passthrough/YOUR_API_KEY"
+        : "https://hooks.example.com/crosswatch";
+    }
+    root.querySelectorAll("[data-webhook-format-for] input,[data-webhook-format-for] select").forEach((node) => {
+      const holder = node.closest("[data-webhook-format-for]");
+      const formats = String(holder?.dataset?.webhookFormatFor || "").split(/\s+/).filter(Boolean);
+      node.disabled = formats.length > 0 && !formats.includes(format);
+    });
+  };
+  const renderWebhooks = () => {
+    const enabled = $("#schWebhookEnabled");
+    const url = $("#schWebhookUrl");
+    const base = $("#schWebhookBase");
+    const start = $("#schWebhookStart");
+    const success = $("#schWebhookSuccess");
+    const failure = $("#schWebhookFailure");
+    const format = $("#schWebhookFormat");
+    const notifiarrChannel = $("#schWebhookNotifiarrChannel");
+    const timeout = $("#schWebhookTimeout");
+    const alertUnresolved = $("#schWebhookAlertUnresolved");
+    if (!enabled || !url || !base || !start || !success || !failure || !format || !notifiarrChannel || !timeout) return;
+    enabled.checked = !!_webhooks.enabled;
+    setWebhookToggleState(enabled, enabled.checked);
+    url.value = _webhooks.url || "";
+    base.value = _webhooks.base_url || "";
+    start.value = _webhooks.start_url || "";
+    success.value = _webhooks.success_url || "";
+    failure.value = _webhooks.failure_url || "";
+    format.value = _webhooks.payload_format || "crosswatch";
+    notifiarrChannel.value = _webhooks.notifiarr_channel_id || "";
+    timeout.value = String(_webhooks.timeout_seconds || 10);
+    if (alertUnresolved) {
+      alertUnresolved.checked = !!_webhooks.alert_on_unresolved;
+      setWebhookToggleState(alertUnresolved, alertUnresolved.checked);
+    }
+    applyWebhookVisibility();
+  };
+  const webhooksValidation = () => {
+    syncWebhooksFromFields();
+    const entries = webhookFormat() === "notifiarr" ? [
+      ["Notifiarr passthrough URL", _webhooks.url]
+    ] : [
+      ["All events URL", _webhooks.url],
+      ["Compatible base URL", _webhooks.base_url],
+      ["Start callback URL", _webhooks.start_url],
+      ["Success callback URL", _webhooks.success_url],
+      ["Failure callback URL", _webhooks.failure_url]
+    ];
+    const issues = [];
+    entries.forEach(([label, value]) => {
+      if (value && !isHttpUrl(value)) issues.push(`${label}: use an http:// or https:// URL.`);
+    });
+    if (webhookFormat() === "notifiarr" && _webhooks.notifiarr_channel_id && !/^\d+$/.test(_webhooks.notifiarr_channel_id)) {
+      issues.push("Notifiarr channel ID: use the numeric Discord channel id.");
+    }
+    if (_webhooks.enabled && !entries.some(([, value]) => String(value || "").trim())) {
+      issues.push(webhookFormat() === "notifiarr"
+        ? "Scheduler Webhooks: add the Notifiarr passthrough URL or turn webhooks off."
+        : "Scheduler Webhooks: add at least one callback URL or turn webhooks off.");
+    }
+    return issues;
+  };
   const alignedField = (control) => stackWrap("field-mini control-align", Object.assign(el("div", "subnote"), { textContent: "Label" }), control);
   const guardInput = ({ id, value, placeholder, title, onChange }) => {
     const input = buildInput({ id, type: "number", min: 0, value, placeholder, onChange });
@@ -955,7 +1164,7 @@ const ensureStdEnabledToggle = () => {
         },
     });
   };
-  const pairOptions = (selected, includeNoneText = "Select pair") => [
+  const pairOptions = (selected, includeNoneText = "Select sync pair") => [
     ["", includeNoneText],
     ..._pairs.map(p => [p.id, p.label + (p.enabled ? "" : " (disabled)"), { disabled: !p.enabled }])
   ];
@@ -963,7 +1172,7 @@ const ensureStdEnabledToggle = () => {
     const text = String(value || "").trim();
     if (!text) return "";
     return text
-      .replace(/^Step (\d+): select a pair\.$/i, "Next: choose a pair for Step $1")
+      .replace(/^Step (\d+): select a pair\.$/i, "Next: choose a sync pair for Step $1")
       .replace(/^Step (\d+): select a time\.$/i, "Next: set a time for Step $1")
       .replace(/^Capture schedule (\d+): select a provider\.$/i, "Next: choose a provider for Capture schedule $1")
       .replace(/^Capture schedule (\d+): choose a configured provider\.$/i, "Pick a configured provider for Capture schedule $1")
@@ -1028,6 +1237,56 @@ const ensureStdEnabledToggle = () => {
       jobs.push(job);
     });
     return { jobs, issues };
+  };
+  const workflowModeOptions = () => [
+    ["hourly", "Every hour"],
+    ["every_n_hours", "Every N hours"],
+    ["daily_time", "Daily at"],
+    ["custom_interval", "Custom interval"]
+  ];
+  const normalizeWorkflow = (workflow = {}) => ({
+    id: workflow.id || genId(),
+    mode: normalizeStandardMode(workflow.mode || "hourly"),
+    every_n_hours: Math.max(1, parseInt(workflow.every_n_hours || 1, 10) || 1),
+    daily_time: String(workflow.daily_time || "03:30").trim() || "03:30",
+    custom_interval_minutes: Math.max(15, parseInt(workflow.custom_interval_minutes || 60, 10) || 60),
+    steps: Array.isArray(workflow.steps) ? workflow.steps.map((step) => ({
+      id: step.id || genId(),
+      pair_id: step.pair_id || null,
+      active: step.active !== false
+    })) : [],
+    active: workflow.active !== false
+  });
+  const isBlankWorkflow = (workflow) => {
+    const steps = Array.isArray(workflow?.steps) ? workflow.steps : [];
+    const hasPair = steps.some((step) => String(step?.pair_id || "").trim());
+    return !hasPair;
+  };
+  const workflowLabel = (workflow) => `Workflow ${Math.max(0, _workflows.indexOf(workflow)) + 1}`;
+  const workflowIssue = (workflow) => {
+    if (isBlankWorkflow(workflow)) return "";
+    const steps = (Array.isArray(workflow?.steps) ? workflow.steps : []).filter((step) => step.active !== false && String(step?.pair_id || "").trim());
+    const rowName = workflowLabel(workflow);
+    if (!steps.length) return `${rowName}: add at least one active step.`;
+    if (steps.some((step) => step.pair_id && !isEnabled(step.pair_id))) return `${rowName}: update a disabled pair.`;
+    if (workflow.mode === "daily_time" && !String(workflow.daily_time || "").trim()) return `${rowName}: choose a time.`;
+    return "";
+  };
+  const serializableWorkflows = () => {
+    const workflows = [];
+    const issues = [];
+    _workflows.forEach((workflow) => {
+      if (isBlankWorkflow(workflow)) return;
+      const issue = workflowIssue(workflow);
+      if (issue) {
+        issues.push(issue);
+        return;
+      }
+      const normalized = normalizeWorkflow(workflow);
+      normalized.steps = normalized.steps.filter((step) => step.pair_id);
+      workflows.push(normalized);
+    });
+    return { workflows, issues };
   };
   const captureProviderById = (provider) => _captureProviders.find((row) => String(row?.id || "") === String(provider || "").trim().toUpperCase()) || null;
   const captureInstanceOptions = (provider, current = "") => {
@@ -1166,6 +1425,137 @@ const ensureStdEnabledToggle = () => {
       && daysA === daysB;
   };
 
+  const workflowStepRow = (workflow, step) => {
+    const row = el("div", "sch-workflow-step");
+    if (step.active !== false && step.pair_id && !isEnabled(step.pair_id)) row.classList.add("row-disabled");
+    const rowKey = fieldKey(step?.id, `workflow_step_${_workflows.indexOf(workflow) + 1}_${workflow.steps.indexOf(step) + 1}`);
+    row.draggable = true;
+    row.dataset.stepId = step.id || "";
+    row.ondragstart = (event) => {
+      row.classList.add("dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", step.id || "");
+    };
+    row.ondragend = () => row.classList.remove("dragging");
+    row.ondragover = (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+    };
+    row.ondrop = (event) => {
+      event.preventDefault();
+      const fromId = event.dataTransfer.getData("text/plain");
+      const toId = step.id || "";
+      if (!fromId || !toId || fromId === toId) return;
+      const from = workflow.steps.findIndex((item) => String(item.id || "") === String(fromId));
+      const to = workflow.steps.findIndex((item) => String(item.id || "") === String(toId));
+      if (from < 0 || to < 0) return;
+      const [moved] = workflow.steps.splice(from, 1);
+      workflow.steps.splice(to, 0, moved);
+      renderWorkflows();
+    };
+    const grip = Object.assign(el("button", "sch-workflow-grip"), { type: "button", ariaLabel: "Drag to reorder sync step", title: "Drag to reorder" });
+    grip.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">drag_indicator</span>`;
+    const index = Object.assign(el("span", "sch-workflow-step-index"), { textContent: String(workflow.steps.indexOf(step) + 1) });
+    const sel = buildSelect({
+      id: `sched_workflow_pair_${rowKey}`,
+      value: step.pair_id || "",
+      options: pairOptions(step.pair_id || null),
+      onChange: value => { step.pair_id = value || null; renderWorkflows(); }
+    });
+    const active = Object.assign(el("input"), { type: "checkbox", checked: step.active !== false });
+    active.id = `sched_workflow_active_${rowKey}`;
+    active.name = active.id;
+    active.onchange = () => { step.active = !!active.checked; renderWorkflows(); };
+    const del = Object.assign(el("button"), { className: "btn ghost sch-remove-btn", type: "button", ariaLabel: "Remove workflow step" });
+    del.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">close</span>`;
+    del.onclick = () => { workflow.steps = workflow.steps.filter((item) => item !== step); renderWorkflows(); };
+    row.append(
+      grip,
+      index,
+      enhanceIconSelect(sel, (value, option) => {
+        const data = pairOptionData(value, String(option?.textContent || "").trim());
+        return data ? { ...data, disabled: !!option?.disabled } : null;
+      }),
+      active,
+      del
+    );
+    return row;
+  };
+
+  const workflowBlock = (workflow) => {
+    const block = el("div", "sch-workflow-card");
+    const rowKey = fieldKey(workflow?.id, `workflow_${_workflows.indexOf(workflow) + 1}`);
+    const mode = buildSelect({
+      id: `sched_workflow_mode_${rowKey}`,
+      value: workflow.mode || "hourly",
+      options: workflowModeOptions(),
+      onChange: value => { workflow.mode = normalizeStandardMode(value); renderWorkflows(); }
+    });
+    const every = buildInput({
+      id: `sched_workflow_hours_${rowKey}`,
+      type: "number",
+      value: String(Math.max(1, parseInt(workflow.every_n_hours || 1, 10) || 1)),
+      min: 1,
+      onChange: value => { workflow.every_n_hours = Math.max(1, parseInt(value || "1", 10) || 1); }
+    });
+    every.classList.add("sch-workflow-number");
+    const daily = buildInput({
+      id: `sched_workflow_time_${rowKey}`,
+      type: "time",
+      value: workflow.daily_time || "03:30",
+      onChange: value => { workflow.daily_time = value || "03:30"; }
+    });
+    const custom = buildInput({
+      id: `sched_workflow_minutes_${rowKey}`,
+      type: "number",
+      value: String(Math.max(15, parseInt(workflow.custom_interval_minutes || 60, 10) || 60)),
+      min: 15,
+      onChange: value => { workflow.custom_interval_minutes = Math.max(15, parseInt(value || "60", 10) || 60); }
+    });
+    custom.classList.add("sch-workflow-number");
+    const active = Object.assign(el("input"), { type: "checkbox", checked: workflow.active !== false });
+    active.id = `sched_workflow_active_${rowKey}`;
+    active.name = active.id;
+    active.setAttribute("aria-label", workflow.active === false ? "Enable workflow" : "Disable workflow");
+    active.onchange = () => { workflow.active = !!active.checked; renderWorkflows(); updateAdvancedStatus(); };
+    const activeWrap = Object.assign(el("label", "cx-toggle sch-workflow-toggle"), { title: workflow.active === false ? "Enable workflow" : "Disable workflow" });
+    const activeUi = el("span", "cx-toggle-ui");
+    activeUi.setAttribute("aria-hidden", "true");
+    activeWrap.append(active, activeUi);
+    const del = Object.assign(el("button"), { className: "btn ghost sch-remove-btn", type: "button", ariaLabel: "Remove workflow" });
+    del.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">close</span>`;
+    del.onclick = () => { _workflows = _workflows.filter((item) => item !== workflow); renderWorkflows(); };
+    const controls = stackWrap("sch-workflow-controls", mode);
+    if (workflow.mode === "every_n_hours") controls.append(every, Object.assign(el("span", "sch-workflow-unit"), { textContent: "hours" }));
+    if (workflow.mode === "daily_time") controls.append(daily);
+    if (workflow.mode === "custom_interval") controls.append(custom, Object.assign(el("span", "sch-workflow-unit"), { textContent: "min" }));
+    const head = el("div", "sch-workflow-top");
+    const title = el("div");
+    title.append(
+      stackWrap(
+        "sch-workflow-titleline",
+        Object.assign(el("div", "sch-adv-section-title"), { textContent: workflowLabel(workflow) }),
+        Object.assign(el("span", workflow.active === false ? "sch-workflow-state-pill is-paused" : "sch-workflow-state-pill"), { textContent: workflow.active === false ? "Paused" : "Active" })
+      ),
+      Object.assign(el("div", "sch-adv-section-copy"), { textContent: "Run these sync steps in order on the selected recurrence." })
+    );
+    head.append(title, stackWrap("sch-workflow-actions", controls, activeWrap, del));
+    const body = el("div", "sch-workflow-steps");
+    workflow.steps = Array.isArray(workflow.steps) ? workflow.steps : [];
+    if (!workflow.steps.length) workflow.steps.push(defaultWorkflowStep());
+    workflow.steps.forEach((step) => body.appendChild(workflowStepRow(workflow, step)));
+    const actions = el("div", "sch-adv-actions");
+    const add = Object.assign(el("button"), { className: "btn", type: "button", textContent: "Add sync step" });
+    add.onclick = () => { workflow.steps.push(defaultWorkflowStep()); renderWorkflows(); };
+    actions.append(add);
+    block.append(head, body, actions);
+    block.querySelectorAll(".sch-help").forEach((btn) => {
+      const tip = HELP_TIPS[btn.dataset.helpKey] || "";
+      if (tip) btn.title = tip;
+    });
+    return block;
+  };
+
   // row builder
   const jobRow = j => {
     const tr = el("tr"); if (j.active !== false && j.pair_id && !isEnabled(j.pair_id)) tr.classList.add("row-disabled");
@@ -1219,7 +1609,7 @@ const ensureStdEnabledToggle = () => {
 
     const tdDays = tdCell("Days", wrap);
     tr.append(
-      tdCell("Pair", enhanceIconSelect(sel, (value, option) => {
+      tdCell("Sync pair", enhanceIconSelect(sel, (value, option) => {
         const data = pairOptionData(value, String(option?.textContent || "").trim());
         return data ? { ...data, disabled: !!option?.disabled } : null;
       })),
@@ -1547,12 +1937,12 @@ const ensureStdEnabledToggle = () => {
   <div class="sch-adv-section-head">
     <div>
       <div class="sch-adv-section-title">Time Plan</div>
-      <div class="sch-adv-section-copy">Use timed steps for the current advanced schedule. Only enabled pairs are selectable.</div>
+      <div class="sch-adv-section-copy">Use timed steps for the current advanced schedule. Only enabled sync pairs are selectable.</div>
     </div>
   </div>
   <table>
     <thead><tr>
-      <th style="width:32%"><span class="th-help">Pair<button type="button" class="sch-help" aria-label="Pair help" title="Pair help" data-help-key="time_pair"></button></span></th>
+      <th style="width:32%"><span class="th-help">Sync pair<button type="button" class="sch-help" aria-label="Sync pair help" title="Sync pair help" data-help-key="time_pair"></button></span></th>
       <th style="width:14%"><span class="th-help">Time<button type="button" class="sch-help" aria-label="Time help" title="Time help" data-help-key="time_time"></button></span></th>
       <th style="width:30%"><span class="th-help">Days<button type="button" class="sch-help" aria-label="Days help" title="Days help" data-help-key="time_days"></button></span></th>
       <th style="width:14%"><span class="th-help">After<button type="button" class="sch-help" aria-label="After help" title="After help" data-help-key="time_after"></button></span></th>
@@ -1563,8 +1953,23 @@ const ensureStdEnabledToggle = () => {
   </table>
   <div class="sch-adv-actions">
     <button class="btn" id="btnAddStep">Add step</button>
-    <button class="btn" id="btnAutoFromPairs">Auto-create from enabled pairs</button>
+    <button class="btn" id="btnAutoFromPairs">Auto-create from enabled sync pairs</button>
     <div class="status inline" id="schJobsStatus"></div>
+  </div>
+</section>
+
+<section class="sch-adv-section">
+  <div class="sch-adv-section-head">
+    <div>
+      <div class="sch-adv-section-title">Recurring workflows</div>
+      <div class="sch-adv-section-copy sch-workflow-intro">Define an ordered chain of existing sync pairs, then repeat it hourly, daily, or on a custom interval.</div>
+    </div>
+  </div>
+  <div id="schWorkflowsBody"></div>
+  <div class="sch-adv-actions">
+    <button class="btn" id="btnAddWorkflow">Add workflow</button>
+    <button class="btn" id="btnWorkflowFromPairs">Build from sync pair order</button>
+    <div class="status inline" id="schWorkflowStatus"></div>
   </div>
 </section>
 
@@ -1619,17 +2024,70 @@ const ensureStdEnabledToggle = () => {
 
 `;
     host.appendChild(adv);
-    adv.querySelectorAll(".sch-help").forEach((btn) => {
-      const tip = HELP_TIPS[btn.dataset.helpKey] || "";
-      if (tip) {
-        btn.title = tip;
-      } else {
-        btn.removeAttribute("title");
-      }
-      btn.onclick = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-      };
+    const hooks = Object.assign(el("div", "sch-adv sch-webhooks"), { id: "schWebhooks" });
+    hooks.dataset.payloadFormat = "crosswatch";
+    hooks.innerHTML = `
+<div class="cw-panel-head">
+  <div class="sch-adv-head-copy sch-card-head">
+    <span class="material-symbols-rounded sch-card-icon" aria-hidden="true">monitor_heart</span>
+    <div class="sch-card-head-copy">
+      <div class="sch-adv-head-title">Scheduler Webhooks</div>
+      <p>Send outbound POST callbacks when scheduled syncs start, succeed, or fail.</p>
+    </div>
+  </div>
+  <label class="cx-toggle">
+    <input type="checkbox" id="schWebhookEnabled">
+    <span class="cx-toggle-ui" aria-hidden="true"></span>
+    <span class="cx-toggle-text">Enable webhooks</span>
+    <span class="cx-toggle-state" aria-hidden="true"></span>
+  </label>
+</div>
+<section class="sch-adv-section">
+  <div class="stack two">
+    <label class="field-mini"><div class="subnote"><span class="th-help"><span id="schWebhookUrlLabel">All events URL</span><button id="schWebhookUrlHelp" type="button" class="sch-help" aria-label="All events URL help" data-help-key="webhook_url"></button></span></div><input id="schWebhookUrl" name="schWebhookUrl" type="url" inputmode="url" pattern="https?://.+" autocomplete="off" placeholder="https://hooks.example.com/crosswatch"></label>
+    <label class="field-mini"><div class="subnote"><span class="th-help">Payload format<button type="button" class="sch-help" aria-label="Payload format help" data-help-key="webhook_format"></button></span></div><select id="schWebhookFormat" name="schWebhookFormat"><option value="crosswatch">CrossWatch JSON</option><option value="notifiarr">Notifiarr Passthrough</option></select></label>
+  </div>
+  <div class="stack two">
+    <label class="field-mini" data-webhook-format-for="crosswatch"><div class="subnote"><span class="th-help">Compatible base URL<button type="button" class="sch-help" aria-label="Compatible base URL help" data-help-key="webhook_base"></button></span></div><input id="schWebhookBase" name="schWebhookBase" type="url" inputmode="url" pattern="https?://.+" autocomplete="off" placeholder="https://monitor.example/ping/crosswatch"></label>
+    <label class="field-mini"><div class="subnote"><span class="th-help">Timeout seconds<button type="button" class="sch-help" aria-label="Timeout seconds help" data-help-key="webhook_timeout"></button></span></div><input id="schWebhookTimeout" name="schWebhookTimeout" type="number" min="1" max="60"></label>
+  </div>
+  <div class="stack">
+    <label class="cx-toggle">
+      <input type="checkbox" id="schWebhookAlertUnresolved">
+      <span class="cx-toggle-ui" aria-hidden="true"></span>
+      <span class="cx-toggle-text"><span class="th-help">Alert on unresolved items<button type="button" class="sch-help" aria-label="Alert on unresolved items help" data-help-key="webhook_alert_unresolved"></button></span></span>
+      <span class="cx-toggle-state" aria-hidden="true"></span>
+    </label>
+  </div>
+  <div class="stack" data-webhook-format-for="notifiarr">
+    <label class="field-mini"><div class="subnote"><span class="th-help">Notifiarr channel ID<button type="button" class="sch-help" aria-label="Notifiarr channel ID help" data-help-key="webhook_notifiarr_channel"></button></span></div><input id="schWebhookNotifiarrChannel" name="schWebhookNotifiarrChannel" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="123456789012345678"></label>
+  </div>
+  <div class="stack three" data-webhook-format-for="crosswatch">
+    <label class="field-mini"><div class="subnote"><span class="th-help">Start callback URL<button type="button" class="sch-help" aria-label="Start callback URL help" data-help-key="webhook_start"></button></span></div><input id="schWebhookStart" name="schWebhookStart" type="url" inputmode="url" pattern="https?://.+" autocomplete="off" placeholder="https://hooks.example.com/crosswatch/start"></label>
+    <label class="field-mini"><div class="subnote"><span class="th-help">Success callback URL<button type="button" class="sch-help" aria-label="Success callback URL help" data-help-key="webhook_success"></button></span></div><input id="schWebhookSuccess" name="schWebhookSuccess" type="url" inputmode="url" pattern="https?://.+" autocomplete="off" placeholder="https://hooks.example.com/crosswatch/success"></label>
+    <label class="field-mini"><div class="subnote"><span class="th-help">Failure callback URL<button type="button" class="sch-help" aria-label="Failure callback URL help" data-help-key="webhook_failure"></button></span></div><input id="schWebhookFailure" name="schWebhookFailure" type="url" inputmode="url" pattern="https?://.+" autocomplete="off" placeholder="https://hooks.example.com/crosswatch/failure"></label>
+  </div>
+</section>
+`;
+    const hooksHost = $("#sec-scheduling .body") || host;
+    hooksHost.appendChild(hooks);
+    hooks.querySelectorAll("input,select").forEach((node) => {
+      node.addEventListener("input", syncWebhooksFromFields);
+      node.addEventListener("change", syncWebhooksFromFields);
+    });
+    [adv, hooks].forEach((root) => {
+      root.querySelectorAll(".sch-help").forEach((btn) => {
+        const tip = HELP_TIPS[btn.dataset.helpKey] || "";
+        if (tip) {
+          btn.title = tip;
+        } else {
+          btn.removeAttribute("title");
+        }
+        btn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        };
+      });
     });
 
     $("#btnAddStep").onclick = () => { _jobs.push(defaultJob()); renderJobs(); };
@@ -1638,6 +2096,15 @@ const ensureStdEnabledToggle = () => {
       _jobs = eps.map(p => ({ id: genId(), pair_id: p.id, at: null, days: [], after: null, active: true }));
       if (!_jobs.length) _jobs.push(defaultJob());
       renderJobs();
+    };
+    $("#btnAddWorkflow").onclick = () => { _workflows.push(defaultWorkflow()); renderWorkflows(); };
+    $("#btnWorkflowFromPairs").onclick = () => {
+      const eps = _pairs.filter(p => p.enabled);
+      const workflow = defaultWorkflow();
+      workflow.steps = eps.map(p => ({ id: genId(), pair_id: p.id, active: true }));
+      if (!workflow.steps.length) workflow.steps.push(defaultWorkflowStep());
+      _workflows.push(workflow);
+      renderWorkflows();
     };
     $("#btnAddCaptureJob").onclick = () => { _captureJobs.push(defaultCaptureJob()); renderCaptureJobs(); };
     $("#btnAddEventRule").onclick = () => { _eventRules.push(defaultEventRule()); renderEventRules(); };
@@ -1660,16 +2127,19 @@ const ensureStdEnabledToggle = () => {
   // render
   const updateAdvancedStatus = () => {
     const jobsSt = $("#schJobsStatus");
+    const workflowSt = $("#schWorkflowStatus");
     const captureSt = $("#schCaptureStatus");
     const eventSt = $("#schEventStatus");
     const summaryText = $("#schAdvSummaryText");
     const summaryNote = $("#schAdvSummaryNote");
     const summaryState = $("#schAdvSummaryState");
     statusText(jobsSt);
+    statusText(workflowSt);
     statusText(captureSt);
     statusText(eventSt);
 
     const invalidJobs = serializableJobs().issues;
+    const invalidWorkflows = serializableWorkflows().issues;
     const blockedJobs = _jobs.some(j => j._blocked);
     const invalidCaptureJobs = serializableCaptureJobs().issues;
     const blockedRules = _eventRules.some(r => r._blocked);
@@ -1677,12 +2147,15 @@ const ensureStdEnabledToggle = () => {
     const invalidRules = _eventRules.map(eventRuleIssue).filter(Boolean);
     const timedJobs = _jobs.filter(j => !isBlankJob(j));
     const activeTimedJobs = timedJobs.filter(j => j.active !== false);
+    const workflows = _workflows.filter(w => !isBlankWorkflow(w));
+    const activeWorkflows = workflows.filter(w => w.active !== false);
     const captureJobs = _captureJobs.filter(j => !isBlankCaptureJob(j));
     const activeCaptureJobs = captureJobs.filter(j => j.active !== false);
     const eventRules = _eventRules.filter(eventRuleHasContent);
     const activeEventRules = eventRules.filter(r => r.active !== false);
-    const totalConfigured = timedJobs.length + captureJobs.length + eventRules.length;
+    const totalConfigured = timedJobs.length + workflows.length + captureJobs.length + eventRules.length;
     const timedIssue = invalidJobs[0] || (blockedJobs ? "Some timed steps reference disabled pairs." : "");
+    const workflowIssueText = invalidWorkflows[0] || "";
     const captureIssue = invalidCaptureJobs[0] || "";
     const eventIssue = (
       (eventRules.length ? _eventRouteError : "")
@@ -1692,6 +2165,7 @@ const ensureStdEnabledToggle = () => {
       || ""
     );
     const summaryIssue = issueLabel("Timed steps", timedIssue)
+      || issueLabel("Recurring workflows", workflowIssueText)
       || issueLabel("Capture schedules", captureIssue)
       || issueLabel("Event triggers", eventIssue);
 
@@ -1699,6 +2173,7 @@ const ensureStdEnabledToggle = () => {
       jobsSt,
       timedIssue
     );
+    statusText(workflowSt, workflowIssueText);
     statusText(captureSt, captureIssue);
     statusText(
       eventSt,
@@ -1710,6 +2185,7 @@ const ensureStdEnabledToggle = () => {
       else {
         const parts = [];
         if (timedJobs.length) parts.push(`${activeTimedJobs.length}/${timedJobs.length} timed step${timedJobs.length === 1 ? "" : "s"}`);
+        if (workflows.length) parts.push(`${activeWorkflows.length}/${workflows.length} recurring workflow${workflows.length === 1 ? "" : "s"}`);
         if (captureJobs.length) parts.push(`${activeCaptureJobs.length}/${captureJobs.length} capture schedule${captureJobs.length === 1 ? "" : "s"}`);
         if (eventRules.length) parts.push(`${activeEventRules.length}/${eventRules.length} event trigger${eventRules.length === 1 ? "" : "s"}`);
         summaryText.textContent = parts.join(" • ");
@@ -1718,7 +2194,7 @@ const ensureStdEnabledToggle = () => {
     if (summaryNote) {
       summaryNote.textContent = summaryIssue || (
         totalConfigured
-          ? "Combine timed steps, automated captures, and event triggers in one advanced plan."
+          ? "Combine timed steps, recurring workflows, automated captures, and event triggers in one advanced plan."
           : "Add timed steps, capture schedules, or event triggers to build an advanced automation flow."
       );
     }
@@ -1727,9 +2203,11 @@ const ensureStdEnabledToggle = () => {
         ? (
           summaryIssue.startsWith("Timed steps:")
             ? "Timed steps need attention"
-            : summaryIssue.startsWith("Capture schedules:")
-              ? "Capture schedules need attention"
-              : "Event triggers need attention"
+            : summaryIssue.startsWith("Recurring workflows:")
+              ? "Recurring workflows need attention"
+              : summaryIssue.startsWith("Capture schedules:")
+                ? "Capture schedules need attention"
+                : "Event triggers need attention"
         )
         : (_advEnabled ? "Advanced plan active" : "Advanced plan ready");
       summaryState.classList.toggle("attention", !!summaryIssue);
@@ -1742,6 +2220,15 @@ const ensureStdEnabledToggle = () => {
     if (!_jobs.length) _jobs.push(defaultJob());
     _jobs.forEach(j => j._blocked = j.active !== false && j.pair_id && !isEnabled(j.pair_id));
     _jobs.forEach(j => tbody.appendChild(jobRow(j)));
+    updateAdvancedStatus();
+    try { window.cwSchedSettingsHubUpdate?.(); } catch {}
+  };
+
+  const renderWorkflows = () => {
+    const body = $("#schWorkflowsBody"); if (!body) return;
+    body.innerHTML = "";
+    if (!_workflows.length) _workflows.push(defaultWorkflow());
+    _workflows.forEach((workflow) => body.appendChild(workflowBlock(workflow)));
     updateAdvancedStatus();
     try { window.cwSchedSettingsHubUpdate?.(); } catch {}
   };
@@ -1811,11 +2298,16 @@ const ensureStdEnabledToggle = () => {
         after: j.after || null,
         active: j.active !== false
       })) : [];
+      _workflows = Array.isArray(adv.workflows) ? adv.workflows.map(normalizeWorkflow) : [];
       _captureJobs = Array.isArray(adv.capture_jobs || adv.captureJobs) ? (adv.capture_jobs || adv.captureJobs).map(normalizeCaptureJob) : [];
       _captureJobs = mergeCaptureJobs(_captureJobs, getCaptureDraftJobs());
       _eventRules = Array.isArray(adv.event_rules || adv.eventRules) ? (adv.event_rules || adv.eventRules).map(normalizeEventRule) : [];
+      _webhooks = normalizeWebhooks(saved?.webhooks || {});
+      _webhooksHydrated = true;
+      renderWebhooks();
       _eventRules.forEach(syncRuleRoute);
       renderJobs();
+      renderWorkflows();
       renderCaptureJobs();
       renderEventRules();
       const pendingCapturePrefills = getPendingCapturePrefills();
@@ -1845,6 +2337,19 @@ const ensureStdEnabledToggle = () => {
       days: Array.isArray(j.days) ? j.days.slice() : [],
       after: j.after || null,
       active: j.active !== false
+    })),
+    workflows: serializableWorkflows().workflows.map(w => ({
+      id: w.id,
+      mode: w.mode || "hourly",
+      every_n_hours: Math.max(1, parseInt(w.every_n_hours || 1, 10) || 1),
+      daily_time: w.daily_time || "03:30",
+      custom_interval_minutes: Math.max(15, parseInt(w.custom_interval_minutes || 60, 10) || 60),
+      steps: (Array.isArray(w.steps) ? w.steps : []).map(step => ({
+        id: step.id,
+        pair_id: step.pair_id || null,
+        active: step.active !== false
+      })),
+      active: w.active !== false
     })),
     capture_jobs: serializableCaptureJobs().jobs.map((job) => ({
       id: job.id,
@@ -1881,12 +2386,16 @@ const ensureStdEnabledToggle = () => {
     }))
   });
   const schedulingValidation = () => {
+    const workflowState = serializableWorkflows();
     const captureState = serializableCaptureJobs();
     const ruleState = serializableEventRules();
+    const webhookIssues = webhooksValidation();
     return {
+      workflowIssues: workflowState.issues.slice(),
       captureIssues: captureState.issues.slice(),
       eventIssues: ruleState.issues.slice(),
-      issues: [...captureState.issues, ...ruleState.issues]
+      webhookIssues: webhookIssues.slice(),
+      issues: [...workflowState.issues, ...captureState.issues, ...ruleState.issues, ...webhookIssues]
     };
   };
   window.getSchedulingValidation = schedulingValidation;
@@ -1899,6 +2408,10 @@ const ensureStdEnabledToggle = () => {
     const daily_time = $("#schTime")?.value || "03:30";
     const custom_interval_minutes = getCustomIntervalMinutes();
     const validation = schedulingValidation();
+    if (validation.workflowIssues.length) {
+      if (strict) throw new Error(validation.workflowIssues[0]);
+      return null;
+    }
     if (validation.captureIssues.length) {
       if (strict) throw new Error(validation.captureIssues[0]);
       return null;
@@ -1907,13 +2420,20 @@ const ensureStdEnabledToggle = () => {
       if (strict) throw new Error(validation.eventIssues[0]);
       return null;
     }
+    if (validation.webhookIssues.length) {
+      if (strict) throw new Error(validation.webhookIssues[0]);
+      return null;
+    }
+    syncWebhooksFromFields();
     const advanced = serializeAdvanced();
 
     // Advanced plan disables standard scheduling
     const stdEnabled = ($("#schEnabled")?.value || "").trim() === "true";
     const enabled = advanced.enabled ? false : stdEnabled;
 
-    return { enabled, mode, every_n_hours, daily_time, custom_interval_minutes, advanced };
+    const patch = { enabled, mode, every_n_hours, daily_time, custom_interval_minutes, advanced };
+    if (_webhooksHydrated) patch.webhooks = normalizeWebhooks(_webhooks);
+    return patch;
   };
 
   // boot

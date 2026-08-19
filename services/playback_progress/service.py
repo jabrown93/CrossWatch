@@ -3,7 +3,6 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude
 from __future__ import annotations
 
-import json
 import math
 import re
 import threading
@@ -15,14 +14,20 @@ from typing import Any, Mapping, cast
 from _logging import log as BASE_LOG
 from cw_platform.config_base import load_config, save_config
 from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.orchestrator._progress_completion import progress_caps_from_ops, progress_write_completion_policy
 from cw_platform.provider_instances import build_provider_config_view, get_instance_block, get_provider_block, list_instance_ids, normalize_instance_id
 
 from .adapters.base import PlaybackProgressAdapter, configured_label
+from .adapters.crosswatch import CrossWatchPlaybackAdapter
+from .adapters.floppy import FloppyPlaybackAdapter
 from .adapters.media_servers import EmbyPlaybackAdapter, JellyfinPlaybackAdapter, KodiPlaybackAdapter, PlexPlaybackAdapter
 from .adapters.mdblist import MDBListPlaybackAdapter
 from .adapters.nuvio import NuvioPlaybackAdapter
 from .adapters.publicmetadb import PublicMetaDBPlaybackAdapter
+from .adapters.punchplay import PunchPlayPlaybackAdapter
+from .adapters.scrob import ScrobPlaybackAdapter
 from .adapters.simkl import SimklPlaybackAdapter
+from .adapters.stremio import StremioPlaybackAdapter
 from .adapters.trakt import TraktPlaybackAdapter
 from .models import PlaybackActionResult, PlaybackCapabilities, PlaybackListResult, clean_mapping, utc_now_iso
 
@@ -30,14 +35,16 @@ from .models import PlaybackActionResult, PlaybackCapabilities, PlaybackListResu
 LOG = BASE_LOG.child("PLAYBACK")
 CACHE_TTL_SECONDS = 60.0
 MAX_WORKERS = 6
-DEFAULT_PROVIDER_TIMEOUT_SECONDS = 12.0
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 20.0
 GROUP_PROGRESS_TOLERANCE = 2.0
-PHASE1_PROVIDERS = ("trakt", "simkl", "mdblist", "publicmetadb", "plex", "emby", "jellyfin", "nuvio", "kodi")
+PHASE1_PROVIDERS = ("crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "punchplay", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy", "scrob")
 SORT_VALUES = {"last_updated", "progress_high", "progress_low", "remaining_time", "rating_high", "title", "provider"}
 LIVE_MEDIA_PROVIDERS = {"plex", "emby", "jellyfin", "kodi"}
 LIVE_ACTIVE_STATES = {"playing", "paused", "buffering"}
 LIVE_MAX_AGE_SECONDS = 10 * 60
 CANONICAL_TMDB_RE = re.compile(r"^tmdb:(\d+)(?:#|$)", re.I)
+EDITABLE_PROGRESS_MIN_PERCENT = 2.0
+EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE = 100.0
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -180,25 +187,18 @@ def _live_rank(stream: Mapping[str, Any]) -> tuple[int, int]:
     return (rank, -updated)
 
 
-def _currently_watching_state_file() -> Any:
+def _currently_watching_state() -> Any:
     try:
-        from providers.scrobble.currently_watching import state_file
+        from providers.scrobble.currently_watching import load_state
 
-        return state_file()
+        return load_state()
     except Exception:
         return None
 
 
 def _load_live_streams(now: int | None = None) -> list[dict[str, Any]]:
-    path = _currently_watching_state_file()
-    if path is None:
-        return []
-    try:
-        if not path.exists():
-            return []
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else None
-    except Exception:
+    data = _currently_watching_state()
+    if data is None:
         return []
     if not isinstance(data, Mapping) or int(data.get("v") or 0) != 2 or not isinstance(data.get("streams"), Mapping):
         return []
@@ -407,23 +407,44 @@ def _show_ids_for_artwork(item: Mapping[str, Any]) -> dict[str, Any]:
             if not _blank_scalar(value):
                 show_ids[target] = value
                 break
-    if _group_text(item.get("media_type") or item.get("type")) in {"episode", "anime_episode"}:
-        match = CANONICAL_TMDB_RE.match(str(item.get("canonical_key") or "").strip())
-        if match and _blank_scalar(show_ids.get("tmdb")):
-            show_ids["tmdb"] = match.group(1)
     return clean_mapping(show_ids)
+
+
+def _artwork_identity_keys(item: Mapping[str, Any]) -> list[str]:
+    media_type = _group_text(item.get("media_type") or item.get("type"))
+    keys: list[str] = []
+    ids = _as_mapping(item.get("ids"))
+    if media_type == "movie":
+        for provider in ("tmdb", "imdb", "tvdb"):
+            value = ids.get(provider)
+            if not _blank_scalar(value):
+                keys.append(f"movie:{provider}:{_group_text(value)}")
+    elif media_type in {"episode", "anime_episode"}:
+        season = _group_number(item.get("season"))
+        episode = _group_number(item.get("episode"))
+        for provider, value in _show_ids_for_artwork(item).items():
+            if provider in {"tmdb", "imdb", "tvdb"} and not _blank_scalar(value):
+                keys.append(f"episode:{provider}:{_group_text(value)}:{season}:{episode}")
+    fallback = _artwork_identity_key(item)
+    if fallback:
+        keys.append(fallback)
+    return list(dict.fromkeys(keys))
 
 
 def _share_artwork_metadata(items: list[dict[str, Any]]) -> None:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in items:
-        key = _artwork_identity_key(item)
-        if key:
+        for key in _artwork_identity_keys(item):
             grouped.setdefault(key, []).append(item)
 
+    seen_groups: set[tuple[int, ...]] = set()
     for records in grouped.values():
         if len(records) < 2:
             continue
+        group_key = tuple(sorted(id(record) for record in records))
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
         shared_show_ids: dict[str, Any] = {}
         poster = ""
         backdrop = ""
@@ -582,15 +603,76 @@ def _group_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _validated_progress_percent(value: Any) -> tuple[float | None, str]:
+def _duration_seconds_from_record(record: Mapping[str, Any]) -> int | None:
+    try:
+        duration = record.get("duration_seconds")
+        if duration not in (None, ""):
+            value = int(float(duration))
+            return value if value > 0 else None
+    except Exception:
+        pass
+    meta = _as_mapping(record.get("provider_metadata"))
+    for key in ("progress_item", "resume_item"):
+        item = _as_mapping(meta.get(key))
+        for field in ("duration_ms", "duration"):
+            try:
+                raw = item.get(field)
+                if raw in (None, ""):
+                    continue
+                value = int(float(raw))
+                if value > 0:
+                    return max(1, round(value / 1000))
+            except Exception:
+                continue
+    return None
+
+
+def _progress_edit_max_exclusive(adapter: PlaybackProgressAdapter | None, record: Mapping[str, Any]) -> float:
+    ops = getattr(adapter, "ops", None)
+    policy = progress_write_completion_policy(progress_caps_from_ops(ops))
+    raw_percent = policy.get("percent")
+    if raw_percent is None:
+        cutoff = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE
+    else:
+        try:
+            cutoff = float(raw_percent)
+        except Exception:
+            cutoff = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE
+    if not math.isfinite(cutoff) or cutoff <= EDITABLE_PROGRESS_MIN_PERCENT or cutoff > EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE:
+        cutoff = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE
+    try:
+        min_duration = int(policy.get("min_duration_seconds") or 0)
+    except Exception:
+        min_duration = 0
+    if min_duration > 0:
+        duration = _duration_seconds_from_record(record)
+        if duration is not None and duration < min_duration:
+            cutoff = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE
+    return round(float(cutoff), 3)
+
+
+def _apply_progress_edit_policy(result: PlaybackListResult, adapter: PlaybackProgressAdapter | None) -> PlaybackListResult:
+    for record in result.items:
+        record.editable_progress_min_percent = EDITABLE_PROGRESS_MIN_PERCENT
+        record.editable_progress_max_exclusive = _progress_edit_max_exclusive(adapter, record.to_dict())
+    return result
+
+
+def _validated_progress_percent(value: Any, *, max_exclusive: float = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE) -> tuple[float | None, str]:
     try:
         progress = float(value)
     except Exception:
         return None, "Progress must be a number."
     if not math.isfinite(progress):
         return None, "Progress must be a finite number."
-    if progress < 2 or progress >= 80:
-        return None, "Progress must be between 2 and 79 percent. Use Mark as Watched for completed items."
+    try:
+        upper = float(max_exclusive)
+    except Exception:
+        upper = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE
+    if not math.isfinite(upper) or upper <= EDITABLE_PROGRESS_MIN_PERCENT or upper > EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE:
+        upper = EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE
+    if progress < EDITABLE_PROGRESS_MIN_PERCENT or progress >= upper:
+        return None, f"Progress must be at least {EDITABLE_PROGRESS_MIN_PERCENT:g} and below {upper:g} percent. Use Mark as Watched for completed items."
     return round(progress, 2), ""
 
 
@@ -609,6 +691,9 @@ def _instance_label(cfg: Mapping[str, Any], provider: str, instance_id: str) -> 
         "jellyfin": "Jellyfin",
         "nuvio": "Nuvio",
         "kodi": "Kodi",
+        "stremio": "Stremio",
+        "floppy": "Floppy",
+        "crosswatch": "CrossWatch",
     }.get(provider, provider)
     if label.lower() == "default":
         return f"{provider_label} Default"
@@ -619,6 +704,17 @@ def _instance_label(cfg: Mapping[str, Any], provider: str, instance_id: str) -> 
 
 def _profile_key(provider: Any, instance_id: Any) -> str:
     return f"{str(provider or '').strip().lower()}:{normalize_instance_id(instance_id)}"
+
+
+def _user_filter_allows(user_filter: Mapping[str, Any] | None, provider: Any, instance_id: Any) -> bool:
+    if not isinstance(user_filter, Mapping) or not user_filter:
+        return True
+    prov = str(provider or "").strip().upper()
+    allowed = user_filter.get(prov)
+    if not isinstance(allowed, list):
+        return False
+    inst = normalize_instance_id(instance_id)
+    return inst in {normalize_instance_id(value) for value in allowed}
 
 
 def _path_value(block: Mapping[str, Any], path: str) -> Any:
@@ -634,6 +730,11 @@ def _profile_has_explicit_identity(cfg: Mapping[str, Any], provider: str, instan
     inst = normalize_instance_id(instance_id)
     if inst == "default":
         return True
+    provider_key = str(provider or "").strip().lower()
+    if provider_key in {"cw", "crosswatch"}:
+        base = cfg.get("crosswatch") if isinstance(cfg, Mapping) else None
+        insts = (base or {}).get("instances") if isinstance(base, Mapping) else None
+        return bool(isinstance(insts, Mapping) and inst in insts and isinstance(insts.get(inst), Mapping))
     raw = get_instance_block(cfg, provider, inst, create=False)
     if not raw:
         return False
@@ -660,6 +761,10 @@ def _profile_has_explicit_identity(cfg: Mapping[str, Any], provider: str, instan
         "jellyfin": ("access_token", "user_id"),
         "nuvio": ("access_token", "refresh_token", "profile_id"),
         "kodi": ("server", "server_url", "connection_verified", "username"),
+        "stremio": ("auth_key", "authKey"),
+        "floppy": ("server_url", "api_token"),
+        "punchplay": ("access_token", "refresh_token", "user_id", "username"),
+        "scrob": ("server_url", "api_key", "username"),
     }.get(str(provider or "").strip().lower(), ())
     return any(str(_path_value(raw, path) or "").strip() for path in identity_paths)
 
@@ -729,20 +834,27 @@ class PlaybackProgressService:
             "jellyfin": JellyfinPlaybackAdapter(),
             "nuvio": NuvioPlaybackAdapter(),
             "kodi": KodiPlaybackAdapter(),
+            "stremio": StremioPlaybackAdapter(),
+            "floppy": FloppyPlaybackAdapter(),
+            "punchplay": PunchPlayPlaybackAdapter(),
+            "scrob": ScrobPlaybackAdapter(),
+            "crosswatch": CrossWatchPlaybackAdapter(),
         }
-        self._cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._lock = threading.RLock()
 
     def _adapter(self, provider: str) -> PlaybackProgressAdapter | None:
         provider_key = str(provider or "").strip().lower()
         return self.adapters.get(provider_key)
 
-    def provider_instances(self, cfg: Mapping[str, Any] | None = None) -> list[dict[str, str]]:
+    def provider_instances(self, cfg: Mapping[str, Any] | None = None, user_filter: Mapping[str, Any] | None = None) -> list[dict[str, str]]:
         config = cfg or load_config()
         out: list[dict[str, str]] = []
         for provider in PHASE1_PROVIDERS:
             for instance_id in list_instance_ids(config, provider):
                 inst = normalize_instance_id(instance_id)
+                if not _user_filter_allows(user_filter, provider, inst):
+                    continue
                 if not _profile_has_explicit_identity(config, provider, inst):
                     continue
                 out.append(
@@ -754,10 +866,10 @@ class PlaybackProgressService:
                 )
         return out
 
-    def capabilities(self, cfg: Mapping[str, Any] | None = None) -> list[PlaybackCapabilities]:
+    def capabilities(self, cfg: Mapping[str, Any] | None = None, user_filter: Mapping[str, Any] | None = None) -> list[PlaybackCapabilities]:
         config = cfg or load_config()
         out: list[PlaybackCapabilities] = []
-        for spec in self.provider_instances(config):
+        for spec in self.provider_instances(config, user_filter=user_filter):
             provider = spec["provider"]
             adapter = self._adapter(provider)
             if not adapter:
@@ -768,7 +880,7 @@ class PlaybackProgressService:
                 cap.included = _profile_included(config, provider, spec["instance_id"])
                 if not cap.included:
                     cap.reason = "Excluded from Playback Progress."
-                cached = self._cache.get((provider, spec["instance_id"]))
+                cached = self._cache.get(self._cache_key(provider, spec["instance_id"], adapter))
                 if cached:
                     cap.last_refresh = cached.get("refreshed_at")
                     err = cached.get("error")
@@ -790,12 +902,16 @@ class PlaybackProgressService:
                 )
         return out
 
-    def _cache_key(self, provider: str, instance_id: str) -> tuple[str, str]:
-        return (str(provider).lower(), normalize_instance_id(instance_id))
+    def _cache_key(self, provider: str, instance_id: str, adapter: PlaybackProgressAdapter | None = None) -> tuple[str, str, str]:
+        prov = str(provider).lower()
+        profile = str(getattr(adapter, "stremio_profile_id", "default") if prov == "stremio" else "default").strip() or "default"
+        return (prov, normalize_instance_id(instance_id), profile)
 
     def invalidate(self, provider: str, instance_id: str) -> None:
         with self._lock:
-            self._cache.pop(self._cache_key(provider, instance_id), None)
+            prefix = (str(provider).lower(), normalize_instance_id(instance_id))
+            for key in [key for key in self._cache if key[:2] == prefix]:
+                self._cache.pop(key, None)
         LOG.debug(f"cache invalidated provider={provider} instance={normalize_instance_id(instance_id)}")
 
     def _activity_marker(self, adapter: PlaybackProgressAdapter, config_view: Mapping[str, Any], *, instance_id: str) -> str:
@@ -834,7 +950,7 @@ class PlaybackProgressService:
                 message=cap.reason or "Provider does not support playback listing.",
             )
 
-        key = self._cache_key(provider, instance_id)
+        key = self._cache_key(provider, instance_id, adapter)
         now = time.time()
         with self._lock:
             cached = self._cache.get(key)
@@ -865,13 +981,16 @@ class PlaybackProgressService:
             instance_label=spec["instance_label"],
             force_refresh=force_refresh,
         )
+        if result.ok:
+            result = _apply_progress_edit_policy(result, adapter)
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        stored_at = time.time()
         with self._lock:
             if result.ok:
-                self._cache[key] = {"ts": now, "result": result, "activity_marker": marker, "refreshed_at": result.refreshed_at}
+                self._cache[key] = {"ts": stored_at, "result": result, "activity_marker": marker, "refreshed_at": result.refreshed_at}
                 LOG.debug(f"provider listed provider={provider} instance={instance_id} items={len(result.items)} elapsed_ms={elapsed_ms}")
             else:
-                self._cache[key] = {"ts": now, "result": result, "activity_marker": marker, "error": result.to_error()}
+                self._cache[key] = {"ts": stored_at, "result": result, "activity_marker": marker, "error": result.to_error()}
                 LOG.warn(f"provider list failed provider={provider} instance={instance_id} error={result.error_code or 'provider_error'} status={result.remote_status or ''} elapsed_ms={elapsed_ms}")
         return result
 
@@ -890,19 +1009,20 @@ class PlaybackProgressService:
         page: int = 1,
         page_size: int = 50,
         force_refresh: bool = False,
+        user_filter: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         cfg = load_config()
         provider_filter = str(provider or "").strip().lower()
         instance_filter = normalize_instance_id(instance_id) if instance_id else ""
         specs = [
             spec
-            for spec in self.provider_instances(cfg)
+            for spec in self.provider_instances(cfg, user_filter=user_filter)
             if (not provider_filter or spec["provider"] == provider_filter)
             and (not instance_filter or spec["instance_id"] == instance_filter)
         ]
         readable_specs: list[dict[str, str]] = []
         skipped_errors: list[dict[str, Any]] = []
-        capabilities = self.capabilities(cfg)
+        capabilities = self.capabilities(cfg, user_filter=user_filter)
         cap_by_key = {(cap.provider, cap.instance_id): cap for cap in capabilities}
         for spec in specs:
             cap = cap_by_key.get((spec["provider"], spec["instance_id"]))
@@ -975,11 +1095,11 @@ class PlaybackProgressService:
             "refreshed_at": utc_now_iso(),
         }
 
-    def settings(self, cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def settings(self, cfg: Mapping[str, Any] | None = None, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
         config = cfg or load_config()
         disabled = _disabled_profiles(config)
         profiles = []
-        for cap in self.capabilities(config):
+        for cap in self.capabilities(config, user_filter=user_filter):
             key = _profile_key(cap.provider, cap.instance_id)
             profiles.append(
                 {
@@ -1117,10 +1237,16 @@ class PlaybackProgressService:
             return None, {}, inst
         return adapter, build_provider_config_view(cfg, provider_key, inst), inst
 
-    def remove(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        cfg = load_config()
+    def _scope_denied(self, provider: str, instance_id: str, operation: str) -> dict[str, Any]:
+        LOG.warn(f"{operation} denied by profile scope provider={provider} instance={instance_id}")
+        return PlaybackActionResult(False, provider, instance_id, operation, error_code="profile_scope_denied", message="This provider instance is not assigned to your profile.").to_dict()
+
+    def remove(self, payload: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
         provider = str(payload.get("provider") or "").lower()
         instance_id = normalize_instance_id(payload.get("instance_id"))
+        if not _user_filter_allows(user_filter, provider, instance_id):
+            return self._scope_denied(provider, instance_id, "remove_progress")
+        cfg = load_config()
         record_value = payload.get("record")
         record = _as_mapping(record_value) if isinstance(record_value, Mapping) else payload
         adapter, config_view, inst = self._adapter_for_action(cfg, provider, instance_id)
@@ -1137,10 +1263,12 @@ class PlaybackProgressService:
             LOG.warn(f"remove progress failed provider={provider} instance={inst} error={result.error_code or 'provider_error'}")
         return result.to_dict()
 
-    def mark_watched(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        cfg = load_config()
+    def mark_watched(self, payload: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
         provider = str(payload.get("provider") or "").lower()
         instance_id = normalize_instance_id(payload.get("instance_id"))
+        if not _user_filter_allows(user_filter, provider, instance_id):
+            return self._scope_denied(provider, instance_id, "mark_watched")
+        cfg = load_config()
         record_value = payload.get("record")
         record = _as_mapping(record_value) if isinstance(record_value, Mapping) else payload
         adapter, config_view, inst = self._adapter_for_action(cfg, provider, instance_id)
@@ -1174,7 +1302,7 @@ class PlaybackProgressService:
             return PlaybackActionResult(True, provider, instance_id, "remove_progress", remote_id=str(record.get("remote_id") or ""), canonical_key=str(record.get("canonical_key") or ""), message="Cleanup skipped because remove progress is unsupported.")
         return adapter.remove_progress(config_view, record, instance_id=instance_id, instance_label=instance_label)
 
-    def bulk(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def bulk(self, payload: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
         action = str(payload.get("action") or "").strip().lower()
         items_value = payload.get("items")
         items: list[Any] = items_value if isinstance(items_value, list) else []
@@ -1189,23 +1317,19 @@ class PlaybackProgressService:
                 if not record.get("can_remove_progress"):
                     results.append({"ok": False, "provider": item.get("provider"), "instance_id": item.get("instance_id"), "operation": action, "remote_id": item.get("remote_id"), "canonical_key": item.get("canonical_key"), "error_code": "unsupported", "message": "Remove Progress is unsupported for this record."})
                     continue
-                results.append(self.remove(item))
+                results.append(self.remove(item, user_filter=user_filter))
             elif action == "mark_watched":
                 if not record.get("can_mark_watched"):
                     results.append({"ok": False, "provider": item.get("provider"), "instance_id": item.get("instance_id"), "operation": action, "remote_id": item.get("remote_id"), "canonical_key": item.get("canonical_key"), "error_code": "unsupported", "message": "Mark as Watched is unsupported for this record."})
                     continue
-                results.append(self.mark_watched(item))
+                results.append(self.mark_watched(item, user_filter=user_filter))
             elif action == "update_progress":
-                progress, reason = _validated_progress_percent(payload.get("progress_percent"))
-                if progress is None:
-                    results.append({"ok": False, "provider": item.get("provider"), "instance_id": item.get("instance_id"), "operation": action, "remote_id": item.get("remote_id"), "canonical_key": item.get("canonical_key"), "error_code": "invalid_progress", "message": reason})
-                    continue
                 if not record.get("can_update_progress"):
                     results.append({"ok": False, "provider": item.get("provider"), "instance_id": item.get("instance_id"), "operation": action, "remote_id": item.get("remote_id"), "canonical_key": item.get("canonical_key"), "error_code": "unsupported", "message": "Edit Progress is unsupported for this record."})
                     continue
                 update_item = dict(item)
-                update_item["progress_percent"] = progress
-                results.append(self.update_progress(update_item))
+                update_item["progress_percent"] = payload.get("progress_percent")
+                results.append(self.update_progress(update_item, user_filter=user_filter))
             else:
                 results.append({"ok": False, "operation": action, "error_code": "unsupported_action", "message": "Unsupported bulk action."})
         successful = sum(1 for r in results if r.get("ok"))
@@ -1220,13 +1344,11 @@ class PlaybackProgressService:
             "unsupported": unsupported,
         }
 
-    def update_progress(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        progress, reason = _validated_progress_percent(payload.get("progress_percent"))
+    def update_progress(self, payload: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
         provider = str(payload.get("provider") or "").lower()
         instance_id = normalize_instance_id(payload.get("instance_id"))
-        if progress is None:
-            LOG.warn(f"update progress rejected provider={provider} instance={instance_id} reason={reason}")
-            return PlaybackActionResult(False, provider, instance_id, "update_progress", error_code="invalid_progress", message=reason).to_dict()
+        if not _user_filter_allows(user_filter, provider, instance_id):
+            return self._scope_denied(provider, instance_id, "update_progress")
         cfg = load_config()
         record_value = payload.get("record")
         record = _as_mapping(record_value) if isinstance(record_value, Mapping) else payload
@@ -1234,6 +1356,10 @@ class PlaybackProgressService:
         if adapter is None:
             LOG.warn(f"update progress requested unknown provider={provider} instance={inst}")
             return PlaybackActionResult(False, provider, inst, "update_progress", error_code="unknown_provider", message="Unknown provider.").to_dict()
+        progress, reason = _validated_progress_percent(payload.get("progress_percent"), max_exclusive=_progress_edit_max_exclusive(adapter, record))
+        if progress is None:
+            LOG.warn(f"update progress rejected provider={provider} instance={instance_id} reason={reason}")
+            return PlaybackActionResult(False, provider, instance_id, "update_progress", error_code="invalid_progress", message=reason).to_dict()
         if not record.get("can_update_progress"):
             LOG.warn(f"update progress unsupported provider={provider} instance={inst} remote_id={record.get('remote_id') or ''}")
             return PlaybackActionResult(False, provider, inst, "update_progress", remote_id=str(record.get("remote_id") or ""), canonical_key=str(record.get("canonical_key") or ""), error_code="unsupported", message="Edit Progress is unsupported for this record.").to_dict()

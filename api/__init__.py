@@ -32,6 +32,7 @@ from .editorAPI import router as editor_router
 from .eventsAPI import router as events_router
 from .providerInstancesAPI import router as provider_instances_router
 from .playbackProgressAPI import router as playback_progress_router
+from .profileAPI import router as profile_router
 from .syncAPI import (
     router as sync_router,
     _is_sync_running,
@@ -41,6 +42,7 @@ from .syncAPI import (
 
 from services.analyzer import router as analyzer_router
 from services.export import router as export_router
+from services.importer import router as importer_router
 
 __all__ = [
     "config_router",
@@ -63,10 +65,12 @@ __all__ = [
     "version_router",
     "analyzer_router",
     "export_router",
+    "importer_router",
     "editor_router",
     "events_router",
     "provider_instances_router",
     "playback_progress_router",
+    "profile_router",
     "register_probes",
     "register_insights",
     "register_wall",
@@ -105,10 +109,12 @@ def register(
     app.include_router(version_router)
     app.include_router(analyzer_router)
     app.include_router(export_router)
+    app.include_router(importer_router)
     app.include_router(editor_router)
     app.include_router(events_router)
     app.include_router(provider_instances_router)
     app.include_router(playback_progress_router)
+    app.include_router(profile_router)
 
     register_probes(app, load_config)
     register_insights(app)

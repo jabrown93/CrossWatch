@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence, Mapping
 from typing import Any, Callable, cast
 from . import _unresolved as _unresolved_mod
+from ..run_control import cancel_requested
 record_unresolved = cast(Callable[..., dict[str, Any]], getattr(_unresolved_mod, "record_unresolved"))
 
 _UNRESOLVED_EXAMPLE_CAP = 25
@@ -147,6 +148,33 @@ def _normalize(
     except Exception:  # pragma: no cover
         _ckey = None  # type: ignore
 
+    try:
+        from ..history_events import history_event_key as _history_event_key  # type: ignore
+    except Exception:  # pragma: no cover
+        _history_event_key = None  # type: ignore
+
+    def _accounting_keys(item: Mapping[str, Any]) -> list[str]:
+        keys: list[str] = []
+
+        def _add(value: Any) -> None:
+            raw = str(value or "").strip()
+            if raw and raw not in keys:
+                keys.append(raw)
+
+        if str(feature or "").lower() == "history":
+            _add(item.get("_cw_event_key"))
+            if _history_event_key:
+                try:
+                    _add(_history_event_key(item, item.get("_cw_event_key")))
+                except Exception:
+                    pass
+        if _ckey:
+            try:
+                _add(_ckey(item) or "")
+            except Exception:
+                pass
+        return keys
+
     if isinstance(unresolved_list, list) and unresolved_list:
         def _unwrap(x: Mapping[str, Any]) -> tuple[Mapping[str, Any], str | None]:
             inner = x.get("item")
@@ -253,11 +281,21 @@ def _normalize(
         unresolved_keys = [k for k in unresolved_keys if k and (k not in seen and not seen.add(k))]
 
     unresolved = len(unresolved_list) if isinstance(unresolved_list, list) else int(unresolved_list or 0)
+    if unresolved_keys:
+        unresolved_key_set = set(unresolved_keys)
+        if ckeys:
+            ckeys = [k for k in ckeys if k not in unresolved_key_set]
+            confirmed = len(ckeys)
+        elif unresolved > 0:
+            confirmed = min(int(confirmed), max(0, attempted - unresolved))
+    elif unresolved > 0 and not ckeys:
+        confirmed = min(int(confirmed), max(0, attempted - unresolved))
+
     errors = int(res.get("errors") or 0)
     skipped_reported_raw = res.get("skipped")
     skipped_exact = len(skeys)
     inferred_remainder = max(0, attempted - int(confirmed) - unresolved - errors)
-    exact_basis = bool(res.get("ambiguous")) or (tag == "apply:add" and bool(ckeys))
+    exact_basis = bool(res.get("ambiguous")) or (tag == "apply:add" and bool(ckeys or skeys))
     if exact_basis:
         skipped = skipped_exact
         skipped_inferred = 0
@@ -267,17 +305,12 @@ def _normalize(
         for it in items:
             if not isinstance(it, Mapping):
                 continue
-            k = ""
-            if _ckey:
-                try:
-                    k = str(_ckey(it) or "")
-                except Exception:
-                    k = ""
-            if k and k in accounted:
+            item_keys = _accounting_keys(it)
+            if any(k in accounted for k in item_keys):
                 continue
             leftover.append(it)
-            if k:
-                unresolved_keys.append(k)
+            if item_keys:
+                unresolved_keys.append(item_keys[0])
         if leftover:
             unresolved += len(leftover)
             try:
@@ -344,6 +377,9 @@ def _apply_chunked(
     total = len(items)
     if total == 0:
         return {"ok": True, "attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0, "count": 0}
+    if cancel_requested():
+        emit(f"{tag}:cancelled", dst=dst, feature=feature, done=0, total=total)
+        return {"ok": True, "attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0, "count": 0, "cancelled": True}
     csize = int(chunk_size or 0)
     if csize <= 0 or total <= csize:
         raw = _retry(lambda: call(items))
@@ -366,6 +402,10 @@ def _apply_chunked(
         "errors": 0,
     }
     for i in range(0, total, csize):
+        if cancel_requested():
+            agg["cancelled"] = True
+            emit(f"{tag}:cancelled", dst=dst, feature=feature, done=done, total=total)
+            break
         chunk = items[i : i + csize]
         raw = _retry(lambda: call(chunk))
         res = _normalize(raw, chunk, tag, dst=dst, feature=feature, emit=emit)
@@ -411,6 +451,14 @@ def _apply_chunked(
     agg["count"] = agg["confirmed"]
     return agg
 
+def _mark_dry_run(res: dict[str, Any]) -> dict[str, Any]:
+    res["dry_run"] = True
+    res["confirmed"] = 0
+    res["confirmed_keys"] = []
+    res["count"] = 0
+    return res
+
+
 def _apply_op(
     verb: str,
     *,
@@ -440,6 +488,8 @@ def _apply_op(
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
     )
+    if dry_run:
+        _mark_dry_run(res)
     _conf = int(res.get("confirmed", 0))
     payload: dict[str, Any] = {
         "dst": dst_name,
@@ -447,6 +497,7 @@ def _apply_op(
         "count": _conf,
         "attempted": int(res.get("attempted", 0)),
         payload_key: _conf,
+        "dry_run": bool(dry_run),
         "skipped": int(res.get("skipped", 0)),
         "skipped_exact": int(res.get("skipped_exact", 0)),
         "skipped_inferred": int(res.get("skipped_inferred", 0)),

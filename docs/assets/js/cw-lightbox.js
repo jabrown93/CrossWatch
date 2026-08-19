@@ -17,7 +17,12 @@
 
       if (!groups.has(name)) groups.set(name, { items: [], anchors: [] });
       const g = groups.get(name);
-      g.items.push({ href, alt, thumb });
+      let itemIndex = g.items.findIndex((it) => it.href === href);
+      if (itemIndex < 0) {
+        itemIndex = g.items.length;
+        g.items.push({ href, alt, thumb });
+      }
+      a.dataset.cwGalleryIndex = String(itemIndex);
       g.anchors.push(a);
     }
   }
@@ -34,9 +39,9 @@
           <button class="cw-lb__close" type="button" aria-label="Close">Close</button>
         </div>
         <div class="cw-lb__stage">
-          <button class="cw-lb__nav prev" type="button" aria-label="Previous">‹</button>
+          <button class="cw-lb__nav prev" type="button" aria-label="Previous">&lsaquo;</button>
           <img class="cw-lb__img" alt="" />
-          <button class="cw-lb__nav next" type="button" aria-label="Next">›</button>
+          <button class="cw-lb__nav next" type="button" aria-label="Next">&rsaquo;</button>
         </div>
         <div class="cw-lb__thumbs" aria-label="Thumbnails"></div>
       </div>
@@ -81,10 +86,14 @@
         lastFocus = document.activeElement;
         restoreOverflow = document.body.style.overflow || "";
         document.body.style.overflow = "hidden";
+        document.documentElement.classList.add("cw-lb-open");
+        document.body.classList.add("cw-lb-open");
         ui.classList.add("is-open");
         btnClose.focus();
       } else {
         ui.classList.remove("is-open");
+        document.documentElement.classList.remove("cw-lb-open");
+        document.body.classList.remove("cw-lb-open");
         document.body.style.overflow = restoreOverflow;
         if (lastFocus && typeof lastFocus.focus === "function") lastFocus.focus();
       }
@@ -118,7 +127,7 @@
 
       imgEl.src = it.href;
       imgEl.alt = it.alt;
-      counter.textContent = `${activeIndex + 1} / ${items.length} — ${it.alt}`;
+      counter.textContent = `${activeIndex + 1} / ${items.length} - ${it.alt}`;
 
       btnPrev.disabled = items.length <= 1;
       btnNext.disabled = items.length <= 1;
@@ -190,10 +199,10 @@
     });
 
     for (const [name, g] of groups.entries()) {
-      g.anchors.forEach((a, idx) => {
+      g.anchors.forEach((a) => {
         a.addEventListener("click", (e) => {
           e.preventDefault();
-          open(name, idx);
+          open(name, Number(a.dataset.cwGalleryIndex || 0));
         });
       });
     }

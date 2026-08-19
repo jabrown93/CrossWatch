@@ -19,6 +19,7 @@ except Exception:
     BASE_LOG = None
 
 from cw_platform.config_base import load_config, save_config
+from cw_platform.account_match import media_account_allowed, normalize_media_account_name
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
 from providers.scrobble.scrobble import (
     Dispatcher,
@@ -89,7 +90,10 @@ def _plex_btok(cfg: dict[str, Any], instance_id: Any = None) -> tuple[str, str]:
         if isinstance(pms_blk, dict):
             pms = str(pms_blk.get("token") or pms_blk.get("x_plex_token") or "").strip()
 
-    if pms:
+    bound = str(px.get("pms_token_server") or "").strip().rstrip("/")
+    stale = bool(pms and cloud and bound and bound != base)
+
+    if pms and not stale:
         return base, pms
     pms2, _ = _try_discover_pms_token(cfg, base, cloud, instance_id=instance_id)
     return base, (pms2 or cloud)
@@ -296,6 +300,9 @@ def _is_live_tv_dvr_event(ev: ScrobbleEvent) -> bool:
         return any("tv.plex.xmltv" in guid.lower() for guid in _iter_guid_strings(ev.raw))
     except Exception:
         return False
+
+
+_ALLOWED_WATCH_TYPES = frozenset({"movie", "episode"})
 
 
 def _media_name(ev: ScrobbleEvent) -> str:
@@ -898,7 +905,7 @@ class WatchService:
         name = str(ident.get("name") or "").strip()
         return name or None
 
-    def _enrich_event_with_plex(self, ev: ScrobbleEvent) -> ScrobbleEvent:
+    def _enrich_event_with_plex(self, ev: ScrobbleEvent) -> ScrobbleEvent | None:
         try:
             if not self._plex:
                 return ev
@@ -917,7 +924,10 @@ class WatchService:
             if not it:
                 return ev
 
-            media_type = getattr(it, "type", "") or ev.media_type
+            media_type = str(getattr(it, "type", "") or ev.media_type).strip().lower()
+            if media_type not in _ALLOWED_WATCH_TYPES:
+                self._dbg(f"drop unsupported plex media type '{media_type}' rk={rk} sess={ev.session_key}")
+                return None
             title = getattr(it, "title", None)
             year = getattr(it, "year", None)
             ids_raw: dict[str, Any] = dict(ev.ids or {}, plex=int(rk))
@@ -1143,7 +1153,10 @@ class WatchService:
                 self._throttled_filtered_log(ev)
                 return
 
-            ev = self._enrich_event_with_plex(ev)
+            enriched = self._enrich_event_with_plex(ev)
+            if enriched is None:
+                return
+            ev = enriched
             sk = str(ev.session_key) if ev.session_key else None
             vo = None
             dur = None
@@ -1169,6 +1182,8 @@ class WatchService:
                     self._update_best_offset(sk, int(o), int(d))
                 if pct != ev.progress:
                     ev = ScrobbleEvent(**{**ev.__dict__, "progress": pct})
+            if o is not None or d is not None:
+                ev = ScrobbleEvent(**{**ev.__dict__, "position_ms": int(o) if o is not None else None, "duration_ms": int(d) if d is not None and d > 0 else None})
 
             if sk and sk not in self._first_seen:
                 self._first_seen[sk] = time.time()
@@ -1389,7 +1404,7 @@ def _emit(logger: Callable[..., None] | None, msg: str, level: str = "INFO") -> 
 
 
 def _norm_user(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    return normalize_media_account_name(s)
 
 
 def _account_key(payload: dict[str, Any]) -> str:
@@ -1407,27 +1422,8 @@ def _account_key(payload: dict[str, Any]) -> str:
     return "unknown"
 
 
-def _account_allowed(allow: Any, payload: dict[str, Any]) -> bool:
-    if not allow:
-        return True
-    allow_list = allow if isinstance(allow, list) else [allow]
-    acc = payload.get("Account") or {}
-    title = str((acc.get("title") if isinstance(acc, dict) else "") or "")
-    acc_id = str((acc.get("id") if isinstance(acc, dict) else "") or "")
-    acc_uuid = str((acc.get("uuid") if isinstance(acc, dict) else "") or "").lower()
-
-    for e in allow_list:
-        s = str(e).strip()
-        if not s:
-            continue
-        sl = s.lower()
-        if sl.startswith("id:") and acc_id and sl.split(":", 1)[1].strip() == acc_id:
-            return True
-        if sl.startswith("uuid:") and acc_uuid and sl.split(":", 1)[1].strip() == acc_uuid:
-            return True
-        if not sl.startswith(("id:", "uuid:")) and _norm_user(s) == _norm_user(title):
-            return True
-    return False
+def _account_allowed(allow: Any, payload: dict[str, Any], *, default_allow: bool = True) -> bool:
+    return media_account_allowed(allow, payload, default_allow=default_allow)
 
 
 def _server_allowed(want_uuid: str, payload: dict[str, Any]) -> bool:
@@ -1729,12 +1725,18 @@ def process_rating_webhook(
         enable_trakt = "trakt" in custom_targets
         enable_simkl = "simkl" in custom_targets
         enable_mdblist = "mdblist" in custom_targets
+        enable_crosswatch = "crosswatch" in custom_targets
+        enable_floppy = "floppy" in custom_targets
+        enable_punchplay = "punchplay" in custom_targets
     else:
         enable_trakt = bool(watch_cfg.get("plex_trakt_ratings"))
         enable_simkl = bool(watch_cfg.get("plex_simkl_ratings"))
         enable_mdblist = bool(watch_cfg.get("plex_mdblist_ratings"))
+        enable_crosswatch = bool(watch_cfg.get("plex_crosswatch_ratings"))
+        enable_floppy = bool(watch_cfg.get("plex_floppy_ratings"))
+        enable_punchplay = bool(watch_cfg.get("plex_punchplay_ratings"))
 
-    if not (enable_trakt or enable_simkl or enable_mdblist):
+    if not (enable_trakt or enable_simkl or enable_mdblist or enable_crosswatch or enable_floppy or enable_punchplay):
         return {"ok": True, "ignored": True}
 
     if not payload:
@@ -1751,7 +1753,10 @@ def process_rating_webhook(
     if not _server_filters_allowed(filt, payload):
         return {"ok": True, "ignored": True}
 
-    if not _account_allowed(wl, payload):
+    scoped = bool(str(watch_cfg.get("route_profile_id") or "").strip())
+    if not _account_allowed(wl, payload, default_allow=not scoped):
+        if not wl and scoped:
+            _emit(logger, f"route {watch_cfg.get('route_id') or '?'}: rating blocked - profile-scoped route has no username whitelist", "WARNING")
         return {"ok": True, "ignored": True}
 
     if not _library_allowed(cfg, payload):
@@ -1773,7 +1778,7 @@ def process_rating_webhook(
         rating_val = 0
 
 
-    if media_type == "episode" and not enable_trakt:
+    if media_type == "episode" and not (enable_trakt or enable_crosswatch or enable_punchplay):
         return {"ok": True, "ignored": True}
 
     acc_key = _account_key(payload)
@@ -1815,4 +1820,24 @@ def process_rating_webhook(
         results["simkl"] = _simkl_send_rating(media_type, ids, rating_val, cfg, logger)
     if enable_mdblist and media_type in ("movie", "show"):
         results["mdblist"] = _mdblist_send_rating(media_type, ids, rating_val, cfg, logger)
+    ops_enabled = [
+        name
+        for name, on in (("crosswatch", enable_crosswatch), ("floppy", enable_floppy), ("punchplay", enable_punchplay))
+        if on
+    ]
+    if ops_enabled:
+        from providers.scrobble.plex.ratings_sync import dispatch_ops_ratings
+
+        sink_inst = str(watch_cfg.get("route_sink_instance") or "default").strip() or "default"
+        results.update(
+            dispatch_ops_ratings(
+                media_type,
+                md,
+                ids,
+                rating_val,
+                cfg,
+                enabled=ops_enabled,
+                instance_for=lambda _sink: sink_inst,
+            )
+        )
     return results

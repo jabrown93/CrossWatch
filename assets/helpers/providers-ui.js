@@ -47,15 +47,15 @@
 
   const AUTH_GROUPS = Object.freeze([
     { id: "sec-auth-media", title: "Media servers", keys: ["PLEX", "JELLYFIN", "EMBY"] },
-    { id: "sec-auth-trackers", title: "Trackers", keys: ["TRAKT", "SIMKL", "TMDB", "MDBLIST", "PUBLICMETADB", "ANILIST"] },
-    { id: "sec-auth-clients", title: "Media clients", keys: ["NUVIO", "KODI"] },
+    { id: "sec-auth-trackers", title: "Trackers", keys: ["CROSSWATCH", "TRAKT", "SIMKL", "TMDB", "MDBLIST", "PUBLICMETADB", "ANILIST", "PUNCHPLAY", "FLOPPY", "SCROB"] },
+    { id: "sec-auth-clients", title: "Media clients", keys: ["NUVIO", "KODI", "STREMIO"] },
     { id: "sec-auth-others", title: "Others", keys: ["TAUTULLI"] },
   ]);
   const AUTH_GROUP_BY_KEY = Object.freeze(Object.fromEntries(AUTH_GROUPS.flatMap((group) => group.keys.map((key) => [key, group.id]))));
   const META_GROUP = Object.freeze({ id: "sec-auth-metadata", title: "Metadata", keys: ["TMDB_METADATA", "ANIME_MAPPING"] });
   const META_ITEMS = Object.freeze({
     TMDB_METADATA: { key: "TMDB_METADATA", label: "TMDb Metadata", logoKey: "TMDB", sectionId: "sec-meta-tmdb", provider: "tmdb" },
-    ANIME_MAPPING: { key: "ANIME_MAPPING", label: "Anime ID Mapping", logoKey: "ANILIST", sectionId: "sec-meta-anime-mapping", provider: "anime-mapping" },
+    ANIME_MAPPING: { key: "ANIME_MAPPING", label: "Anime ID Mapping", icon: "shield", sectionId: "sec-meta-anime-mapping", provider: "anime-mapping" },
   });
 
   function providerMeta() {
@@ -129,6 +129,7 @@
   }
 
   function metadataProviderLogo(info) {
+    if (info?.icon) return `<span class="material-symbols-rounded cw-auth-provider-icon" aria-hidden="true">${escHtml(info.icon)}</span>`;
     return window.CW?.ProviderMeta?.logoHtml?.(info?.logoKey || info?.label || "", "cw-auth-provider-logo") || `<span class="token-text">${info?.label || ""}</span>`;
   }
 
@@ -159,10 +160,15 @@
     if (p === "trakt" || p === "simkl") return hasConfiguredValue(b.access_token) || hasConfiguredValue(b.refresh_token);
     if (p === "anilist") return hasConfiguredValue(b.access_token) || hasConfiguredValue(b.token);
     if (p === "mdblist") return hasConfiguredValue(b.api_key) || hasConfiguredValue(b.access_token);
+    if (p === "punchplay") return hasConfiguredValue(b.access_token);
+    if (p === "floppy") return hasConfiguredValue(b.server_url || b.server) && hasConfiguredValue(b.api_token || b.token);
+    if (p === "scrob") return hasConfiguredValue(b.server_url) && hasConfiguredValue(b.api_key) && hasConfiguredValue(b.username) && hasConfiguredValue(b.password);
     if (p === "nuvio") return (hasConfiguredValue(b.access_token) || hasConfiguredValue(b.refresh_token)) && hasConfiguredValue(b.profile_id);
     if (p === "kodi") return hasConfiguredValue(b.server) && b.connection_verified === true;
+    if (p === "stremio") return hasConfiguredValue(b.auth_key) || hasConfiguredValue(b.authKey);
     if (p === "tautulli") return hasConfiguredValue((b || cfg?.tautulli || cfg?.auth?.tautulli || {}).server_url || (b || cfg?.tautulli || cfg?.auth?.tautulli || {}).server);
     if (p === "tmdb") return hasConfiguredValue(b.account_id) || (hasConfiguredValue(b.api_key) && hasConfiguredValue(b.session_id || b.session));
+    if (p === "crosswatch") return !!(cfg?.crosswatch || cfg?.CrossWatch) && b.connected === true && b.enabled !== false;
     return hasConfiguredValue(b.access_token) || hasConfiguredValue(b.api_key) || hasConfiguredValue(b.token);
   }
 
@@ -187,16 +193,30 @@
     return Array.from(new Set(out)).sort((a, b) => (a !== "default") - (b !== "default") || a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
   }
 
+  function profileFriendlyName(cfg, provider, id) {
+    const raw = String(id || "").trim();
+    const isDefault = raw.toLowerCase() === "default";
+    const block = providerConfigBlock(cfg, provider);
+    const instances = block?.instances;
+    const source = isDefault ? block : (instances && typeof instances === "object" ? instances[raw] : null);
+    const label = source && typeof source === "object" ? String(source.label || "").trim() : "";
+    return label || (isDefault ? "Default" : profileDisplayName(raw));
+  }
+
+  const PROFILE_PILL_LIMIT = 3;
+
   function authProfileBadges(card, cfg) {
-    const ids = configuredProfileIds(cfg, card.provider, !!card.status?.ok)
-      .filter((id) => String(id || "").trim().toLowerCase() !== "default");
+    const ids = configuredProfileIds(cfg, card.provider, !!card.status?.ok);
     if (!ids.length) return "";
     const label = ids.length === 1 ? "Configured profile" : "Configured profiles";
-    const pills = ids.map((id) => {
-      const name = profileDisplayName(id);
-      return `<span class="cw-auth-profile-pill" title="${escHtml(`${label}: ${name}`)}">${escHtml(name)}</span>`;
-    }).join("");
-    return `<span class="cw-auth-profile-strip" aria-label="${label}">${pills}</span>`;
+    const names = ids.map((id) => profileFriendlyName(cfg, card.provider, id));
+    const shown = names.slice(0, PROFILE_PILL_LIMIT);
+    const rest = names.slice(PROFILE_PILL_LIMIT);
+    const pills = shown.map((name) => `<span class="cw-auth-profile-pill" title="${escHtml(`${label}: ${name}`)}">${escHtml(name)}</span>`);
+    if (rest.length) {
+      pills.push(`<span class="cw-auth-profile-pill is-overflow" title="${escHtml(`${label}: ${rest.join(", ")}`)}">+${rest.length}</span>`);
+    }
+    return `<span class="cw-auth-profile-strip" aria-label="${escHtml(`${label}: ${names.join(", ")}`)}">${pills.join("")}</span>`;
   }
 
   function authProviderKeysWithSections() {
@@ -262,9 +282,10 @@
           <button type="button" class="cw-auth-icon-btn material-symbols-rounded" data-cw-auth-close aria-label="Close">close</button>
         </div>
         <div class="cw-auth-provider-picker" id="cw-auth-provider-picker"></div>
-        <div class="cw-auth-provider-form hidden" id="cw-auth-provider-form"></div>
+        <form class="cw-auth-provider-form hidden" id="cw-auth-provider-form" autocomplete="off" onsubmit="return false"></form>
       </div>`;
     slot.appendChild(overlay);
+    bindAuthPresentation(slot);
     return overlay;
   }
 
@@ -341,6 +362,7 @@
       "sec-auth-trackers": "radar",
       "sec-auth-clients": "tv",
       "sec-auth-metadata": "database",
+      "sec-user-profiles": "groups",
     };
     const groupData = AUTH_GROUPS.filter((group) => group.id !== "sec-auth-others").map((group) => {
       const supported = group.keys.filter((key) => !!authProviderInfo(key).sectionId);
@@ -363,9 +385,15 @@
       ...groupData,
       { ...META_GROUP, cards: metadataCards, okCount: metadataCards.filter((card) => card.status.ok).length, total: META_GROUP.keys.length, copy: sectionCopy[META_GROUP.id] },
     ];
-    const summaryCards = sections.map((section) => `<div class="cw-auth-summary-card" data-cw-auth-summary="${section.id}">
+    const userProfilesRaw = cfg?.user_profiles;
+    const userProfileCount = userProfilesRaw && typeof userProfilesRaw === "object" ? Object.keys(userProfilesRaw).length : 0;
+    const summarySections = [
+      ...sections,
+      { id: "sec-user-profiles", title: "User profiles", okCount: userProfileCount, total: userProfileCount || 0 },
+    ];
+    const summaryCards = summarySections.map((section) => `<div class="cw-auth-summary-card ${section.okCount ? "" : "is-empty"}" data-cw-auth-summary="${section.id}">
       <span class="cw-auth-summary-icon material-symbols-rounded" aria-hidden="true">${summaryIcon[section.id] || "hub"}</span>
-      <span><strong>${section.title}</strong><small>${section.okCount}/${section.total}</small></span>
+      <span><strong>${section.title}</strong><small>${section.id === "sec-user-profiles" ? `${section.okCount} profile${section.okCount === 1 ? "" : "s"}` : `${section.okCount}/${section.total}`}</small></span>
     </div>`).join("");
     const renderCard = (card) => {
       const attr = card.type === "metadata" ? `data-cw-meta-open="${card.key}"` : `data-cw-auth-open="${card.key}"`;
@@ -393,6 +421,14 @@
         <span class="material-symbols-rounded cw-auth-chevron" aria-hidden="true">arrow_forward</span>
       </button>`;
     };
+    const userProfileSection = `<section class="cw-auth-service-section cw-user-profile-section" data-cw-auth-group="sec-user-profiles">
+        <div class="cw-auth-service-head">
+          <h4>User profiles</h4>
+          <p>Manage people and provider instances linked to Managed User accounts.</p>
+          <span class="material-symbols-rounded cw-auth-section-chevron" aria-hidden="true">expand_more</span>
+        </div>
+        <div id="cw-user-profile-manager" class="cw-user-profile-manager" aria-live="polite"></div>
+      </section>`;
     const serviceSections = sections.map((section) => {
       const addCard = section.cards.length < section.total ? renderAddCard(section) : "";
       const cards = `${section.cards.map(renderCard).join("")}${addCard}`;
@@ -410,8 +446,9 @@
         <div class="cw-auth-summary-row">
           ${summaryCards}
         </div>
-        <div class="cw-auth-service-list">${serviceSections}</div>
+        <div class="cw-auth-service-list">${userProfileSection}${serviceSections}</div>
       </div>`;
+    try { window.cwUserProfilesManager?.init?.(true); } catch {}
     const overlay = document.getElementById("cw-auth-connection-overlay");
     renderAuthPicker(overlay, cfg, overlay?.dataset?.cwPickerMode || "provider");
   }
@@ -513,14 +550,42 @@
       code: ["#mdblist_device_panel"],
       actions: [{ row: ".mdbl-method-row", status: "#mdblist_msg", buttons: "#mdblist_device_start, #mdblist_device_cancel, #mdblist_device_restart, #mdblist_save", extract: ".mdbl-actions", order: "6" }]
     },
+    SCROB: {
+      provider: "scrob", logo: "SCROB", help: window.CW.HelpLinks.url("scrob"), deleteSelector: "#scrob_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect your Scrob server"] },
+      copy: { auth: ["Scrob Authentication", "Connect your self hosted Scrob server."] },
+      journey: ["Connect to Scrob", "Copy the API key from Scrob > Connections > API Key, then enter the same URL you open Scrob with plus your Scrob username and password.", "111,54,204", "174,69,200", "SCROB"],
+      steps: [["1", "Enter server URL", "The address you open Scrob with"], ["2", "Paste the API key", "Scrob > Connections > API Key"], ["3", "Sign in", "Scrob only accepts writes from a signed in session"]],
+      order: [".grid2", "#scrob_totp_row", "#scrob_reauth", ".verify", "#scrob_actions_row"],
+      actions: [{ row: "#scrob_actions_row", status: "#scrob_msg", buttons: "#scrob_connect" }]
+    },
+    PUNCHPLAY: {
+      provider: "punchplay", logo: "PUNCHPLAY", help: window.CW.HelpLinks.url("punchplay"), deleteSelector: "#punchplay_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect with a device code"] },
+      copy: { auth: ["PunchPlay Authentication", "Connect PunchPlay with a device code."] },
+      journey: ["Connect to PunchPlay", "Click Connect PunchPlay and approve the code at punchplay.tv/link. No API keys are needed - CrossWatch ships its own PunchPlay app id.", "244,64,15", "0,132,216", "PUNCHPLAY"],
+      steps: [["1", "Start device login", "CrossWatch shows a short link code"], ["2", "Approve access", "Enter the code at punchplay.tv/link"], ["3", "Validate account", "CrossWatch confirms PunchPlay access"]],
+      order: ["#punchplay_device_panel", ".pp-actions"],
+      code: ["#punchplay_device_panel"],
+      actions: [{ row: ".pp-actions", status: "#punchplay_msg", buttons: "#punchplay_device_start, #punchplay_device_cancel, #punchplay_device_restart" }]
+    },
     PUBLICMETADB: {
       provider: "publicmetadb", logo: "PUBLICMETADB", help: window.CW.HelpLinks.url("publicmetadb"), deleteSelector: "#publicmetadb_disconnect",
       tabs: { auth: ["lock", "Authentication", "Connect your PublicMetaDB API key"] },
       copy: { auth: ["PublicMetaDB Authentication", "Connect PublicMetaDB with an API key."] },
       journey: ["Connect to PublicMetaDB", "Paste your PublicMetaDB API key and click Connect PublicMetaDB. CrossWatch uses the key for metadata-backed matching and provider lookups.", "155,155,155", "155,155,155", "PUBLICMETADB"],
       steps: [["1", "Create API key", "Generate a key in PublicMetaDB"], ["2", "Connect key", "Paste the key and connect"], ["3", "Validate access", "CrossWatch confirms the key works"]],
-      order: [".grid2", ".publicmetadb-actions"],
+      order: [".grid2", "#publicmetadb_hint", ".publicmetadb-actions"],
       actions: [{ row: ".publicmetadb-actions", status: "#publicmetadb_msg", buttons: "#publicmetadb_save" }]
+    },
+    FLOPPY: {
+      provider: "floppy", logo: "FLOPPY", help: window.CW.HelpLinks.url("floppy"), deleteSelector: "#floppy_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect your Floppy server"] },
+      copy: { auth: ["Floppy Authentication", "Connect Floppy with server URL and API token."] },
+    journey: ["Connect to Floppy", "Create an API token in Floppy Settings > Integrations, then connect your self-hosted server.", "245,101,30", "4,181,220", "FLOPPY"],
+      steps: [["1", "Create token", "Generate a token in Floppy"], ["2", "Enter server", "Add your Floppy server URL"], ["3", "Validate access", "CrossWatch confirms the token works"]],
+      order: [".grid2", ".verify", "#floppy_actions_row"],
+      actions: [{ row: "#floppy_actions_row", status: "#floppy_msg", buttons: "#floppy_connect" }]
     },
     NUVIO: {
       provider: "nuvio", logo: "NUVIO", help: window.CW.HelpLinks.url("nuvio"), deleteSelector: "#nuvio_disconnect",
@@ -541,6 +606,15 @@
       order: [".grid2", ".inline"],
       actions: [{ row: ".inline", status: "#kodi_msg", buttons: "#kodi_connect" }]
     },
+    STREMIO: {
+      provider: "stremio", logo: "STREMIO", help: window.CW.HelpLinks.url("stremio"), deleteSelector: "#stremio_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect with Stremio account"] },
+      copy: { auth: ["Stremio Authentication", "Connect with your Stremio account. CrossWatch stores only the returned auth key."] },
+      journey: ["Connect to Stremio", "Enter your Stremio email and password once. CrossWatch exchanges them for an auth key and does not retain the password.", "114,44,254", "22,182,255", "STREMIO"],
+      steps: [["1", "Enter account", "Use your Stremio email and password"], ["2", "Exchange key", "CrossWatch requests an auth key"], ["3", "Store key", "Only the auth key is saved"]],
+      order: [".grid2", ".inline"],
+      actions: [{ row: ".inline", status: "#stremio_msg", buttons: "#stremio_connect" }]
+    },
     ANILIST: {
       provider: "anilist", logo: "ANILIST", help: window.CW.HelpLinks.url("anilist"), deleteSelector: "#btn-delete-anilist",
       tabs: { auth: ["lock", "Authentication", "Connect your AniList account"] },
@@ -559,6 +633,16 @@
       order: [".grid2", "#tautulli_hint", "#tautulli_actions_row"],
       actions: [{ row: "#tautulli_actions_row", status: "#tautulli_msg", buttons: "#tautulli_save" }]
     },
+    CROSSWATCH: {
+      provider: "crosswatch", logo: "CROSSWATCH", help: window.CW.HelpLinks.url("crosswatch"), deleteSelector: "#cw_crosswatch_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect local tracker"], settings: ["database", "Settings", "Storage and restore"] },
+      copy: { auth: ["CrossWatch Authentication", "Connect this local tracker profile."], settings: ["CrossWatch Local Tracker", "Configure storage and restore snapshots for this tracker profile."] },
+      journey: ["Connect Local Tracker", "Enable the built-in CrossWatch tracker as a normal connection. Use profiles when you want separate local watchlist, ratings, history or progress data.", "124,92,255", "98,194,255", "CROSSWATCH"],
+      steps: [["1", "Choose profile", "Use Default or create CW-P profiles"], ["2", "Connect locally", "Enable the selected profile as a connection"], ["3", "Sync locally", "Use the profile in normal sync pairs"]],
+      introSubs: ["auth"],
+      order: [".cw-tracker-auth-card", ".cw-tracker-settings-stack"],
+      actions: [{ row: ".cw-tracker-auth-actions", status: "#cw_tracker_auth_msg", buttons: "#cw_crosswatch_connect" }]
+    },
     TMDB_METADATA: {
       provider: "tmdb", logo: "TMDB", help: window.CW.HelpLinks.url("tmdb-metadata"), deleteSelector: "#tmdb_delete",
       tabs: { api: ["key", "API key", "Connect TMDb metadata"], advanced: ["tune", "Advanced", "Configure locale and cache behavior"] },
@@ -572,10 +656,11 @@
     },
     ANIME_MAPPING: {
       provider: "anime-mapping", logo: "ANILIST", help: window.CW.HelpLinks.url("anime-mapping"), deleteSelector: "",
+      hideNav: true,
       tabs: { overview: ["hub", "Mapping", "Manage the local anime ID index"] },
-      copy: { overview: ["Anime ID Mapping", "Local anime ID index for AniList watchlist and ratings pairs."] },
-      journey: ["Enable Anime ID Mapping", "Use the local AniBridge mapping dataset to translate anime identifiers between AniList and TMDb, TVDb, IMDb, MyAnimeList and AniDB.", "2,169,255", "78,141,255", "ANILIST"],
-      steps: [["1", "Enable mapping", "Turn on the local anime index"], ["2", "Update dataset", "Download or refresh AniBridge mappings"], ["3", "Improve matches", "Use mappings for AniList pairs"]],
+      copy: { overview: ["Anime ID Mapping", "Local anime ID index for AniList and SIMKL pairs."] },
+      journey: ["Enable Anime ID Mapping", "Use the local mapping datasets to translate anime identifiers and episode numbering between AniDB, MyAnimeList, AniList, Kitsu, SIMKL, TMDb and TVDb.", "2,169,255", "78,141,255", "ANILIST"],
+      steps: [["1", "Enable mapping", "Turn on the local anime index"], ["2", "Update datasets", "Download or refresh the mapping data"], ["3", "Improve matches", "Use mappings for AniList and SIMKL pairs"]],
       introSubs: ["overview"],
       order: [".anime-mapping-summary", ".anime-mapping-status-grid", ".anime-mapping-source", "#anime_mapping_error", ".anime-mapping-actions"]
     },
@@ -621,6 +706,10 @@
     return !!info && !["TMDB_METADATA", "ANIME_MAPPING"].includes(info.key);
   }
 
+  function connectionModalAllowsCelebration(info) {
+    return connectionModalSupportsProfiles(info);
+  }
+
   function connectionModalConfigured(info, cfg = getCachedConfig()) {
     if (!info) return false;
     if (info.key === "TMDB_METADATA" || info.key === "ANIME_MAPPING") return metadataConfigured(info.key, cfg);
@@ -634,6 +723,18 @@
       const text = String(node?.textContent || "").trim().toLowerCase();
       return /\bconnected\b/.test(text) && !/\bnot\s+connected\b/.test(text) && !node.classList?.contains("hidden") && node.getAttribute?.("aria-hidden") !== "true";
     }) || null;
+  }
+
+  function connectionModalCelebrationTarget(panel) {
+    if (!panel) return null;
+    const statuses = Array.from(panel.querySelectorAll("#plex_msg, #jfy_msg, #emby_msg, .cw-connection-status-pill"));
+    const status = statuses.find((node) => {
+      const text = String(node?.textContent || "").trim().toLowerCase();
+      return /\bconnected\b/.test(text) && !/\bnot\s+connected\b/.test(text) && !node.classList?.contains("hidden") && node.getAttribute?.("aria-hidden") !== "true" && node.getBoundingClientRect?.().width > 0;
+    });
+    if (status) return status;
+    const actions = Array.from(panel.querySelectorAll(".cw-connection-primary-action.cw-auth-connect-locked, .cw-connection-primary-action[aria-disabled='true'], .cw-connection-primary-action:disabled"));
+    return actions.find((node) => !node.classList?.contains("hidden") && node.getAttribute?.("aria-hidden") !== "true" && node.getBoundingClientRect?.().width > 0) || connectionModalStatusTarget(panel);
   }
 
   function connectionStatusText(node) {
@@ -739,7 +840,7 @@
   }
 
   function queueConnectionSuccess(panel, info) {
-    if (!panel || !info) return;
+    if (!panel || !connectionModalAllowsCelebration(info)) return;
     panel.__cwConnectionSuccessPending = {
       key: info.key,
       queuedAt: Date.now(),
@@ -761,13 +862,13 @@
   }
 
   function playConnectionSuccess(panel, info, opts = {}) {
-    if (!panel || panel.__cwConnectionSuccessTimer) return;
+    if (!panel || !connectionModalAllowsCelebration(info) || panel.__cwConnectionSuccessTimer) return;
     if (opts.defer !== false && !connectionWindowReadyForCelebration()) {
       queueConnectionSuccess(panel, info);
       return;
     }
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
-    const target = connectionModalStatusTarget(panel);
+    const target = connectionModalCelebrationTarget(panel);
     panel.classList.remove("cw-connection-success-pulse");
     void panel.offsetWidth;
     panel.classList.add("cw-connection-success-pulse");
@@ -800,7 +901,7 @@
       bit.style.setProperty("--h", `${height}px`);
       bit.style.setProperty("--r", `${Math.floor(Math.random() * 180)}deg`);
       bit.style.setProperty("--spin", `${180 + Math.floor(Math.random() * 360)}deg`);
-      bit.style.setProperty("--d", `${Math.random() * 120}ms`);
+      bit.style.setProperty("--d", `${Math.random() * 55}ms`);
       bit.style.setProperty("--c", colors[i % colors.length]);
       burst.appendChild(bit);
     }
@@ -812,7 +913,7 @@
       burst.replaceChildren();
       panel.classList.remove("cw-connection-success-pulse");
       panel.__cwConnectionSuccessTimer = 0;
-    }, 1900);
+    }, 1100);
   }
 
   function showConnectionDisconnected(panel) {
@@ -851,10 +952,8 @@
     if (!panel || !info) return;
     const profile = connectionModalProfileId(panel);
     const switched = panel.__cwConnectionProfileSeen !== profile;
-    const connected = switched
-      ? connectionModalProfileConfigured(panel, info, cfg)
-      : connectionModalProfileConnected(panel, info, cfg);
-    if (!switched && connected && panel.__cwConnectionWasConnected === false) playConnectionSuccess(panel, info);
+    const connected = connectionModalProfileConnected(panel, info, cfg);
+    if (connectionModalAllowsCelebration(info) && !switched && connected && panel.__cwConnectionWasConnected === false) playConnectionSuccess(panel, info);
     panel.__cwConnectionProfileSeen = profile;
     panel.__cwConnectionWasConnected = connected;
     updateConnectionSaveEnabled(panel, info, cfg);
@@ -994,6 +1093,142 @@
     return card;
   }
 
+  function ensureConnectionWhitelistTable() {
+    if (window.cwWhitelistTable) return Promise.resolve(true);
+    if (window.__cwWhitelistTableLoading) return window.__cwWhitelistTableLoading;
+    window.__cwWhitelistTableLoading = new Promise((resolve) => {
+      const script = document.createElement("script");
+      script.src = `/assets/helpers/whitelist_table.js${window.__CW_VERSION__ ? `?v=${encodeURIComponent(window.__CW_VERSION__)}` : ""}`;
+      script.async = true;
+      script.onload = () => resolve(!!window.cwWhitelistTable);
+      script.onerror = () => resolve(false);
+      document.head.appendChild(script);
+    });
+    return window.__cwWhitelistTableLoading;
+  }
+
+  function connectionWhitelistConfig(info) {
+    if (!info) return null;
+    const map = {
+      PLEX: { prefix: "plex", api: "plex" },
+      JELLYFIN: { prefix: "jfy", api: "jellyfin" },
+      EMBY: { prefix: "emby", api: "emby" },
+      KODI: { prefix: "kodi", api: "kodi", host: "kodi_libraries" },
+    };
+    return map[info.key] || null;
+  }
+
+  function connectionWhitelistInstance(panel, info) {
+    const scoped = panel?.querySelector(`.cw-profile-switcher[data-cw-profile-provider="${info?.provider}"] select`);
+    return String(scoped?.value || panel?.querySelector(".cw-profile-switcher select")?.value || "default");
+  }
+
+  function connectionWhitelistSelect(prefix, feature) {
+    const suffix = { hist: "history", rate: "ratings", prog: "progress", scr: "scrobble" }[feature] || feature;
+    return document.getElementById(`${prefix}_lib_${suffix}`);
+  }
+
+  function connectionWhitelistRead(prefix, feature) {
+    return new Set(Array.from(connectionWhitelistSelect(prefix, feature)?.selectedOptions || []).map((opt) => String(opt.value || "").trim()).filter(Boolean));
+  }
+
+  function connectionWhitelistWrite(prefix, feature, values) {
+    const sel = connectionWhitelistSelect(prefix, feature);
+    if (!sel) return;
+    const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    sel.innerHTML = Array.from(values || []).map((value) => `<option selected value="${esc(value)}">${esc(value)}</option>`).join("");
+  }
+
+  function markConnectionWhitelistHydrated(info) {
+    if (info?.key === "PLEX") window.__plexHydrated = true;
+    else if (info?.key === "JELLYFIN") {
+      window.__jellyfinHydrated = true;
+      window.__jfyHydrated = true;
+    } else if (info?.key === "EMBY") window.__embyHydrated = true;
+    else if (info?.key === "KODI") window.__kodiHydrated = true;
+  }
+
+  async function loadConnectionWhitelistLibraries(panel, info, cfg) {
+    const inst = connectionWhitelistInstance(panel, info);
+    const url = new URL(`/api/${cfg.api}/libraries`, window.location.origin);
+    if (inst) url.searchParams.set("instance", inst);
+    const response = await fetch(url.toString(), { cache: "no-store" });
+    const data = response.ok ? await response.json().catch(() => ({})) : {};
+    return Array.isArray(data?.libraries) ? data.libraries : (Array.isArray(data) ? data : []);
+  }
+
+  async function renderConnectionWhitelist(panel, info, opts = {}) {
+    const cfg = connectionWhitelistConfig(info);
+    if (!panel || !cfg) return false;
+    const host = document.getElementById(cfg.host || `${cfg.prefix}_lib_matrix`);
+    if (!host) return false;
+    const inst = connectionWhitelistInstance(panel, info);
+    if (host.__cwConnectionWhitelistInstance !== inst) {
+      host.__cwConnectionWhitelistInstance = inst;
+      host.__cwConnectionWhitelistSets = null;
+      host.__cwConnectionWhitelistLibs = null;
+      host.__cwConnectionWhitelistHandle = null;
+    }
+    await ensureConnectionWhitelistTable();
+    if (!window.cwWhitelistTable) return false;
+
+    const sets = host.__cwConnectionWhitelistSets || {
+      hist: connectionWhitelistRead(cfg.prefix, "hist"),
+      rate: connectionWhitelistRead(cfg.prefix, "rate"),
+      prog: connectionWhitelistRead(cfg.prefix, "prog"),
+      scr: connectionWhitelistRead(cfg.prefix, "scr"),
+    };
+    host.__cwConnectionWhitelistSets = sets;
+    const syncHidden = () => {
+      Object.keys(sets).forEach((feature) => connectionWhitelistWrite(cfg.prefix, feature, sets[feature]));
+      markConnectionWhitelistHydrated(info);
+    };
+    const ensureLibs = async (force = false) => {
+      if (force || !Array.isArray(host.__cwConnectionWhitelistLibs)) {
+        host.__cwConnectionWhitelistLibs = await loadConnectionWhitelistLibraries(panel, info, cfg);
+      }
+      return host.__cwConnectionWhitelistLibs;
+    };
+
+    if (!host.__cwConnectionWhitelistHandle) {
+      host.__cwConnectionWhitelistLibs = Array.isArray(host.__cwConnectionWhitelistLibs) ? host.__cwConnectionWhitelistLibs : [];
+      syncHidden();
+      host.__cwConnectionWhitelistHandle = window.cwWhitelistTable.mount({
+        host,
+        features: [
+          { key: "hist", label: "History" },
+          { key: "rate", label: "Ratings" },
+          { key: "prog", label: "Progress" },
+          { key: "scr", label: "Scrobble" },
+        ],
+        getLibs: () => host.__cwConnectionWhitelistLibs || [],
+        isOn: (feature, id) => sets[feature]?.has(String(id)),
+        setOn: (feature, id, on) => { if (on) sets[feature]?.add(String(id)); else sets[feature]?.delete(String(id)); },
+        commit: syncHidden,
+        load: async () => { host.__cwConnectionWhitelistLibs = await ensureLibs(true); syncHidden(); },
+      });
+    }
+
+    if (opts.force || !Array.isArray(host.__cwConnectionWhitelistLibs) || !host.__cwConnectionWhitelistLibs.length) {
+      host.__cwConnectionWhitelistLibs = await ensureLibs(!!opts.force);
+    }
+    syncHidden();
+    host.__cwConnectionWhitelistHandle?.render?.();
+    return true;
+  }
+
+  async function syncConnectionProviderSub(panel, info, sub) {
+    if (!panel || !info) return;
+    const wanted = String(sub || "").toLowerCase();
+    if (info.key === "TMDB_METADATA") {
+      try { window.cwMetaProviderSubSelect?.("tmdb", wanted); } catch {}
+      return;
+    }
+    if (wanted !== "whitelist") return;
+
+    await renderConnectionWhitelist(panel, info, { force: true });
+  }
+
   function ensureConnectionModalNav(panel, info) {
     if (!panel) return;
     let nav = panel.querySelector(":scope > .cw-subtiles");
@@ -1013,11 +1248,7 @@
         btn.innerHTML = `<span class="material-symbols-rounded cw-connection-nav-icon" aria-hidden="true">${data[0]}</span><span class="cw-connection-nav-copy"><strong>${data[1]}</strong><small>${data[2] || ""}</small></span><span class="material-symbols-rounded cw-connection-nav-chev" aria-hidden="true">chevron_right</span>`;
         btn.addEventListener("click", () => {
           const sub = String(btn.dataset.sub || "").toLowerCase();
-          if (info.key === "TMDB_METADATA") {
-            try { window.cwMetaProviderSubSelect?.("tmdb", sub); } catch {}
-          }
-          nav.querySelectorAll(".cw-subtile[data-sub]").forEach((node) => node.classList.toggle("active", node === btn));
-          panel.querySelectorAll(".cw-subpanel[data-sub]").forEach((node) => node.classList.toggle("active", String(node.dataset.sub || "").toLowerCase() === sub));
+          selectConnectionModalSub(panel, info, sub);
           setTimeout(() => {
             applyConnectionModalOrder(panel, info);
             syncConnectionModalCopy(panel, info);
@@ -1031,6 +1262,7 @@
     const tabCount = nav.querySelectorAll(".cw-subtile[data-sub]").length || 1;
     nav.style.gridTemplateRows = cardVisible ? `repeat(${tabCount}, 92px) auto` : `repeat(${tabCount}, 92px)`;
     if (cardVisible) profileCard.style.gridRow = String(tabCount + 1);
+    panel.classList.toggle("cw-connection-no-nav", !!info.hideNav && !cardVisible);
     return nav;
   }
 
@@ -1052,6 +1284,7 @@
     applyConnectionModalOrder(panel, info);
     syncConnectionModalCopy(panel, info, overlay);
     resetConnectionModalScroll(panel);
+    syncConnectionProviderSub(panel, info, wanted).finally(() => scheduleConnectionModalSize(panel, info));
   }
 
   function resetConnectionModalScroll(panel) {
@@ -1062,7 +1295,6 @@
 
   function connectionModalMaxHeight(info) {
     const viewport = Math.max(360, window.innerHeight || document.documentElement?.clientHeight || 720);
-    if (info?.key === "ANIME_MAPPING") return Math.max(520, viewport - 32);
     const cap = (info?.size || "wide") === "wide" ? 660 : 620;
     return Math.max(360, Math.min(cap, viewport - 176));
   }
@@ -1085,9 +1317,14 @@
   function connectionModalContentHeight(scroller) {
     if (!scroller) return 0;
     const activePanel = scroller.querySelector(":scope > .cw-subpanel.active") || scroller.querySelector(":scope > .cw-subpanel");
-    const contentNode = activePanel || scroller.firstElementChild || scroller;
+    if (!activePanel) {
+      const kids = Array.from(scroller.children || []);
+      const last = kids[kids.length - 1];
+      if (!last) return 0;
+      return Math.ceil((last.offsetTop || 0) + (last.offsetHeight || 0) + cssPx(scroller, "padding-bottom"));
+    }
     const padding = cssPx(scroller, "padding-top") + cssPx(scroller, "padding-bottom");
-    return Math.ceil((contentNode.scrollHeight || contentNode.offsetHeight || 0) + padding);
+    return Math.ceil((activePanel.scrollHeight || activePanel.offsetHeight || 0) + padding);
   }
 
   function updateConnectionModalSize(panel, info) {
@@ -1241,7 +1478,9 @@
     const sel = panel.querySelector(".cw-profile-switcher select");
     const current = String(sel?.value || "default").toLowerCase();
     if (current !== "default") return false;
-    return configuredProfileIds(getCachedConfig(), info.provider).some((id) => String(id).toLowerCase() !== "default");
+    const ids = configuredProfileIds(getCachedConfig(), info.provider).map((id) => String(id).toLowerCase());
+    if (!ids.includes("default")) return false;
+    return ids.some((id) => id !== "default");
   }
 
   function setConnectionSaveBusy(btn, busy) {
@@ -1329,6 +1568,7 @@
           if (info.key === "NUVIO") await window.cwAuth?.nuvio?.saveSelectedProfile?.({ silent: true });
           const ret = window.saveSettings?.();
           if (ret && typeof ret.then === "function") await ret;
+          await window.CW?.AuthShared?.saveVisibleProfileLabels?.(panel);
           flashConnectionResult(btn, true);
           loadConfig(true).then((cfg) => syncConnectionSuccessState(panel, info, cfg)).catch(() => {});
           if (!keepOpen) setTimeout(closeAuthProviderOverlay, 1100);
@@ -1388,7 +1628,7 @@
     panel.__cwConnectionProfileSeen = connectionModalProfileId(panel);
     panel.__cwConnectionWasConnected = connectionModalProfileConnected(panel, info);
     updateConnectionSaveEnabled(panel, info);
-    ensureConnectionSuccessBurst(panel);
+    if (connectionModalAllowsCelebration(info)) ensureConnectionSuccessBurst(panel);
     scheduleConnectionModalSize(panel, info);
     resetConnectionModalScroll(panel);
     requestAnimationFrame(() => {
@@ -1428,7 +1668,11 @@
     if (!document.getElementById(info.sectionId)) await mountAuthProviders();
     const overlay = ensureAuthOverlay(slot);
     const form = overlay.querySelector("#cw-auth-provider-form");
-    const section = document.getElementById(info.sectionId);
+    let section = document.getElementById(info.sectionId);
+    if (!section) {
+      await mountAuthProviders(true);
+      section = document.getElementById(info.sectionId);
+    }
     if (!form || !section) return;
     parkActiveAuthForm();
     form.appendChild(section);
@@ -1451,9 +1695,25 @@
     if (!slot) return;
     if (!document.getElementById(info.sectionId)) await mountMetadataProviders();
     try { window.cwMetaProviderEnsure?.(); } catch {}
+    if (info.key === "TMDB_METADATA") {
+      try { await window.cwRefreshTmdbMetadataState?.({ force: true }); } catch {}
+    }
     const overlay = ensureAuthOverlay(slot);
     const form = overlay.querySelector("#cw-auth-provider-form");
-    const section = document.getElementById(info.sectionId);
+    let section = document.getElementById(info.sectionId);
+    if (!section) {
+      try {
+        if (info.key === "TMDB_METADATA") window.cwBuildTmdbPanel?.();
+        if (info.key === "ANIME_MAPPING") window.cwBuildAnimeMappingPanel?.();
+        window.cwMetaProviderEnsure?.();
+      } catch {}
+      section = document.getElementById(info.sectionId);
+    }
+    if (!section) {
+      await mountMetadataProviders(true);
+      try { window.cwMetaProviderEnsure?.(); } catch {}
+      section = document.getElementById(info.sectionId);
+    }
     if (!form || !section) return;
     parkActiveAuthForm();
     form.appendChild(section);
@@ -1474,6 +1734,9 @@
       try { window.cwAnimeMappingRefreshStatus?.(); } catch {}
     }
     enhanceConnectionModal(section, overlay, info.key);
+    if (info.key === "TMDB_METADATA") {
+      try { window.cwRefreshTmdbMetadataState?.(); } catch {}
+    }
     requestAnimationFrame(() => overlay.querySelector("[data-cw-auth-close]")?.focus?.());
   }
 
@@ -1607,13 +1870,26 @@
         const slot = document.getElementById("auth-providers");
         if (!slot) return;
         if (!authHtml || force) authHtml = await apiText("/api/auth/providers/html");
+        const overlay = slot.querySelector(":scope > .cw-auth-overlay");
+        const liveSectionIds = new Set(
+          Array.from(overlay?.querySelectorAll("#cw-auth-provider-form > .section[id]") || [], (node) => node.id)
+        );
+        overlay?.remove();
         slot.innerHTML = authHtml;
+        if (overlay) {
+          Array.from(slot.querySelectorAll(".section[id]")).forEach((node) => {
+            if (liveSectionIds.has(node.id)) node.remove();
+          });
+          slot.appendChild(overlay);
+        }
         bindAuthPresentation(slot);
         ensureAuthShell(slot);
         initMountedAuthSections(slot);
+        if (overlay) slot.appendChild(overlay);
 
         window.initMDBListAuthUI?.();
         window.initPublicMetaDBAuthUI?.();
+        window.cwAuth?.floppy?.init?.();
         window.initNuvioAuthUI?.();
         window.initTautulliAuthUI?.();
         window.initAniListAuthUI?.();
@@ -1662,8 +1938,6 @@
           try { window.cwMetaProviderEnsure?.(); } catch {}
           try { window.updateTmdbHint?.(); } catch {}
           try { window.cwMetaProviderUpdateChips?.(); } catch {}
-          document.getElementById("sec-meta")?.classList.add("cw-meta-integrated-source");
-          document.querySelector('[data-target="sec-meta"]')?.classList.add("cw-meta-integrated-source");
           const authSlot = document.getElementById("auth-providers");
           if (authSlot) refreshAuthPresentation(authSlot, false).catch(() => {});
           return;
@@ -1683,8 +1957,6 @@
         try { window.cwMetaProviderEnsure?.(); } catch {}
         try { window.updateTmdbHint?.(); } catch {}
         try { window.cwMetaProviderUpdateChips?.(); } catch {}
-        document.getElementById("sec-meta")?.classList.add("cw-meta-integrated-source");
-        document.querySelector('[data-target="sec-meta"]')?.classList.add("cw-meta-integrated-source");
         const authSlot = document.getElementById("auth-providers");
         if (authSlot) refreshAuthPresentation(authSlot, false).catch(() => {});
       } catch (e) {
@@ -1871,14 +2143,30 @@
     refreshAuthPresentation(slot, false).catch(() => {});
   }, true);
 
+  async function openAddConnection() {
+    const slot = document.getElementById("auth-providers");
+    if (!slot) return;
+    bindAuthPresentation(slot);
+    await mountAuthProviders();
+    openAuthOverlay("picker", "", "provider");
+  }
+
+  async function openAddMetadata() {
+    const slot = document.getElementById("auth-providers");
+    if (!slot) return;
+    bindAuthPresentation(slot);
+    await mountMetadataProviders();
+    openAuthOverlay("picker", "", "metadata");
+  }
+
   const ProvidersUI = {
     updateFlowRailLogos,
     ensureProvidersPaneReady,
     mountAuthProviders,
     mountMetadataProviders,
     loadProviders,
-    openAddConnection: () => openAuthOverlay("picker", "", "provider"),
-    openAddMetadata: () => openAuthOverlay("picker", "", "metadata"),
+    openAddConnection,
+    openAddMetadata,
     openAuthProviderForm,
     openMetadataProviderForm,
     closeAuthProviderOverlay,

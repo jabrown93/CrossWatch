@@ -3,6 +3,7 @@
   if (w.cwAuthLoader) return;
 
   const SCRIPTS = {
+    crosswatch: "/assets/auth/auth.crosswatch.js",
     plex: "/assets/auth/auth.plex.js",
     simkl: "/assets/auth/auth.simkl.js",
     trakt: "/assets/auth/auth.trakt.js",
@@ -12,12 +13,17 @@
     publicmetadb: "/assets/auth/auth.publicmetadb.js",
     nuvio: "/assets/auth/auth.nuvio.js",
     kodi: "/assets/auth/auth.kodi.js",
+    stremio: "/assets/auth/auth.stremio.js",
+    floppy: "/assets/auth/auth.floppy.js",
     tmdb: "/assets/auth/auth.tmdb.js",
     tautulli: "/assets/auth/auth.tautulli.js",
     anilist: "/assets/auth/auth.anilist.js",
+    punchplay: "/assets/auth/auth.punchplay.js",
+    scrob: "/assets/auth/auth.scrob.js",
   };
 
   const SECTION_TO_PROVIDER = {
+    "sec-crosswatch": "crosswatch",
     "sec-plex": "plex",
     "sec-simkl": "simkl",
     "sec-trakt": "trakt",
@@ -27,9 +33,13 @@
     "sec-publicmetadb": "publicmetadb",
     "sec-nuvio": "nuvio",
     "sec-kodi": "kodi",
+    "sec-stremio": "stremio",
+    "sec-floppy": "floppy",
     "sec-tmdb-sync": "tmdb",
     "sec-tautulli": "tautulli",
     "sec-anilist": "anilist",
+    "sec-punchplay": "punchplay",
+    "sec-scrob": "scrob",
   };
 
   const loaded = new Map();

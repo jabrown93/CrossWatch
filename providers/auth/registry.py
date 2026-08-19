@@ -138,8 +138,8 @@ def _module_html(mod: ModuleType) -> str:
 def auth_providers_html() -> str:
     groups: list[tuple[str, str, list[str]]] = [
         ("sec-auth-media", "Media servers", ["plex", "jellyfin", "emby"]),
-        ("sec-auth-trackers", "Trackers", ["trakt", "simkl", "tmdb", "mdblist", "publicmetadb", "anilist"]),
-        ("sec-auth-clients", "Media clients", ["nuvio", "kodi"]),
+        ("sec-auth-trackers", "Trackers", ["crosswatch", "trakt", "simkl", "tmdb", "mdblist", "publicmetadb", "anilist", "punchplay", "floppy", "scrob"]),
+        ("sec-auth-clients", "Media clients", ["nuvio", "kodi", "stremio"]),
         ("sec-auth-others", "Others", ["tautulli"]),
     ]
 
@@ -174,7 +174,7 @@ def auth_providers_html() -> str:
         return (
             f'<div class="section open" id="{gid}">'
             f'  <div class="head" data-toggle-section="{gid}"><span class="chev"></span><strong>{title}</strong></div>'
-            f'  <div class="body">{body}</div>'
+            f'  <div class="body"><form class="cw-password-form-scope" autocomplete="off" onsubmit="return false">{body}</form></div>'
             f'</div>'
         )
 

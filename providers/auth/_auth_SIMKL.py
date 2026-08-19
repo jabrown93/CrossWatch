@@ -478,11 +478,11 @@ def html() -> str:
               <div class="grid2">
                 <div>
                   <label for="simkl_client_id">Client ID</label>
-                  <input id="simkl_client_id" data-cfg-path="simkl.client_id" data-cfg-instance-root="simkl" name="simkl_client_id" placeholder="Your SIMKL client id">
+                  <input id="simkl_client_id" data-cfg-path="simkl.client_id" data-cfg-instance-root="simkl" name="simkl_client_id" placeholder="Your SIMKL client id" autocomplete="off" spellcheck="false" autocapitalize="off">
                 </div>
                 <div>
                   <label for="simkl_client_secret">Client Secret</label>
-                  <input id="simkl_client_secret" data-cfg-path="simkl.client_secret" data-cfg-instance-root="simkl" name="simkl_client_secret" placeholder="Your SIMKL client secret" type="password">
+                  <input id="simkl_client_secret" data-cfg-path="simkl.client_secret" data-cfg-instance-root="simkl" name="simkl_client_secret" placeholder="Your SIMKL client secret" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true">
                 </div>
               </div>
 

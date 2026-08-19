@@ -864,7 +864,7 @@ def html() -> str:
             <div id="nuvio_profile_state" class="nuvio-profile-row hidden">
               <div>
                 <label for="nuvio_profile_select">Nuvio profile</label>
-                <select id="nuvio_profile_select" data-cfg-path="nuvio.profile_id" data-cfg-instance-root="nuvio"></select>
+                <select id="nuvio_profile_select" data-cfg-path="nuvio.profile_id" data-cfg-instance-root="nuvio" autocomplete="off"></select>
               </div>
             </div>
             <div id="nuvio_login_state" class="nuvio-qc hidden">

@@ -38,14 +38,14 @@ def _state(simkl_items, trakt_items):
     }
 
 
-def _cfg(src="SIMKL", dst="TRAKT", src_inst="SIMKL-P01", dst_inst="TRAKT-P01"):
+def _cfg(src="SIMKL", dst="TRAKT", src_inst="SIMKL-P01", dst_inst="TRAKT-P01", rewatches=False):
     pair: dict[str, Any] = {
         "id": "p1",
         "enabled": True,
         "source": src,
         "target": dst,
         "mode": "one-way",
-        "features": {"history": {"enable": True}},
+        "features": {"history": {"enable": True, "rewatches": bool(rewatches)}},
     }
     if src_inst:
         pair["source_instance"] = src_inst
@@ -156,6 +156,21 @@ def test_alias_ignored_when_watched_at_differs_by_more_than_a_minute(cws) -> Non
     assert stats["synced"] == 0
 
 
+def test_rewatch_pair_requires_each_history_event(cws) -> None:
+    first = _episode(12971, 1, 40, series="Dragon Ball Z", watched="2024-01-01T00:00:00Z")
+    second = _episode(12971, 1, 40, series="Dragon Ball Z", watched="2024-01-02T00:00:00Z")
+    simkl = {
+        "tmdb:12971#s01e40@1704067200": first,
+        "tmdb:12971#s01e40@1704153600": second,
+    }
+    trakt = {"tmdb:12971#s01e40@1704067200": first}
+
+    stats = _synced(_state(simkl, trakt), _cfg(rewatches=True))
+
+    assert stats["total"] == 2
+    assert stats["synced"] == 1
+
+
 def test_alias_from_another_pair_is_ignored(cws) -> None:
     simkl = {"tmdb:12971#s01e40": _episode(12971, 1, 40, series="Dragon Ball Z")}
     trakt = {"tmdb:12971#s02e01": _episode(12971, 2, 1, series="Dragon Ball Z")}
@@ -207,6 +222,37 @@ def test_unaliased_translation_still_counts_as_unsynced(cws) -> None:
     stats = _synced(_state(simkl, trakt), _cfg())
 
     assert stats["synced"] == 0
+
+
+def test_episode_ids_match_when_source_lacks_show_ids(cws) -> None:
+    simkl = {
+        "imdb:tt7228262#s00e04": {
+            "type": "episode",
+            "title": "S00E04",
+            "series_title": "Fullmetal Alchemist: Brotherhood",
+            "season": 0,
+            "episode": 4,
+            "watched_at": WATCHED,
+            "ids": {"imdb": "tt7228262", "tvdb": "2832871"},
+        }
+    }
+    trakt = {
+        "tmdb:31911#s00e04": {
+            "type": "episode",
+            "title": "Yet Another Man's Battlefield",
+            "series_title": "Fullmetal Alchemist: Brotherhood",
+            "season": 0,
+            "episode": 4,
+            "watched_at": WATCHED,
+            "ids": {"imdb": "tt7228262", "tvdb": "2832871"},
+            "show_ids": {"tmdb": "31911"},
+        }
+    }
+
+    stats = _synced(_state(simkl, trakt), _cfg())
+
+    assert stats["total"] == 1
+    assert stats["synced"] == 1
 
 
 def test_state_baselines_are_not_rewritten(cws) -> None:

@@ -17,12 +17,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Mapping
 
 import requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
+from cw_platform.access_policy import filter_pairs_for_profile, filter_pairs_for_user, managed_profile_instances, profile_instances_map, request_user
 from cw_platform.config_base import load_config as _load_config
 
 from cw_platform.provider_instances import get_provider_block, list_instance_ids, normalize_instance_id, provider_key
+from providers.auth._auth_KODI import KodiAuthError, verify_connection as verify_kodi_connection
 from providers.sync.simkl._common import simkl_api_params, simkl_user_agent
 
 
@@ -49,6 +51,7 @@ STATUS_TTL = int(os.environ.get("CW_STATUS_TTL", "60"))
 PROBE_TTL = int(os.environ.get("CW_PROBE_TTL", "15"))
 USERINFO_TTL = int(os.environ.get("CW_USERINFO_TTL", "600"))
 PROVIDERS: tuple[str, ...] = (
+    "crosswatch",
     "plex",
     "simkl",
     "trakt",
@@ -62,6 +65,10 @@ PROVIDERS: tuple[str, ...] = (
     "tautulli",
     "nuvio",
     "kodi",
+    "stremio",
+    "floppy",
+    "punchplay",
+    "scrob",
 )
 
 # Caches
@@ -131,6 +138,12 @@ PROBE_CFG_KEY: dict[str, str] = {
     "TAUTULLI": "tautulli",
     "NUVIO": "nuvio",
     "KODI": "kodi",
+    "STREMIO": "stremio",
+    "FLOPPY": "floppy",
+    "PUNCHPLAY": "punchplay",
+    "SCROB": "scrob",
+    "CROSSWATCH": "crosswatch",
+    "CW": "crosswatch",
 }
 
 _FALLBACK_KEYS: dict[str, tuple[str, ...]] = {
@@ -254,6 +267,40 @@ def _probe_key(provider_id: str, cfg: Mapping[str, Any]) -> str:
         tok = str((n.get("access_token") or "")).strip()
         profile = str((n.get("profile_id") or "")).strip()
         return f"nuvio|base:{_secret_cache_tag(base)}|tok:{_secret_cache_tag(tok)}|profile:{profile}"
+
+    if p == "stremio":
+        s = cfg.get("stremio") or {}
+        key = str((s.get("auth_key") or s.get("authKey") or "")).strip()
+        profile = str(s.get("stremio_profile_id") or "default").strip() or "default"
+        return f"stremio|auth:{_secret_cache_tag(key)}|profile:{profile}" if key else "stremio|unconfigured"
+
+    if p == "floppy":
+        f = cfg.get("floppy") or {}
+        base = _norm_url(f.get("server_url") or f.get("server"))
+        key = str((f.get("api_token") or f.get("token") or "")).strip()
+        return f"floppy|srv:{_secret_cache_tag(base)}|key:{_secret_cache_tag(key)}" if (base and key) else "floppy|unconfigured"
+
+    if p == "punchplay":
+        pp = cfg.get("punchplay") or {}
+        tok = str((pp.get("access_token") or "")).strip()
+        exp = str(pp.get("expires_at") or "0")
+        return f"punchplay|tok:{_secret_cache_tag(tok)}|exp:{exp}" if tok else "punchplay|unconfigured"
+
+    if p == "scrob":
+        sc = cfg.get("scrob") or {}
+        base = _norm_url(sc.get("server_url"))
+        key = str((sc.get("api_key") or "")).strip()
+        user = str((sc.get("username") or "")).strip()
+        return f"scrob|srv:{_secret_cache_tag(base)}|key:{_secret_cache_tag(key)}|user:{_secret_cache_tag(user)}" if (base and key) else "scrob|unconfigured"
+
+    if p == "crosswatch":
+        c = cfg.get("crosswatch") or {}
+        hint = cfg.get("_cw_probe") if isinstance(cfg.get("_cw_probe"), Mapping) else {}
+        inst = normalize_instance_id((hint or {}).get("instance"))
+        connected = "1" if isinstance(c, Mapping) and c.get("connected") is True else "0"
+        enabled = "0" if isinstance(c, Mapping) and c.get("enabled") is False else "1"
+        root = str((c.get("root_dir") if isinstance(c, Mapping) else "") or "/config/.cw_provider").strip()
+        return f"crosswatch|inst:{inst}|connected:{connected}|enabled:{enabled}|root:{_secret_cache_tag(root)}"
 
     if p == "tautulli":
         t = cfg.get("tautulli") or {}
@@ -949,6 +996,203 @@ def _probe_emby_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tup
     return ok, rsn
 
 
+def _probe_stremio_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("stremio", cfg)
+    bust_ts = _consume_bust("stremio")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    from providers.auth._auth_STREMIO import StremioAuthError, StremioClient
+
+    s: Mapping[str, Any] = (cfg.get("stremio") or {}) if isinstance(cfg.get("stremio"), Mapping) else {}
+    if not _provider_auth().is_configured("stremio", s):
+        rsn = "Stremio: missing auth key"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    try:
+        hint = cfg.get("_cw_probe") if isinstance(cfg.get("_cw_probe"), Mapping) else {}
+        inst = normalize_instance_id((hint or {}).get("instance"))
+        ok = bool(StremioClient(cfg, instance_id=inst).validate())
+        rsn = "" if ok else "Stremio: invalid response"
+    except StremioAuthError as exc:
+        reason = str(getattr(exc, "reason", "error"))
+        if reason in {"missing_auth_key", "invalid_credentials"}:
+            rsn = "Stremio: authentication failed"
+        elif reason == "unreachable":
+            rsn = "Stremio: API unreachable"
+        elif reason == "service_unavailable":
+            rsn = "Stremio: API unavailable"
+        else:
+            rsn = "Stremio: probe failed"
+        ok = False
+    except Exception:
+        ok = False
+        rsn = "Stremio: probe failed"
+
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
+    return ok, rsn
+
+
+def _probe_floppy_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("floppy", cfg)
+    bust_ts = _consume_bust("floppy")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    from providers.auth import _auth_FLOPPY as floppy
+
+    f: Mapping[str, Any] = (cfg.get("floppy") or {}) if isinstance(cfg.get("floppy"), Mapping) else {}
+    server = floppy.normalize_server_url(f.get("server_url") or f.get("server"))
+    token = str(f.get("api_token") or f.get("token") or "").strip()
+    if not server or not token:
+        rsn = "Floppy: missing server URL or API token"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    ok, reason = floppy.validate_credentials(
+        server,
+        token,
+        timeout=float(f.get("timeout", HTTP_TIMEOUT) or HTTP_TIMEOUT),
+        verify_ssl=bool(f.get("verify_ssl", False)),
+    )
+    rsn = "" if ok else {
+        "server_url_required": "Floppy: missing server URL",
+        "api_token_required": "Floppy: missing API token",
+        "invalid_api_token": "Floppy: invalid API token",
+        "validation_timeout": "Floppy: validation timed out",
+        "unreachable": "Floppy: server unreachable",
+        "invalid_ssl": "Floppy: SSL validation failed",
+        "validation_bad_response": "Floppy: invalid response",
+        "server_error": "Floppy: server error",
+    }.get(str(reason or ""), "Floppy: probe failed")
+
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
+    return ok, rsn
+
+
+def _probe_scrob_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("scrob", cfg)
+    bust_ts = _consume_bust("scrob")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    from providers.auth import _auth_SCROB as scrob
+
+    s: Mapping[str, Any] = (cfg.get("scrob") or {}) if isinstance(cfg.get("scrob"), Mapping) else {}
+    if not scrob.is_configured(s):
+        rsn = "Scrob: missing server URL, API key or account"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    ok = False
+    reason = "request_failed"
+    try:
+        client = scrob.client_from_block(s)
+        if scrob.needs_reauth(s):
+            payload = client.request_json("GET", scrob.PROFILE_PATH)
+            ok = isinstance(payload, Mapping)
+            reason = "" if ok else "validation_bad_response"
+        else:
+            client.access_token = scrob.access_token_for(cfg, session=client.session)
+            payload = client.request_json("GET", scrob.ME_PATH)
+            ok = isinstance(payload, Mapping) and bool(payload.get("id"))
+            reason = "" if ok else "validation_bad_response"
+    except scrob.ScrobAuthError as exc:
+        reason = str(exc.reason or "request_failed")
+    except Exception:
+        reason = "request_failed"
+
+    rsn = "" if ok else {
+        "server_url_required": "Scrob: missing server URL",
+        "api_key_required": "Scrob: missing API key",
+        "not_configured": "Scrob: missing server URL, API key or account",
+        "invalid_api_key": "Scrob: invalid API key",
+        "invalid_credentials": "Scrob: reconnect required",
+        "credentials_mismatch": "Scrob: API key and login are different accounts",
+        "invalid_totp_code": "Scrob: invalid two factor code",
+        "password_login_disabled": "Scrob: password login is disabled on this server",
+        "email_not_confirmed": "Scrob: account email is not confirmed",
+        "unauthorized": "Scrob: reconnect required",
+        "api_prefix_mismatch": "Scrob: API not reachable at this URL",
+        "api_not_found": "Scrob: API not found on this server",
+        "validation_timeout": "Scrob: validation timed out",
+        "unreachable": "Scrob: server unreachable",
+        "invalid_ssl": "Scrob: SSL validation failed",
+        "validation_bad_response": "Scrob: invalid response",
+        "server_error": "Scrob: server error",
+        "totp_required": "Scrob: two factor re-authentication required",
+    }.get(str(reason or ""), "Scrob: probe failed")
+
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
+    return ok, rsn
+
+
+def _probe_punchplay_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("punchplay", cfg)
+    bust_ts = _consume_bust("punchplay")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    from providers.auth import _auth_PUNCHPLAY as punchplay
+
+    p: Mapping[str, Any] = (cfg.get("punchplay") or {}) if isinstance(cfg.get("punchplay"), Mapping) else {}
+    if not punchplay.is_configured(p):
+        rsn = "PunchPlay: missing authentication"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    try:
+        sess = requests.Session()
+        hint = cfg.get("_cw_probe") if isinstance(cfg.get("_cw_probe"), Mapping) else {}
+        inst = normalize_instance_id((hint or {}).get("instance"))
+        r = _provider_auth().request_with_auth(
+            "punchplay",
+            sess,
+            "GET",
+            punchplay.ME_URL,
+            cfg=cfg,
+            instance_id=inst,
+            headers=UA,
+            timeout=max(int(HTTP_TIMEOUT), 6),
+            max_retries=1,
+        )
+        code = int(r.status_code)
+        body = r.text or ""
+    except Exception as e:
+        code = 0
+        body = ""
+        _set_http_error(str(e))
+
+    if code != 200:
+        rsn = "PunchPlay: reconnect required" if code == 401 else _reason_http(code, "PunchPlay")
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
+    j = _json_loads(body) or {}
+    ok = bool(isinstance(j, dict) and j.get("id"))
+    rsn = "" if ok else "PunchPlay: invalid response"
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
+    return ok, rsn
+
+
 def _probe_kodi_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
     key = _probe_key("kodi", cfg)
     bust_ts = _consume_bust("kodi")
@@ -971,9 +1215,66 @@ def _probe_kodi_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tup
             PROBE_DETAIL_CACHE[key] = (now, False, rsn)
         return False, rsn
 
+    try:
+        timeout = max(1.0, min(float(kodi.get("timeout", HTTP_TIMEOUT) or HTTP_TIMEOUT), float(HTTP_TIMEOUT)))
+    except Exception:
+        timeout = float(HTTP_TIMEOUT)
+
+    try:
+        verify_kodi_connection(
+            server,
+            username=str(kodi.get("username") or ""),
+            password=str(kodi.get("password") or ""),
+            verify_ssl=bool(kodi.get("verify_ssl", False)),
+            timeout=timeout,
+        )
+    except KodiAuthError as exc:
+        reason = str(exc.reason or "probe_failed")
+        rsn = {
+            "unreachable": "Kodi: server unreachable",
+            "invalid_credentials": "Kodi: invalid credentials",
+            "not_kodi": "Kodi: not a Kodi server",
+            "version_too_old": "Kodi: version too old",
+            "jsonrpc_too_old": "Kodi: JSON-RPC version too old",
+            "invalid_response": "Kodi: invalid JSON-RPC response",
+        }.get(reason, "Kodi: probe failed")
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+    except Exception:
+        rsn = "Kodi: probe failed"
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, rsn)
+        return False, rsn
+
     with _CACHE_LOCK:
         PROBE_DETAIL_CACHE[key] = (now, True, "")
     return True, ""
+
+
+def _probe_crosswatch_detail(cfg: dict[str, Any], max_age_sec: int = PROBE_TTL) -> tuple[bool, str]:
+    key = _probe_key("crosswatch", cfg)
+    bust_ts = _consume_bust("crosswatch")
+    now = time.time()
+    cached = PROBE_DETAIL_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return cached[1], cached[2]
+
+    raw = cfg.get("crosswatch") if isinstance(cfg.get("crosswatch"), Mapping) else cfg.get("CrossWatch")
+    if not isinstance(raw, Mapping):
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, "CrossWatch Local Tracker: not configured")
+        return False, "CrossWatch Local Tracker: not configured"
+    cw = raw
+    if cw.get("connected") is not True:
+        with _CACHE_LOCK:
+            PROBE_DETAIL_CACHE[key] = (now, False, "CrossWatch Local Tracker: not connected")
+        return False, "CrossWatch Local Tracker: not connected"
+    ok = not (isinstance(cw, Mapping) and cw.get("enabled") is False)
+    rsn = "" if ok else "CrossWatch Local Tracker: disabled"
+    with _CACHE_LOCK:
+        PROBE_DETAIL_CACHE[key] = (now, ok, rsn)
+    return ok, rsn
 
 def plex_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> dict[str, Any]:
     key = _probe_key("plex", cfg)
@@ -1083,6 +1384,92 @@ def mdblist_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> d
             "user_id": j.get("user_id"),
             "limits": limits,
         }
+
+    with _CACHE_LOCK:
+        _USERINFO_CACHE[key] = (now, out)
+    return out
+
+def scrob_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> dict[str, Any]:
+    key = _probe_key("scrob", cfg)
+    bust_ts = _consume_bust("scrob")
+    now = time.time()
+    cached = _USERINFO_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts):
+        return dict(cached[1])
+
+    from providers.auth import _auth_SCROB as scrob
+
+    s = (cfg.get("scrob") or cfg.get("SCROB") or {}) or {}
+    if not scrob.is_configured(s):
+        return {}
+
+    out: dict[str, Any] = {}
+    try:
+        client = scrob.client_from_block(s)
+        client.access_token = scrob.access_token_for(cfg, session=client.session)
+        payload = client.request_json("GET", scrob.ME_PATH)
+        if isinstance(payload, Mapping):
+            username = str(payload.get("display_name") or payload.get("username") or "").strip()
+            if username:
+                out["username"] = username
+            email = str(payload.get("email") or "").strip()
+            if email:
+                out["email"] = email
+    except Exception:
+        return {}
+
+    with _CACHE_LOCK:
+        _USERINFO_CACHE[key] = (now, dict(out))
+    return dict(out)
+
+
+def punchplay_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> dict[str, Any]:
+    key = _probe_key("punchplay", cfg)
+    bust_ts = _consume_bust("punchplay")
+    now = time.time()
+    cached = _USERINFO_CACHE.get(key)
+    if cached and (now - cached[0]) < max_age_sec and (not bust_ts or cached[0] >= bust_ts) and isinstance(cached[1], dict):
+        return cached[1]
+
+    from providers.auth import _auth_PUNCHPLAY as punchplay
+
+    pp = (cfg.get("punchplay") or cfg.get("PUNCHPLAY") or {}) or {}
+    if not punchplay.is_configured(pp):
+        with _CACHE_LOCK:
+            _USERINFO_CACHE[key] = (now, {})
+        return {}
+
+    try:
+        sess = requests.Session()
+        hint = cfg.get("_cw_probe") if isinstance(cfg.get("_cw_probe"), Mapping) else {}
+        inst = normalize_instance_id((hint or {}).get("instance"))
+        r = _provider_auth().request_with_auth(
+            "punchplay",
+            sess,
+            "GET",
+            punchplay.ME_URL,
+            cfg=cfg,
+            instance_id=inst,
+            headers=UA,
+            timeout=6,
+            max_retries=1,
+        )
+        code, body = int(r.status_code), r.text or ""
+    except Exception:
+        code, body = 0, ""
+
+    out: dict[str, Any] = {}
+    if code == 200:
+        j = _json_loads(body) or {}
+        if isinstance(j, dict):
+            prof = j.get("profile") if isinstance(j.get("profile"), Mapping) else {}
+            scopes = j.get("scopes")
+            out = {
+                "username": j.get("username") or (prof or {}).get("displayName") or j.get("name"),
+                "user_id": j.get("id"),
+                "avatar": (prof or {}).get("avatarUrl"),
+                "scopes": list(scopes) if isinstance(scopes, (list, tuple)) else [],
+            }
 
     with _CACHE_LOCK:
         _USERINFO_CACHE[key] = (now, out)
@@ -1299,7 +1686,13 @@ def _prov_configured(cfg: dict[str, Any], name: str, instance_id: Any = "default
 
     # CrossWatch local/virtual provider
     if n in ("CROSSWATCH", "CW"):
-        cw = cfg.get("crosswatch") or cfg.get("CrossWatch") or {}
+        inst = normalize_instance_id(instance_id)
+        raw = cfg.get("crosswatch") if isinstance(cfg.get("crosswatch"), Mapping) else cfg.get("CrossWatch")
+        if not isinstance(raw, Mapping):
+            return False
+        cw = get_provider_block(cfg, "crosswatch", inst) or cfg.get("crosswatch") or cfg.get("CrossWatch") or {}
+        if cw.get("connected") is not True:
+            return False
         enabled = cw.get("enabled")
         return bool(enabled) if isinstance(enabled, bool) else True
 
@@ -1347,6 +1740,23 @@ def _prov_configured(cfg: dict[str, Any], name: str, instance_id: Any = "default
 
     if ck == "nuvio":
         return _provider_auth().is_configured("nuvio", blk)
+
+    if ck == "stremio":
+        return _provider_auth().is_configured("stremio", blk)
+
+    if ck == "floppy":
+        return bool(str(blk.get("server_url") or blk.get("server") or "").strip() and str(blk.get("api_token") or blk.get("token") or "").strip())
+
+    if ck == "punchplay":
+        return bool(str(blk.get("access_token") or "").strip())
+
+    if ck == "scrob":
+        return bool(
+            str(blk.get("server_url") or "").strip()
+            and str(blk.get("api_key") or "").strip()
+            and str(blk.get("username") or "").strip()
+            and str(blk.get("password") or "").strip()
+        )
 
     if ck == "tmdb_sync":
         return bool(str(blk.get("api_key") or "").strip() and str(blk.get("session_id") or "").strip())
@@ -1410,6 +1820,7 @@ def connected_status(cfg: dict[str, Any]) -> tuple[bool, bool, bool, bool, bool,
 
 # Mappings
 DETAIL_PROBES: dict[str, Callable[..., tuple[bool, str]]] = {
+    "CROSSWATCH": _probe_crosswatch_detail,
     "PLEX": _probe_plex_detail,
     "SIMKL": _probe_simkl_detail,
     "TRAKT": _probe_trakt_detail,
@@ -1422,6 +1833,10 @@ DETAIL_PROBES: dict[str, Callable[..., tuple[bool, str]]] = {
     "PUBLICMETADB": _probe_publicmetadb_detail,
     "TAUTULLI": _probe_tautulli_detail,
     "NUVIO": _probe_nuvio_detail,
+    "STREMIO": _probe_stremio_detail,
+    "FLOPPY": _probe_floppy_detail,
+    "PUNCHPLAY": _probe_punchplay_detail,
+    "SCROB": _probe_scrob_detail,
 }
 USERINFO_FNS: dict[str, Callable[..., dict[str, Any]]] = {
     "PLEX": plex_user_info,
@@ -1430,27 +1845,46 @@ USERINFO_FNS: dict[str, Callable[..., dict[str, Any]]] = {
     "ANILIST": anilist_user_info,
     "EMBY": emby_user_info,
     "MDBLIST": mdblist_user_info,
+    "PUNCHPLAY": punchplay_user_info,
+    "SCROB": scrob_user_info,
 }
 
 # Registry API
 def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) -> None:
+    def _status_scope_profile(cfg: Mapping[str, Any], request: Request, requested: Any) -> str:
+        try:
+            from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
+
+            token = request.cookies.get(COOKIE_NAME) if request is not None else None
+            return str(effective_user_profile_id(dict(cfg or {}), token, requested) or "").strip()
+        except Exception:
+            return ""
+
     @app.get("/api/status", tags=["Probes"])
-    def api_status(fresh: int = Query(0)) -> JSONResponse:
+    def api_status(request: Request, fresh: int = Query(0), user_profile: str = Query("")) -> JSONResponse:
+        cfg0 = load_config_fn() or {}
+        scoped_user = request_user(request)
+        scope_profile = _status_scope_profile(cfg0, request, user_profile)
+        managed_scope = bool(scope_profile) or bool(scoped_user and not scoped_user.get("is_admin"))
         now = time.time()
         cached = STATUS_CACHE["data"]
         age = (now - STATUS_CACHE["ts"]) if cached else 1e9
-        if not fresh and cached and age < STATUS_TTL:
+        if not managed_scope and not fresh and cached and age < STATUS_TTL:
             return JSONResponse(cached, headers={"Cache-Control": "no-store"})
 
         with STATUS_LOCK:
             now = time.time()
             cached = STATUS_CACHE["data"]
             age = (now - STATUS_CACHE["ts"]) if cached else 1e9
-            if not fresh and cached and age < STATUS_TTL:
+            if not managed_scope and not fresh and cached and age < STATUS_TTL:
                 return JSONResponse(cached, headers={"Cache-Control": "no-store"})
 
-            cfg = load_config_fn() or {}
+            cfg = cfg0 if managed_scope else (load_config_fn() or {})
             pairs = cfg.get("pairs") or []
+            if scope_profile:
+                pairs = filter_pairs_for_profile(cfg, scope_profile, [p for p in pairs if isinstance(p, dict)])
+            elif managed_scope:
+                pairs = filter_pairs_for_user(cfg, scoped_user, [p for p in pairs if isinstance(p, dict)])
             enabled_pairs = [p for p in pairs if isinstance(p, dict) and p.get("enabled", True) is not False]
             any_pair_ready = any(_pair_ready(cfg, p) for p in enabled_pairs)
 
@@ -1521,6 +1955,17 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     _add(s, "default")
                 return out
 
+            allowed_instances = (
+                profile_instances_map(cfg, scope_profile)
+                if scope_profile
+                else (managed_profile_instances(cfg, scoped_user) if managed_scope else {})
+            )
+
+            def _scope_allows(prov: str, inst: Any) -> bool:
+                if not managed_scope:
+                    return True
+                return normalize_instance_id(inst) in set(allowed_instances.get(prov) or [])
+
             pair_targets = _pair_targets()
             watcher_targets = _watcher_targets(cfg)
 
@@ -1531,7 +1976,7 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
 
             for prov, inst in pair_targets:
                 c = _canon_probe_code(prov)
-                if not c:
+                if not c or not _scope_allows(c, inst):
                     continue
                 targets.add((c, inst))
                 prov_sources.setdefault(c, set()).add("pair")
@@ -1539,7 +1984,7 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
 
             for prov, inst in watcher_targets:
                 c = _canon_probe_code(prov)
-                if not c:
+                if not c or not _scope_allows(c, inst):
                     continue
                 targets.add((c, inst))
                 prov_sources.setdefault(c, set()).add("watcher")
@@ -1552,11 +1997,19 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     normalize_instance_id(inst)
                     for inst in list_instance_ids(cfg, ck)
                 }
-                if prov == "NUVIO":
+                if managed_scope:
+                    insts &= set(allowed_instances.get(prov) or [])
+                if managed_scope or prov == "NUVIO":
                     insts = {
                         inst
                         for inst in insts
                         if _prov_configured(cfg, prov, inst)
+                    }
+                else:
+                    insts = {
+                        inst
+                        for inst in insts
+                        if inst != "default" or _prov_configured(cfg, prov, inst)
                     }
                 if insts:
                     configured_instances[prov] = insts
@@ -1565,6 +2018,8 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 insts = configured_instances.get(prov) or set()
                 if not insts:
                     return set()
+                if prov == "CROSSWATCH":
+                    return set(insts)
                 used = {
                     inst
                     for inst in (used_instances.get(prov) or set())
@@ -1572,9 +2027,11 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 }
                 if used:
                     return used
-                if "default" in insts:
+                ready = {inst for inst in insts if _prov_configured(cfg, prov, inst)}
+                pool = ready or insts
+                if "default" in pool:
                     return {"default"}
-                return {sorted(insts, key=lambda x: (x != "default", x))[0]}
+                return {sorted(pool, key=lambda x: (x != "default", x))[0]}
 
             for prov in DETAIL_PROBES.keys():
                 for inst in _probe_targets_for(prov):
@@ -1612,7 +2069,11 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
 
             def _rep_instance(prov: str) -> str:
                 items = per.get(prov) or {}
-                used = used_instances.get(prov) or set()
+                used = {
+                    inst
+                    for inst in (used_instances.get(prov) or set())
+                    if _prov_configured(cfg, prov, inst)
+                }
                 used_non_default = sorted([i for i in used if i != "default"])
 
                 for inst in used_non_default:
@@ -1634,6 +2095,13 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 for inst, tup in items.items():
                     if tup[0]:
                         return inst
+
+                probed = sorted(
+                    [i for i in items if _prov_configured(cfg, prov, i)],
+                    key=lambda x: (x != "default", x),
+                )
+                if probed:
+                    return probed[0]
 
                 if "default" in items:
                     return "default"
@@ -1662,9 +2130,14 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
             emby_ok, emby_reason, cfg_emby = _provider_tuple("EMBY")
             kodi_ok, kodi_reason, cfg_kodi = _provider_tuple("KODI")
             tmdb_ok, tmdb_reason, cfg_tmdb = _provider_tuple("TMDB")
+            crosswatch_ok, crosswatch_reason, cfg_crosswatch = _provider_tuple("CROSSWATCH")
             mdbl_ok, mdbl_reason, cfg_mdbl = _provider_tuple("MDBLIST")
             publicmetadb_ok, publicmetadb_reason, cfg_publicmetadb = _provider_tuple("PUBLICMETADB")
             nuvio_ok, nuvio_reason, cfg_nuvio = _provider_tuple("NUVIO")
+            stremio_ok, stremio_reason, cfg_stremio = _provider_tuple("STREMIO")
+            floppy_ok, floppy_reason, cfg_floppy = _provider_tuple("FLOPPY")
+            punchplay_ok, punchplay_reason, cfg_punchplay = _provider_tuple("PUNCHPLAY")
+            scrob_ok, scrob_reason, cfg_scrob = _provider_tuple("SCROB")
             taut_ok, taut_reason, cfg_taut = _provider_tuple("TAUTULLI")
             anilist_ok, anilist_reason, cfg_anilist = _provider_tuple("ANILIST")
 
@@ -1681,6 +2154,10 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 userinfo_jobs["EMBY"] = (emby_user_info, cfg_emby)
             if mdbl_ok:
                 userinfo_jobs["MDBLIST"] = (mdblist_user_info, cfg_mdbl)
+            if punchplay_ok:
+                userinfo_jobs["PUNCHPLAY"] = (punchplay_user_info, cfg_punchplay)
+            if scrob_ok:
+                userinfo_jobs["SCROB"] = (scrob_user_info, cfg_scrob)
 
             userinfo: dict[str, dict[str, Any]] = {}
             if userinfo_jobs:
@@ -1738,7 +2215,7 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 ok_count = 0
                 probed_count = 0
                 for inst in inst_ids:
-                    payload: dict[str, Any] = {"configured": True, "probed": False}
+                    payload: dict[str, Any] = {"configured": bool(_prov_configured(cfg, prov, inst)), "probed": False}
                     if inst in items:
                         ok, rsn, _ = items.get(inst) or (False, "", {})
                         payload["connected"] = bool(ok)
@@ -1768,6 +2245,20 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     "connected": plex_ok,
                     **({} if plex_ok else {"reason": plex_reason}),
                     **({} if not info_plex else {"plexpass": bool(info_plex.get("plexpass")), "subscription": info_plex.get("subscription") or {}}),
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
+            if "CROSSWATCH" in active_providers:
+                inst_map, inst_sum = _instances_payload("CROSSWATCH")
+                cw_block = (cfg_crosswatch.get("crosswatch") or {}) if isinstance(cfg_crosswatch.get("crosswatch"), Mapping) else {}
+                providers_out["CROSSWATCH"] = {
+                    "connected": crosswatch_ok,
+                    **({} if crosswatch_ok else {"reason": crosswatch_reason}),
+                    "vip": True,
+                    "vip_type": "crown",
+                    "vip_text": "You've earned it",
+                    **({"root_dir": cw_block.get("root_dir")} if cw_block.get("root_dir") else {}),
                     "instances": inst_map,
                     "instances_summary": inst_sum,
                     "rep_instance": inst_sum.get("rep"),
@@ -1908,7 +2399,58 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     "rep_instance": inst_sum.get("rep"),
                 }
 
+            if "STREMIO" in active_providers:
+                inst_map, inst_sum = _instances_payload("STREMIO")
+                providers_out["STREMIO"] = {
+                    "connected": stremio_ok,
+                    **({} if stremio_ok else {"reason": stremio_reason}),
+                    "experimental": True,
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
 
+            if "FLOPPY" in active_providers:
+                inst_map, inst_sum = _instances_payload("FLOPPY")
+                f_block = (cfg_floppy.get("floppy") or {}) if isinstance(cfg_floppy.get("floppy"), Mapping) else {}
+                providers_out["FLOPPY"] = {
+                    "connected": floppy_ok,
+                    **({} if floppy_ok else {"reason": floppy_reason}),
+                    "experimental": True,
+                    **({"server_url": f_block.get("server_url")} if f_block.get("server_url") else {}),
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
+
+            if "SCROB" in active_providers:
+                inst_map, inst_sum = _instances_payload("SCROB")
+                s_block = (cfg_scrob.get("scrob") or {}) if isinstance(cfg_scrob.get("scrob"), Mapping) else {}
+                providers_out["SCROB"] = {
+                    "connected": scrob_ok,
+                    **({} if scrob_ok else {"reason": scrob_reason}),
+                    **(
+                        {"reauth_required": True, "notice": "Scrob 2FA session expired. Reads and scrobbling continue; enter a new code to resume writes."}
+                        if s_block.get("reauth_required")
+                        else {}
+                    ),
+                    "experimental": True,
+                    **({"server_url": s_block.get("server_url")} if s_block.get("server_url") else {}),
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
+
+            if "PUNCHPLAY" in active_providers:
+                inst_map, inst_sum = _instances_payload("PUNCHPLAY")
+                providers_out["PUNCHPLAY"] = {
+                    "connected": punchplay_ok,
+                    **({} if punchplay_ok else {"reason": punchplay_reason}),
+                    "experimental": True,
+                    "instances": inst_map,
+                    "instances_summary": inst_sum,
+                    "rep_instance": inst_sum.get("rep"),
+                }
 
             def _scope_for(prov: str) -> str:
                 ss = prov_sources.get(prov) or set()
@@ -1956,9 +2498,14 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 "emby_connected": emby_ok,
                 "kodi_connected": kodi_ok,
                 "tmdb_connected": tmdb_ok,
+                "crosswatch_connected": crosswatch_ok,
                 "mdblist_connected": mdbl_ok,
                 "publicmetadb_connected": publicmetadb_ok,
                 "nuvio_connected": nuvio_ok,
+                "stremio_connected": stremio_ok,
+                "floppy_connected": floppy_ok,
+                "punchplay_connected": punchplay_ok,
+                "scrob_connected": scrob_ok,
                 "tautulli_connected": taut_ok,
                 "debug": debug,
                 "can_run": bool(any_pair_ready),
@@ -1966,8 +2513,9 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                 "providers": providers_out,
             }
 
-            STATUS_CACHE["ts"] = now
-            STATUS_CACHE["data"] = data
+            if not managed_scope:
+                STATUS_CACHE["ts"] = now
+                STATUS_CACHE["data"] = data
             return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/debug/clear_probe_cache", tags=["Probes"])

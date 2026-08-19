@@ -411,6 +411,7 @@ function _cwHasConfiguredValue(v) {
       "emby.user",
       "kodi.server",
       "kodi.connection_verified",
+      "stremio.auth_key",
       "app_auth.username",
       "app_auth.password.hash",
     ];
@@ -428,6 +429,7 @@ function _cwHasConfiguredValue(v) {
 
 async function _cwShouldOpenSetupWizard(meta) {
   try {
+    if (_cwForceSetupRequested()) return true;
     if ((!meta?.exists) || !!meta?.first_run || !!meta?.autogen) return true;
     if (!!meta?.needs_upgrade) return false;
     if (typeof meta?.setup_wizard_required === "boolean") return meta.setup_wizard_required;
@@ -441,6 +443,16 @@ async function _cwShouldOpenSetupWizard(meta) {
     return _cwConfigLooksLikeFirstRun(cfg);
   } catch (e) {
     console.warn("[crosswatch] setup wizard config check failed", e);
+    return false;
+  }
+}
+
+function _cwForceSetupRequested() {
+  try {
+    const q = new URLSearchParams(window.location.search || "");
+    const raw = String(q.get("setup") || q.get("first_setup") || q.get("auth_setup") || "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "yes";
+  } catch {
     return false;
   }
 }
@@ -480,30 +492,44 @@ window.cwIsAuthSetupPending = () => window.__cwAuthSetupPending === true;
     (async () => {
       try {
         const boot = await (window.__cwAuthBootstrapPromise || Promise.resolve(null));
-        const meta = boot?.meta || null;
-        if (!meta) return;
+        const forceSetup = _cwForceSetupRequested();
+        const meta = boot?.meta || {};
+        if (!boot?.meta && !forceSetup) return;
 
-        async function ensureModals() {
-          if (typeof window.openUpgradeWarning === "function" || typeof window.openSetupWizard === "function") return true;
+        async function ensureModals(required) {
+          const ready = () => typeof window[required] === "function";
+          if (ready()) return true;
           try {
             const v = encodeURIComponent(String(window.APP_VERSION || window.__CW_VERSION__ || Date.now()));
             await import(`/assets/js/modals.js?v=${v}`);
-            return true;
           } catch (e) {
             console.warn("[crosswatch] modals.js failed to load/execute", e);
-            return false;
           }
+          for (let i = 0; i < 100 && !ready(); i++) {
+            await new Promise(r => setTimeout(r, 50));
+          }
+          if (!ready()) console.warn(`[crosswatch] modals.js loaded but ${required} is unavailable`);
+          return ready();
         }
 
         const firstRun = await _cwShouldOpenSetupWizard(meta);
 
         if (firstRun) {
-          if (await ensureModals()) { try { await window.openSetupWizard?.(meta); } catch (e) { console.warn(e); } }
+          if (await ensureModals("openSetupWizard")) {
+            try {
+              await window.openSetupWizard({
+                ...meta,
+                auth_setup_required: true,
+                setup_wizard_required: true,
+                auth_reset_required: !!(meta?.auth_reset_required || boot?.status?.reset_required),
+              });
+            } catch (e) { console.warn(e); }
+          }
           return;
         }
 
         if (meta.needs_upgrade) {
-          if (await ensureModals()) { try { await window.openUpgradeWarning?.(meta); } catch (e) { console.warn(e); } }
+          if (await ensureModals("openUpgradeWarning")) { try { await window.openUpgradeWarning(meta); } catch (e) { console.warn(e); } }
         }
       } catch {}
     })();

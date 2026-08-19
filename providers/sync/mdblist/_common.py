@@ -26,6 +26,10 @@ START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 # and the other sync providers already defer directory creation the same way.
 
 
+class MDBListFetchError(RuntimeError):
+    pass
+
+
 def _scoped_watermark_path(path: Path) -> Path:
     if path != WATERMARK_PATH:
         return path

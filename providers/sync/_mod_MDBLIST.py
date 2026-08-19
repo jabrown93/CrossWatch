@@ -21,12 +21,38 @@ from ._mod_common import (
     parse_rate_limit,
     make_snapshot_progress,
     _confirmed_keys,
+    _unresolved_keys,
 )
 
+
+def _write_result(raw: Any, items: list[Mapping[str, Any]]) -> dict[str, Any]:
+    if isinstance(raw, Mapping):
+        out = dict(raw)
+        out.setdefault("ok", True)
+        out.setdefault("unresolved", [])
+    else:
+        _cnt, unresolved = raw
+        out = {"ok": True, "unresolved": unresolved}
+
+    unresolved_keys = _unresolved_keys(_mdblist_key_of, out.get("unresolved") or [])
+    confirmed_keys = (
+        [str(x) for x in (out.get("confirmed_keys") or []) if x]
+        if isinstance(out.get("confirmed_keys"), list)
+        else _confirmed_keys(_mdblist_key_of, items, out.get("unresolved") or [])
+    )
+    unresolved_set = set(unresolved_keys)
+    out["unresolved_keys"] = unresolved_keys
+    out["confirmed_keys"] = [k for k in confirmed_keys if k not in unresolved_set]
+    out["count"] = len(out["confirmed_keys"])
+    return out
 
 def _mdblist_key_of(obj: Any) -> str:
     try:
         if isinstance(obj, Mapping):
+            if obj.get("_cw_rewatch_sync") is True:
+                key = str(obj.get("_cw_event_key") or "").strip()
+                if key:
+                    return key
             return str(canonical_key(id_minimal(obj)) or "").strip()
     except Exception:
         pass
@@ -61,7 +87,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.3"
+__VERSION__ = "1.6"
 __all__ = ["get_manifest", "MDBLISTModule", "OPS"]
 
 def _health(status: str, ok: bool, latency_ms: int) -> None:
@@ -168,12 +194,20 @@ def get_manifest() -> Mapping[str, Any]:
             "bidirectional": True,
             "provides_ids": True,
             "index_semantics": "present",
+            "watchlist": {
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": False, "episodes": False},
+                "upsert": True,
+                "remove": True,
+            },
             "history": {
                 "observed_deletes": True,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "remove": True,
                 "from_date": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": False},
             },
             "ratings": {
                 "observed_deletes": True,
@@ -188,6 +222,10 @@ def get_manifest() -> Mapping[str, Any]:
                 "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
                 "upsert": True,
                 "remove": True,
+                "completion_policy": {
+                    "progress_write": {"mode": "none"},
+                    "stop_scrobble": {"marks_watched_percent": 80, "comparison": "gte"},
+                },
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         },
@@ -646,6 +684,20 @@ class MDBLISTModule:
         mod = _FEATURES.get(feature)
         return mod.build_index(self, **kwargs) if mod else {}
 
+    def destination_comparison_view(
+        self,
+        feature: str,
+        index: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if str(feature or "").strip().lower() != "history":
+            return index
+        mod = _FEATURES.get("history")
+        hook = getattr(mod, "destination_comparison_view", None)
+        if not callable(hook):
+            return index
+        out = hook(index, self)
+        return out if isinstance(out, Mapping) else index
+
     def add(
         self,
         feature: str,
@@ -667,19 +719,7 @@ class MDBLISTModule:
             return {"ok": True, "count": 0, "unresolved": []}
         try:
             raw = mod.add(self, lst)
-            if isinstance(raw, Mapping):
-                out = dict(raw)
-                out.setdefault("ok", True)
-                out.setdefault("unresolved", [])
-                out.setdefault("confirmed_keys", [])
-                if isinstance(out.get("confirmed_keys"), list):
-                    out["count"] = len([x for x in out.get("confirmed_keys") or [] if x])
-                else:
-                    out.setdefault("count", int(out.get("count", 0) or 0))
-                return out
-            cnt, unresolved = raw
-            confirmed_keys = _confirmed_keys(_mdblist_key_of, lst, unresolved)
-            return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+            return _write_result(raw, lst)
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -704,19 +744,7 @@ class MDBLISTModule:
             return {"ok": True, "count": 0, "unresolved": []}
         try:
             raw = mod.remove(self, lst)
-            if isinstance(raw, Mapping):
-                out = dict(raw)
-                out.setdefault("ok", True)
-                out.setdefault("unresolved", [])
-                out.setdefault("confirmed_keys", [])
-                if isinstance(out.get("confirmed_keys"), list):
-                    out["count"] = len([x for x in out.get("confirmed_keys") or [] if x])
-                else:
-                    out.setdefault("count", int(out.get("count", 0) or 0))
-                return out
-            cnt, unresolved = raw
-            confirmed_keys = _confirmed_keys(_mdblist_key_of, lst, unresolved)
-            return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
+            return _write_result(raw, lst)
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -736,12 +764,20 @@ class _MDBLISTOPS:
             "bidirectional": True,
             "provides_ids": True,
             "index_semantics": "present",
+            "watchlist": {
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": False, "episodes": False},
+                "upsert": True,
+                "remove": True,
+            },
             "history": {
                 "observed_deletes": True,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "remove": True,
                 "from_date": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": True, "account_gate": False},
             },
             "ratings": {
                 "observed_deletes": True,
@@ -756,6 +792,10 @@ class _MDBLISTOPS:
                 "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
                 "upsert": True,
                 "remove": True,
+                "completion_policy": {
+                    "progress_write": {"mode": "none"},
+                    "stop_scrobble": {"marks_watched_percent": 80, "comparison": "gte"},
+                },
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         }
@@ -875,6 +915,19 @@ class _MDBLISTOPS:
         feature: str,
     ) -> Mapping[str, dict[str, Any]]:
         return self._adapter(cfg).build_index(feature)
+
+    def destination_comparison_view(
+        self,
+        cfg: Mapping[str, Any],
+        *,
+        feature: str,
+        index: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        try:
+            return self._adapter(cfg).destination_comparison_view(feature, index)
+        except Exception as e:
+            _warn("destination_comparison_failed", feature=feature, error=str(e))
+            return index
 
     def add(
         self,

@@ -3,48 +3,16 @@
 /* SyncBar UI component for showing sync progress in the header. */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (() => {
-  (document.getElementById("syncbar-css") || {}).remove?.();
-  document.head.appendChild(Object.assign(document.createElement("style"), {
-    id: "syncbar-css", textContent: `
-#ux-progress{margin-top:12px;position:relative;z-index:1;padding:12px 14px 10px;border-radius:18px;background:radial-gradient(120% 150% at 10% 0%,rgba(76,61,168,.08) 0%,rgba(76,61,168,0) 34%),radial-gradient(90% 140% at 100% 100%,rgba(31,48,94,.07) 0%,rgba(31,48,94,0) 44%),linear-gradient(180deg,rgba(8,11,18,.985),rgba(4,6,10,.975));border:1px solid rgba(255,255,255,.07);box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 14px 30px rgba(0,0,0,.22);backdrop-filter:blur(14px) saturate(108%);-webkit-backdrop-filter:blur(14px) saturate(108%)}
-.sb-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
-.sb-head-main{display:flex;align-items:center;gap:0;min-width:0}
-.sb-label{font-size:12px;font-weight:700;letter-spacing:.02em;color:rgba(244,247,255,.94)}
-.sb-phase{min-width:0}
-.sb-phase-text{font-size:11px;color:rgba(190,199,215,.72);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sb-badge{display:inline-flex;align-items:center;justify-content:center;min-width:74px;height:26px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.07);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));box-shadow:inset 0 1px 0 rgba(255,255,255,.02);font-size:11px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:rgba(235,241,252,.88)}
-.sb-badge.running{background:linear-gradient(180deg,rgba(88,104,170,.2),rgba(28,35,58,.24));border-color:rgba(132,149,214,.18);color:#edf4ff}
-.sb-badge.done{background:linear-gradient(180deg,rgba(48,92,78,.22),rgba(17,45,38,.24));border-color:rgba(109,176,147,.16);color:#e9fff8}
-.sb-badge.error{background:linear-gradient(180deg,rgba(106,48,56,.24),rgba(53,20,26,.26));border-color:rgba(214,128,141,.14);color:#fff0f0}
-.sb-rail{position:relative;height:8px;border-radius:999px;overflow:visible;background:rgba(255,255,255,.08);border:0;box-shadow:inset 0 1px 2px rgba(0,0,0,.38),inset 0 -1px 0 rgba(255,255,255,.035)}
-.sb-rail::before{content:none}
-.sb-rail.error{background:rgba(224,100,112,.18)}
-.sb-fill{position:absolute;inset:0 auto 0 0;width:0%;height:100%;border-radius:inherit;background:linear-gradient(90deg,#5fb6ff,#7ee2b8);box-shadow:inset 0 1px 0 rgba(255,255,255,.34),inset 0 -1px 0 rgba(0,0,0,.16);transition:width .28s ease,filter .22s ease,opacity .22s ease;z-index:1;overflow:hidden}
-@keyframes sbShift{0%{background-position:0% 50%}100%{background-position:100% 50%}}
-@keyframes sbShimmer{to{transform:translateX(100%)}}
-@keyframes sbPulse{from{opacity:.9}to{opacity:.75}}
-.sb-rail.running .sb-fill{background-size:200% 100%}
-.sb-rail.starting .sb-fill{animation:sbPulse .9s ease-in-out infinite alternate}
-.sb-rail.finishing .sb-fill{filter:saturate(1.2) brightness(1.05)}
-#ux-progress .sb-steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
-#ux-progress .sb-steps span{display:flex;align-items:center;justify-content:center;height:28px;padding:0 8px;border-radius:999px;white-space:nowrap;font-size:10px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;position:relative;isolation:isolate;color:rgba(176,188,206,.82);border:1px solid rgba(255,255,255,.055);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.016));box-shadow:inset 0 1px 0 rgba(255,255,255,.016);opacity:1;transition:color .2s ease,border-color .2s ease,background .2s ease,box-shadow .2s ease,transform .2s ease,filter .2s ease}
-#ux-progress .sb-steps span::before{content:"";position:absolute;inset:1px;border-radius:inherit;pointer-events:none;background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,0));z-index:-1}
-#ux-progress .sb-steps span.current{color:rgba(249,251,255,.98)!important;border-color:rgba(122,137,194,.2)!important;background:linear-gradient(180deg,rgba(78,88,134,.24),rgba(26,31,48,.34))!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.045),0 0 0 1px rgba(91,103,154,.06)!important;transform:none;filter:none}
-#ux-progress .sb-steps span.current::after{content:"";position:absolute;left:10px;top:50%;width:6px;height:6px;border-radius:999px;transform:translateY(-50%);background:rgba(171,185,233,.8);box-shadow:none}
-#ux-progress .sb-steps span.done{color:rgba(234,241,255,.94)!important;border-color:rgba(255,255,255,.075)!important;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.024))!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
-#ux-progress .sb-steps span.done:not(.current){color:rgba(221,231,245,.86)!important}
-.sb-fly{position:absolute;top:-30px;left:0;transform:translateX(-50%);font-size:11px;line-height:1;padding:7px 10px;border-radius:999px;white-space:nowrap;color:rgba(242,246,255,.92);background:rgba(9,13,21,.72);backdrop-filter:blur(10px) saturate(120%);-webkit-backdrop-filter:blur(10px) saturate(120%);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 24px rgba(0,0,0,.24);opacity:.92;pointer-events:none;transition:left .25s ease,opacity .15s ease;z-index:2}
-.sb-fly.hide{opacity:0}
-.sb-rail.indet .sb-fill{background-size:200% 100%;animation:sbShift 1.15s linear infinite}
-.sb-rail.indet .sb-fill::after{content:"";position:absolute;inset:0;background:linear-gradient(105deg,transparent 18%,rgba(255,255,255,.32) 48%,transparent 72%);transform:translateX(-100%);animation:sbShimmer 1.15s linear infinite;pointer-events:none}
-.sb-rail.apply.indet .sb-fill::after{animation-duration:1s}
-@media (prefers-reduced-motion:reduce){.sb-rail.running.indet::after,.sb-fill.indet,.sb-rail.starting .sb-fill{animation:none}}
-@media (max-width:640px){#ux-progress{padding:11px 12px 10px}.sb-head{align-items:flex-start;flex-direction:column}.sb-badge{min-width:0}#ux-progress .sb-steps{gap:6px}#ux-progress .sb-steps span{height:26px;padding:0 6px;font-size:9px}#ux-progress .sb-steps span.current::after{left:8px}}
-` }));
-
   const Anch = Object.freeze({ start0: 0, preStart: 35, preEnd: 57, postEnd: 67, done: 100 });
   const clamp = (n, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Math.round(n)));
   const POST_DONE_GRACE_MS = 20000;
+  const AGE_REFRESH_MS = 30000;
+  const asEpochSec = (v) => {
+    if (v == null || v === "") return 0;
+    const n = typeof v === "number" ? v : Date.parse(v);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.floor(n > 1e12 ? n / 1000 : n);
+  };
 
   const PhaseAgg = {
     snap: { done: 0, total: 0, started: false, finished: false },
@@ -154,6 +122,9 @@
       this._successExit0Seen = false;
       this._exitCode = null;
       this._hadError = false;
+      this._unresolved = 0;
+      this._finishedAt = 0;
+      this._ageTimer = null;
       this.render();
     }
 
@@ -202,7 +173,9 @@
         _streamArmed: false,
         _successExit0Seen: false,
         _exitCode: null,
-        _hadError: false
+        _hadError: false,
+        _unresolved: 0,
+        _finishedAt: 0
       });
       PhaseAgg.snap = { done: 0, total: 0, started: false, finished: false };
       PhaseAgg.apply = { done: 0, total: 0, started: false, finished: false };
@@ -348,6 +321,11 @@
         if (p === "apply" || p === "sync" || p === "syncing") mapped.post = true;
       }
       const exitCode = sum?.exit_code != null ? Number(sum.exit_code) : null;
+      const unresolved = Number(sum?.unresolved || 0);
+      if (Number.isFinite(unresolved) && unresolved >= 0) this._unresolved = unresolved;
+
+      const finishedAt = asEpochSec(sum?.finished_at);
+      if (finishedAt) this._finishedAt = finishedAt;
 
       if (exitCode != null) {
         if (exitCode === 0) this.success();
@@ -408,6 +386,14 @@
       }
     }
 
+    _trackAge(active) {
+      if (active && !this._ageTimer) this._ageTimer = setInterval(() => this.render(), AGE_REFRESH_MS);
+      else if (!active && this._ageTimer) {
+        clearInterval(this._ageTimer);
+        this._ageTimer = null;
+      }
+    }
+
     _ensureDom() {
       const host = this.el;
       if (!host) return null;
@@ -430,10 +416,15 @@
       phase.append(phaseText);
       meta.append(label, phase);
       headMain.append(meta);
+      const headSide = document.createElement("div");
+      headSide.className = "sb-head-side";
+      const note = document.createElement("div");
+      note.className = "sb-note hide";
       const badge = document.createElement("div");
       badge.className = "sb-badge";
       badge.textContent = "Idle";
-      head.append(headMain, badge);
+      headSide.append(note, badge);
+      head.append(headMain, headSide);
 
       const rail = document.createElement("div");
       rail.className = "sb-rail";
@@ -451,7 +442,7 @@
       });
       rail.append(fill, fly);
       host.append(head, rail, steps);
-      dom = { head, badge, phaseText, rail, fill, fly, steps };
+      dom = { head, badge, phaseText, note, rail, fill, fly, steps };
       this._dom = dom;
       return dom;
     }
@@ -461,7 +452,7 @@
       if (!host) return;
       const dom = this._ensureDom();
       if (!dom) return;
-      const { badge, phaseText: phaseTextEl, rail, fill, fly, steps } = dom;
+      const { badge, phaseText: phaseTextEl, note: noteEl, rail, fill, fly, steps } = dom;
       fly.textContent = this._pairText || "";
 
       const allowDone = !!this._successExit0Seen;
@@ -490,19 +481,32 @@
       const shouldFlow = isRunning && !hardDone;
       const currentStep = hardDone ? "done" : this.timeline.post ? "syncing" : this.timeline.pre ? "discovering" : this.timeline.start ? "start" : "";
       const statusText = this._hadError ? "Error" : hardDone ? "Synced" : this._pendingDone ? "Finalizing" : this.timeline.post ? "Syncing" : this.timeline.pre ? "Discovering" : isRunning ? "Starting" : "Idle";
+      const settled = hardDone || this._hadError;
+      const doneAge = settled && this._finishedAt ? (window.relTimeFromEpoch?.(this._finishedAt) || "") : "";
       const phaseLabel = (this._hadError
         ? `Sync failed${this._exitCode != null ? ` (code ${this._exitCode})` : ""}`
         : hardDone ? "Completed successfully"
         : this._pendingDone ? "Wrapping up final tasks"
         : this.timeline.post ? "Applying changes across enabled features"
         : this.timeline.pre ? "Scanning current state before applying changes"
-        : "Waiting for the next sync run");
+        : "Waiting for the next sync run") + (doneAge ? ` · ${doneAge}` : "");
+      this._trackAge(!!doneAge);
 
       badge.textContent = statusText;
       badge.classList.toggle("running", isRunning && !hardDone && !this._hadError);
       badge.classList.toggle("done", hardDone && !this._hadError);
       badge.classList.toggle("error", this._hadError);
       phaseTextEl.textContent = phaseLabel;
+
+      const unresolved = Number(this._unresolved || 0);
+      const showNote = unresolved > 0 && (hardDone || this._hadError);
+      if (noteEl) {
+        noteEl.classList.toggle("hide", !showNote);
+        if (showNote) {
+          noteEl.textContent = `${unresolved} unresolved`;
+          noteEl.title = `${unresolved} item${unresolved === 1 ? "" : "s"} could not be written to the destination. See the sync log for details.`;
+        }
+      }
 
       rail.classList.toggle("running", isRunning && !this.timeline.done);
       rail.classList.toggle("indet", shouldFlow);

@@ -9,6 +9,20 @@ import os
 import re
 import datetime as _dt
 
+from ._progress_completion import fcfg_for_progress_target
+
+
+def load_feature_state(state_store: Any, feature: str) -> dict[str, Any]:
+    load_features = getattr(state_store, "load_state_features", None)
+    if callable(load_features):
+        state = load_features({feature})
+        return state if isinstance(state, dict) else {}
+    load_all = getattr(state_store, "load_state", None)
+    if callable(load_all):
+        state = load_all()
+        return state if isinstance(state, dict) else {}
+    return {}
+
 
 def _emit_item_failures(emit, provider, feature, pair, keys, key2item, bb_res) -> None:
     try:
@@ -87,7 +101,9 @@ def compute_effective_add(
     verify_after_write,
     provider_skipped,
 ) -> dict[str, Any]:
-    conf = list(confirmed_keys or [])
+    unres = set(still_unresolved or set())
+    skset = set(skipped_keys or set())
+    conf = [k for k in (confirmed_keys or []) if k not in unres and k not in skset]
     pc = int(prov_confirmed or 0)
     if have_exact_keys:
         pc = min(pc or len(conf), len(conf))
@@ -97,8 +113,9 @@ def compute_effective_add(
         eff = 0
     else:
         eff = len(conf) if (verify_after_write or have_exact_keys) else min(pc, len(conf))
+    skipped_success = [k for k in (attempted_keys or []) if k in skset]
     success_keys = conf if (verify_after_write or have_exact_keys) else conf[:eff]
-    skset = set(skipped_keys or set())
+    success_keys = list(dict.fromkeys(list(success_keys) + skipped_success))
     sset = set(success_keys)
     failed_keys = [k for k in (attempted_keys or []) if k not in sset and k not in skset]
     return {
@@ -184,10 +201,15 @@ def select_baseline_keys(success_keys, result) -> list:
 from ..provider_instances import normalize_instance_id
 
 from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
+from ..history_events import history_sync_key, minimal_history_item
 from ..anime_mapping.service import (
     anime_mapping_pair_feature_options as _anime_pair_feature_options,
     config_with_pair_feature_options as _anime_config_with_pair_feature_options,
     enrich_index_for_pair as _anime_enrich_index_for_pair,
+)
+from ..anime_mapping.history_coords import (
+    HistoryCoordinateAliases as _HistoryCoordinateAliases,
+    build_history_coordinate_aliases as _build_history_coordinate_aliases,
 )
 from ._snapshots import (
     build_snapshots_for_feature,
@@ -209,6 +231,7 @@ from ._tombstones import clear_items_for_feature
 
 
 from ._pairs_utils import (
+    config_with_pair_libraries as _config_with_pair_libraries,
     _supports_feature,
     _resolve_flags,
     _health_status,
@@ -221,6 +244,15 @@ from ._pairs_utils import (
 )
 from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_delete
 from ._pairs_blocklist import apply_blocklist
+from ._history_rewatches import (
+    collapse_history_latest,
+    config_with_history_rewatches,
+    filter_history_events,
+    history_event_diff,
+    history_event_present,
+    history_rewatch_pair_enabled,
+    history_rewatches_requested,
+)
 
 # Blackbox imports
 from ._blackbox import load_blackbox_keys, record_attempts, record_success
@@ -378,6 +410,49 @@ def _filter_items_for_dropped_shows(items: list[dict[str, Any]], dropped_tokens:
             continue
         out.append(it)
     return out, removed
+
+
+def _history_upsert_supported(ops: Any, feature: str) -> bool:
+    if str(feature or "").strip().lower() != "history":
+        return False
+    try:
+        caps = ops.capabilities() or {}
+        per = caps.get("history") if isinstance(caps, Mapping) else None
+        if isinstance(per, Mapping):
+            return bool(per.get("upsert"))
+    except Exception:
+        pass
+    return False
+
+
+def _history_watched_at_value(it: Mapping[str, Any] | None) -> Any:
+    if not isinstance(it, Mapping):
+        return None
+    return it.get("watched_at") or it.get("last_watched_at")
+
+
+def _history_watched_at_epoch(it: Mapping[str, Any] | None) -> int | None:
+    raw = _history_watched_at_value(it)
+    if raw in (None, ""):
+        return None
+    try:
+        s = str(raw).strip().replace("Z", "+00:00").replace(" ", "T")
+        dt = _dt.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _history_watched_at_differs(src_item: Mapping[str, Any], dst_item: Mapping[str, Any] | None) -> bool:
+    src_ts = _history_watched_at_epoch(src_item)
+    if src_ts is None:
+        return False
+    dst_ts = _history_watched_at_epoch(dst_item)
+    if dst_ts is None:
+        return True
+    return int(src_ts) != int(dst_ts)
 
 
 def _index_semantics(ops, feature: str, *, cfg: Mapping[str, Any] | None = None, provider: str = "") -> str:
@@ -629,7 +704,7 @@ def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[
     return {k: v for k, v in idx.items() if _keep(v)}
 
 # One-way sync core
-def run_one_way_feature(
+def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     ctx,
     src: str,
     dst: str,
@@ -649,7 +724,8 @@ def run_one_way_feature(
     src_ops = provs.get(src)
     dst_ops = provs.get(dst)
     anime_pair_opts = _anime_pair_feature_options(cfg, fcfg, feature, src, dst, anime_only_default=(dst == "ANILIST"))
-    provider_cfg = _anime_config_with_pair_feature_options(cfg, anime_pair_opts) if "ANILIST" in {src, dst} else cfg
+    provider_cfg = _anime_config_with_pair_feature_options(cfg, anime_pair_opts)
+    provider_cfg = _config_with_pair_libraries(provider_cfg, fcfg, feature, (src, dst))
 
     emit("feature:start", src=src, dst=dst, feature=feature)
 
@@ -689,6 +765,14 @@ def run_one_way_feature(
     include_observed = bool(sync_cfg.get("include_observed_deletes", True))
     if src_down or dst_down:
         include_observed = False
+
+    history_rewatch_requested = history_rewatches_requested(feature, fcfg)
+    history_event_mode = history_rewatch_pair_enabled(feature, fcfg, src, src_ops, dst, dst_ops)
+    if history_event_mode:
+        provider_cfg = config_with_history_rewatches(provider_cfg, True)
+    elif history_rewatch_requested:
+        provider_cfg = config_with_history_rewatches(provider_cfg, False)
+        emit("debug", msg="history.rewatches.disabled", src=src, dst=dst, reason="provider_capability")
 
     def _cap_obsdel(ops) -> bool | None:
         try:
@@ -732,6 +816,8 @@ def run_one_way_feature(
         except Exception:
             pass
 
+    coord_aliases: _HistoryCoordinateAliases = _HistoryCoordinateAliases.disabled()
+
     def _typed_tokens(it: Mapping[str, Any]) -> set[str]:
         typ = str(it.get("type") or "").strip().lower()
         show_ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else {}
@@ -739,9 +825,18 @@ def run_one_way_feature(
         show_ids = dict(show_ids_raw or {})
         ids = dict(ids_raw or {})
 
-        toks: set[str] = set()
+        toks: set[str] = set(coord_aliases.tokens(it))
 
         if typ == "episode":
+            if show_ids:
+                for k in ("tmdb", "imdb", "tvdb", "trakt"):
+                    v = ids.get(k)
+                    if v is None or str(v) == "":
+                        continue
+                    show_v = show_ids.get(k)
+                    if show_v is not None and str(show_v).lower() == str(v).lower():
+                        continue
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
             try:
                 season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
                 episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
@@ -787,6 +882,29 @@ def run_one_way_feature(
 
         return toks
 
+    def _sync_key(it: Mapping[str, Any], fallback_key: str | None = None) -> str:
+        if feature == "history":
+            return history_sync_key(it, fallback_key, event_mode=history_event_mode)
+        return _ck(it) or (str(fallback_key or "").strip())
+
+    def _sync_minimal(it: Mapping[str, Any], fallback_key: str | None = None) -> dict[str, Any]:
+        if feature == "history":
+            return minimal_history_item(it, fallback_key, event_mode=history_event_mode)
+        return _minimal(it)
+
+    def _find_history_event_in_idx(idx: Mapping[str, Any], it: Mapping[str, Any], fallback_key: str | None = None) -> Mapping[str, Any] | None:
+        if feature != "history" or not history_event_mode:
+            return None
+        sk = _sync_key(it, fallback_key)
+        direct = idx.get(sk) if sk else None
+        if isinstance(direct, Mapping):
+            return direct
+        bucket_sec = _history_bucket_sec(src, dst, feature)
+        for dk, dv in (idx or {}).items():
+            if isinstance(dv, Mapping) and history_event_present(it, sk, {str(dk): dv}, _typed_tokens, bucket_sec=bucket_sec):
+                return dv
+        return None
+
     def _show_level_tokens(it: Mapping[str, Any]) -> set[str]:
         ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else it.get("ids")
         ids = ids_raw if isinstance(ids_raw, Mapping) else {}
@@ -829,6 +947,14 @@ def run_one_way_feature(
         if _history_show_present(idx, it):
             return True
         return False
+
+    def _coord_only_present(idx: dict[str, Any], alias: dict[str, str], it: Mapping[str, Any]) -> bool:
+        coord_toks = coord_aliases.tokens(it) if coord_aliases.enabled else set()
+        if not coord_toks or _ck(it) in idx:
+            return False
+        if any(tok in alias for tok in (_typed_tokens(it) - coord_toks)):
+            return False
+        return any(tok in alias for tok in coord_toks)
 
     def _find_in_idx(idx: dict[str, Any], alias: dict[str, str], it: Mapping[str, Any]) -> Mapping[str, Any] | None:
         ck = _ck(it)
@@ -929,7 +1055,7 @@ def run_one_way_feature(
     src_cur = snaps.get(src) or {}
     dst_cur = snaps.get(dst) or {}
 
-    prev_state = ctx.state_store.load_state() or {}
+    prev_state = load_feature_state(ctx.state_store, feature)
     manual_adds, manual_blocks = _manual_policy(prev_state, src, feature)
     prev_provs = (prev_state.get("providers") or {})
 
@@ -1040,14 +1166,39 @@ def run_one_way_feature(
     if bool(anime_pair_opts.get("use_anime_mapping", False)):
         src_before = len(src_idx)
         dst_before = len(dst_full)
-        src_idx = _anime_enrich_index_for_pair(src_idx, provider_cfg, src, dst)
-        dst_full = _anime_enrich_index_for_pair(dst_full, provider_cfg, src, dst)
+        src_stats: dict[str, int] = {}
+        dst_stats: dict[str, int] = {}
+        src_idx = _anime_enrich_index_for_pair(src_idx, provider_cfg, src, dst, stats=src_stats)
+        dst_full = _anime_enrich_index_for_pair(dst_full, provider_cfg, src, dst, stats=dst_stats)
+        if src_stats:
+            dbg("anime_mapping.enrich", feature=feature, side=src, role="source", **src_stats)
+        if dst_stats:
+            dbg("anime_mapping.enrich", feature=feature, side=dst, role="target", **dst_stats)
         if len(src_idx) != src_before or len(dst_full) != dst_before:
             dbg("anime_mapping.rekeyed", feature=feature, src=src, dst=dst, src_items=len(src_idx), dst_items=len(dst_full))
 
+    if feature == "history":
+        src_idx = filter_history_events(src_idx, event_mode=history_event_mode)
+        dst_full = filter_history_events(dst_full, event_mode=history_event_mode)
+        if history_event_mode:
+            prev_src = filter_history_events(prev_src, event_mode=True)
+            prev_dst = filter_history_events(prev_dst, event_mode=True)
+        else:
+            src_idx = collapse_history_latest(src_idx)
+            dst_full = collapse_history_latest(dst_full)
+            prev_src = collapse_history_latest(prev_src)
+            prev_dst = collapse_history_latest(prev_dst)
+
+    coord_aliases = _build_history_coordinate_aliases(cfg, feature, (src_idx, dst_full))
+    if coord_aliases.enabled:
+        dbg("anime_mapping.history_coords", feature=feature, src=src, dst=dst, **coord_aliases.stats())
+
+    dst_canonical: dict[str, Any] = {}
+    if feature == "history" and not history_event_mode:
+        dst_canonical = dict(dst_full)
+
     # Repair sparse destination snapshots using the source index.
-    dst_canonical: dict[str, Any] = dict(dst_full) if feature == "history" else {}
-    if feature in ("history", "ratings", "progress"):
+    if feature in ("history", "ratings", "progress") and not (feature == "history" and history_event_mode):
         try:
             _view_hook = getattr(dst_ops, "destination_comparison_view", None)
             if callable(_view_hook):
@@ -1097,7 +1248,8 @@ def run_one_way_feature(
         except Exception:
             dst_for_src = dict(dst_full or {})
 
-        adds, mirror_removes = diff_progress(src_idx, dst_for_src, fcfg=fcfg)
+        dst_progress_fcfg = fcfg_for_progress_target(fcfg, dst_ops)
+        adds, mirror_removes = diff_progress(src_idx, dst_for_src, fcfg=dst_progress_fcfg)
         
         # Mirror-mode clears for progress:
         if (
@@ -1128,13 +1280,42 @@ def run_one_way_feature(
             src_idx = _merge_manual_adds(src_idx, manual_adds)
 
         # Strip synthetic entries (no watched_at) from src before planning
-        if feature == "history":
+        if feature == "history" and history_event_mode:
+            src_idx = filter_history_events(src_idx, event_mode=True)
+            dst_full = filter_history_events(dst_full, event_mode=True)
+            adds, mirror_removes = history_event_diff(
+                src_idx,
+                dst_full,
+                typed_tokens=_typed_tokens,
+                bucket_sec=_history_bucket_sec(src, dst, feature),
+            )
+        elif feature == "history" and not history_event_mode:
             src_idx = {
                 k: dict(v) for k, v in src_idx.items()
                 if isinstance(v, Mapping) and (v.get("watched_at") or v.get("last_watched_at"))
             }
+            if _history_upsert_supported(dst_ops, feature):
+                history_update_idx = dst_canonical if dst_canonical else dst_full
+                dst_alias_tmp = _alias_index(history_update_idx)
+                seen_history_updates: set[str] = set()
+                manual_history_adds = manual_adds if isinstance(manual_adds, Mapping) else {}
+                for _sk, sv in manual_history_adds.items():
+                    if not isinstance(sv, Mapping):
+                        continue
+                    dv = _find_in_idx(history_update_idx, dst_alias_tmp, sv)
+                    if not isinstance(dv, Mapping):
+                        continue
+                    if not _history_watched_at_differs(sv, dv):
+                        continue
+                    upd = _minimal(sv)
+                    uk = _ck(upd) or _ck(sv) or str(_sk)
+                    if uk and uk in seen_history_updates:
+                        continue
+                    if uk:
+                        seen_history_updates.add(uk)
+                    updates.append(upd)
 
-        bucket_sec = _history_bucket_sec(src, dst, feature)
+        bucket_sec = 0 if (feature == "history" and history_event_mode) else _history_bucket_sec(src, dst, feature)
         if bucket_sec and int(bucket_sec) > 1:
             b = int(bucket_sec)
 
@@ -1197,7 +1378,7 @@ def run_one_way_feature(
                 if toks and any((tok, tsb) in src_tok_ts for tok in toks):
                     continue
                 mirror_removes.append(_minimal(dv))
-        else:
+        elif not (feature == "history" and history_event_mode):
             adds, mirror_removes = diff(src_idx, dst_full)
 
     src_alias = _alias_index(src_idx)
@@ -1207,13 +1388,18 @@ def run_one_way_feature(
         # Progress uses upsert semantics (update resume position)
         if feature not in ("ratings", "history", "progress"):
             adds = [it for it in adds if not _present(dst_full, dst_alias, it)]
-        elif feature == "history":
+        elif feature == "history" and not history_event_mode:
             pruned: list[dict[str, Any]] = []
+            coord_pruned = 0
             for it in adds:
                 ck = _ck(it) or ""
                 if ck and _history_ts_from_key(ck) is None and _present(dst_full, dst_alias, it):
+                    if _coord_only_present(dst_full, dst_alias, it):
+                        coord_pruned += 1
                     continue
                 pruned.append(it)
+            if coord_pruned:
+                dbg("anime_mapping.coord_pruned", feature=feature, src=src, dst=dst, adds=coord_pruned)
             adds = pruned
 
     removes: list[dict[str, Any]] = []
@@ -1226,13 +1412,21 @@ def run_one_way_feature(
         src_obs = dict(src_cur or {})
         if manual_adds:
             src_obs = _merge_manual_adds(src_obs, manual_adds)
+        if feature == "history":
+            src_obs = filter_history_events(src_obs, event_mode=history_event_mode)
+            if not history_event_mode:
+                src_obs = collapse_history_latest(src_obs)
         src_obs_alias = _alias_index(src_obs)
 
         observed: list[Mapping[str, Any]] = []
-        for it in (prev_src or {}).values():
+        for pk, it in (prev_src or {}).items():
             if not isinstance(it, Mapping):
                 continue
-            if not _present(src_obs, src_obs_alias, it):
+            if feature == "history" and history_event_mode:
+                if _find_history_event_in_idx(src_obs, it, str(pk)):
+                    continue
+                observed.append(it)
+            elif not _present(src_obs, src_obs_alias, it):
                 observed.append(it)
 
         if not observed:
@@ -1240,15 +1434,15 @@ def run_one_way_feature(
 
         seen: set[str] = set()
         for it in observed:
-            dv = _find_in_idx(dst_full, dst_alias, it)
+            dv = _find_history_event_in_idx(dst_full, it) if (feature == "history" and history_event_mode) else _find_in_idx(dst_full, dst_alias, it)
             if not dv:
                 continue
-            rk = _ck(dv) or _ck(it)
+            rk = _sync_key(dv) or _sync_key(it)
             if rk and rk in seen:
                 continue
             if rk:
                 seen.add(rk)
-            observed_removes.append(_minimal(dv))
+            observed_removes.append(_sync_minimal(dv))
 
         return observed_removes
 
@@ -1263,16 +1457,21 @@ def run_one_way_feature(
         elif remove_mode == "mirror":
             removes = list(mirror_removes or [])
             if removes:
-                removes = [it for it in removes if not _present(src_idx, src_alias, it)]
-                try:
-                    removes = [it for it in removes if _ck(it) in prev_dst]
-                except Exception:
-                    pass
+                if feature == "history" and history_event_mode:
+                    removes = [it for it in removes if not _find_history_event_in_idx(src_idx, it)]
+                    if prev_dst:
+                        removes = [it for it in removes if _find_history_event_in_idx(prev_dst, it)]
+                else:
+                    removes = [it for it in removes if not _present(src_idx, src_alias, it)]
+                    try:
+                        removes = [it for it in removes if _ck(it) in prev_dst]
+                    except Exception:
+                        pass
         else:
             removes = _observed_source_removes()
 
         if not dst_suspect:
-            planned = {k for k in (_ck(it) for it in removes) if k}
+            planned = {k for k in (_sync_key(it) for it in removes) if k}
             retry_removes: list[dict[str, Any]] = []
             stale_pending: list[str] = []
             try:
@@ -1286,20 +1485,22 @@ def run_one_way_feature(
                 key = str(rec.get("key") or "")
                 if not isinstance(item, Mapping):
                     continue
-                if _present(src_idx, src_alias, item):
+                if (feature == "history" and history_event_mode and _find_history_event_in_idx(src_idx, item)) or (
+                    not (feature == "history" and history_event_mode) and _present(src_idx, src_alias, item)
+                ):
                     if key:
                         stale_pending.append(key)
                     continue
-                dv = _find_in_idx(dst_full, dst_alias, item)
+                dv = _find_history_event_in_idx(dst_full, item) if (feature == "history" and history_event_mode) else _find_in_idx(dst_full, dst_alias, item)
                 if not dv:
                     if key:
                         stale_pending.append(key)
                     continue
-                rk = _ck(dv) or _ck(item)
+                rk = _sync_key(dv) or _sync_key(item)
                 if not rk or rk in planned:
                     continue
                 planned.add(rk)
-                retry_removes.append(_minimal(dv))
+                retry_removes.append(_sync_minimal(dv))
             if stale_pending and not bool(ctx.dry_run or sync_cfg.get("dry_run", False)):
                 try:
                     clear_unresolved(dst, feature, stale_pending)
@@ -1368,7 +1569,7 @@ def run_one_way_feature(
 
     if unresolved_known:
         try:
-            retried = sum(1 for it in adds if _ck(it) in unresolved_known) + sum(1 for it in updates if _ck(it) in unresolved_known)
+            retried = sum(1 for it in adds if _sync_key(it) in unresolved_known) + sum(1 for it in updates if _sync_key(it) in unresolved_known)
         except Exception:
             retried = 0
         if retried:
@@ -1384,20 +1585,20 @@ def run_one_way_feature(
 
     guard = PhantomGuard(src, dst, feature, ttl_days=ttl_days, enabled=use_phantoms)
     if use_phantoms and adds:
-        adds, _blocked = guard.filter_adds(adds, _ck, _minimal, emit, ctx.state_store, pair_key)
+        adds, _blocked = guard.filter_adds(adds, _sync_key, _sync_minimal, emit, ctx.state_store, pair_key)
 
     attempted_keys: list[str] = []
     key2item: dict[str, Any] = {}
     seen: set[str] = set()
 
     for it in adds:
-        k = _ck(it)
+        k = _sync_key(it)
         if not k:
             continue
         if k not in seen:
             attempted_keys.append(k)
             seen.add(k)
-        key2item.setdefault(k, _minimal(it))
+        key2item.setdefault(k, _sync_minimal(it))
 
     add_attempted_raw = len(adds)
     add_attempted_unique = len(attempted_keys)
@@ -1545,7 +1746,7 @@ def run_one_way_feature(
 
             skipped_keys_set: set[str] = set(prov_skipped_keys)
 
-            have_exact_keys = bool(prov_confirmed_keys)
+            have_exact_keys = bool(prov_confirmed_keys or prov_skipped_keys)
             if have_exact_keys:
                 attempted_set = set(attempted_keys)
                 confirmed_keys = [k for k in prov_confirmed_keys if k in attempted_set]
@@ -1588,6 +1789,7 @@ def run_one_way_feature(
             )
             prov_confirmed = _decision["prov_confirmed"]
             added_effective = _decision["effective"]
+            added_provider_reported = prov_confirmed
             ambiguous_partial = _decision["ambiguous_partial"]
             success_keys = _decision["success_keys"]
             failed_keys = _decision["failed_keys"]
@@ -1608,7 +1810,7 @@ def run_one_way_feature(
                     skip_basis=str(res_add.get("skip_basis") or "provider_keys"),
                 )
             try:
-                if failed_keys and not ambiguous_partial:
+                if failed_keys and not ambiguous_partial and not dry_run_flag:
                     _bb = record_attempts(dst, feature, failed_keys, reason="apply:add:failed", op="add",
                         pair=pair_key, cfg=cfg)
                     promoted_keys = {str(x) for x in ((_bb or {}).get("promoted_keys") or []) if x}
@@ -1621,9 +1823,10 @@ def run_one_way_feature(
                         
                     _emit_item_failures(emit, dst, feature, pair_key, failed_keys, key2item, _bb)
                             
-                if success_keys and not ambiguous_partial:
+                if success_keys and not ambiguous_partial and not dry_run_flag:
                     record_success(dst, feature, success_keys, pair=pair_key, cfg=cfg)
                     clear_unresolved(dst, feature, success_keys)
+                    unresolved_new_total = max(0, unresolved_new_total - len(set(success_keys) & set(still_unresolved)))
                     resolved_keys = [k for k in success_keys if k in unresolved_before]
                     if resolved_keys:
                         _emit_item_resolutions(emit, dst, feature, pair_key, resolved_keys, key2item)
@@ -1634,7 +1837,7 @@ def run_one_way_feature(
                         [key2item[k] for k in success_keys if k in key2item],
                         pair=pair_key,
                     )
-                if use_phantoms and guard and success_keys and not ambiguous_partial:
+                if use_phantoms and guard and success_keys and not ambiguous_partial and not dry_run_flag:
                     guard.record_success(success_keys)
             except Exception:
                 pass
@@ -1643,7 +1846,7 @@ def run_one_way_feature(
             if baseline_writes and not dry_run_flag:
                 for dk, item in baseline_writes:
                     dst_full[dk] = item
-                    if feature == "history":
+                    if feature == "history" and not history_event_mode:
                         dst_canonical[dk] = item
                 _bust_snapshot(dst)
             post_apply_add_res = add_res
@@ -1655,9 +1858,9 @@ def run_one_way_feature(
     if removes:
         try:
             for it in removes:
-                k = _ck(_minimal(it))
+                k = _sync_key(_sync_minimal(it))
                 if k:
-                    rem_key2item.setdefault(k, it)
+                    rem_key2item.setdefault(k, _sync_minimal(it))
             rem_keys_attempted = list(rem_key2item.keys())
         except Exception:
             rem_keys_attempted = []
@@ -1721,6 +1924,8 @@ def run_one_way_feature(
                             continue
                         try:
                             removed_tokens.add(k)
+                            if feature == "history" and history_event_mode:
+                                continue
                             ids = (it.get("ids") or {})
                             for idk, idv in (ids or {}).items():
                                 if idv is None or str(idv) == "":
@@ -1741,7 +1946,7 @@ def run_one_way_feature(
                 for k in rem_success_keys:
                     if k in dst_full:
                         dst_full.pop(k, None)
-                if feature == "history":
+                if feature == "history" and not history_event_mode:
                     dest_removed = [str(x) for x in ((rem_res or {}).get("removed_destination_keys") or []) if x]
                     for dk in dest_removed:
                         dst_canonical.pop(dk, None)
@@ -1785,7 +1990,7 @@ def run_one_way_feature(
                 if rk not in dst_full:
                     base_update += 1
                 dst_full[rk] = rv
-                if feature == "history":
+                if feature == "history" and not history_event_mode:
                     dst_canonical[rk] = rv
         tk = str(os.environ.get("CW_PLEX_TRACE_KEY", "") or "").strip().lower()
         contains_trace = bool(tk) and any(str(k).split("@", 1)[0].lower() == tk for k in (refreshed or {}))
@@ -1793,109 +1998,113 @@ def run_one_way_feature(
              refreshed_count=len(refreshed or {}), first_keys=list(refreshed or {})[:10],
              contains_trace_key=contains_trace, baseline_update_count=base_update)
 
-    try:
-        st = ctx.state_store.load_state() or {}
-        provs_block = st.setdefault("providers", {})
+    if getattr(ctx, "write_state_json", True):
+        try:
+            provs_block: dict[str, Any] = {}
 
-        def _ensure_pf(pmap, prov, inst, feat):
-            pprov = pmap.setdefault(prov, {})
-            if inst != "default":
-                insts = pprov.setdefault("instances", {})
-                pprov = insts.setdefault(inst, {})
-            return pprov.setdefault(feat, {"baseline": {"items": {}}, "checkpoint": None})
-
-        def _commit_baseline(pmap, prov, inst, feat, items):
-            pf = _ensure_pf(pmap, prov, inst, feat)
-            pkey = _PROVIDER_KEY_MAP.get(str(prov or "").upper(), str(prov or "").strip().lower())
-
-            kept: dict[str, Any] = {}
-            for k, v in (items or {}).items():
-                if not isinstance(v, Mapping):
-                    continue
-
-                if v.get("_cw_persist") is False or v.get("_cw_transient") is True or v.get("_cw_skip_persist") is True:
-                    continue
-
-                pobj = v.get(pkey)
-                if isinstance(pobj, Mapping) and pobj.get("ignored") is True:
-                    continue
-
-                mv = _minimal(v)
+            def _ensure_pf(pmap, prov, inst, feat):
+                pprov = pmap.setdefault(prov, {})
                 if inst != "default":
-                    mv["_cw_instance"] = inst
-                kept[str(k)] = mv
+                    insts = pprov.setdefault("instances", {})
+                    pprov = insts.setdefault(inst, {})
+                return pprov.setdefault(feat, {"baseline": {"items": {}}, "checkpoint": None})
 
-            pf["baseline"] = {"items": kept}
+            def _commit_baseline(pmap, prov, inst, feat, items):
+                pf = _ensure_pf(pmap, prov, inst, feat)
+                pkey = _PROVIDER_KEY_MAP.get(str(prov or "").upper(), str(prov or "").strip().lower())
 
-        def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
-            out = dict(base or {})
-            for k, v in (extra or {}).items():
-                if k in ("ids", "show_ids"):
-                    continue
-                if out.get(k) in (None, "") and v not in (None, ""):
-                    out[k] = v
+                kept: dict[str, Any] = {}
+                for k, v in (items or {}).items():
+                    if not isinstance(v, Mapping):
+                        continue
 
-            for fld in ("ids", "show_ids"):
-                b = out.get(fld) if isinstance(out.get(fld), Mapping) else {}
-                e = extra.get(fld) if isinstance(extra.get(fld), Mapping) else {}
-                if b or e:
-                    merged: dict[str, Any] = dict(b or {})
-                    for kk, vv in (e or {}).items():
-                        if merged.get(kk) in (None, "") and vv not in (None, ""):
-                            merged[kk] = vv
-                    if merged:
-                        out[fld] = merged
+                    if v.get("_cw_persist") is False or v.get("_cw_transient") is True or v.get("_cw_skip_persist") is True:
+                        continue
 
-            if feature == "history":
-                a0 = out.get("watched_at")
-                b0 = extra.get("watched_at")
-                if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
-                    out["watched_at"] = b0
-            elif feature == "ratings":
-                a0 = out.get("rated_at")
-                b0 = extra.get("rated_at")
-                if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
-                    out["rated_at"] = b0
-            elif feature == "progress":
-                a0 = out.get("progress_at")
-                b0 = extra.get("progress_at")
-                if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
-                    out["progress_at"] = b0
-            return out
+                    pobj = v.get(pkey)
+                    if isinstance(pobj, Mapping) and pobj.get("ignored") is True:
+                        continue
+
+                    mv = _sync_minimal(v, str(k))
+                    if inst != "default":
+                        mv["_cw_instance"] = inst
+                    kept[str(k)] = mv
+
+                pf["baseline"] = {"items": kept}
+
+            def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+                out = dict(base or {})
+                for k, v in (extra or {}).items():
+                    if k in ("ids", "show_ids"):
+                        continue
+                    if out.get(k) in (None, "") and v not in (None, ""):
+                        out[k] = v
+
+                for fld in ("ids", "show_ids"):
+                    b = out.get(fld) if isinstance(out.get(fld), Mapping) else {}
+                    e = extra.get(fld) if isinstance(extra.get(fld), Mapping) else {}
+                    if b or e:
+                        merged: dict[str, Any] = dict(b or {})
+                        for kk, vv in (e or {}).items():
+                            if merged.get(kk) in (None, "") and vv not in (None, ""):
+                                merged[kk] = vv
+                        if merged:
+                            out[fld] = merged
+
+                if feature == "history":
+                    a0 = out.get("watched_at")
+                    b0 = extra.get("watched_at")
+                    if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
+                        out["watched_at"] = b0
+                elif feature == "ratings":
+                    a0 = out.get("rated_at")
+                    b0 = extra.get("rated_at")
+                    if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
+                        out["rated_at"] = b0
+                elif feature == "progress":
+                    a0 = out.get("progress_at")
+                    b0 = extra.get("progress_at")
+                    if isinstance(b0, str) and b0 and (not isinstance(a0, str) or not a0 or b0 > a0):
+                        out["progress_at"] = b0
+                return out
 
 
-        def _commit_checkpoint(pmap, prov, inst, feat, chk):
-            if not chk:
-                return
-            pf = _ensure_pf(pmap, prov, inst, feat)
-            pf["checkpoint"] = chk
+            def _commit_checkpoint(pmap, prov, inst, feat, chk):
+                if not chk:
+                    return
+                pf = _ensure_pf(pmap, prov, inst, feat)
+                pf["checkpoint"] = chk
 
-        def _rekey_state_to_src_keyspace(idx0: dict[str, Any], src_idx0: dict[str, Any]) -> dict[str, Any]:
-            return _rekey_index_to_match_other_keys(
-                idx0,
-                src_idx0,
-                typed_tokens=_typed_tokens,
-                merge_payload=_merge_payload,
-            )
+            def _rekey_state_to_src_keyspace(idx0: dict[str, Any], src_idx0: dict[str, Any]) -> dict[str, Any]:
+                return _rekey_index_to_match_other_keys(
+                    idx0,
+                    src_idx0,
+                    typed_tokens=_typed_tokens,
+                    merge_payload=_merge_payload,
+                )
 
-        if feature in ("ratings", "progress"):
-            dst_full = _rekey_state_to_src_keyspace(dst_full, src_idx)
+            if feature in ("ratings", "progress"):
+                dst_full = _rekey_state_to_src_keyspace(dst_full, src_idx)
 
-        dst_commit = dst_canonical if feature == "history" else dst_full
-        if feature == "history" and len(dst_commit) != len(dst_full):
-            dbg("baseline.provider_native", feature=feature, dst=dst,
-                canonical=len(dst_commit), comparison=len(dst_full))
+            dst_commit = dst_full if (feature == "history" and history_event_mode) else (dst_canonical if feature == "history" else dst_full)
+            if feature == "history" and len(dst_commit) != len(dst_full):
+                dbg("baseline.provider_native", feature=feature, dst=dst,
+                    canonical=len(dst_commit), comparison=len(dst_full))
 
-        _commit_baseline(provs_block, src, src_inst, feature, src_idx)
-        _commit_baseline(provs_block, dst, dst_inst, feature, dst_commit)
-        _commit_checkpoint(provs_block, src, src_inst, feature, now_cp_src)
-        _commit_checkpoint(provs_block, dst, dst_inst, feature, now_cp_dst)
+            _commit_baseline(provs_block, src, src_inst, feature, src_idx)
+            _commit_baseline(provs_block, dst, dst_inst, feature, dst_commit)
+            _commit_checkpoint(provs_block, src, src_inst, feature, now_cp_src)
+            _commit_checkpoint(provs_block, dst, dst_inst, feature, now_cp_dst)
 
-        import time as _t
-        st["last_sync_epoch"] = int(_t.time())
-        ctx.state_store.save_state(st)
-    except Exception:
-        pass
+            import time as _t
+            last_sync_epoch = int(_t.time())
+            blocks = {
+                (str(src).upper(), str(src_inst or "default"), str(feature).lower()): _ensure_pf(provs_block, src, src_inst, feature),
+                (str(dst).upper(), str(dst_inst or "default"), str(feature).lower()): _ensure_pf(provs_block, dst, dst_inst, feature),
+            }
+            ctx.state_store.save_feature_blocks(blocks, last_sync_epoch=last_sync_epoch)
+        except Exception:
+            pass
 
     emit("feature:done", src=src, dst=dst, feature=feature)
 

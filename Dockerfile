@@ -36,6 +36,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # nonroot ownership (the runtime stage has no shell to chown).
 RUN mkdir -p /config-skel
 
+# Version stamp copied into the shell-less runtime stage as /app/VERSION.
+ARG APP_VERSION=dev
+RUN printf '%s' "${APP_VERSION}" > /VERSION && chmod 0444 /VERSION
+
 # =====================================================================
 # Runtime: the hardened DHI image has no shell, no package manager, and
 # runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
@@ -89,6 +93,10 @@ COPY . /app
 # inherit this ownership on first use; bind mounts must be chowned on the
 # host to the nonroot UID, since this image cannot remap UIDs at runtime.
 COPY --chown=nonroot:nonroot --from=builder /config-skel/ /config/
+
+# Version stamp read by api/versionAPI.py; baked in the builder stage
+# because this stage has no shell to run printf.
+COPY --from=builder /VERSION /app/VERSION
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD ["python","-c","import os,socket,sys; s=socket.socket(); s.settimeout(2); p=int(os.environ.get('WEB_PORT','8787')); sys.exit(0 if s.connect_ex(('127.0.0.1',p))==0 else 1)"]

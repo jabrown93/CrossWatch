@@ -30,6 +30,23 @@ def _strong_keys(item: Mapping[str, Any]) -> set[str]:
                 out.add(t)
         return out
 
+    show_ids: Mapping[str, Any] = {}
+    show_ids_raw = item.get("show_ids")
+    if isinstance(show_ids_raw, Mapping) and show_ids_raw:
+        show_ids = coalesce_ids(show_ids_raw) or {}
+
+    if typ == "episode" and show_ids:
+        for k in _STRONG_ID_KEYS:
+            own = ids.get(k)
+            if own is None or str(own).strip() == "":
+                continue
+            show = show_ids.get(k)
+            if show is not None and str(show).strip().lower() == str(own).strip().lower():
+                continue
+            t = _tok(k, own)
+            if t:
+                out.add(t)
+
     s = item.get("season") if item.get("season") is not None else item.get("season_number")
     e = item.get("episode") if item.get("episode") is not None else item.get("episode_number")
     try:
@@ -55,10 +72,7 @@ def _strong_keys(item: Mapping[str, Any]) -> set[str]:
                 out.add(t)
         return out
 
-    source_ids: Mapping[str, Any] = ids
-    show_ids_raw = item.get("show_ids")
-    if isinstance(show_ids_raw, Mapping) and show_ids_raw:
-        source_ids = coalesce_ids(show_ids_raw) or ids
+    source_ids: Mapping[str, Any] = show_ids or ids
 
     for k in _STRONG_ID_KEYS:
         t = _tok(k, source_ids.get(k))
@@ -225,6 +239,11 @@ def diff_progress(
     min_seconds = int(cfg.get("min_seconds") or cfg.get("minSeconds") or 60)
     delta_seconds = int(cfg.get("delta_seconds") or cfg.get("deltaSeconds") or 30)
     max_percent = float(cfg.get("max_percent") or cfg.get("maxPercent") or 95)
+    max_percent_min_duration_seconds = int(
+        cfg.get("max_percent_min_duration_seconds")
+        or cfg.get("maxPercentMinDurationSeconds")
+        or 0
+    )
 
     def _as_int(v: Any) -> int | None:
         try:
@@ -305,6 +324,16 @@ def diff_progress(
         except Exception:
             return None
 
+    def _at_completion_cutoff(percent: float | None, it: Mapping[str, Any]) -> bool:
+        if percent is None or percent < max_percent:
+            return False
+        if max_percent_min_duration_seconds <= 0:
+            return True
+        dur = _duration_ms(it)
+        if dur is None:
+            return True
+        return dur >= max_percent_min_duration_seconds * 1000
+
     def _pack_progress(it: Mapping[str, Any]) -> dict[str, Any]:
         base = minimal(it)
         pm = _progress_ms(it)
@@ -339,7 +368,7 @@ def diff_progress(
             continue
         s_dur = _duration_ms(s_it)
         p = _pct(s_ms, s_dur) if s_ms is not None else s_percent
-        if p is not None and p >= max_percent:
+        if _at_completion_cutoff(p, s_it):
             # Near completion: let history sync handle the played state.
             continue
 

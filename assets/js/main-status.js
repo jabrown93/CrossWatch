@@ -24,6 +24,33 @@
   let authRetry = 0;
   let dots = null;
 
+  function providerStatusInstance(data) {
+    const probe = data?._cw_probe && typeof data._cw_probe === "object" ? data._cw_probe : null;
+    const summary = data?.instances_summary && typeof data.instances_summary === "object" ? data.instances_summary : null;
+    return txt(probe?.instance || data?.instance || data?.instance_id || data?.rep_instance || summary?.rep || "default") || "default";
+  }
+
+  async function openProviderConnection(key, instance = "default") {
+    const prov = up(key);
+    if (!prov) return;
+    if (typeof meta.sectionId === "function" && !meta.sectionId(prov)) return;
+    try { localStorage.setItem(`cw.ui.${prov.toLowerCase()}.auth.instance.v1`, txt(instance) || "default"); } catch {}
+    try {
+      window.__cwSettingsPane = "providers";
+      await window.showTab?.("settings");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      window.cwSettingsSelect?.("providers");
+      let opener = window.CW?.ProvidersUI?.openAuthProviderForm || window.openAuthProviderForm;
+      for (let i = 0; !opener && i < 20; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        opener = window.CW?.ProvidersUI?.openAuthProviderForm || window.openAuthProviderForm;
+      }
+      await opener?.(prov);
+    } catch (e) {
+      console.warn("open provider connection failed", e);
+    }
+  }
+
   function activeTab() {
     return String(
       document.documentElement?.dataset?.tab || document.body?.dataset?.tab || "main"
@@ -49,46 +76,89 @@
     try { delete window._cfgCache; } catch {}
   };
 
-  function isProviderConfigured(key, cfg = getCachedConfig()) {
+  function configuredProviderSet(cfg = getCachedConfig()) {
     try {
       if (typeof window.getConfiguredProviders === "function") {
-        return window.getConfiguredProviders(cfg).has(up(key));
+        const set = window.getConfiguredProviders(cfg);
+        if (set && typeof set.has === "function") return set;
       }
     } catch {}
-    return false;
+    return new Set();
   }
 
-  function ensureDot(head) {
-    const existing = head.querySelector(".auth-dot");
-    if (existing) return existing;
-    if (getComputedStyle(head).display !== "flex") {
-      Object.assign(head.style, { display: "flex", alignItems: "center" });
-    }
+  function isProviderConfigured(key, cfg = getCachedConfig(), configured = null) {
+    return (configured || configuredProviderSet(cfg)).has(up(key));
+  }
+
+  function isManagedUser() {
+    const auth = window.CW?.AuthState?.read?.();
+    if (auth && typeof auth === "object") return !!auth.isManaged;
+    return document.documentElement?.dataset?.cwRole === "user";
+  }
+
+  function overviewProfileScope() {
+    const profile = window.CW?.OverviewProfile;
+    return String(profile?.id || "").trim() ? profile : null;
+  }
+
+  function matchesOverviewProfile(key, data) {
+    const profile = overviewProfileScope();
+    if (!profile) return true;
+    const instances = data?.instances && typeof data.instances === "object" ? Object.keys(data.instances) : [];
+    if (!instances.length) return profile.matchesEndpoint(key, "default");
+    return instances.some((instance) => profile.matchesEndpoint(key, instance));
+  }
+
+  function isStatusProviderVisible(key, data, cfg = getCachedConfig(), configured = null) {
+    if (!data || typeof data !== "object") return false;
+    if (!matchesOverviewProfile(key, data)) return false;
+    const set = configured || configuredProviderSet(cfg);
+    const managed = isManagedUser();
+    if (!managed && !isProviderConfigured(key, cfg, set)) return false;
+    const instances = data.instances && typeof data.instances === "object" ? data.instances : null;
+    const summary = data.instances_summary && typeof data.instances_summary === "object" ? data.instances_summary : null;
+    if (!!(instances && Object.keys(instances).length) || Number(summary?.total || 0) > 0) return true;
+    return isProviderConfigured(key, cfg, set);
+  }
+
+  function createDot(head, needsFlex) {
+    if (needsFlex) Object.assign(head.style, { display: "flex", alignItems: "center" });
     return head.appendChild(
       Object.assign(document.createElement("span"), { className: "auth-dot" })
     );
   }
 
-  function setDot(id, on) {
-    const sec = $(id);
-    const head = sec?.querySelector(".head") || sec?.firstElementChild;
-    if (!head) return false;
-    const dot = ensureDot(head);
-    const want = !!on;
+  function readDotTargets() {
+    const out = [];
+    AUTH_MAP.forEach(([id, key]) => {
+      const sec = $(id);
+      const head = sec?.querySelector(".head") || sec?.firstElementChild;
+      if (!head) return;
+      const dot = head.querySelector(".auth-dot");
+      out.push({ key, head, dot, needsFlex: dot ? false : getComputedStyle(head).display !== "flex" });
+    });
+    return out;
+  }
+
+  function writeDot(target, want) {
+    const dot = target.dot || createDot(target.head, target.needsFlex);
     const state = want ? "1" : "0";
-    if (dot.dataset.on === state) return true;
+    if (dot.dataset.on === state) return;
     dot.dataset.on = state;
     dot.classList.toggle("on", want);
     dot.title = want ? "Configured" : "Not configured";
     dot.setAttribute("aria-label", dot.title);
-    return true;
   }
 
   function applyAuthDots(cfg) {
     if (cfg && typeof cfg === "object") {
       try { window._cfgCache = cfg; } catch {}
     }
-    return AUTH_MAP.reduce((any, [id, key]) => setDot(id, isProviderConfigured(key, cfg)) || any, false);
+    const targets = readDotTargets();
+    if (!targets.length) return false;
+    const configured = configuredProviderSet(cfg);
+    targets.forEach((target) => writeDot(target, configured.has(up(target.key))));
+    return true;
   }
 
   async function refreshAuthDots(force = false) {
@@ -226,29 +296,34 @@
       case "PLEX":
         return {
           vip: !!(data?.plexpass || data?.subscription?.plan),
-          detail: data?.subscription?.plan ? `Plex Pass - ${data.subscription.plan}` : "",
+          detail: data?.subscription?.plan ? `Plan: ${titleCase(data.subscription.plan)}` : (data?.plexpass ? "Plan: Plex Pass" : ""),
         };
       case "TRAKT":
-        return { vip: !!data?.vip, detail: data?.vip ? "VIP status" : "Free account" };
+        return { vip: !!data?.vip, detail: data?.vip ? "Plan: VIP" : "Plan: Free" };
       case "SIMKL": {
         const plan = txt(data?.account_type || data?.plan_type || data?.account?.type).toLowerCase();
         const premium = plan === "pro" || plan === "vip";
         const label = plan ? (plan === "vip" ? "VIP" : titleCase(plan)) : "";
-        return { vip: premium, detail: label ? `SIMKL plan: ${label}` : "" };
+        return { vip: premium, detail: label ? `Plan: ${label}` : "" };
       }
       case "EMBY":
-        return { vip: !!data?.premiere, detail: data?.premiere ? "Premiere active" : "" };
-      case "MDBLIST":
-        return { vip: !!data?.vip, detail: "" };
+        return { vip: !!data?.premiere, detail: data?.premiere ? "Plan: Premiere" : "" };
+      case "MDBLIST": {
+        const plan = txt(data?.vip_type || data?.patron_status || (data?.vip ? "VIP" : ""));
+        return { vip: !!data?.vip, detail: plan ? `Plan: ${titleCase(plan.replace(/^active[_ -]/i, ""))}` : "" };
+      }
+      case "CROSSWATCH":
+        return { vip: true, detail: ["Plan: VIP", txt(data?.vip_text) || "You've earned it"].join("\n") };
       default:
         return { vip: false, detail: "" };
     }
   }
 
-  function updateConn(wrap, { name, connected, vip, detail, key }) {
+  function updateConn(wrap, { name, connected, vip, detail, key, instance }) {
     const pill = wrap?.querySelector?.(".conn-pill");
     if (!pill) return;
     const provKey = up(key || name);
+    const inst = txt(instance) || "default";
     const dot = pill.querySelector(".dot");
     const brand = pill.querySelector(".conn-brand");
     const hasSlot = !!pill.querySelector(".conn-slot");
@@ -264,11 +339,17 @@
     if (dot && dot.parentElement !== visual) visual.appendChild(dot);
 
     wrap.dataset.prov = provKey;
+    wrap.dataset.providerKey = provKey;
+    wrap.dataset.providerInstance = inst;
     pill.dataset.prov = provKey;
+    pill.dataset.providerKey = provKey;
+    pill.dataset.providerInstance = inst;
     pill.classList.toggle("ok", !!connected);
     pill.classList.toggle("no", !connected);
     pill.classList.toggle("has-vip", !!vip);
-    pill.ariaLabel = `${name} ${connected ? "connected" : "disconnected"}`;
+    pill.role = "button";
+    pill.tabIndex = 0;
+    pill.ariaLabel = `Open ${name} connection settings`;
     if (detail) pill.title = detail;
     else pill.removeAttribute("title");
     const logoSrc = providerLogo(provKey);
@@ -285,15 +366,22 @@
     }
   }
 
-  function makeConn({ name, connected, vip, detail, key }) {
+  function makeConn({ name, connected, vip, detail, key, instance }) {
     const wrap = document.createElement("div");
     const pill = document.createElement("div");
+    const provKey = up(key || name);
+    const inst = txt(instance) || "default";
     wrap.className = "conn-item";
-    wrap.dataset.prov = up(key || name);
+    wrap.dataset.prov = provKey;
+    wrap.dataset.providerKey = provKey;
+    wrap.dataset.providerInstance = inst;
     pill.className = `conn-pill ${connected ? "ok" : "no"}${vip ? " has-vip" : ""}`;
-    pill.dataset.prov = up(key || name);
-    pill.role = "status";
-    pill.ariaLabel = `${name} ${connected ? "connected" : "disconnected"}`;
+    pill.dataset.prov = provKey;
+    pill.dataset.providerKey = provKey;
+    pill.dataset.providerInstance = inst;
+    pill.role = "button";
+    pill.tabIndex = 0;
+    pill.ariaLabel = `Open ${name} connection settings`;
     if (detail) pill.title = detail;
     pill.innerHTML = `<div class="conn-brand">${
       vip ? `<span class="conn-slot">${CROWN}</span>` : ""
@@ -301,7 +389,7 @@
       connected ? "ok" : "no"
     }" aria-hidden="true"></span></span>`;
     wrap.appendChild(pill);
-    updateConn(wrap, { name, connected, vip, detail, key });
+    updateConn(wrap, { name, connected, vip, detail, key, instance: inst });
     return wrap;
   }
 
@@ -324,7 +412,8 @@
     host.classList.add("vip-badges");
     if (btn && host.contains(btn)) host.removeChild(btn);
 
-    const keys = Object.keys(providers).filter((k) => isProviderConfigured(k, cfg)).sort();
+    const configured = configuredProviderSet(cfg);
+    const keys = Object.keys(providers).filter((k) => isStatusProviderVisible(k, providers[k], cfg, configured)).sort();
     const none = !keys.length;
     host.classList.toggle("hidden", none);
     if (none) {
@@ -355,9 +444,10 @@
           usageDetail(data),
         ].filter(Boolean).join("\n");
         const provKey = up(key);
+        const instance = providerStatusInstance(data);
         const existing = existingByKey.get(provKey);
-        const item = existing || makeConn({ name, connected: !!data.connected, vip: meta.vip, detail, key });
-        updateConn(item, { name, connected: !!data.connected, vip: meta.vip, detail, key });
+        const item = existing || makeConn({ name, connected: !!data.connected, vip: meta.vip, detail, key, instance });
+        updateConn(item, { name, connected: !!data.connected, vip: meta.vip, detail, key, instance });
         return item;
       });
     placeConnItems(host, items);
@@ -383,6 +473,24 @@
     btn.addEventListener("click", (e) => window.manualRefreshStatus?.(e));
   }
 
+  function bindProviderOpeners() {
+    const host = $("conn-badges");
+    if (!host || host.dataset.boundProviderOpen === "1") return;
+    host.dataset.boundProviderOpen = "1";
+    const openFrom = (node) => openProviderConnection(node?.dataset?.providerKey || node?.dataset?.prov, node?.dataset?.providerInstance || "default");
+    host.addEventListener("click", (ev) => {
+      const node = ev.target?.closest?.(".conn-pill[data-provider-key],.conn-item[data-provider-key]");
+      if (node && host.contains(node)) openFrom(node);
+    });
+    host.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const node = ev.target?.closest?.(".conn-pill[data-provider-key],.conn-item[data-provider-key]");
+      if (!node || !host.contains(node)) return;
+      ev.preventDefault();
+      openFrom(node);
+    });
+  }
+
   function makeDotsController() {
     const create = window.CW?.createAuthDotsController;
     if (typeof create !== "function") return null;
@@ -398,6 +506,7 @@
 
   function init() {
     bindStatusButton();
+    bindProviderOpeners();
     dots = makeDotsController();
     dots?.syncObserver();
     observeMeta(syncMetadataProviderDot);
@@ -455,6 +564,10 @@
     },
     true
   );
+
+  window.addEventListener("cw:overview-profile-changed", () => {
+    try { renderProviders(); } catch {}
+  });
 
   window.addEventListener("auth-changed", () => {
     const done = dots ? dots.onConfigChanged() : refreshAuthDots(true);

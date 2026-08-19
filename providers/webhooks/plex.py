@@ -23,8 +23,9 @@ except Exception:
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
+from providers.scrobble.plex.ratings_sync import RATING_SINKS
 from providers.scrobble.sources import source_enabled
-from providers.webhooks.config import configured_webhook_sinks
+from providers.webhooks.config import configured_webhook_sinks, profile_scoped_webhook, webhook_sink_instance
 from providers.webhooks.dispatch import dispatch_scrobble as _dispatch_scrobble
 
 try:
@@ -57,6 +58,9 @@ _DEF_WEBHOOK: dict[str, Any] = {
     "plex_trakt_ratings": False,
     "plex_simkl_ratings": False,
     "plex_mdblist_ratings": False,
+    "plex_crosswatch_ratings": False,
+    "plex_floppy_ratings": False,
+    "plex_punchplay_ratings": False,
 }
 
 _DEF_TRAKT: dict[str, Any] = {
@@ -82,7 +86,7 @@ def _archive(event_type: str, media_type: str, md: dict[str, Any], ids: dict[str
         pass
 
 
-def _call_remove_across(ids: dict[str, Any], media_type: str) -> None:
+def _call_remove_across(ids: dict[str, Any], media_type: str, origin: str = "") -> None:
     if not isinstance(ids, dict) or not ids:
         return
     try:
@@ -103,13 +107,13 @@ def _call_remove_across(ids: dict[str, Any], media_type: str) -> None:
         pass
     try:
         if callable(_rm_across):
-            _rm_across(ids, media_type)
+            _rm_across(ids, media_type, scope=origin or None)
             return
     except Exception:
         pass
     try:
         if callable(_rm_across_api):
-            _rm_across_api(ids, media_type)  # type: ignore[arg-type]
+            _rm_across_api(ids, media_type, origin=origin or None)  # type: ignore[arg-type]
             return
     except Exception:
         pass
@@ -203,13 +207,17 @@ def _ensure_scrobble(cfg: dict[str, Any]) -> dict[str, Any]:
     if "probe_session_progress" not in wh:
         wh["probe_session_progress"] = _DEF_WEBHOOK["probe_session_progress"]
         changed = True
-    if "plex_trakt_ratings" not in wh:
-        wh["plex_trakt_ratings"] = _DEF_WEBHOOK.get("plex_trakt_ratings", False)
-    if "plex_simkl_ratings" not in wh:
-        wh["plex_simkl_ratings"] = _DEF_WEBHOOK.get("plex_simkl_ratings", False)
-    if "plex_mdblist_ratings" not in wh:
-        wh["plex_mdblist_ratings"] = _DEF_WEBHOOK.get("plex_mdblist_ratings", False)
-        changed = True
+    for key in (
+        "plex_trakt_ratings",
+        "plex_simkl_ratings",
+        "plex_mdblist_ratings",
+        "plex_crosswatch_ratings",
+        "plex_floppy_ratings",
+        "plex_punchplay_ratings",
+    ):
+        if key not in wh:
+            wh[key] = _DEF_WEBHOOK.get(key, False)
+            changed = True
 
 
     flt = wh.setdefault("filters_plex", {})
@@ -1133,6 +1141,9 @@ def process_webhook(
     enable_trakt_ratings = bool(wh.get("plex_trakt_ratings", False)) and "trakt" in selected_rating_sinks
     enable_simkl_ratings = bool(wh.get("plex_simkl_ratings", False)) and "simkl" in selected_rating_sinks
     enable_mdblist_ratings = bool(wh.get("plex_mdblist_ratings", False)) and "mdblist" in selected_rating_sinks
+    enable_crosswatch_ratings = bool(wh.get("plex_crosswatch_ratings", False)) and "crosswatch" in selected_rating_sinks
+    enable_floppy_ratings = bool(wh.get("plex_floppy_ratings", False)) and "floppy" in selected_rating_sinks
+    enable_punchplay_ratings = bool(wh.get("plex_punchplay_ratings", False)) and "punchplay" in selected_rating_sinks
     flt = (wh.get("filters_plex") or {})
     allow_users = {str(x).strip() for x in (flt.get("username_whitelist") or []) if str(x).strip()}
     srv_uuid_allow = _as_filter_set(flt.get("server_uuid_whitelist"))
@@ -1178,6 +1189,10 @@ def process_webhook(
         _emit(logger, f"ignored server '{srv_uuid_evt or 'none'}' (allowed={sorted(srv_uuid_allow)})", "DEBUG")
         return {"ok": True, "ignored": True}
 
+    if not allow_users and profile_scoped_webhook(cfg, "plex", provider_instance):
+        _emit(logger, "blocked - profile-scoped webhook has no username whitelist", "WARNING")
+        return {"ok": True, "ignored": True}
+
     if not _account_matches(allow_users, payload, logger=logger):
         _emit(logger, f"ignored user '{_mask_account(acc_title)}'", "DEBUG")
         return {"ok": True, "ignored": True}
@@ -1210,7 +1225,7 @@ def process_webhook(
     _emit(logger, f"ids resolved: {media_name_dbg} -> {_describe_ids((show_ids or epi_ids) or all_ids)}", "DEBUG")
 
     if event == "media.rate":
-        if not (enable_trakt_ratings or enable_simkl_ratings or enable_mdblist_ratings):
+        if not (enable_trakt_ratings or enable_simkl_ratings or enable_mdblist_ratings or enable_crosswatch_ratings or enable_floppy_ratings):
             _emit(logger, "rating forwarding disabled", "DEBUG")
             return {"ok": True, "ignored": True}
 
@@ -1275,11 +1290,38 @@ def process_webhook(
                     sent = True
                     results["mdblist"] = _mdblist_send_rating(media_type, ids_all2, int(rating_val or 0), cfg, logger)
 
+        ops_enabled = [
+            name
+            for name, on in (
+                ("crosswatch", enable_crosswatch_ratings),
+                ("floppy", enable_floppy_ratings),
+                ("punchplay", enable_punchplay_ratings),
+            )
+            if on
+        ]
+        if ops_enabled:
+            from providers.scrobble.plex.ratings_sync import dispatch_ops_ratings
+
+            sent = True
+            results.update(
+                dispatch_ops_ratings(
+                    media_type,
+                    md,
+                    ids_all2,
+                    rating_val,
+                    cfg,
+                    enabled=ops_enabled,
+                    instance_for=lambda sink: webhook_sink_instance(wh, sink),
+                    show_ids=show_ids,
+                    episode_ids=epi_ids,
+                )
+            )
+
         if not sent:
             _emit(logger, "no usable rating target; ignored", "DEBUG")
             return {"ok": True, "ignored": True}
 
-        target_results = [v for k, v in results.items() if k in {"trakt", "simkl", "mdblist"} and isinstance(v, dict)]
+        target_results = [v for k, v in results.items() if k in RATING_SINKS and isinstance(v, dict)]
         ok = any(bool(item.get("ok")) for item in target_results)
         results["ok"] = ok
         results["status"] = 200 if ok else 502
@@ -1587,7 +1629,7 @@ def process_webhook(
     if r.status_code < 400:
         if intended == "/scrobble/stop" and prog >= watched_at and not (st.get("wl_removed") is True):
             try:
-                _call_remove_across(ids_all2 or {}, media_type)
+                _call_remove_across(ids_all2 or {}, media_type, origin=f"plex:{provider_instance}")
                 st = {**st, "wl_removed": True}
             except Exception:
                 pass

@@ -311,7 +311,7 @@ def _lookup_type(it: Mapping[str, Any]) -> str:
 
 
 def looks_like_bad_id(iid: Any) -> bool:
-    return bool(_BAD_NUM.match(str(iid or "")))
+    return False
 
 
 def _ids_from_provider_ids(pids: Mapping[str, Any] | None) -> dict[str, str]:
@@ -613,6 +613,14 @@ def provider_index(adapter: Any, *, ttl_sec: int = 300, force_refresh: bool = Fa
     return idx
 
 
+def _cached_provider_index(adapter: Any, feature: str, *, ttl_sec: int = 300) -> dict[str, list[dict[str, Any]]] | None:
+    key = (id(adapter), tuple(sorted(emby_selected_library_ids(adapter.cfg, feature))))
+    hit = _PROVIDER_INDEX_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < max(1, int(ttl_sec)):
+        return hit[1]
+    return None
+
+
 def find_series_in_index(adapter: Any, pairs: Iterable[str]) -> dict[str, Any] | None:
     idx = provider_index(adapter)
     scope_hist: dict[str, Any] = {}
@@ -658,7 +666,7 @@ def find_series_in_index(adapter: Any, pairs: Iterable[str]) -> dict[str, Any] |
 
 
 # Shows/episodes
-def get_series_episodes(http: Any, user_id: str, series_id: str, start: int = 0, limit: int = 500) -> dict[str, Any]:
+def get_series_episodes(http: Any, user_id: str, series_id: str, start: int = 0, limit: int = 500) -> dict[str, Any] | None:
     q = {
         "UserId": user_id,
         "StartIndex": max(0, int(start)),
@@ -668,8 +676,11 @@ def get_series_episodes(http: Any, user_id: str, series_id: str, start: int = 0,
     }
     r = http.get(f"/Shows/{series_id}/Episodes", params=q)
     if getattr(r, "status_code", 0) != 200:
-        return {"Items": [], "TotalRecordCount": 0}
-    data = r.json() or {}
+        return None
+    try:
+        data = r.json() or {}
+    except Exception:
+        return None
     data.setdefault("Items", [])
     data.setdefault("TotalRecordCount", len(data["Items"]))
     return data
@@ -793,12 +804,14 @@ def _fetch_all_series_episodes(
     sid: str,
     *,
     page_size: int,
-) -> list[Mapping[str, Any]]:
+) -> list[Mapping[str, Any]] | None:
     start = 0
     total: int | None = None
     out: list[Mapping[str, Any]] = []
     while True:
         body = get_series_episodes(http, uid, sid, start=start, limit=page_size)
+        if body is None:
+            return None
         rows: list[Mapping[str, Any]] = body.get("Items") or []
         if total is None:
             total = int(body.get("TotalRecordCount") or 0)
@@ -807,6 +820,25 @@ def _fetch_all_series_episodes(
         if not rows or (total is not None and start >= total):
             break
     return out
+
+
+def _series_episodes_cached(adapter: Any, http: Any, uid: str, sid: str) -> list[Mapping[str, Any]]:
+    cache = getattr(adapter, "_emby_series_episodes_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(adapter, "_emby_series_episodes_cache", cache)
+        except Exception:
+            pass
+    key = str(sid)
+    rows = cache.get(key)
+    if rows is None:
+        rows = _fetch_all_series_episodes(http, uid, sid, page_size=500)
+        if rows is not None:
+            cache[key] = rows
+        else:
+            cw_log("EMBY", "common", "debug", "series_episodes_fetch_failed", series_id=key)
+    return rows or []
 
 
 def _fetch_all_collection_items(
@@ -1501,7 +1533,9 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
                 )
         ser_row: Mapping[str, Any] | None = None
         matched_series_pair: str | None = None
-        for pref in series_pairs:
+        known_idx = _cached_provider_index(adapter, feature)
+        series_lookups = [] if (known_idx and series_pairs and not any(p in known_idx for p in series_pairs)) else series_pairs
+        for pref in series_lookups:
             rows = _direct_query_by_pairs(http, uid, [pref], "Series", scope)
             series_rows = [r for r in _prefer_library(rows) if (r.get("Type") or "") == "Series"]
             if series_rows:
@@ -1511,7 +1545,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
         if ser_row and season is not None and episode is not None:
             sid = ser_row.get("Id")
             if sid:
-                eps = _fetch_all_series_episodes(http, uid, sid, page_size=500)
+                eps = _series_episodes_cached(adapter, http, uid, sid)
                 for ep in eps:
                     if (
                         int(ep.get("ParentIndexNumber") or -1) == int(season)
@@ -1589,7 +1623,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
         if series_row and season is not None and episode is not None:
             sid = series_row.get("Id")
             if sid:
-                eps = _fetch_all_series_episodes(http, uid, sid, page_size=500)
+                eps = _series_episodes_cached(adapter, http, uid, sid)
                 for row in eps:
                     s = row.get("ParentIndexNumber")
                     e = row.get("IndexNumber")
@@ -1682,7 +1716,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
                     continue
                 nm = (row.get("Name") or "").strip().lower()
                 yr = row.get("ProductionYear")
-                if (nm == title_lc or nm.startswith(title_lc)) and (
+                if nm == title_lc and (
                     (year is None) or (isinstance(yr, int) and abs(yr - year) <= 1)
                 ):
                     cand2.append(row)

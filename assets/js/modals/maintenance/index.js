@@ -37,6 +37,7 @@ const fjson = async (url, opts = {}) => {
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
+const escapeHtml = (value) => String(value ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[ch]));
 const post = (url, body) =>
   fjson(url, body === undefined ? { method: "POST" } : {
     method: "POST",
@@ -52,9 +53,12 @@ const SIMPLE_OPS = {
   stats: "/api/maintenance/reset-stats",
   playing: "/api/maintenance/reset-currently-watching",
   captures: "/api/snapshots/clear",
+  "database-health": "/api/maintenance/database-health",
   "events-health": "/api/maintenance/events-health",
   "events-optimize": "/api/maintenance/events-optimize",
   "events-rebuild": "/api/maintenance/events-rebuild",
+  "state-file": "/api/maintenance/state-file/compact",
+  "state-file-prune": "/api/maintenance/state-file/prune",
 };
 const OPS = [
   {
@@ -74,6 +78,30 @@ const OPS = [
     desc: "Clears temporary retry and health data so items are tried again.",
   },
   {
+    key: "database-health",
+    kind: "database-health",
+    icon: "database",
+    title: "Database health",
+    tag: "diagnostics",
+    desc: "Checks the local CrossWatch database integrity and row consistency.",
+  },
+  {
+    key: "state-file",
+    kind: "state-file",
+    icon: "data_object",
+    title: "Compact sync state",
+    tag: "backup first",
+    desc: "Creates an app-state backup, then rewrites the sync state database.",
+  },
+  {
+    key: "state-file-prune",
+    kind: "state-file-prune",
+    icon: "cleaning_services",
+    title: "Prune stale state",
+    tag: "backup first",
+    desc: "Creates an app-state backup, then removes state baselines for pairs or routes that no longer exist.",
+  },
+  {
     key: "meta",
     kind: "metadata",
     icon: "gallery_thumbnail",
@@ -89,15 +117,23 @@ const OPS = [
     tag: "archive & recovery",
     desc: "Manage local tracker state files, snapshots, exports and imports.",
     extra: `
-      <div class="action-options">
-        <label><input type="checkbox" id="cxm-cw-state" checked><span>Tracker state files</span></label>
-        <label><input type="checkbox" id="cxm-cw-snaps"><span>All snapshots</span></label>
+      <div class="action-options tracker-archive-options">
+        <label class="tracker-profile-control">
+          <span>Profile</span>
+          <select id="cxm-cw-profile" class="input"><option value="default">Default</option></select>
+        </label>
+        <label class="tracker-archive-check"><input type="checkbox" id="cxm-cw-state" checked><span>Tracker state files</span></label>
+        <label class="tracker-archive-check"><input type="checkbox" id="cxm-cw-snaps"><span>All snapshots</span></label>
       </div>
     `,
     sideActions: `
       <div class="archive-actions">
-        <button type="button" class="archive-btn secondary" id="cxm-cw-export" data-label="Download tracker archive">Download ZIP</button>
-        <button type="button" class="archive-btn secondary" id="cxm-cw-import" data-label="Import tracker archive">Import file</button>
+        <button type="button" class="archive-btn icon-only secondary" id="cxm-cw-export" data-label="Download tracker archive" title="Download tracker archive" aria-label="Download tracker archive">
+          <span class="material-symbols-rounded" aria-hidden="true">download</span>
+        </button>
+        <button type="button" class="archive-btn icon-only secondary" id="cxm-cw-import" data-label="Import tracker archive" title="Import tracker archive" aria-label="Import tracker archive">
+          <span class="material-symbols-rounded" aria-hidden="true">upload_file</span>
+        </button>
         <input type="file" id="cxm-cw-import-file" accept=".zip,.json" hidden>
       </div>
     `,
@@ -197,6 +233,13 @@ const GROUPS = [
     keys: ["events-health", "events-optimize", "events-rebuild"],
   },
   {
+    id: "state-file",
+    icon: "data_object",
+    title: "Sync State",
+    desc: "Inspect, compact and prune the sync state database.",
+    keys: ["database-health", "state-file", "state-file-prune"],
+  },
+  {
     id: "archive",
     icon: "inventory_2",
     title: "Archive & Recovery",
@@ -220,12 +263,12 @@ const GROUPS = [
 ];
 
 const OPS_BY_KEY = Object.fromEntries(OPS.map((op) => [op.key, op]));
-const OVERVIEW_EXCLUDED_KEYS = new Set(["tracker", "captures", "defaults", "events-health", "events-optimize", "events-rebuild"]);
+const OVERVIEW_EXCLUDED_KEYS = new Set(["tracker", "captures", "defaults", "events-health", "events-optimize", "events-rebuild", "database-health", "state-file", "state-file-prune"]);
 const OVERVIEW_KEYS = GROUPS
   .flatMap((group) => group.keys)
   .filter((key) => !OVERVIEW_EXCLUDED_KEYS.has(key));
 
-const renderActionRow = ({ key, kind, icon, title, desc, extra = "", sideActions = "" }) => `
+const renderActionRow = ({ key, kind, icon, title, desc, extra = "", sideActions = "", runLabel = "Run" }) => `
   <div class="action-row${sideActions ? " has-side-actions" : ""}" data-op="${key}" data-kind="${kind}" tabindex="0" aria-label="Inspect ${title} status">
     <div class="action-main">
       <div class="action-icon">
@@ -238,7 +281,7 @@ const renderActionRow = ({ key, kind, icon, title, desc, extra = "", sideActions
       </div>
     </div>
     ${sideActions ? `<div class="action-side-actions">${sideActions}</div>` : ""}
-    <button type="button" class="run-btn action-run-btn" data-label="${title}">Run</button>
+    <button type="button" class="run-btn action-run-btn" data-label="${title}">${runLabel}</button>
   </div>
 `;
 
@@ -347,6 +390,13 @@ export default {
                     <span>Events</span>
                   </button>
                 </div>
+                <div class="side-nav-item" data-group="state-file">
+                  <button type="button" class="side-nav-btn" data-target="cxm-group-state-file">
+                    <span class="material-symbols-rounded" aria-hidden="true">data_object</span>
+                    <span>Sync State</span>
+                  </button>
+                  <button type="button" class="category-run-btn" data-run-group="state-file" aria-label="Run all Sync State tools">Run</button>
+                </div>
                 <div class="side-nav-item" data-group="archive">
                   <button type="button" class="side-nav-btn" data-target="cxm-group-archive">
                     <span class="material-symbols-rounded" aria-hidden="true">inventory_2</span>
@@ -436,10 +486,33 @@ export default {
       statusEl.className = "status-message" + (kind ? " " + kind : "");
       statusEl.hidden = !msg;
     };
+    const trackerProfile = () => String($("#cxm-cw-profile", root)?.value || "default").trim() || "default";
+    const trackerProfileQuery = () => `provider_instance=${encodeURIComponent(trackerProfile())}`;
+    const loadTrackerProfiles = async () => {
+      const sel = $("#cxm-cw-profile", root);
+      if (!sel) return;
+      const current = sel.value || "default";
+      try {
+        const data = await fjson("/api/provider-instances/CROSSWATCH");
+        const list = Array.isArray(data) && data.length ? data : [{ id: "default", label: "Default" }];
+        sel.innerHTML = list
+          .map(p => `<option value="${escapeHtml(String(p?.id || "default"))}">${escapeHtml(String(p?.label || p?.id || "Default"))}</option>`)
+          .join("");
+      } catch {
+        sel.innerHTML = '<option value="default">Default</option>';
+      }
+      const values = Array.from(sel.options).map(o => o.value);
+      sel.value = values.includes(current) ? current : "default";
+      window.CW?.ProfileSelect?.enhanceProfile?.(sel, {
+        className: "cxm-tracker-profile-select",
+        menuClassName: "cxm-tracker-profile-menu",
+        menuMinWidth: 220,
+      });
+    };
 
     const downloadTrackerArchive = () => {
       const a = document.createElement("a");
-      a.href = "/api/maintenance/crosswatch-tracker/export";
+      a.href = `/api/maintenance/crosswatch-tracker/export?${trackerProfileQuery()}`;
       a.download = "crosswatch-tracker.zip";
       document.body.appendChild(a);
       a.click();
@@ -454,7 +527,7 @@ export default {
       setOperationBusy(true);
       setStatus("Importing tracker archive...", "busy");
       try {
-        const data = await fjson("/api/maintenance/crosswatch-tracker/import", {
+        const data = await fjson(`/api/maintenance/crosswatch-tracker/import?${trackerProfileQuery()}`, {
           method: "POST",
           body: form,
         });
@@ -477,7 +550,7 @@ export default {
     function setOperationBusy(busy) {
       if (operationBusy === busy) return;
       operationBusy = busy;
-      const controls = root.querySelectorAll(".run-btn, .archive-btn, .category-run-btn, #cxm-close");
+      const controls = root.querySelectorAll(".run-btn, .archive-btn, .category-run-btn, #cxm-cw-profile, #cxm-close");
       controls.forEach((control) => {
         if (busy) {
           control.dataset.cwWasDisabled = control.disabled ? "1" : "0";
@@ -547,6 +620,48 @@ export default {
         return `Rebuild archive · ${new Intl.NumberFormat().format(res.events || 0)} events rebuilt from runtime state.`;
       }
       return null;
+    };
+
+    const databaseReceipt = (kind, res) => {
+      if (!res || typeof res !== "object" || kind !== "database-health") return null;
+      const tables = res.table_counts || {};
+      const orphanCounts = res.orphan_counts || {};
+      const orphanRows = Object.values(orphanCounts).reduce((total, value) => total + Number(value || 0), 0);
+      const bits = [
+        `integrity ${res.integrity || "?"}`,
+        `schema v${res.schema_version ?? "?"}`,
+        `${new Intl.NumberFormat().format(tables.provider_feature_state || 0)} baselines`,
+        `${new Intl.NumberFormat().format(tables.baseline_items || 0)} items`,
+        `${new Intl.NumberFormat().format(orphanRows)} orphan rows`,
+        formatBytes(res.size_bytes || 0),
+      ];
+      if (res.wal_size_bytes) bits.push(`WAL ${formatBytes(res.wal_size_bytes)}`);
+      return `Database health · ${res.healthy ? "healthy" : "issues found"} · ${bits.join(" · ")}.`;
+    };
+
+    const stateFileReceipt = (res) => {
+      if (!res || typeof res !== "object") return null;
+      const backupPath = res.backup && res.backup.path ? String(res.backup.path) : "";
+      const before = formatBytes(res.before_bytes || 0);
+      const after = formatBytes(res.after_bytes || 0);
+      const freed = formatBytes((res.summary && res.summary.freed_bytes) || 0);
+      const bits = [`${before} → ${after}`, `${freed} reclaimed`];
+      if (backupPath) bits.push(`backup ${backupPath}`);
+      return `Compact sync state completed · ${bits.join(" · ")}.`;
+    };
+
+    const statePruneReceipt = (res) => {
+      if (!res || typeof res !== "object") return null;
+      const removed = res.removed || {};
+      const baselines = Number(removed.removed_baselines || 0);
+      const instances = Number(removed.removed_instances || 0);
+      const providers = Number(removed.removed_providers || 0);
+      const items = Number(removed.removed_items || 0);
+      const freed = formatBytes((res.summary && res.summary.freed_bytes) || 0);
+      const backupPath = res.backup && res.backup.path ? String(res.backup.path) : "";
+      const bits = [`${providers} providers`, `${instances} instances`, `${baselines} baselines`, `${items} items`, `${freed} reclaimed`];
+      if (backupPath) bits.push(`backup ${backupPath}`);
+      return `Prune sync state completed · ${bits.join(" · ")}.`;
     };
 
     const formatMetric = ({ value, format }) => {
@@ -670,7 +785,7 @@ export default {
     async function refreshSummary() {
       try {
         const [tracker, cache] = await Promise.all([
-          fjson("/api/maintenance/crosswatch-tracker").catch(() => null),
+          fjson(`/api/maintenance/crosswatch-tracker?${trackerProfileQuery()}`).catch(() => null),
           fjson("/api/maintenance/provider-cache").catch(() => null),
         ]);
 
@@ -748,6 +863,16 @@ export default {
         return false;
       }
 
+      if (!skipConfirm && kind === "state-file" && !confirm("Create an app-state backup and compact the sync state database?")) {
+        setStatus("Cancelled.", "");
+        return false;
+      }
+
+      if (!skipConfirm && kind === "state-file-prune" && !confirm("Create an app-state backup and prune stale sync state baselines?\n\nThis removes provider or instance baselines that are no longer referenced by configured sync pairs or scrobbler routes.")) {
+        setStatus("Cancelled.", "");
+        return false;
+      }
+
       if (manageLock) setOperationBusy(true);
       startActionFeedback(btn);
       const label = btn?.dataset?.label || OPS.find((item) => item.kind === kind)?.title || kind;
@@ -779,6 +904,7 @@ export default {
           res = await post("/api/maintenance/crosswatch-tracker/clear", {
             clear_state: clearState,
             clear_snapshots: clearSnaps,
+            provider_instance: trackerProfile(),
           });
         } else if (kind === "defaults") {
           const warn = [
@@ -837,7 +963,10 @@ export default {
 
         if (selectedInsightKind === kind) await loadActionInsight(kind);
         const evReceipt = eventsReceipt(kind, res);
-        setStatus(evReceipt || completionReceipt(label, res), "ok");
+        const dbReceipt = databaseReceipt(kind, res);
+        const stateReceipt = kind === "state-file" ? stateFileReceipt(res) : null;
+        const statePrune = kind === "state-file-prune" ? statePruneReceipt(res) : null;
+        setStatus(evReceipt || dbReceipt || stateReceipt || statePrune || completionReceipt(label, res), "ok");
         finishActionFeedback(btn, "success");
         return res || { ok: true };
       } catch (e) {
@@ -882,7 +1011,7 @@ export default {
       const btn = row?.querySelector(".action-run-btn");
       if (btn) btn.addEventListener("click", () => runOp(kind, btn));
       row?.addEventListener("click", (event) => {
-        if (event.target.closest("button, input, label, a, summary")) return;
+        if (event.target.closest("button, input, label, a, summary, .cw-icon-select")) return;
         loadActionInsight(kind);
       });
       row?.addEventListener("keydown", (event) => {
@@ -893,6 +1022,10 @@ export default {
     });
 
     root.querySelector("#cxm-cw-export")?.addEventListener("click", downloadTrackerArchive);
+    root.querySelector("#cxm-cw-profile")?.addEventListener("change", async () => {
+      await refreshSummary();
+      if (selectedInsightKind === "tracker") await loadActionInsight("tracker");
+    });
     const archiveInput = root.querySelector("#cxm-cw-import-file");
     root.querySelector("#cxm-cw-import")?.addEventListener("click", () => archiveInput?.click());
     archiveInput?.addEventListener("change", async () => {
@@ -945,6 +1078,7 @@ export default {
     }
 
     showOverviewStatus();
+    await loadTrackerProfiles();
     await refreshSummary();
     setStatus("");
     const initialGroup = String(props?.group || props?.target || "").trim().toLowerCase();

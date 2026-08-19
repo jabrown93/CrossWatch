@@ -54,7 +54,9 @@
     { key: "EMBY", paths: [["emby"], ["auth", "emby"]], keys: ["access_token", "api_key", "token"] },
     { key: "MDBLIST", paths: [["mdblist"], ["auth", "mdblist"]], keys: ["api_key", "access_token"] },
     { key: "PUBLICMETADB", paths: [["publicmetadb"], ["auth", "publicmetadb"]], keys: ["api_key"] },
+    { key: "PUNCHPLAY", paths: [["punchplay"], ["auth", "punchplay"]], keys: ["access_token"] },
     { key: "NUVIO", paths: [["nuvio"], ["auth", "nuvio"]], keys: ["access_token", "refresh_token"] },
+    { key: "STREMIO", paths: [["stremio"], ["auth", "stremio"]], keys: ["auth_key", "authKey"] },
   ];
 
   const UI = (window._ui ||= { status: null, summary: null, pairedProviders: null });
@@ -64,6 +66,7 @@
     currentSummary: null,
     currentTab: "",
     lastStatusMs: 0,
+    navSeq: 0,
     pairedFetchAt: 0,
     softMainBusy: false,
   };
@@ -75,6 +78,8 @@
   const PAIRS_CACHE_KEY = "cw.pairs.v1";
   const PAIRS_TTL_MS = 15_000;
   const STATUS_CACHE_KEY = "cw.status.v1";
+  const statusCacheKey = () => `${STATUS_CACHE_KEY}.${String(window.CW?.OverviewProfile?.id || "").trim() || "all"}`;
+  const DETAILS_MAX_LINES = 300;
   const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
   const ROUTE_TABS = new Set(["main", "watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"]);
   const SETTINGS_PANES = new Set(["overview", "providers", "sync", "scrobbler", "scheduling", "app", "maintenance"]);
@@ -92,6 +97,31 @@
   function normalizeRouteTab(value) {
     const tab = routeSegment(value);
     return ROUTE_TABS.has(tab) ? tab : "main";
+  }
+
+  function canUseRouteTab(tab) {
+    const normalized = normalizeRouteTab(tab);
+    const auth = window.CW?.AuthState?.read?.();
+    const managed = auth ? auth.isManaged : document.documentElement?.dataset?.cwRole === "user";
+    if (!managed) return true;
+    const perms = auth?.permissions || {};
+    if (normalized === "main") return perms.dashboard !== false;
+    if (normalized === "playback_progress") return perms.playback !== false;
+    if (normalized === "watchlist") return perms.watchlist !== false;
+    if (["snapshots", "playlists", "editor"].includes(normalized)) return perms.write === true;
+    return false;
+  }
+
+  function allowedRouteTab(value) {
+    const tab = normalizeRouteTab(value);
+    if (canUseRouteTab(tab)) return tab;
+    if (canUseRouteTab("main")) return "main";
+    if (canUseRouteTab("watchlist")) return "watchlist";
+    if (canUseRouteTab("playback_progress")) return "playback_progress";
+    if (canUseRouteTab("snapshots")) return "snapshots";
+    if (canUseRouteTab("playlists")) return "playlists";
+    if (canUseRouteTab("editor")) return "editor";
+    return "main";
   }
 
   function normalizeSettingsPane(value) {
@@ -186,6 +216,42 @@
     const match = (block) => {
       if (!block || typeof block !== "object") return false;
       return hasValue(block.server) && block.connection_verified === true;
+    };
+    if (match(root)) return true;
+    const instances = root.instances;
+    if (!instances || typeof instances !== "object") return false;
+    return Object.values(instances).some(match);
+  }
+
+  function hasScrobConfig(root) {
+    if (!root || typeof root !== "object") return false;
+    const match = (block) => {
+      if (!block || typeof block !== "object") return false;
+      return hasValue(block.server_url) && hasValue(block.api_key) && hasValue(block.username) && hasValue(block.password);
+    };
+    if (match(root)) return true;
+    const instances = root.instances;
+    if (!instances || typeof instances !== "object") return false;
+    return Object.values(instances).some(match);
+  }
+
+  function hasCrosswatchConfig(root) {
+    if (!root || typeof root !== "object") return false;
+    const match = (block) => {
+      if (!block || typeof block !== "object") return false;
+      return block.connected === true && block.enabled !== false;
+    };
+    if (match(root)) return true;
+    const instances = root.instances;
+    if (!instances || typeof instances !== "object") return false;
+    return Object.values(instances).some(match);
+  }
+
+  function hasFloppyConfig(root) {
+    if (!root || typeof root !== "object") return false;
+    const match = (block) => {
+      if (!block || typeof block !== "object") return false;
+      return hasValue(block.server_url || block.server) && hasValue(block.api_token || block.token);
     };
     if (match(root)) return true;
     const instances = root.instances;
@@ -345,11 +411,12 @@
 
     if ([cfg?.nuvio, cfg?.auth?.nuvio].some(hasNuvioConfig)) set.add("NUVIO");
     if ([cfg?.kodi, cfg?.auth?.kodi].some(hasKodiConfig)) set.add("KODI");
+    if ([cfg?.floppy, cfg?.auth?.floppy].some(hasFloppyConfig)) set.add("FLOPPY");
+    if ([cfg?.scrob, cfg?.auth?.scrob].some(hasScrobConfig)) set.add("SCROB");
     if ([cfg?.tmdb_sync, cfg?.auth?.tmdb_sync].some(hasTmdbConfig)) set.add("TMDB");
     if ([cfg?.tautulli, cfg?.auth?.tautulli].some((block) => hasAnyConfigValue(block, ["api_key", "server_url", "server"]))) set.add("TAUTULLI");
 
-    const crosswatch = cfg?.crosswatch || cfg?.CrossWatch || {};
-    if (crosswatch.enabled !== false) set.add("CROSSWATCH");
+    if ([cfg?.crosswatch, cfg?.CrossWatch].some(hasCrosswatchConfig)) set.add("CROSSWATCH");
     return set;
   }
 
@@ -396,22 +463,27 @@
       : getConfiguredProviders();
     const host = byId("providers_list");
     if (host) {
-      const cards = host.querySelectorAll(".prov-card").length
-        ? host.querySelectorAll(".prov-card")
-        : host.querySelectorAll(":scope > .card, :scope > *");
+      const named = host.querySelectorAll(".prov-card");
+      const cards = named.length ? named : host.querySelectorAll(":scope > .card, :scope > *");
 
       cards.forEach((card) => {
-        const key = String(card.dataset?.prov || "").toUpperCase() || resolveProviderKeyFromNode(card);
+        const cached = String(card.dataset?.prov || card.dataset?.syncProv || "").toUpperCase();
+        const key = cached || resolveProviderKeyFromNode(card);
         if (!key) return;
-        card.dataset.syncProv = key;
-        card.style.display = allowed.has(key) ? "" : "none";
+        if (card.dataset.syncProv !== key) card.dataset.syncProv = key;
+        const display = allowed.has(key) ? "" : "none";
+        if (card.style.display !== display) card.style.display = display;
       });
     }
+
+    const wanted = PROVIDER_ORDER.filter((key) => allowed.has(key));
 
     ["source-provider", "target-provider"].forEach((id) => {
       const select = byId(id);
       if (!select) return;
       const hadPlaceholder = !!select.options[0] && select.options[0].value === "";
+      const current = Array.from(select.options || [], (option) => option.value).filter(Boolean);
+      if (current.length === wanted.length && current.every((value, i) => value === wanted[i])) return;
       const previous = String(select.value || "").toUpperCase();
       select.innerHTML = "";
       if (hadPlaceholder) {
@@ -420,7 +492,7 @@
         placeholder.textContent = "— select —";
         select.appendChild(placeholder);
       }
-      PROVIDER_ORDER.filter((key) => allowed.has(key)).forEach((key) => select.appendChild(buildProviderOption(key)));
+      wanted.forEach((key) => select.appendChild(buildProviderOption(key)));
       select.value = previous && allowed.has(previous) ? previous : (hadPlaceholder ? "" : select.value);
     });
   }
@@ -455,27 +527,44 @@
     scheduleApplySyncVisibility();
   }
 
-  const pairsMemory = { ts: 0, list: null, pending: null };
+  const pairsMemory = { scope: "", ts: 0, list: null, pending: null };
+
+  function pairsCacheScope() {
+    const auth = window.CW?.AuthState?.read?.();
+    const managed = auth ? auth.isManaged : document.documentElement?.dataset?.cwRole === "user";
+    const profileId = auth?.profileId || document.documentElement?.dataset?.cwProfileId || "";
+    return managed ? `user:${String(profileId || "").trim() || "none"}` : "admin";
+  }
+
+  function pairsCacheKey() {
+    return `${PAIRS_CACHE_KEY}:${pairsCacheScope()}`;
+  }
 
   function _invalidatePairsCache() {
+    const key = pairsCacheKey();
     pairsMemory.ts = 0;
     pairsMemory.list = null;
     pairsMemory.pending = null;
-    try { localStorage.removeItem(PAIRS_CACHE_KEY); } catch {}
+    pairsMemory.scope = "";
+    try { localStorage.removeItem(key); localStorage.removeItem(PAIRS_CACHE_KEY); } catch {}
     try { CW.Cache?.invalidate?.("pairs"); } catch {}
   }
 
   function _savePairsCache(pairs) {
     const list = Array.isArray(pairs) ? pairs : [];
+    const scope = pairsCacheScope();
+    pairsMemory.scope = scope;
     pairsMemory.ts = Date.now();
     pairsMemory.list = list;
-    try { localStorage.setItem(PAIRS_CACHE_KEY, JSON.stringify({ pairs: list, t: pairsMemory.ts })); } catch {}
+    try { localStorage.setItem(`${PAIRS_CACHE_KEY}:${scope}`, JSON.stringify({ pairs: list, t: pairsMemory.ts, scope })); } catch {}
   }
 
   function _loadPairsCache() {
-    if (Array.isArray(pairsMemory.list) && pairsMemory.ts) return { pairs: pairsMemory.list, t: pairsMemory.ts };
+    const scope = pairsCacheScope();
+    if (pairsMemory.scope === scope && Array.isArray(pairsMemory.list) && pairsMemory.ts) return { pairs: pairsMemory.list, t: pairsMemory.ts };
     try {
-      return JSON.parse(localStorage.getItem(PAIRS_CACHE_KEY) || "null");
+      const cached = JSON.parse(localStorage.getItem(`${PAIRS_CACHE_KEY}:${scope}`) || "null");
+      return cached?.scope === scope ? cached : null;
     } catch {
       return null;
     }
@@ -483,9 +572,9 @@
 
   async function _getPairsFresh(force = false) {
     const now = Date.now();
-    if (!force && Array.isArray(pairsMemory.list) && (now - pairsMemory.ts) < PAIRS_TTL_MS) return pairsMemory.list;
+    const scope = pairsCacheScope();
+    if (!force && pairsMemory.scope === scope && Array.isArray(pairsMemory.list) && (now - pairsMemory.ts) < PAIRS_TTL_MS) return pairsMemory.list;
     if (pairsMemory.pending) return pairsMemory.pending;
-
     pairsMemory.pending = (async () => {
       try {
         const list = typeof API.Pairs?.list === "function"
@@ -503,6 +592,11 @@
 
     return pairsMemory.pending;
   }
+
+  window.addEventListener("cw:auth-state-changed", () => {
+    _invalidatePairsCache();
+    try { window.cx && (window.cx.pairs = []); } catch {}
+  });
 
   async function isWatchlistEnabledInPairs() {
     const cached = _loadPairsCache();
@@ -569,13 +663,13 @@
 
   function saveStatusCache(providers) {
     try {
-      localStorage.setItem(STATUS_CACHE_KEY, JSON.stringify({ providers: normalizeProviders(providers), updatedAt: Date.now(), v: 1 }));
+      localStorage.setItem(statusCacheKey(), JSON.stringify({ providers: normalizeProviders(providers), updatedAt: Date.now(), v: 1 }));
     } catch {}
   }
 
   function loadStatusCache(maxAgeMs = 10 * 60 * 1000) {
     try {
-      const cached = JSON.parse(localStorage.getItem(STATUS_CACHE_KEY) || "null");
+      const cached = JSON.parse(localStorage.getItem(statusCacheKey()) || "null");
       if (!cached?.providers) return null;
       if ((Date.now() - (cached.updatedAt || 0)) > maxAgeMs) return null;
       return { providers: normalizeProviders(cached.providers), updatedAt: cached.updatedAt };
@@ -820,17 +914,26 @@
 
   function recomputeRunDisabled() {
     const running = !!state.busy || !!UI.summary?.running || !!(window.syncBar?.isRunning?.());
-    const disabled = running || !(UI.status ? !!UI.status.can_run : true);
+    const canRun = UI.status ? !!UI.status.can_run : true;
+    const pending = running && (state.cancelPending || !!UI.summary?.cancel_requested);
+    if (!running) state.cancelPending = false;
     const runButton = byId("run");
     if (runButton) {
       runButton.classList.toggle("loading", running);
+      runButton.classList.toggle("is-cancel", running);
       runButton.setAttribute("aria-busy", String(running));
+      const icon = runButton.querySelector(".cw-sync-action-icon");
+      const label = runButton.querySelector(".label");
+      if (icon) icon.textContent = running ? "cancel" : "sync";
+      if (label) label.textContent = running ? (pending ? "Cancelling…" : "Cancel") : "Synchronize";
+      runButton.title = running ? "Cancel the running synchronization" : "Run synchronization";
+      runButton.disabled = running ? pending : !canRun;
     }
     byId("cw-sync-split")?.classList.toggle("running", running);
-    [byId("run"), byId("run-menu")].forEach((btn) => {
-      if (btn) btn.disabled = disabled;
-    });
-    if (disabled && !byId("cw-sync-menu")?.classList.contains("hidden")) {
+    byId("cw-sync-split")?.classList.toggle("cancelling", pending);
+    const menuButton = byId("run-menu");
+    if (menuButton) menuButton.disabled = running || !canRun;
+    if ((running || !canRun) && !byId("cw-sync-menu")?.classList.contains("hidden")) {
       try { cwCloseSyncMenu(); } catch {}
     }
   }
@@ -933,6 +1036,7 @@
     byId("page-editor")?.classList.toggle("hidden", tab !== "editor");
     byId("page-settings")?.classList.toggle("hidden", tab !== "settings");
 
+    delete document.documentElement.dataset.cwInitialTab;
     document.documentElement.dataset.tab = tab;
     if (document.body) document.body.dataset.tab = tab;
   }
@@ -965,26 +1069,51 @@
   }
 
   async function showTab(name) {
-    const tab = normalizeRouteTab(name);
+    let tab = allowedRouteTab(name);
+    const auth = window.CW?.AuthState?.read?.();
+    const managed = auth ? auth.isManaged : document.documentElement.dataset.cwRole === "user";
+    if (managed) {
+      const perms = auth?.permissions || {};
+      const dashboardAllowed = perms.dashboard !== false;
+      const watchlistAllowed = perms.watchlist !== false;
+      const playbackAllowed = perms.playback !== false;
+      const writeAllowed = perms.write === true;
+      if (!(tab === "main" && dashboardAllowed) && !(tab === "watchlist" && watchlistAllowed) && !(tab === "playback_progress" && playbackAllowed) && !(["snapshots", "playlists", "editor"].includes(tab) && writeAllowed)) tab = allowedRouteTab(tab);
+    }
     writeRouteHash(tab);
+
+    if (state.currentTab === tab) {
+      if (tab === "settings") {
+        const pane = normalizeSettingsPane(window.__cwSettingsPane || readRouteHash().pane || "overview");
+        window.__cwSettingsPane = pane;
+        setTimeout(() => window.cwSettingsSelect?.(pane), 0);
+      }
+      return;
+    }
+
+    const navSeq = ++state.navSeq;
+    const previousTab = state.currentTab;
+    const isCurrentNavigation = () => navSeq === state.navSeq;
+
     setTabHeaderState(tab);
     setPageVisibility(tab);
     document.dispatchEvent(new CustomEvent("tab-changed", { detail: { id: tab, tab } }));
+    state.currentTab = tab;
 
     const layout = byId("layout");
     const logPanel = byId("log-panel");
 
     if (tab === "main") {
       enforceMainLayout();
-      if (state.currentTab === "main") await softRefreshMain();
+      if (previousTab === "main") await softRefreshMain();
       else await hardRefreshMain();
+      if (!isCurrentNavigation()) return;
       logPanel?.classList.remove("hidden");
       queueSafe(() => {
         if (byId("det-log") && !window.esDet) {
           try { window.openDetailsLog?.(); } catch {}
         }
       });
-      state.currentTab = "main";
       return;
     }
 
@@ -1000,7 +1129,7 @@
       } catch (e) {
         console.warn("Watchlist load/refresh failed:", e);
       }
-      state.currentTab = "watchlist";
+      if (!isCurrentNavigation()) return;
       return;
     }
 
@@ -1015,7 +1144,7 @@
           root.innerHTML = '<div class="cw-page-load-error">Playback Progress failed to load. Refresh the page and try again.</div>';
         }
       }
-      state.currentTab = "playback_progress";
+      if (!isCurrentNavigation()) return;
       return;
     }
 
@@ -1027,7 +1156,7 @@
       } catch (e) {
         console.warn("Snapshots load/refresh failed:", e);
       }
-      state.currentTab = "snapshots";
+      if (!isCurrentNavigation()) return;
       return;
     }
 
@@ -1042,41 +1171,56 @@
           root.innerHTML = '<div class="cw-page-load-error">Playlists failed to load. Refresh the page and try again.</div>';
         }
       }
-      state.currentTab = "playlists";
+      if (!isCurrentNavigation()) return;
       return;
     }
 
     if (tab === "editor") {
       try {
+        await ensurePageModule("editor-datetime", "/assets/js/editor/datetime.js", "CrossWatchEditorDateTime");
+        await ensurePageModule("editor-search", "/assets/js/editor/search.js", "CrossWatchEditorSearch");
+        await ensurePageModule("editor-rows", "/assets/js/editor/rows.js", "CrossWatchEditorRows");
+        await ensurePageModule("editor-sources", "/assets/js/editor/sources.js", "CrossWatchEditorSources");
+        await ensurePageModule("editor-importers", "/assets/js/editor/importers.js", "CrossWatchEditorImporters");
+        await ensurePageModule("editor-persistence", "/assets/js/editor/persistence.js", "CrossWatchEditorPersistence");
+        await ensurePageModule("editor-table", "/assets/js/editor/table.js", "CrossWatchEditorTable");
+        await ensurePageModule("editor-chrome", "/assets/js/editor/chrome.js", "CrossWatchEditorChrome");
+        await ensurePageModule("editor-row-editor", "/assets/js/editor/row-editor.js", "CrossWatchEditorRowEditor");
+        await ensurePageModule("editor-table-controller", "/assets/js/editor/table-controller.js", "CrossWatchEditorTableController");
+        await ensurePageModule("editor-file-utils", "/assets/js/editor/file-utils.js", "CrossWatchEditorFileUtils");
+        await ensurePageModule("editor-load-controller", "/assets/js/editor/load-controller.js", "CrossWatchEditorLoadController");
+        await ensurePageModule("editor-extra-editors", "/assets/js/editor/extra-editors.js", "CrossWatchEditorExtraEditors");
+        await ensurePageModule("editor-metadata-replacer", "/assets/js/editor/metadata-replacer.js", "CrossWatchEditorMetadataReplacer");
+        await ensurePageModule("editor-send-modal", "/assets/js/editor/send-modal.js", "CrossWatchEditorSendModal");
         await ensurePageModule("editor", "/assets/js/editor.js", "Editor");
       } catch (e) {
         console.warn("Editor load failed:", e);
       }
-      state.currentTab = "editor";
+      if (!isCurrentNavigation()) return;
       return;
     }
 
     if (tab === "settings") {
       await hydrateSettingsPage();
-      state.currentTab = "settings";
+      if (!isCurrentNavigation()) return;
       const pane = normalizeSettingsPane(window.__cwSettingsPane || readRouteHash().pane || "overview");
       window.__cwSettingsPane = pane;
       setTimeout(() => window.cwSettingsSelect?.(pane), 0);
       return;
     }
-
-    state.currentTab = tab;
   }
 
   window.addEventListener("hashchange", () => {
     const route = readRouteHash();
+    const tab = allowedRouteTab(route.tab);
     routeSyncing = true;
     try {
-      if (route.tab === "settings") window.__cwSettingsPane = route.pane;
-      Promise.resolve(showTab(route.tab)).catch(() => {});
-      if (route.tab === "settings") setTimeout(() => window.cwSettingsSelect?.(route.pane), 0);
+      if (tab === "settings") window.__cwSettingsPane = route.pane;
+      Promise.resolve(showTab(tab)).catch(() => {});
+      if (tab === "settings") setTimeout(() => window.cwSettingsSelect?.(route.pane), 0);
     } finally {
       routeSyncing = false;
+      if (tab !== route.tab) writeRouteHash(tab);
     }
   });
 
@@ -1107,6 +1251,14 @@
     queueSafe(() => {
       hardRefreshMain().catch(() => {});
     });
+  });
+
+  window.addEventListener("cw:overview-profile-changed", () => {
+    try { window.CW?.Cache?.invalidate?.(["status"]); } catch {}
+    queueSafe(() => { refreshStatus(true); });
+    const current = normalizeRouteTab(state.currentTab || document.documentElement?.dataset?.tab || document.body?.dataset?.tab || "main");
+    const tab = allowedRouteTab(current);
+    if (tab !== current) Promise.resolve(showTab(tab)).catch(() => {});
   });
 
   window.addEventListener("load", () => {
@@ -1315,7 +1467,14 @@
       runSync();
     }));
 
-    let pairs = Array.isArray(window.cx?.pairs) && window.cx.pairs.length ? window.cx.pairs : await _getPairsFresh(false);
+    const auth = window.CW?.AuthState?.read?.();
+    let pairs = await _getPairsFresh(auth?.isManaged === true);
+    window.cx = window.cx || {};
+    window.cx.pairs = Array.isArray(pairs) ? pairs : [];
+    const profileId = String(auth?.profileId || document.documentElement?.dataset?.cwProfileId || "").trim();
+    if (auth?.isManaged === true) {
+      pairs = (Array.isArray(pairs) ? pairs : []).filter((pair) => String(pair?.profile_id || "").trim() === profileId);
+    }
     const runnable = (Array.isArray(pairs) ? pairs : []).filter(pairCanRun);
     if (!runnable.length) {
       const empty = document.createElement("div");
@@ -1409,7 +1568,8 @@
   }
 
   async function runSync(opts) {
-    if (state.busy || window.syncBar?.isRunning?.()) return;
+    if (!!UI.summary?.running || window.syncBar?.isRunning?.()) return cancelSync();
+    if (state.busy) return;
     try { cwCloseSyncMenu(); } catch {}
 
     let pairId = "";
@@ -1460,6 +1620,27 @@
       setBusy(false);
       recomputeRunDisabled();
       if (AUTO_STATUS) queueSafe(() => refreshStatus(false));
+    }
+  }
+
+  async function cancelSync() {
+    if (state.cancelPending) return;
+    state.cancelPending = true;
+    recomputeRunDisabled();
+    try {
+      const response = await fetch("/api/run/cancel", { method: "POST", cache: "no-store" });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || payload?.ok !== true) {
+        state.cancelPending = false;
+        setSyncHeader("sync-warn", payload?.error ? `Cancel failed – ${payload.error}` : "Cancel failed");
+      } else {
+        setSyncHeader("sync-warn", "Cancelling — finishing the current step…");
+      }
+    } catch {
+      state.cancelPending = false;
+      setSyncHeader("sync-bad", "Failed to reach server");
+    } finally {
+      recomputeRunDisabled();
     }
   }
 
@@ -1578,47 +1759,8 @@
     });
   }
 
-  function ensureMainUpdateSlot() {
-    let slot = byId("st-main-update");
-    if (slot) return slot;
-
-    const syncButton = Array.from(document.querySelectorAll("button")).find((btn) => /synchroni[sz]e/i.test(btn.textContent || ""));
-    const actionsRow = syncButton
-      ? (syncButton.closest(".sync-actions, .cx-sync-actions, .actions, .row, .toolbar") || syncButton.parentElement)
-      : document.querySelector(".sync-actions, .cx-sync-actions, .actions, .row, .toolbar");
-
-    slot = document.createElement("div");
-    slot.id = "st-main-update";
-    slot.className = "hidden";
-    if (actionsRow?.parentElement) {
-      actionsRow.insertAdjacentElement("afterend", slot);
-      return slot;
-    }
-
-    const previewHeader = Array.from(document.querySelectorAll("h2, .section-title")).find((node) => /watchlist\s*preview/i.test(node.textContent || ""));
-    if (previewHeader?.parentElement) {
-      previewHeader.insertAdjacentElement("beforebegin", slot);
-      return slot;
-    }
-
-    const main = document.querySelector('#tab-main, [data-tab="main"], .page-main, main') || document.body;
-    main.insertBefore(slot, main.firstChild || null);
-    return slot;
-  }
-
-  function renderMainUpdatePill(hasUpdate, latest, url) {
-    const host = ensureMainUpdateSlot();
-    if (!host) return;
-    if (hasUpdate && latest) {
-      host.innerHTML = `<div class="pill"><span class="dot" aria-hidden="true"></span><span>Update <strong>${latest}</strong> available · <a href="${url}" target="_blank" rel="noopener">Release notes</a></span></div>`;
-      host.classList.remove("hidden");
-      return;
-    }
-    host.classList.add("hidden");
-    host.textContent = "";
-  }
-
   async function checkForUpdate() {
+    if (document.documentElement?.dataset?.cwRole === "user") return null;
     try {
       const payload = await requestJSON("/api/update", {}, 15000);
       const current = String(payload.current_version ?? payload.current ?? "0.0.0").trim();
@@ -1655,7 +1797,6 @@
         }
       }
 
-      renderMainUpdatePill(hasUpdate, latest, url);
       return updateDetail;
     } catch (err) {
       const updateDetail = { current: String(window.CW_CURRENT_VERSION || ""), latest: null, url: "", available: false, known: true, unavailable: true };
@@ -1672,6 +1813,7 @@
     let retryTimer = null;
     const run = async () => {
       try {
+        if (document.documentElement?.dataset?.cwRole === "user") return;
         if (window.__cwAuthBootstrapPromise) {
           try { await window.__cwAuthBootstrapPromise; } catch {}
         }
@@ -1707,7 +1849,8 @@
     };
     Object.entries(chips).forEach(([id, value]) => setText(id, value ?? "–"));
 
-    if (summary.running) setSyncHeader("sync-warn", "Running…");
+    if (summary.running) setSyncHeader("sync-warn", summary.cancel_requested ? "Cancelling…" : "Running…");
+    else if (summary.cancelled) setSyncHeader("sync-warn", "Cancelled — partial sync applied");
     else if (summary.exit_code === 0) setSyncHeader("sync-ok", String(summary.result || "").toUpperCase() === "EQUAL" ? "In sync " : "Synced ");
     else if (summary.exit_code != null) setSyncHeader("sync-bad", "Attention needed ⚠️");
     else setSyncHeader("sync-warn", "Idle — run a sync to see results");
@@ -1925,7 +2068,7 @@ Object.assign(window, {
   _invalidatePairsCache, isWatchlistEnabledInPairs,
   loadStatusCache, renderConnectorStatus, refreshStatus, manualRefreshStatus,
   computeRedirectURI, recomputeRunDisabled, relTimeFromEpoch,
-  showTab, toggleSection, runSync,
+  showTab, toggleSection, runSync, cancelSync,
   copySummary, loadPairs, cxSavePair,
   cwToggleSyncMenu,
 });

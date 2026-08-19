@@ -168,6 +168,18 @@ def ids_from_guid(guid: str | None) -> dict[str, str]:
     return out
 
 
+def ids_from_jellyfin_providerids(provider_ids: Mapping[str, Any] | None) -> dict[str, str]:
+    """Normalize Jellyfin ProviderIds into CrossWatch id keys."""
+    if not isinstance(provider_ids, Mapping):
+        return {}
+    remapped = {
+        "imdb": provider_ids.get("Imdb") or provider_ids.get("IMDb") or provider_ids.get("imdb"),
+        "tmdb": provider_ids.get("Tmdb") or provider_ids.get("TMDb") or provider_ids.get("tmdb"),
+        "tvdb": provider_ids.get("Tvdb") or provider_ids.get("TVDb") or provider_ids.get("tvdb"),
+    }
+    return coalesce_ids(remapped)
+
+
 # Collect and merge
 def coalesce_ids(*many: Mapping[str, Any]) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -342,7 +354,34 @@ def minimal(item: Mapping[str, Any]) -> dict[str, Any]:
             out[opt] = item.get(opt)
 
     # Preserve provider-specific raw history ids
-    for opt in ("_trakt_history_id", "history_id", "simkl_bucket", "anime_type", "_simkl_episode_number"):
+    for opt in (
+        "_trakt_history_id",
+        "trakt_history_id",
+        "history_id",
+        "provider_event_id",
+        "_publicmetadb_history_id",
+        "_simkl_history_id",
+        "_simkl_rewatch_id",
+        "rewatch_id",
+        "is_rewatch",
+        "rewatch_status",
+        "simkl_bucket",
+        "anime_type",
+        "_simkl_episode_number",
+        "_floppy_consumption_id",
+        "consumption_id",
+        "_history_id",
+        "_floppy_list_item_id",
+        "_scrob_history_id",
+        "_scrob_media_id",
+        "_scrob_list_id",
+        "_scrob_list_item_id",
+        "_floppy_season",
+        "_floppy_episode",
+        "_cw_event_key",
+        "_cw_rewatch_sync",
+        "_cw_anime_map",
+    ):
         if opt in item and item.get(opt) not in (None, ""):
             out[opt] = item.get(opt)
 

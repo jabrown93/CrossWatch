@@ -1,557 +1,29 @@
 /* assets/js/editor.js */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (function () {
-  const PAGE_SIZE = 100;
-  const STORAGE_KEY = "cw-editor-ui";
-  const ensureStyle = (id, txt) => {
-    let s = document.getElementById(id);
-    if (!s) {
-      s = document.createElement("style");
-      s.id = id;
-    }
-    s.textContent = txt;
-    if (!s.parentNode) document.head.appendChild(s);
+  const PAGE_SIZE_OPTIONS = [50, 100, 150, 200];
+  const DEFAULT_PAGE_SIZE = 50;
+  const COLUMN_KEYS = ["key", "type", "title", "year", "id", "imdb", "tvdb", "trakt", "simkl", "anilist", "extra"];
+  const COLUMN_LAYOUT_VERSION = 4;
+  const DEFAULT_COLUMN_ORDER = COLUMN_KEYS.slice();
+  const DEFAULT_COLUMN_VISIBILITY = { key: true, type: true, title: true, year: false, id: true, imdb: false, tvdb: false, trakt: false, simkl: false, anilist: false, extra: true };
+  const DEFAULT_COLUMN_WIDTHS = { key: 132, type: 126, title: 360, year: 92, id: 132, imdb: 150, tvdb: 120, trakt: 120, simkl: 120, anilist: 120, extra: 220 };
+  const MIN_COLUMN_WIDTHS = { key: 96, type: 116, title: 220, year: 84, id: 120, imdb: 130, tvdb: 110, trakt: 110, simkl: 110, anilist: 110, extra: 180 };
+  const MAX_COLUMN_WIDTHS = { key: 340, type: 240, title: 760, year: 180, id: 280, imdb: 280, tvdb: 240, trakt: 240, simkl: 240, anilist: 240, extra: 560 };
+  const COLUMN_META = {
+    key: { icon: "key", label: "Key" },
+    type: { icon: "category", label: "Type" },
+    title: { icon: "title", label: "Title", required: true },
+    year: { icon: "event", label: "Year" },
+    id: { icon: "fingerprint", label: "IDs" },
+    imdb: { icon: "tag", label: "IMDb" },
+    tvdb: { icon: "dns", label: "TVDB" },
+    trakt: { icon: "confirmation_number", label: "Trakt" },
+    simkl: { icon: "hub", label: "SIMKL" },
+    anilist: { icon: "animation", label: "AniList" },
+    extra: { icon: "tune", label: "Extra" },
   };
-  const css = `.cw-root{--cw-shell-bg:linear-gradient(180deg,rgba(7,10,16,.98),rgba(4,6,10,.97));--cw-panel-bg:linear-gradient(180deg,rgba(11,15,22,.96),rgba(6,8,14,.95));--cw-panel-strong:linear-gradient(180deg,rgba(9,12,19,.985),rgba(4,6,10,.975));--cw-border:rgba(255,255,255,.08);--cw-border-soft:rgba(255,255,255,.05);--cw-shadow:0 18px 46px rgba(0,0,0,.38),inset 0 1px 0 rgba(255,255,255,.03);--cw-fg:#f3f6ff;--cw-fg-soft:rgba(204,213,229,.70);--cw-accent:rgba(112,96,245,.34);--cw-accent-strong:rgba(112,96,245,.52);display:flex;flex-direction:column;gap:12px;color:var(--cw-fg)}.cw-topline{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:2px;padding:16px 18px;border-radius:24px;border:1px solid var(--cw-border);background:radial-gradient(120% 130% at 12% 0%,rgba(86,75,196,.13),transparent 42%),radial-gradient(90% 120% at 100% 100%,rgba(70,54,170,.08),transparent 52%),var(--cw-shell-bg);box-shadow:var(--cw-shadow);backdrop-filter:blur(16px) saturate(125%);-webkit-backdrop-filter:blur(16px) saturate(125%)}.cw-head-copy{min-width:0;display:block}.cw-title-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.cw-title{font-weight:900;font-size:28px;letter-spacing:-.03em;line-height:1.02;color:var(--cw-fg)}.cw-sub{max-width:74ch;color:var(--cw-fg-soft);font-size:14px;line-height:1.45}.cw-head-pills{margin-left:auto;display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.cw-chip{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:40px;padding:0 14px;border-radius:999px;border:1px solid rgba(255,255,255,.09);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02));color:var(--cw-fg-soft);font-size:12px;font-weight:700;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}.cw-chip strong{color:var(--cw-fg);font-weight:800}.cw-wrap{display:grid;grid-template-columns:minmax(0,1fr) 368px;gap:14px;align-items:stretch}.cw-main,.cw-side{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0}.cw-table-wrap,.cw-empty,#page-editor .ins-card,.cw-pop{border:1px solid var(--cw-border);background:var(--cw-panel-bg);box-shadow:var(--cw-shadow);backdrop-filter:blur(14px) saturate(124%);-webkit-backdrop-filter:blur(14px) saturate(124%)}.cw-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px;border-radius:20px;border:1px solid var(--cw-border);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015));box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}.cw-controls .cw-input{flex:1 1 280px;max-width:none}.cw-controls-spacer{flex:1 1 auto}.cw-status-text{font-size:12px;color:var(--cw-fg-soft)}.cw-input,.cw-select,.cw-btn,.cw-pop-btn,.cw-extra-display{font:inherit;color:var(--cw-fg);outline:none}.cw-input,.cw-select{width:100%;min-height:40px;padding:9px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:rgba(3,6,11,.86);box-shadow:inset 0 1px 0 rgba(255,255,255,.02);transition:border-color .16s ease,background .16s ease,box-shadow .16s ease,transform .16s ease}.cw-input:hover,.cw-select:hover{border-color:rgba(255,255,255,.12);background:rgba(5,8,14,.92)}.cw-input:focus,.cw-select:focus{border-color:rgba(117,104,240,.34);box-shadow:0 0 0 3px rgba(117,104,240,.11),inset 0 1px 0 rgba(255,255,255,.03);background:rgba(5,8,14,.96)}.cw-btn,.cw-pop-btn{min-height:38px;padding:0 14px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.025));cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap;font-weight:700;transition:transform .16s ease,background .16s ease,border-color .16s ease,opacity .16s ease,box-shadow .16s ease}.cw-btn:hover,.cw-pop-btn:hover,.cw-extra-display:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.14);background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.04))}.cw-btn:active,.cw-pop-btn:active{transform:translateY(0)}.cw-btn[disabled],.cw-pop-btn[disabled]{opacity:.46;cursor:not-allowed;transform:none}.cw-btn.primary,.cw-pop-btn.primary{background:linear-gradient(180deg,rgba(96,104,242,.40),rgba(68,74,170,.26));border-color:rgba(133,140,255,.24);color:#f8fbff;box-shadow:0 8px 24px rgba(76,82,182,.16),inset 0 1px 0 rgba(255,255,255,.05)}.cw-btn.danger{background:linear-gradient(180deg,rgba(120,35,52,.30),rgba(72,18,29,.22));border-color:rgba(255,132,154,.14);color:#ffe7ee}.cw-btn-del{padding:0;width:30px;min-width:30px;height:30px;border-radius:10px}.cw-btn-del .material-symbol{font-size:15px;line-height:1}.cw-btn.sm{min-height:34px;padding:0 12px;font-size:12px}.cw-side .cw-select,.cw-side .cw-input{width:100%}.cw-backup-actions{display:flex;flex-wrap:wrap;gap:8px}.cw-table-wrap{border-radius:22px;position:relative;overflow:hidden;flex:1 1 auto;min-height:420px;background:var(--cw-panel-strong)}.cw-table-scroll{position:absolute;inset:0;overflow:auto;border-radius:22px}.cw-table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;font-size:12px;color:var(--cw-fg)}.cw-table th,.cw-table td{padding:10px 10px;border-bottom:1px solid rgba(255,255,255,.05);text-align:left;vertical-align:middle;white-space:nowrap}.cw-table th{position:sticky;top:0;z-index:1;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:rgba(226,233,246,.68);background:linear-gradient(180deg,rgba(12,16,24,.98),rgba(7,9,15,.96));backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.cw-table th.sortable{cursor:pointer;user-select:none}.cw-table th.sortable::after{content:"";margin-left:6px;opacity:.55;font-size:10px}.cw-table th.sort-asc::after{content:"▲"}.cw-table th.sort-desc::after{content:"▼"}.cw-table tbody tr{transition:background .15s ease,box-shadow .15s ease}.cw-table tbody tr:hover{background:rgba(255,255,255,.028)}.cw-table tr:last-child td{border-bottom:none}.cw-table input:not(.cw-checkbox){width:100%;min-height:34px;padding:7px 9px;background:rgba(3,6,11,.82);border:1px solid rgba(255,255,255,.08);border-radius:10px;font-size:12px;color:var(--cw-fg);transition:border-color .16s ease,box-shadow .16s ease,background .16s ease}.cw-table input:not(.cw-checkbox):focus{border-color:rgba(117,104,240,.36);box-shadow:0 0 0 3px rgba(117,104,240,.10);background:rgba(6,9,14,.95)}.cw-col-year input{min-width:74px}.cw-table .cw-key{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}.cw-row-episode{background:rgba(96,104,242,.04)}.cw-row-deleted td{opacity:.38;text-decoration:line-through}.cw-title-cell{display:flex;flex-direction:column;align-items:stretch;gap:5px;min-width:0}.cw-title-row{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:nowrap}.cw-title-sub{font-size:11px;color:var(--cw-fg-soft);line-height:1.25;padding-left:2px;white-space:normal}.cw-title-row>input{flex:1 1 auto;min-width:0;width:auto}.cw-title-search-btn{flex:0 0 auto;width:34px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02));color:#eff4ff;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0;box-shadow:inset 0 1px 0 rgba(255,255,255,.03);transition:transform .16s ease,border-color .16s ease,background .16s ease,box-shadow .16s ease}.cw-title-search-btn:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.15);background:linear-gradient(180deg,rgba(255,255,255,.09),rgba(255,255,255,.04));box-shadow:0 8px 20px rgba(0,0,0,.18)}.cw-title-search-btn .material-symbol{font-size:18px}.cw-pop{position:fixed;z-index:10060;padding:12px 12px 13px;color:var(--cw-fg);width:min(560px,calc(100vw - 28px));max-height:calc(100vh - 120px);overflow:hidden;display:flex;flex-direction:column;border-radius:22px;background:linear-gradient(180deg,rgba(8,11,18,.98),rgba(4,6,10,.97))}.cw-pop-title{font-size:11px;font-weight:800;margin-bottom:6px;letter-spacing:.12em;text-transform:uppercase;color:var(--cw-fg-soft)}.cw-pop-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px;flex-wrap:wrap}.cw-pop-btn.ghost{background:rgba(255,255,255,.03)}.cw-search-bar{display:grid;gap:8px;padding:12px;border-radius:18px;border:1px solid rgba(255,255,255,.07);background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.012));box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}.cw-search-bar input,.cw-search-bar select,.cw-pop input[type="time"]{width:100%;min-height:42px;padding:10px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:rgba(2,4,9,.92);color:var(--cw-fg);outline:none}.cw-search-bar input:focus,.cw-search-bar select:focus,.cw-pop input[type="time"]:focus{border-color:rgba(117,104,240,.26);box-shadow:0 0 0 3px rgba(117,104,240,.08)}.cw-search-results{margin-top:10px;border:1px solid rgba(255,255,255,.06);border-radius:18px;overflow:auto;background:rgba(255,255,255,.02)}.cw-search-item{display:flex;gap:12px;width:100%;padding:14px;border:0;border-bottom:1px solid rgba(255,255,255,.05);cursor:pointer;transition:background .14s ease,border-color .14s ease,transform .14s ease;background:linear-gradient(180deg,rgba(255,255,255,.028),rgba(255,255,255,.015));color:var(--cw-fg);font:inherit;text-align:left}.cw-search-item:last-child{border-bottom:none}.cw-search-item:hover{background:rgba(255,255,255,.05)}.cw-search-poster{width:52px;height:76px;border-radius:10px;overflow:hidden;background:#050810;border:1px solid rgba(255,255,255,.06);flex:0 0 auto}.cw-search-poster img{width:100%;height:100%;object-fit:cover}.cw-search-poster-placeholder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--cw-fg-soft);font-size:11px}.cw-search-content{display:grid;gap:4px;min-width:0;align-content:start}.cw-search-title-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.cw-search-title{font-weight:800;color:var(--cw-fg)}.cw-search-tag,.cw-rating-pill,.cw-type-pill,.cw-type-chip,.cw-extra-display,.cw-tag{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid rgba(255,255,255,.09);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.025));box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}.cw-search-tag{min-height:22px;padding:0 8px;font-size:10px;font-weight:800;color:rgba(236,242,251,.78);letter-spacing:.04em;text-transform:uppercase}.cw-search-meta,.cw-search-overview,.cw-search-empty,.cw-search-status{font-size:12px;color:var(--cw-fg-soft);line-height:1.4}.cw-search-overview{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.cw-search-empty{padding:14px}.cw-datetime-grid,.cw-rating-grid,.cw-type-grid{display:grid;gap:8px}.cw-datetime-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.cw-rating-grid{grid-template-columns:repeat(auto-fit,minmax(64px,1fr));margin-top:10px}.cw-rating-pill,.cw-type-pill{min-height:34px;padding:0 10px;font-size:12px;font-weight:800;color:var(--cw-fg-soft);cursor:pointer;transition:transform .16s ease,border-color .16s ease,background .16s ease}.cw-rating-pill:hover,.cw-type-pill:hover,.cw-type-chip:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.14);background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.04))}.cw-rating-pill.active,.cw-type-pill.active,.cw-type-chip.active{color:#f7f9ff;border-color:rgba(133,140,255,.22);background:linear-gradient(180deg,rgba(96,104,242,.24),rgba(70,74,150,.12))}.cw-type-grid{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-top:10px}.cw-type-filter{display:flex;gap:8px;flex-wrap:wrap}.cw-type-chip{min-height:34px;padding:0 12px;font-size:12px;font-weight:800;color:var(--cw-fg-soft);cursor:pointer;transition:transform .16s ease,border-color .16s ease,background .16s ease}.cw-empty{display:grid;place-items:center;min-height:160px;border-radius:22px;padding:18px;text-align:center;color:var(--cw-fg-soft)}.cw-pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:2px;color:var(--cw-fg-soft);font-size:12px}.cw-pager .cw-page-info{min-width:200px;text-align:center}.cw-pager .cw-btn{min-width:110px}#page-editor .ins-card{position:relative;border-radius:22px;padding:12px 13px;overflow:hidden}#page-editor .ins-card::before{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(130% 120% at 100% 0%,rgba(94,81,210,.09),transparent 58%)}#page-editor .ins-row{position:relative;z-index:1;display:flex;align-items:center;gap:10px;padding:10px 4px;border-top:1px solid rgba(255,255,255,.05)}#page-editor .ins-row:first-child{border-top:none;padding-top:2px}#page-editor .ins-icon{width:36px;height:36px;border-radius:14px;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 22px rgba(0,0,0,.22)}#page-editor .ins-title{font-weight:900;letter-spacing:-.01em;font-size:15px;color:var(--cw-fg)}#page-editor .ins-kv{display:grid;grid-template-columns:92px minmax(0,1fr);gap:10px;align-items:center;width:100%}#page-editor .ins-kv label{color:var(--cw-fg-soft);font-size:12px;font-weight:700;letter-spacing:.03em}#page-editor .ins-metrics{display:flex;flex-direction:column;gap:8px;width:100%}#page-editor .metric-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}#page-editor .metric-divider{height:1px;background:rgba(255,255,255,.06);margin:2px 0}#page-editor .metric{position:relative;display:grid;grid-template-columns:32px minmax(0,1fr);align-items:center;gap:8px;min-height:60px;padding:10px;border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015));border:1px solid rgba(255,255,255,.07);overflow:hidden}#page-editor .metric::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.03),transparent 55%)}#page-editor .metric .material-symbol{font-size:18px;color:#edf3ff;opacity:.92;-webkit-text-fill-color:currentColor}#page-editor .metric .m-val{font-weight:900;font-size:18px;line-height:1;color:#f8fbff}#page-editor .metric .m-lbl{font-size:11px;opacity:.72;letter-spacing:.08em;text-transform:uppercase;margin-top:3px}.cw-tag{position:relative;gap:8px;min-height:34px;padding:0 12px;color:var(--cw-fg-soft);font-size:12px;font-weight:800}.cw-tag-dot{width:8px;height:8px;border-radius:999px;background:#94a3b8;box-shadow:0 0 0 6px rgba(148,163,184,.08)}.cw-tag.loaded{color:#ebfff4;border-color:rgba(108,216,167,.16);background:linear-gradient(180deg,rgba(31,85,58,.18),rgba(255,255,255,.025))}.cw-tag.loaded .cw-tag-dot{background:#42d392;box-shadow:0 0 0 6px rgba(66,211,146,.10)}.cw-tag.warn{color:#fff9ea;border-color:rgba(255,210,109,.18);background:linear-gradient(180deg,rgba(112,88,33,.18),rgba(255,255,255,.025))}.cw-tag.warn .cw-tag-dot{background:#f5c563;box-shadow:0 0 0 6px rgba(245,197,99,.10)}.cw-tag.error{color:#fff0f3;border-color:rgba(255,132,154,.16);background:linear-gradient(180deg,rgba(108,34,49,.18),rgba(255,255,255,.025))}.cw-tag.error .cw-tag-dot{background:#ff879d;box-shadow:0 0 0 6px rgba(255,135,157,.10)}.cw-extra-display{min-height:34px;width:100%;padding:0 12px;display:inline-flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);cursor:pointer;transition:transform .16s ease,border-color .16s ease,background .16s ease}.cw-extra-display-label,.cw-extra-display-placeholder{font-size:11px;font-weight:800;color:var(--cw-fg-soft);letter-spacing:.05em;text-transform:uppercase}.cw-extra-display-value{font-size:12px;font-weight:700;color:var(--cw-fg)}.cw-extra-display-icon{opacity:.7}.cw-state-hint{border:1px dashed rgba(255,255,255,.12);border-radius:16px;padding:12px 13px;background:rgba(255,255,255,.02);color:var(--cw-fg-soft);font-size:12px;line-height:1.5}.cw-state-hint strong{color:var(--cw-fg)}.cw-checkbox{appearance:none;-webkit-appearance:none;position:relative;display:inline-block;vertical-align:middle;flex:none;width:18px!important;height:18px!important;min-width:18px!important;min-height:18px!important;margin:0;padding:0!important;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015));box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 4px 12px rgba(0,0,0,.16);cursor:pointer;transition:border-color .16s ease,background .16s ease,box-shadow .16s ease,transform .16s ease}.cw-checkbox:hover{border-color:rgba(255,255,255,.22);background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.03))}.cw-checkbox:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(104,112,236,.12),inset 0 1px 0 rgba(255,255,255,.04),0 4px 12px rgba(0,0,0,.18)}.cw-checkbox:checked{border-color:rgba(132,140,255,.34);background:linear-gradient(180deg,rgba(84,94,214,.52),rgba(56,63,144,.30));box-shadow:0 0 0 3px rgba(104,112,236,.11),inset 0 1px 0 rgba(255,255,255,.06),0 6px 16px rgba(0,0,0,.18)}.cw-checkbox:checked::after{content:"";position:absolute;left:5px;top:1px;width:5px;height:10px;border-right:2px solid #fff;border-bottom:2px solid #fff;transform:rotate(45deg)}.cw-checkbox:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}.cw-bulk{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));box-shadow:inset 0 1px 0 rgba(255,255,255,.02)}.cw-bulk-count{font-size:12px;font-weight:800;color:var(--cw-fg)}.cw-progress{height:10px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden;border:1px solid rgba(255,255,255,.07)}.cw-progress>span{display:block;height:100%;width:40%;background:linear-gradient(90deg,rgba(96,104,242,.10),rgba(96,104,242,.72),rgba(122,132,255,.88),rgba(96,104,242,.10));animation:cw-progress-move 1.15s linear infinite}@keyframes cw-progress-move{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}.cw-collapse summary{list-style:none;color:var(--cw-fg);font-weight:800}.cw-collapse summary::-webkit-details-marker{display:none}@media (max-width:1120px){.cw-wrap{grid-template-columns:minmax(0,1fr)}.cw-head-pills{margin-left:0;justify-content:flex-start}}@media (max-width:760px){.cw-topline{padding:14px}.cw-title{font-size:24px}.cw-sub{font-size:13px}.cw-controls{padding:10px}.cw-table th,.cw-table td{padding:9px 8px}#page-editor .ins-kv{grid-template-columns:1fr;gap:8px}.cw-pager{flex-wrap:wrap}}`;
-  ensureStyle("editor-styles", css);
-  ensureStyle("editor-flat-theme-styles",`
-    html[data-cw-theme] #page-editor .cw-root{
-      --cw-shell-bg:#171a22;
-      --cw-panel-bg:#20242d;
-      --cw-panel-strong:#171a22;
-      --cw-border:rgba(255,255,255,.13);
-      --cw-border-soft:rgba(255,255,255,.10);
-      --cw-shadow:none;
-      --cw-fg:#eef1f6;
-      --cw-fg-soft:#a9b0bd;
-    }
-    html[data-cw-theme] body .cw-pop{
-      --cw-fg:#eef1f6;
-      --cw-fg-soft:#a9b0bd;
-      --cw-border:rgba(255,255,255,.13);
-      background:#171a22!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.13)!important;
-      box-shadow:none!important;
-      backdrop-filter:none!important;
-      -webkit-backdrop-filter:none!important;
-      color:#eef1f6!important;
-    }
-    html[data-cw-theme] #page-editor .cw-topline,
-    html[data-cw-theme] #page-editor .cw-controls,
-    html[data-cw-theme] #page-editor .cw-table-wrap,
-    html[data-cw-theme] #page-editor .ins-card,
-    html[data-cw-theme] #page-editor .cw-pop{
-      background:#171a22!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.13)!important;
-      box-shadow:none!important;
-      backdrop-filter:none!important;
-      -webkit-backdrop-filter:none!important;
-    }
-    html[data-cw-theme] #page-editor .cw-controls,
-    html[data-cw-theme] #page-editor .cw-table tbody tr,
-    html[data-cw-theme] #page-editor .metric,
-    html[data-cw-theme] #page-editor .cw-search-bar,
-    html[data-cw-theme] #page-editor .cw-search-results,
-    html[data-cw-theme] #page-editor .cw-search-item,
-    html[data-cw-theme] #page-editor .cw-policy-action{
-      background:#20242d!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.13)!important;
-      box-shadow:none!important;
-    }
-    html[data-cw-theme] #page-editor .cw-table th{
-      background:#20242d!important;
-      background-image:none!important;
-      border-bottom:1px solid rgba(255,255,255,.13)!important;
-      color:#a9b0bd!important;
-      box-shadow:none!important;
-      backdrop-filter:none!important;
-      -webkit-backdrop-filter:none!important;
-      text-shadow:none!important;
-    }
-    html[data-cw-theme] #page-editor .cw-table td{
-      background:#20242d!important;
-      border-bottom-color:rgba(255,255,255,.10)!important;
-    }
-    html[data-cw-theme] #page-editor .cw-table tbody tr:hover td{
-      background:#252a34!important;
-    }
-    html[data-cw-theme] #page-editor .cw-action-cell{
-      width:46px!important;
-      min-width:46px!important;
-      padding-left:14px!important;
-      padding-right:16px!important;
-      text-align:center!important;
-    }
-    html[data-cw-theme] #page-editor .cw-btn-del{
-      width:26px!important;
-      min-width:26px!important;
-      height:26px!important;
-      min-height:26px!important;
-      padding:0!important;
-      border-radius:8px!important;
-    }
-    html[data-cw-theme] #page-editor .cw-btn-del .material-symbol{
-      font-size:14px!important;
-      line-height:1!important;
-      font-variation-settings:"FILL" 0,"wght" 520,"GRAD" 0,"opsz" 18!important;
-    }
-    html[data-cw-theme] #page-editor .cw-input,
-    html[data-cw-theme] #page-editor .cw-select,
-    html[data-cw-theme] #page-editor .cw-table input:not(.cw-checkbox),
-    html[data-cw-theme] #page-editor .cw-search-bar input,
-    html[data-cw-theme] #page-editor .cw-search-bar select,
-    html[data-cw-theme] #page-editor .cw-pop input[type="time"],
-    html[data-cw-theme] #page-editor .cw-extra-display{
-      background:#141821!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.15)!important;
-      color:#eef1f6!important;
-      box-shadow:none!important;
-    }
-    html[data-cw-theme] body .cw-pop .cw-search-bar,
-    html[data-cw-theme] body .cw-pop .cw-search-results,
-    html[data-cw-theme] body .cw-pop .cw-search-item{
-      background:#20242d!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.13)!important;
-      box-shadow:none!important;
-      color:#eef1f6!important;
-    }
-    html[data-cw-theme] body .cw-pop input,
-    html[data-cw-theme] body .cw-pop select,
-    html[data-cw-theme] body .cw-pop input[type="time"]{
-      background:#141821!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.15)!important;
-      color:#eef1f6!important;
-      box-shadow:none!important;
-    }
-    html[data-cw-theme] #page-editor .cw-btn,
-    html[data-cw-theme] #page-editor .cw-pop-btn,
-    html[data-cw-theme] #page-editor .cw-type-chip,
-    html[data-cw-theme] #page-editor .cw-rating-pill,
-    html[data-cw-theme] #page-editor .cw-tag,
-    html[data-cw-theme] #page-editor .cw-chip,
-    html[data-cw-theme] #page-editor .cw-bulk{
-      background:#20242d!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.14)!important;
-      box-shadow:none!important;
-      color:#eef1f6!important;
-    }
-    html[data-cw-theme] body .cw-pop .cw-pop-btn,
-    html[data-cw-theme] body .cw-pop .cw-type-pill,
-    html[data-cw-theme] body .cw-pop .cw-rating-pill,
-    html[data-cw-theme] body .cw-pop .cw-search-tag{
-      background:#20242d!important;
-      background-image:none!important;
-      border-color:rgba(255,255,255,.14)!important;
-      box-shadow:none!important;
-      color:#eef1f6!important;
-    }
-    html[data-cw-theme] #page-editor .cw-btn.primary,
-    html[data-cw-theme] #page-editor .cw-pop-btn.primary,
-    html[data-cw-theme] #page-editor .cw-type-chip.active,
-    html[data-cw-theme] #page-editor .cw-rating-pill.active{
-      background:#252b3d!important;
-      border-color:rgba(125,134,201,.45)!important;
-      color:#f5f7ff!important;
-    }
-    html[data-cw-theme] body .cw-pop .cw-pop-btn.primary,
-    html[data-cw-theme] body .cw-pop .cw-type-pill.active,
-    html[data-cw-theme] body .cw-pop .cw-rating-pill.active{
-      background:#252b3d!important;
-      border-color:rgba(125,134,201,.45)!important;
-      color:#f5f7ff!important;
-    }
-    html[data-cw-theme] #page-editor .cw-btn.danger{
-      background:#43272e!important;
-      border-color:rgba(216,102,114,.42)!important;
-      color:#ffe3e7!important;
-    }
-    html[data-cw-theme] #page-editor .cw-btn:hover,
-    html[data-cw-theme] #page-editor .cw-pop-btn:hover,
-    html[data-cw-theme] #page-editor .cw-type-chip:hover,
-    html[data-cw-theme] #page-editor .cw-extra-display:hover{
-      background:#252a34!important;
-      border-color:rgba(255,255,255,.20)!important;
-      filter:none!important;
-      transform:none!important;
-    }
-    html[data-cw-theme] body .cw-pop .cw-pop-btn:hover,
-    html[data-cw-theme] body .cw-pop .cw-type-pill:hover,
-    html[data-cw-theme] body .cw-pop .cw-rating-pill:hover,
-    html[data-cw-theme] body .cw-pop .cw-search-item:hover{
-      background:#252a34!important;
-      border-color:rgba(255,255,255,.20)!important;
-      filter:none!important;
-      transform:none!important;
-    }
-    html[data-cw-theme] body .cw-pop .cw-search-poster{
-      background:#141821!important;
-      border-color:rgba(255,255,255,.13)!important;
-      box-shadow:none!important;
-    }
-    html[data-cw-theme] #page-editor .cw-topline::before,
-    html[data-cw-theme] #page-editor .ins-card::before,
-    html[data-cw-theme] #page-editor .metric::before{
-      content:none!important;
-      display:none!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-root{
-      --cw-shell-bg:#ffffff;
-      --cw-panel-bg:#f5f7fb;
-      --cw-panel-strong:#ffffff;
-      --cw-border:rgba(16,24,40,.18);
-      --cw-border-soft:rgba(16,24,40,.12);
-      --cw-fg:#111827;
-      --cw-fg-soft:#475467;
-    }
-    html[data-cw-theme="flat-light"] body .cw-pop{
-      --cw-fg:#111827;
-      --cw-fg-soft:#475467;
-      --cw-border:rgba(16,24,40,.18);
-      background:#ffffff!important;
-      border-color:rgba(16,24,40,.18)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-topline,
-    html[data-cw-theme="flat-light"] #page-editor .cw-table-wrap,
-    html[data-cw-theme="flat-light"] #page-editor .ins-card,
-    html[data-cw-theme="flat-light"] #page-editor .cw-pop{
-      background:#ffffff!important;
-      border-color:rgba(16,24,40,.18)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-controls,
-    html[data-cw-theme="flat-light"] #page-editor .cw-table th,
-    html[data-cw-theme="flat-light"] #page-editor .cw-table td,
-    html[data-cw-theme="flat-light"] #page-editor .metric,
-    html[data-cw-theme="flat-light"] #page-editor .cw-search-bar,
-    html[data-cw-theme="flat-light"] #page-editor .cw-search-results,
-    html[data-cw-theme="flat-light"] #page-editor .cw-search-item,
-    html[data-cw-theme="flat-light"] #page-editor .cw-policy-action{
-      background:#f5f7fb!important;
-      border-color:rgba(16,24,40,.16)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-search-bar,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-search-results,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-search-item{
-      background:#f5f7fb!important;
-      border-color:rgba(16,24,40,.16)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-input,
-    html[data-cw-theme="flat-light"] #page-editor .cw-select,
-    html[data-cw-theme="flat-light"] #page-editor .cw-table input:not(.cw-checkbox),
-    html[data-cw-theme="flat-light"] #page-editor .cw-search-bar input,
-    html[data-cw-theme="flat-light"] #page-editor .cw-search-bar select,
-    html[data-cw-theme="flat-light"] #page-editor .cw-pop input[type="time"],
-    html[data-cw-theme="flat-light"] #page-editor .cw-extra-display{
-      background:#ffffff!important;
-      border-color:rgba(16,24,40,.18)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] body .cw-pop input,
-    html[data-cw-theme="flat-light"] body .cw-pop select,
-    html[data-cw-theme="flat-light"] body .cw-pop input[type="time"]{
-      background:#ffffff!important;
-      border-color:rgba(16,24,40,.18)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-btn,
-    html[data-cw-theme="flat-light"] #page-editor .cw-pop-btn,
-    html[data-cw-theme="flat-light"] #page-editor .cw-type-chip,
-    html[data-cw-theme="flat-light"] #page-editor .cw-rating-pill,
-    html[data-cw-theme="flat-light"] #page-editor .cw-tag,
-    html[data-cw-theme="flat-light"] #page-editor .cw-chip,
-    html[data-cw-theme="flat-light"] #page-editor .cw-bulk{
-      background:#ffffff!important;
-      border-color:rgba(16,24,40,.18)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-pop-btn,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-type-pill,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-rating-pill,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-search-tag{
-      background:#ffffff!important;
-      border-color:rgba(16,24,40,.18)!important;
-      color:#111827!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-btn.primary,
-    html[data-cw-theme="flat-light"] #page-editor .cw-pop-btn.primary,
-    html[data-cw-theme="flat-light"] #page-editor .cw-type-chip.active,
-    html[data-cw-theme="flat-light"] #page-editor .cw-rating-pill.active{
-      background:#e9ecf7!important;
-      border-color:rgba(88,101,168,.34)!important;
-      color:#172033!important;
-    }
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-pop-btn.primary,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-type-pill.active,
-    html[data-cw-theme="flat-light"] body .cw-pop .cw-rating-pill.active{
-      background:#e9ecf7!important;
-      border-color:rgba(88,101,168,.34)!important;
-      color:#172033!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-action-cell{
-      width:58px!important;
-      min-width:58px!important;
-      padding-left:18px!important;
-      padding-right:18px!important;
-      text-align:center!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-btn-del{
-      width:28px!important;
-      min-width:28px!important;
-      height:28px!important;
-      min-height:28px!important;
-      border-radius:10px!important;
-      background:#ffffff!important;
-      border-color:rgba(169,63,77,.34)!important;
-      color:#8a2f3b!important;
-      -webkit-text-fill-color:#8a2f3b!important;
-      box-shadow:none!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-btn-del:hover{
-      background:#a33d4b!important;
-      border-color:rgba(163,61,75,.34)!important;
-      color:#ffffff!important;
-      -webkit-text-fill-color:#ffffff!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-btn-del .material-symbol,
-    html[data-cw-theme="flat-light"] #page-editor .cw-btn-del .material-symbols-rounded{
-      color:currentColor!important;
-      -webkit-text-fill-color:currentColor!important;
-      font-size:16px!important;
-      line-height:1!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .ins-title,
-    html[data-cw-theme="flat-light"] #page-editor .metric .m-val{
-      color:#111827!important;
-      -webkit-text-fill-color:#111827!important;
-      opacity:1!important;
-      text-shadow:none!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .metric .m-lbl,
-    html[data-cw-theme="flat-light"] #page-editor .ins-kv label,
-    html[data-cw-theme="flat-light"] #page-editor .cw-status-text{
-      color:#667085!important;
-      -webkit-text-fill-color:#667085!important;
-      opacity:1!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .metric .material-symbol,
-    html[data-cw-theme="flat-light"] #page-editor .metric .material-symbols-rounded,
-    html[data-cw-theme="flat-light"] #page-editor .ins-icon .material-symbol,
-    html[data-cw-theme="flat-light"] #page-editor .ins-icon .material-symbols-rounded{
-      color:#4656a6!important;
-      -webkit-text-fill-color:#4656a6!important;
-      opacity:1!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .metric{
-      background:#eef3f8!important;
-      border-color:rgba(16,24,40,.18)!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-checkbox{
-      appearance:none!important;
-      -webkit-appearance:none!important;
-      width:18px!important;
-      min-width:18px!important;
-      height:18px!important;
-      min-height:18px!important;
-      border-radius:6px!important;
-      border:1px solid rgba(16,24,40,.28)!important;
-      background:#ffffff!important;
-      box-shadow:none!important;
-      position:relative!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-checkbox:checked{
-      background:#4656a6!important;
-      border-color:#4656a6!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-checkbox:checked::after{
-      content:""!important;
-      position:absolute!important;
-      left:5px!important;
-      top:1px!important;
-      width:5px!important;
-      height:10px!important;
-      border-right:2px solid #ffffff!important;
-      border-bottom:2px solid #ffffff!important;
-      transform:rotate(45deg)!important;
-    }
-    html[data-cw-theme="flat-light"] #page-editor .cw-checkbox:focus-visible{
-      outline:none!important;
-      box-shadow:0 0 0 3px rgba(70,86,166,.18)!important;
-    }
-  `);
-  ensureStyle("editor-scrollbars",".cw-table-scroll{scrollbar-width:thin;scrollbar-color:#8b5cf6 #10131a}.cw-table-scroll::-webkit-scrollbar{height:10px;width:10px}.cw-table-scroll::-webkit-scrollbar-track{background:rgba(255,255,255,.03);border-radius:12px}.cw-table-scroll::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#8b5cf6 0%,#3b82f6 100%);border-radius:12px;border:2px solid #11141c;box-shadow:inset 0 0 0 1px rgba(139,92,246,.35),0 0 10px rgba(139,92,246,.4)}.cw-table-wrap::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#a78bfa 0%,#60a5fa 100%)}");
-  ensureStyle("editor-icon-select-styles",".cw-editor-icon-select{min-width:200px;flex:1}.cw-editor-icon-select .cw-icon-select-btn{min-height:40px}.cw-editor-icon-select .cw-icon-select-icon{width:16px;height:16px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}.cw-editor-icon-select .cw-icon-select-label{font-size:13px}");
-  ensureStyle("editor-import-styles",".cw-import-panel,.cw-policy-panel{width:100%}.cw-import-summary{display:flex!important;align-items:center;justify-content:space-between;gap:10px;padding:2px 0 4px;cursor:pointer;font-weight:800;user-select:none}.cw-import-title{min-width:0;color:var(--cw-fg);font-weight:900;letter-spacing:-.01em}.cw-import-help{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:rgba(220,228,246,.78);font-size:17px;line-height:1}.cw-import-help:hover{border-color:rgba(133,140,255,.24);background:rgba(133,140,255,.10);color:#fff}.cw-import-body,.cw-policy-body{display:grid!important;gap:12px!important;width:100%!important;margin-top:10px!important}.cw-import-fields{display:grid!important;grid-template-columns:1fr!important;gap:10px!important;align-items:stretch!important}.cw-import-field{display:grid!important;gap:6px!important;width:100%!important;margin:0!important;min-width:0!important}.cw-import-field-label{font-size:10px;font-weight:900;letter-spacing:.10em;text-transform:uppercase;color:rgba(204,213,229,.62)}.cw-import-field .cw-select,.cw-import-field .cw-icon-select{width:100%!important;min-width:0!important;flex:none!important}.cw-import-actions{display:grid!important;grid-template-columns:1fr!important;gap:10px!important;align-items:stretch!important}.cw-import-features{display:flex;flex-wrap:wrap;gap:8px}.cw-import-feature{display:inline-flex!important;align-items:center;gap:7px;min-height:34px;margin:0!important;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.035);color:rgba(225,232,246,.78);font-size:12px;font-weight:800}.cw-import-feature input{flex:0 0 auto}.cw-import-run-row{display:flex!important;justify-content:flex-end!important;gap:8px!important}.cw-import-run-row .cw-btn{min-width:112px}.cw-import-progress-row{width:100%}.cw-policy-row{width:100%;padding-top:0!important}.cw-policy-copy{font-size:12px;line-height:1.45;color:rgba(204,213,229,.68)}.cw-policy-actions{display:grid;grid-template-columns:1fr;gap:8px}.cw-policy-actions .cw-btn{width:100%;justify-content:center}.cw-policy-action{display:grid;gap:5px;padding:10px;border-radius:18px;border:1px solid rgba(255,255,255,.075);background:rgba(255,255,255,.025)}.cw-policy-action span{font-size:10px;font-weight:900;letter-spacing:.10em;text-transform:uppercase;color:rgba(204,213,229,.56)}@media(max-width:760px){.cw-import-run-row{justify-content:stretch!important}.cw-import-run-row .cw-btn{width:100%}}");
-  ensureStyle("editor-polish-styles",`
-    #page-editor .cw-btn .material-symbol,#page-editor .cw-btn .material-symbols-rounded,#page-editor .cw-type-chip .material-symbol{font-size:18px;line-height:1;font-variation-settings:"FILL" 0,"wght" 560,"GRAD" 0,"opsz" 20}
-
-    #page-editor .cw-controls>.cw-btn{min-height:44px;padding:0 18px;border-radius:13px;font-size:13px;font-weight:850;gap:9px;border-color:rgba(132,148,184,.18);background:rgba(12,18,30,.68);box-shadow:inset 0 1px 0 rgba(255,255,255,.045),0 10px 24px rgba(0,0,0,.18)}
-    #page-editor .cw-controls>.cw-btn.primary{border-color:#674eea;background:#563bd9;box-shadow:inset 0 1px 0 rgba(255,255,255,.10)}
-    #page-editor .cw-controls>.cw-btn.primary:hover{background:#6247e8}
-    #page-editor .cw-controls>.cw-btn.is-busy{pointer-events:none;opacity:.78;transform:translateY(1px);box-shadow:inset 0 2px 8px rgba(0,0,0,.25)}
-    #page-editor .cw-controls>.cw-btn.is-busy .material-symbols-rounded{animation:cw-editor-spin .72s linear infinite}
-    @keyframes cw-editor-spin{to{transform:rotate(360deg)}}
-
-    #page-editor .cw-type-filter-shell{display:grid;gap:10px;width:100%;grid-column:1/-1;min-width:0}
-    #page-editor .cw-type-filter-head{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}
-    #page-editor .cw-type-filter{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;width:100%}
-    #page-editor .cw-type-filter-clear{border:0;background:transparent;color:#8b6dff;font:inherit;font-size:11px;font-weight:850;cursor:pointer;padding:2px 4px}
-    #page-editor .cw-type-filter-clear:hover{color:#b2a1ff}
-    #page-editor .cw-type-filter-clear .material-symbol{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-left:4px;border-radius:0;background:transparent;color:#8c73ff;vertical-align:middle;font-size:17px}
-
-    #page-editor .cw-type-chip{position:relative;justify-content:flex-start;min-width:0;min-height:48px;padding:0 42px 0 14px;gap:11px;border-radius:9px;color:rgba(239,245,255,.90);background:rgba(16,23,36,.66);border-color:rgba(128,145,178,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.035)}
-    #page-editor .cw-type-chip span:not(.cw-type-icon){min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    #page-editor .cw-type-chip .cw-type-icon{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:0;color:rgba(229,238,252,.84);background:transparent}
-    #page-editor .cw-type-chip.active{color:#f7fff9;border-color:rgba(35,197,132,.62);background:linear-gradient(180deg,rgba(18,67,57,.42),rgba(17,47,44,.38));box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 0 0 1px rgba(35,197,132,.10)}
-    #page-editor .cw-type-chip.active::after{content:"check";position:absolute;right:12px;top:50%;width:18px;height:18px;display:grid;place-items:center;border-radius:0;background:transparent;color:#58e5a4;font-family:"Material Symbols Rounded","Material Symbols Outlined";font-size:18px;line-height:1;transform:translateY(-50%);font-variation-settings:"FILL" 0,"wght" 700,"GRAD" 0,"opsz" 18}
-    #page-editor .cw-type-chip#cw-blocked-only{background:rgba(36,39,64,.62);border-color:rgba(126,127,178,.28)}
-    #page-editor .cw-type-chip#cw-blocked-only .cw-type-icon{background:transparent;color:#ddd4ff}
-    #page-editor .cw-type-chip#cw-blocked-only.active{border-color:rgba(151,134,255,.58);background:linear-gradient(180deg,rgba(52,45,95,.62),rgba(39,38,73,.58))}
-
-    #page-editor .cw-type-display{justify-content:center;min-height:32px;padding:0 11px;border-radius:11px;width:auto;max-width:100%;gap:8px}
-    #page-editor .cw-type-display .cw-extra-display-label{font-size:10px;letter-spacing:.045em}
-    #page-editor .cw-type-display .cw-extra-display-icon{font-size:14px;opacity:.86}
-    #page-editor .cw-type-display.type-movie{color:#c3d5ff;border-color:rgba(79,132,255,.22);background:linear-gradient(180deg,rgba(23,49,88,.54),rgba(16,32,58,.42))}
-    #page-editor .cw-type-display.type-episode{color:#7fc7ff;border-color:rgba(70,166,255,.26);background:linear-gradient(180deg,rgba(16,47,76,.55),rgba(12,31,55,.44))}
-    #page-editor .cw-type-display.type-show,#page-editor .cw-type-display.type-season,#page-editor .cw-type-display.type-anime{color:#c9d4ea;border-color:rgba(145,163,190,.18);background:rgba(19,25,38,.70)}
-
-    html[data-cw-theme] #page-editor .cw-controls>.cw-btn,html[data-cw-theme="flat-light"] #page-editor .cw-controls>.cw-btn{border-radius:13px!important}
-    html[data-cw-theme] #page-editor .cw-controls>.cw-btn.primary,html[data-cw-theme="flat-light"] #page-editor .cw-controls>.cw-btn.primary{background:#563bd9!important;border-color:#674eea!important;color:#fff!important}
-    html[data-cw-theme] #page-editor .cw-type-chip.active,html[data-cw-theme="flat-light"] #page-editor .cw-type-chip.active{border-color:rgba(35,197,132,.62)!important;background:linear-gradient(180deg,rgba(18,67,57,.42),rgba(17,47,44,.38))!important;color:#f7fff9!important}
-    html[data-cw-theme] #page-editor .cw-type-chip#cw-blocked-only.active,html[data-cw-theme="flat-light"] #page-editor .cw-type-chip#cw-blocked-only.active{border-color:rgba(151,134,255,.58)!important;background:linear-gradient(180deg,rgba(52,45,95,.62),rgba(39,38,73,.58))!important}
-    html[data-cw-theme] #page-editor .cw-type-display.type-movie,html[data-cw-theme="flat-light"] #page-editor .cw-type-display.type-movie{color:#c3d5ff!important;border-color:rgba(79,132,255,.30)!important;background:linear-gradient(180deg,rgba(23,49,88,.54),rgba(16,32,58,.42))!important}
-    html[data-cw-theme] #page-editor .cw-type-display.type-episode,html[data-cw-theme="flat-light"] #page-editor .cw-type-display.type-episode{color:#7fc7ff!important;border-color:rgba(70,166,255,.34)!important;background:linear-gradient(180deg,rgba(16,47,76,.58),rgba(12,31,55,.46))!important}
-  `);
-  ensureStyle("editor-action-column-styles",`
-    #page-editor .cw-action-head.cw-action-wide,
-    html[data-cw-theme] #page-editor .cw-action-head.cw-action-wide,
-    html[data-cw-theme="flat-light"] #page-editor .cw-action-head.cw-action-wide{
-      width:132px!important;
-      min-width:132px!important;
-    }
-    #page-editor .cw-action-cell.cw-action-wide,
-    html[data-cw-theme] #page-editor .cw-action-cell.cw-action-wide,
-    html[data-cw-theme="flat-light"] #page-editor .cw-action-cell.cw-action-wide{
-      width:132px!important;
-      min-width:132px!important;
-      padding-left:14px!important;
-      padding-right:14px!important;
-      white-space:nowrap!important;
-    }
-  `);
-  ensureStyle("editor-toolbar-compact-styles",`
-    #page-editor .cw-controls{
-      flex-wrap:nowrap!important;
-      align-items:center!important;
-      gap:10px!important;
-    }
-    #page-editor .cw-sub{
-      max-width:none!important;
-      white-space:nowrap!important;
-      overflow:hidden!important;
-      text-overflow:ellipsis!important;
-    }
-    #page-editor .cw-controls .cw-input{
-      flex:1 1 320px!important;
-      min-width:180px!important;
-    }
-    #page-editor .cw-controls-spacer{
-      flex:1 1 auto!important;
-      min-width:8px!important;
-    }
-    #page-editor #cw-status{
-      display:none!important;
-    }
-    #page-editor .cw-bulk{
-      flex:0 0 auto!important;
-      flex-wrap:nowrap!important;
-      min-height:44px!important;
-      padding:8px!important;
-      gap:8px!important;
-      border-radius:18px!important;
-      border-color:transparent!important;
-      background:transparent!important;
-      background-image:none!important;
-      box-shadow:none!important;
-    }
-    html[data-cw-theme] #page-editor .cw-bulk,
-    html[data-cw-theme="flat-light"] #page-editor .cw-bulk{
-      border-color:transparent!important;
-      background:transparent!important;
-      background-image:none!important;
-      box-shadow:none!important;
-    }
-    #page-editor .cw-bulk-count{
-      white-space:nowrap!important;
-      min-width:82px!important;
-      padding:0 6px!important;
-      text-align:left!important;
-    }
-    #page-editor .cw-bulk .cw-btn.cw-icon-only{
-      width:44px!important;
-      min-width:44px!important;
-      height:44px!important;
-      min-height:44px!important;
-      padding:0!important;
-      border-radius:13px!important;
-      gap:0!important;
-    }
-    #page-editor .cw-bulk .cw-btn.cw-icon-only .material-symbols-rounded{
-      font-size:21px!important;
-      line-height:1!important;
-    }
-    @media(max-width:980px){
-      #page-editor .cw-controls{flex-wrap:wrap!important}
-      #page-editor .cw-controls .cw-input{flex-basis:100%!important}
-    }
-  `);
-  ensureStyle("editor-page-shell-styles",`
-    #page-editor,#page-editor.card{max-width:none!important;width:100%!important;grid-column:1/-1!important;margin-left:0!important;margin-right:0!important;padding:0!important;background:transparent!important;background-image:none!important;border:0!important;box-shadow:none!important;outline:0!important;overflow:visible!important}
-    #page-editor .cw-root{max-width:none!important;width:100%!important}
-    #page-editor .cw-topline.cw-page-hero{display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;align-items:center!important;gap:18px!important;min-height:112px!important;padding:20px 30px!important;background:radial-gradient(820px 250px at 100% 0%,rgba(112,96,245,.10),transparent 68%),linear-gradient(100deg,#111821 0%,#151d31 48%,#181a38 100%)!important;overflow:hidden!important;position:relative!important}
-    html[data-cw-theme="flat-light"] #page-editor .cw-topline.cw-page-hero{background:radial-gradient(820px 250px at 100% 0%,rgba(112,96,245,.18),transparent 68%),linear-gradient(100deg,#fff 0%,#eef4ff 50%,#dfe3ff 100%)!important;color:#172033!important}
-  `);
-  ensureStyle("editor-hero-summary-styles",`
-    #page-editor .cw-editor-hero-summary{align-self:end;justify-self:end;display:inline-flex;align-items:stretch;min-height:58px;border-radius:14px;border:1px solid rgba(218,227,245,.13);background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.025));box-shadow:none;overflow:hidden;backdrop-filter:blur(6px) saturate(120%);-webkit-backdrop-filter:blur(6px) saturate(120%);position:relative;z-index:1}
-    #page-editor .cw-editor-hero-seg{display:grid;place-items:center;align-content:center;gap:4px;min-width:118px;padding:9px 16px;border-left:1px solid rgba(218,227,245,.13);color:rgba(204,213,229,.72);font-size:12px;font-weight:780;line-height:1.05;text-align:center;white-space:nowrap}
-    #page-editor .cw-editor-hero-seg:first-child{border-left:0}
-    #page-editor .cw-editor-hero-seg strong{display:block;max-width:160px;color:#f3f6ff;font-size:18px;font-weight:900;line-height:1.05;overflow:hidden;text-overflow:ellipsis}
-    #page-editor .cw-editor-hero-count strong{font-size:22px;line-height:1}
-    #page-editor .cw-editor-hero-seg span{display:block;color:rgba(204,213,229,.70);font-size:12px;font-weight:760;line-height:1.1}
-    #page-editor .cw-editor-hero-sync{min-width:112px}
-    #page-editor .cw-editor-refresh{display:inline-flex;align-items:center;justify-content:center;width:58px;height:auto;min-height:58px;margin:0;padding:0;border:0!important;border-left:1px solid rgba(218,227,245,.13)!important;border-radius:0!important;background:transparent!important;background-image:none!important;box-shadow:none!important;color:#aebdff;cursor:pointer}
-    #page-editor .cw-editor-refresh:hover{background:rgba(255,255,255,.055)!important;transform:none}
-    #page-editor .cw-editor-refresh[disabled]{opacity:.55;cursor:not-allowed}
-    #page-editor .cw-editor-refresh .material-symbols-rounded{font-size:23px;line-height:1;color:#aebdff;-webkit-text-fill-color:#aebdff}
-    #page-editor .cw-editor-refresh.is-refreshing .material-symbols-rounded{animation:cwEditorRefreshSpin .8s linear infinite}
-    @keyframes cwEditorRefreshSpin{to{transform:rotate(360deg)}}
-    html[data-cw-theme="flat-light"] #page-editor .cw-editor-hero-summary{background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.38));border-color:rgba(78,96,180,.20)}
-    html[data-cw-theme="flat-light"] #page-editor .cw-editor-hero-seg,html[data-cw-theme="flat-light"] #page-editor .cw-editor-refresh{border-color:rgba(78,96,180,.18)!important;color:rgba(23,32,51,.68)}
-    html[data-cw-theme="flat-light"] #page-editor .cw-editor-hero-seg strong{color:#172033}
-    html[data-cw-theme="flat-light"] #page-editor .cw-editor-refresh .material-symbols-rounded{color:#172033;-webkit-text-fill-color:#172033}
-    @media(max-width:760px){#page-editor .cw-editor-hero-summary{justify-self:start;max-width:100%;min-height:50px;flex-wrap:wrap}#page-editor .cw-editor-hero-seg{min-width:96px;padding:8px 12px}#page-editor .cw-editor-hero-seg strong{font-size:16px;max-width:132px}#page-editor .cw-editor-hero-count strong{font-size:18px}#page-editor .cw-editor-refresh{width:52px;min-height:50px}}
-    @media(prefers-reduced-motion:reduce){#page-editor .cw-editor-refresh.is-refreshing .material-symbols-rounded{animation:none!important}}
-  `);
-  ensureStyle("editor-progress-popup-styles",`
-    .cw-pop .cw-progress-edit-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
-    .cw-pop .cw-progress-edit-field{display:grid;gap:6px;min-width:0}
-    .cw-pop .cw-progress-edit-label{font-size:10px;font-weight:900;letter-spacing:.10em;text-transform:uppercase;color:rgba(204,213,229,.62)}
-    .cw-pop .cw-progress-percent-field{margin-top:10px}
-    .cw-pop .cw-progress-percent-wrap{position:relative}
-    .cw-pop .cw-progress-percent-wrap input{padding-right:44px!important}
-    .cw-pop .cw-progress-percent-suffix{position:absolute;right:14px;top:50%;transform:translateY(-50%);font-weight:900;color:rgba(204,213,229,.62);pointer-events:none}
-    @media(max-width:640px){.cw-pop .cw-progress-edit-grid{grid-template-columns:1fr}}
-  `);
-
+  const STORAGE_KEY = "cw-editor-ui";
   let cwEditorBooted = false;
   let cwEditorBootRetryWired = false;
 
@@ -582,12 +54,10 @@
     snapshots: [],
     instance: "default",
     playlistEndpoints: [],
+    playlistEndpointsLoaded: false,
     playlistResource: null,
     playlistWarnings: [],
     playlistOriginalKeys: [],
-    workspace: "",
-    trackerWorkspaces: [],
-    trackerAvailable: false,
     importEnabled: false,
     importProviders: [],
     importProvider: "",
@@ -596,11 +66,68 @@
     importFeatures: { watchlist: true, history: true, ratings: true, progress: true },
     hasChanges: false,
     page: 0,
+    pageSize: DEFAULT_PAGE_SIZE,
     blockedOnly: false,
     typeFilter: { movie: true, show: true, anime: true, season: true, episode: true },
+    columnVisibility: { ...DEFAULT_COLUMN_VISIBILITY },
+    columnOrder: DEFAULT_COLUMN_ORDER.slice(),
+    columnWidths: { ...DEFAULT_COLUMN_WIDTHS },
+    wideView: false,
     sortKey: "title",
     sortDir: "asc",
   };
+  const editorModules = window.CW && window.CW.Editor;
+  if (!editorModules) throw new Error("Editor module registry missing");
+  const requireEditorModule = name => {
+    const mod = editorModules[name];
+    if (!mod) throw new Error(`Editor module missing: ${name}`);
+    return mod;
+  };
+  const editorDateTime = requireEditorModule("DateTime");
+  const editorSearch = requireEditorModule("Search");
+  const editorRows = requireEditorModule("Rows");
+  const editorSources = requireEditorModule("Sources");
+  const editorImporters = requireEditorModule("Importers");
+  const editorPersistence = requireEditorModule("Persistence");
+  const editorTable = requireEditorModule("Table");
+  const editorChrome = requireEditorModule("Chrome");
+  const editorRowEditor = requireEditorModule("RowEditor");
+  const editorTableController = requireEditorModule("TableController");
+  const editorFileUtils = requireEditorModule("FileUtils");
+  const editorLoadController = requireEditorModule("LoadController");
+  const editorExtraEditors = requireEditorModule("ExtraEditors");
+  const editorMetadataReplacer = requireEditorModule("MetadataReplacer");
+  const editorSendModal = requireEditorModule("SendModal");
+  const rowBuilderOptions = () => ({
+    nextRid: () => state.ridSeq++,
+    sort: state.source !== "playlist",
+  });
+
+  function isRequiredColumn(column) {
+    return !!(COLUMN_META[column] && COLUMN_META[column].required);
+  }
+
+  function normalizeColumnOrder(order) {
+    const seen = new Set();
+    const out = [];
+    (Array.isArray(order) ? order : []).forEach(column => {
+      if (!COLUMN_KEYS.includes(column) || seen.has(column)) return;
+      seen.add(column);
+      out.push(column);
+    });
+    COLUMN_KEYS.forEach(column => {
+      if (!seen.has(column)) out.push(column);
+    });
+    return out;
+  }
+
+  function clampColumnWidth(column, value) {
+    const fallback = DEFAULT_COLUMN_WIDTHS[column] || 160;
+    const n = Number(value);
+    const min = MIN_COLUMN_WIDTHS[column] || 80;
+    const max = MAX_COLUMN_WIDTHS[column] || 720;
+    return Math.max(min, Math.min(max, Math.round(Number.isFinite(n) ? n : fallback)));
+  }
 
   function restoreUIState() {
     try {
@@ -609,10 +136,8 @@
       if (!raw) return;
       const saved = JSON.parse(raw);
 
-      const sources = ["state", "tracker", "playlist"];
+      const sources = ["state", "manual", "playlist"];
       if (saved.source && sources.includes(saved.source)) state.source = saved.source;
-
-      if (typeof saved.workspace === "string") state.workspace = saved.workspace;
 
       if (typeof saved.blockedOnly === "boolean") state.blockedOnly = saved.blockedOnly;
 
@@ -623,91 +148,46 @@
       if (typeof saved.instance === "string" && saved.instance.trim()) state.instance = saved.instance;
 
       if (typeof saved.filter === "string") state.filter = saved.filter;
+      if (PAGE_SIZE_OPTIONS.includes(Number(saved.pageSize))) state.pageSize = Number(saved.pageSize);
+      if (typeof saved.wideView === "boolean") state.wideView = saved.wideView;
 
       if (saved.typeFilter && typeof saved.typeFilter === "object") {
         ["movie", "show", "anime", "season", "episode"].forEach(t => {
           if (typeof saved.typeFilter[t] === "boolean") state.typeFilter[t] = saved.typeFilter[t];
         });
       }
+      const restoreColumnLayout = saved.columnLayoutVersion === COLUMN_LAYOUT_VERSION;
+      if (restoreColumnLayout && saved.columnVisibility && typeof saved.columnVisibility === "object") {
+        COLUMN_KEYS.forEach(k => {
+          if (typeof saved.columnVisibility[k] === "boolean") state.columnVisibility[k] = saved.columnVisibility[k];
+        });
+      }
+      if (restoreColumnLayout && Array.isArray(saved.columnOrder)) state.columnOrder = normalizeColumnOrder(saved.columnOrder);
+      if (restoreColumnLayout && saved.columnWidths && typeof saved.columnWidths === "object") {
+        COLUMN_KEYS.forEach(k => {
+          if (saved.columnWidths[k] != null) state.columnWidths[k] = clampColumnWidth(k, saved.columnWidths[k]);
+        });
+      }
 
-      const sortKeys = ["title", "type", "key", "extra"];
+      const sortKeys = COLUMN_KEYS;
       if (saved.sortKey && sortKeys.includes(saved.sortKey)) state.sortKey = saved.sortKey;
       if (saved.sortDir === "asc" || saved.sortDir === "desc") state.sortDir = saved.sortDir;
     } catch (_) {}
   }
   restoreUIState();
 
-  function wireStaticLabels(root) {
-    if (!root) return;
+  host.innerHTML = `<div class="cw-root"><div class="cw-topline cw-page-hero cw-page-hero-editor" data-hero-icon="edit_note"><div class="cw-head-copy cw-page-hero-copy"><div class="cw-page-hero-kicker">EDITOR</div><div class="cw-title-row"><div><div class="cw-title cw-page-hero-title">Editor</div><div class="cw-sub cw-page-hero-sub">Edit your current state or playlist endpoints</div></div></div></div><div class="cw-editor-hero-summary cw-page-hero-actions" id="cw-hero-summary" aria-label="Editor summary"><div class="cw-editor-hero-seg"><strong id="cw-pill-source">Current state</strong><span>source</span></div><div class="cw-editor-hero-seg"><strong id="cw-pill-kind">Watchlist</strong><span>view</span></div><div class="cw-editor-hero-seg cw-editor-hero-count"><strong id="cw-pill-count">0</strong><span>rows</span></div><div class="cw-editor-hero-seg cw-editor-hero-sync"><span>Synced</span><strong id="cw-pill-sync">never</strong></div><button id="cw-reload" class="cw-editor-refresh" type="button" title="Refresh editor data" aria-label="Refresh editor data"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button></div></div><div class="cw-wrap"><div class="cw-main"><div class="cw-controls"><input id="cw-filter" class="cw-input" placeholder="Filter by key / title / id..."><span class="cw-status-text" id="cw-status"></span><label class="cw-page-size-control" for="cw-page-size"><span>Rows</span><select id="cw-page-size" class="cw-select"><option value="50">50</option><option value="100">100</option><option value="150">150</option><option value="200">200</option></select></label><div class="cw-controls-spacer"></div><div class="cw-bulk" id="cw-bulk" style="display:none"><span class="cw-bulk-count" id="cw-bulk-count"></span><button id="cw-bulk-remove" class="cw-btn danger" type="button"></button><button id="cw-bulk-restore" class="cw-btn" type="button"></button><button id="cw-bulk-clear" class="cw-btn" type="button">Clear</button></div><button id="cw-add" class="cw-btn" type="button">Add row</button><button id="cw-save" class="cw-btn primary" type="button">Save changes</button></div><div class="cw-table-wrap" id="cw-table-wrap"><div class="cw-table-scroll"><table class="cw-table"><thead><tr><th style="width:34px"><input id="cw-select-page" class="cw-checkbox" type="checkbox" title="Select page"></th><th class="cw-action-head" style="width:46px"></th><th class="cw-col-key sortable" style="width:12%" data-sort="key">Key</th><th class="cw-col-type sortable" style="width:13%" data-sort="type">Type</th><th class="cw-col-title sortable" style="width:33%" data-sort="title">Title</th><th class="cw-col-year" style="width:84px">Year</th><th class="cw-col-id cw-col-id-a" style="width:12%" id="cw-col-id-a">TMDB</th><th class="cw-col-extra sortable" style="width:21%" data-sort="extra">Extra</th></tr></thead><tbody id="cw-tbody"></tbody></table></div></div><div class="cw-pager" id="cw-pager" style="display:none"><button id="cw-prev" class="cw-btn" type="button">Previous</button><span id="cw-page-info" class="cw-page-info"></span><button id="cw-next" class="cw-btn" type="button">Next</button></div><div class="cw-empty" id="cw-empty" role="status" style="display:none"><span class="material-symbols-rounded cw-empty-icon" aria-hidden="true">table_rows</span><div class="cw-empty-text">No rows match this view.</div></div></div><aside class="cw-side"><div class="ins-card"><div class="ins-row"><div class="ins-icon"><span class="material-symbol">tune</span></div><div class="ins-title">Workspace</div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><label>Source</label><select id="cw-source" class="cw-select"><option value="state">Current State</option><option value="manual">Manual Overrides</option></select><label>Kind</label><select id="cw-kind" class="cw-select"><option value="watchlist">Watchlist</option><option value="history">History</option><option value="ratings">Ratings</option><option value="progress">Progress</option></select><label id="cw-pair-label" style="display:none">Pair</label><select id="cw-pair" class="cw-select" style="display:none"></select><label id="cw-snapshot-label">Snapshot</label><select id="cw-snapshot" class="cw-select"><option value="">Latest</option></select><label id="cw-instance-label" style="display:none">Profile</label><select id="cw-instance" class="cw-select" style="display:none"><option value="default">Default</option></select><div id="cw-instance-shared" class="cw-shared-note" role="note" style="display:none"></div></div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><div class="field-label">Types</div><div id="cw-type-filter" class="cw-type-filter"><button type="button" data-type="movie" class="cw-type-chip active">Movies</button><button type="button" data-type="show" class="cw-type-chip active">Shows</button><button type="button" data-type="anime" class="cw-type-chip active">Anime</button><button type="button" data-type="season" class="cw-type-chip active">Seasons</button><button type="button" data-type="episode" class="cw-type-chip active">Episodes</button><button type="button" id="cw-blocked-only" class="cw-type-chip">Blocked</button></div></div></div><div class="ins-row" id="cw-state-bulk" style="display:none"><details class="cw-collapse" id="cw-bulk-details" style="width:100%"><summary style="cursor:pointer;font-weight:700;user-select:none">Block rules</summary><div style="display:flex;flex-direction:column;gap:8px;width:100%;margin-top:10px"><select id="cw-bulk-type" class="cw-select" style="width:100%"></select><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="cw-bulk-block-type" class="cw-btn danger" type="button" style="flex:1 1 0;min-width:120px">Block all</button><button id="cw-bulk-unblock-type" class="cw-btn" type="button" style="flex:1 1 0;min-width:120px">Unblock all</button></div><div class="cw-status-text">Current State only â€¢ affects baseline items</div></div></details></div><div class="ins-row" id="cw-import-row" style="display:none"><details class="cw-collapse" id="cw-import-details" style="width:100%"><summary style="cursor:pointer;font-weight:700;user-select:none">Import provider state</summary><div style="display:flex;flex-direction:column;gap:10px;width:100%;margin-top:10px"><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><select id="cw-import-provider" class="cw-select" style="flex:1;min-width:200px"></select><select id="cw-import-instance" class="cw-select" style="min-width:180px"></select><select id="cw-import-mode" class="cw-select" style="min-width:180px"><option value="replace">Replace baseline</option><option value="merge">Merge (keep old)</option></select></div><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><label id="cw-import-watchlist-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-watchlist" class="cw-checkbox" type="checkbox" checked>Watchlist </label><label id="cw-import-history-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-history" class="cw-checkbox" type="checkbox" checked>History </label><label id="cw-import-ratings-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-ratings" class="cw-checkbox" type="checkbox" checked>Ratings </label><label id="cw-import-progress-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-progress-cb" class="cw-checkbox" type="checkbox" checked>Progress </label><span style="flex:1 1 auto"></span><button id="cw-import-run" class="cw-btn sm" type="button">Import</button></div><div id="cw-import-progress" style="display:none"><div class="cw-progress"><span></span></div><div class="cw-status-text" id="cw-import-progress-text" style="margin-top:6px"></div></div></div></details></div></div><div class="ins-card"><div class="ins-row" style="align-items:center"><div class="ins-icon"><span class="material-symbol">insights</span></div><div class="ins-title" style="margin-right:auto">Pulse</div><span class="cw-tag" id="cw-tag-status"><span class="cw-tag-dot"></span><span id="cw-tag-label">Idle</span></span></div><div class="ins-row"><div class="ins-metrics"><div class="metric-row"><div class="metric"><span class="material-symbol">view_list</span><div><div class="m-val" id="cw-summary-total">0</div><div class="m-lbl">Total rows</div></div></div><div class="metric"><span class="material-symbol">visibility</span><div><div class="m-val" id="cw-summary-visible">0</div><div class="m-lbl">Rows visible</div></div></div></div><div class="metric-divider"></div><div class="metric-row"><div class="metric"><span class="material-symbol">movie</span><div><div class="m-val" id="cw-summary-movies">0</div><div class="m-lbl">Movies</div></div></div><div class="metric"><span class="material-symbol">monitoring</span><div><div class="m-val" id="cw-summary-shows">0</div><div class="m-lbl">Shows</div></div></div><div class="metric"><span class="material-symbol">layers</span><div><div class="m-val" id="cw-summary-seasons">0</div><div class="m-lbl">Seasons</div></div></div><div class="metric"><span class="material-symbol">live_tv</span><div><div class="m-val" id="cw-summary-episodes">0</div><div class="m-lbl">Episodes</div></div></div></div><div class="metric-divider"></div><div class="metric-row"><div class="metric"><span class="material-symbol">description</span><div><div class="m-val" id="cw-summary-state-files">0</div><div class="m-lbl">State files</div></div></div><div class="metric"><span class="material-symbol">folder_copy</span><div><div class="m-val" id="cw-summary-snapshots">0</div><div class="m-lbl">Snapshots</div></div></div></div><div id="cw-state-hint" class="cw-state-hint" style="display:none"><strong>No sync state found.</strong> Run a CrossWatch sync once to generate it.</div></div></div></div><div class="ins-card" id="cw-backup-card"><div class="ins-row"><div class="ins-icon"><span class="material-symbol">backup</span></div><div class="ins-title">Archive</div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><label>Export / Import</label><div class="cw-backup-actions"><button id="cw-download" class="cw-btn" type="button">Download ZIP</button><button id="cw-upload" class="cw-btn" type="button">Import file</button><input id="cw-upload-input" type="file" accept=".zip,.json" style="display:none"></div></div></div></div><div class="ins-card" id="cw-state-backup-card"><div class="ins-row"><div class="ins-icon"><span class="material-symbol">backup</span></div><div class="ins-title">Policy backup</div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><label>Export / Import</label><div class="cw-backup-actions"><button id="cw-state-download" class="cw-btn" type="button">Download JSON</button><button id="cw-state-upload" class="cw-btn" type="button">Import file</button><input id="cw-state-upload-input" type="file" accept=".json" style="display:none"></div></div></div></div></aside></div></div>`;
 
-    const bindPrevLabel = (fieldId) => {
-      const field = root.querySelector(`#${fieldId}`);
-      const label = field?.previousElementSibling;
-      if (label?.tagName === "LABEL") label.htmlFor = fieldId;
-    };
-
-    bindPrevLabel("cw-source");
-    bindPrevLabel("cw-kind");
-    bindPrevLabel("cw-pair");
-    bindPrevLabel("cw-snapshot");
-    bindPrevLabel("cw-instance");
-
-    const convertGroupLabel = (cardId) => {
-      const field = root.querySelector(`#${cardId} .ins-kv`);
-      const label = field?.firstElementChild;
-      if (!field || label?.tagName !== "LABEL") return;
-      const title = document.createElement("div");
-      title.className = "field-label";
-      title.textContent = label.textContent || "";
-      label.replaceWith(title);
-    };
-
-    convertGroupLabel("cw-backup-card");
-    convertGroupLabel("cw-state-backup-card");
-  }
-
-  host.innerHTML = `<div class="cw-root"><div class="cw-topline cw-page-hero cw-page-hero-editor" data-hero-icon="edit_note"><div class="cw-head-copy cw-page-hero-copy"><div class="cw-page-hero-kicker">EDITOR</div><div class="cw-title-row"><div><div class="cw-title cw-page-hero-title">Editor</div><div class="cw-sub cw-page-hero-sub">Edit your current state, tracker or cache</div></div></div></div><div class="cw-editor-hero-summary cw-page-hero-actions" id="cw-hero-summary" aria-label="Editor summary"><div class="cw-editor-hero-seg"><strong id="cw-pill-source">Current state</strong><span>source</span></div><div class="cw-editor-hero-seg"><strong id="cw-pill-kind">Watchlist</strong><span>view</span></div><div class="cw-editor-hero-seg cw-editor-hero-count"><strong id="cw-pill-count">0</strong><span>rows</span></div><div class="cw-editor-hero-seg cw-editor-hero-sync"><span>Synced</span><strong id="cw-pill-sync">never</strong></div><button id="cw-reload" class="cw-editor-refresh" type="button" title="Refresh editor data" aria-label="Refresh editor data"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button></div></div><div class="cw-wrap"><div class="cw-main"><div class="cw-controls"><input id="cw-filter" class="cw-input" placeholder="Filter by key / title / id..."><span class="cw-status-text" id="cw-status"></span><div class="cw-controls-spacer"></div><div class="cw-bulk" id="cw-bulk" style="display:none"><span class="cw-bulk-count" id="cw-bulk-count"></span><button id="cw-bulk-remove" class="cw-btn danger" type="button"></button><button id="cw-bulk-restore" class="cw-btn" type="button"></button><button id="cw-bulk-clear" class="cw-btn" type="button">Clear</button></div><button id="cw-add" class="cw-btn" type="button">Add row</button><button id="cw-save" class="cw-btn primary" type="button">Save changes</button></div><div class="cw-table-wrap" id="cw-table-wrap"><div class="cw-table-scroll"><table class="cw-table"><thead><tr><th style="width:34px"><input id="cw-select-page" class="cw-checkbox" type="checkbox" title="Select page"></th><th class="cw-action-head" style="width:46px"></th><th style="width:12%" data-sort="key" class="sortable">Key</th><th style="width:13%" data-sort="type" class="sortable">Type</th><th style="width:33%" data-sort="title" class="sortable">Title</th><th style="width:84px">Year</th><th style="width:12%" id="cw-col-id-a">TMDB</th><th style="width:21%" data-sort="extra" class="sortable">Extra</th></tr></thead><tbody id="cw-tbody"></tbody></table></div></div><div class="cw-pager" id="cw-pager" style="display:none"><button id="cw-prev" class="cw-btn" type="button">Previous</button><span id="cw-page-info" class="cw-page-info"></span><button id="cw-next" class="cw-btn" type="button">Next</button></div><div class="cw-empty" id="cw-empty" style="display:none">No rows match this view.</div></div><aside class="cw-side"><div class="ins-card"><div class="ins-row"><div class="ins-icon"><span class="material-symbol">tune</span></div><div class="ins-title">Workspace</div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><label>Source</label><select id="cw-source" class="cw-select"><option value="state">Current State</option><option value="pair">Pair Cache</option><option value="tracker">Local Tracker</option></select><label>Kind</label><select id="cw-kind" class="cw-select"><option value="watchlist">Watchlist</option><option value="history">History</option><option value="ratings">Ratings</option><option value="progress">Progress</option></select><label id="cw-pair-label" style="display:none">Pair</label><select id="cw-pair" class="cw-select" style="display:none"></select><label id="cw-snapshot-label">Snapshot</label><select id="cw-snapshot" class="cw-select"><option value="">Latest</option></select><label id="cw-instance-label" style="display:none">Profile</label><select id="cw-instance" class="cw-select" style="display:none"><option value="default">Default</option></select></div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><div class="field-label">Types</div><div id="cw-type-filter" class="cw-type-filter"><button type="button" data-type="movie" class="cw-type-chip active">Movies</button><button type="button" data-type="show" class="cw-type-chip active">Shows</button><button type="button" data-type="anime" class="cw-type-chip active">Anime</button><button type="button" data-type="season" class="cw-type-chip active">Seasons</button><button type="button" data-type="episode" class="cw-type-chip active">Episodes</button><button type="button" id="cw-blocked-only" class="cw-type-chip">Blocked</button></div></div></div><div class="ins-row" id="cw-state-bulk" style="display:none"><details class="cw-collapse" id="cw-bulk-details" style="width:100%"><summary style="cursor:pointer;font-weight:700;user-select:none">Block rules</summary><div style="display:flex;flex-direction:column;gap:8px;width:100%;margin-top:10px"><select id="cw-bulk-type" class="cw-select" style="width:100%"></select><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="cw-bulk-block-type" class="cw-btn danger" type="button" style="flex:1 1 0;min-width:120px">Block all</button><button id="cw-bulk-unblock-type" class="cw-btn" type="button" style="flex:1 1 0;min-width:120px">Unblock all</button></div><div class="cw-status-text">Current State only • affects baseline items</div></div></details></div><div class="ins-row" id="cw-import-row" style="display:none"><details class="cw-collapse" id="cw-import-details" style="width:100%"><summary style="cursor:pointer;font-weight:700;user-select:none">Import provider state</summary><div style="display:flex;flex-direction:column;gap:10px;width:100%;margin-top:10px"><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><select id="cw-import-provider" class="cw-select" style="flex:1;min-width:200px"></select><select id="cw-import-instance" class="cw-select" style="min-width:180px"></select><select id="cw-import-mode" class="cw-select" style="min-width:180px"><option value="replace">Replace baseline</option><option value="merge">Merge (keep old)</option></select></div><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><label id="cw-import-watchlist-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-watchlist" class="cw-checkbox" type="checkbox" checked>Watchlist </label><label id="cw-import-history-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-history" class="cw-checkbox" type="checkbox" checked>History </label><label id="cw-import-ratings-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-ratings" class="cw-checkbox" type="checkbox" checked>Ratings </label><label id="cw-import-progress-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;width:auto;margin:0"><input id="cw-import-progress-cb" class="cw-checkbox" type="checkbox" checked>Progress </label><span style="flex:1 1 auto"></span><button id="cw-import-run" class="cw-btn sm" type="button">Import</button></div><div id="cw-import-progress" style="display:none"><div class="cw-progress"><span></span></div><div class="cw-status-text" id="cw-import-progress-text" style="margin-top:6px"></div></div></div></details></div></div><div class="ins-card"><div class="ins-row" style="align-items:center"><div class="ins-icon"><span class="material-symbol">insights</span></div><div class="ins-title" style="margin-right:auto">Pulse</div><span class="cw-tag" id="cw-tag-status"><span class="cw-tag-dot"></span><span id="cw-tag-label">Idle</span></span></div><div class="ins-row"><div class="ins-metrics"><div class="metric-row"><div class="metric"><span class="material-symbol">view_list</span><div><div class="m-val" id="cw-summary-total">0</div><div class="m-lbl">Total rows</div></div></div><div class="metric"><span class="material-symbol">visibility</span><div><div class="m-val" id="cw-summary-visible">0</div><div class="m-lbl">Rows visible</div></div></div></div><div class="metric-divider"></div><div class="metric-row"><div class="metric"><span class="material-symbol">movie</span><div><div class="m-val" id="cw-summary-movies">0</div><div class="m-lbl">Movies</div></div></div><div class="metric"><span class="material-symbol">monitoring</span><div><div class="m-val" id="cw-summary-shows">0</div><div class="m-lbl">Shows</div></div></div><div class="metric"><span class="material-symbol">layers</span><div><div class="m-val" id="cw-summary-seasons">0</div><div class="m-lbl">Seasons</div></div></div><div class="metric"><span class="material-symbol">live_tv</span><div><div class="m-val" id="cw-summary-episodes">0</div><div class="m-lbl">Episodes</div></div></div></div><div class="metric-divider"></div><div class="metric-row"><div class="metric"><span class="material-symbol">description</span><div><div class="m-val" id="cw-summary-state-files">0</div><div class="m-lbl">State files</div></div></div><div class="metric"><span class="material-symbol">folder_copy</span><div><div class="m-val" id="cw-summary-snapshots">0</div><div class="m-lbl">Snapshots</div></div></div></div><div id="cw-state-hint" class="cw-state-hint" style="display:none"><strong>No tracker data found.</strong> Run a CrossWatch sync with the tracker enabled once. After that, tracker state files and snapshots will appear here and you can edit them. </div></div></div></div><div class="ins-card" id="cw-backup-card"><div class="ins-row"><div class="ins-icon"><span class="material-symbol">backup</span></div><div class="ins-title">Archive</div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><label>Export / Import</label><div class="cw-backup-actions"><button id="cw-download" class="cw-btn" type="button">Download ZIP</button><button id="cw-upload" class="cw-btn" type="button">Import file</button><input id="cw-upload-input" type="file" accept=".zip,.json" style="display:none"></div></div></div></div><div class="ins-card" id="cw-state-backup-card"><div class="ins-row"><div class="ins-icon"><span class="material-symbol">backup</span></div><div class="ins-title">Policy backup</div></div><div class="ins-row"><div class="ins-kv" style="width:100%"><label>Export / Import</label><div class="cw-backup-actions"><button id="cw-state-download" class="cw-btn" type="button">Download JSON</button><button id="cw-state-upload" class="cw-btn" type="button">Import file</button><input id="cw-state-upload-input" type="file" accept=".json" style="display:none"></div></div></div></div></aside></div></div>`;
-
-  wireStaticLabels(host);
-
-  const sourceSelectBoot = document.getElementById("cw-source");
-  if (sourceSelectBoot) {
-    sourceSelectBoot.querySelector('option[value="pair"]')?.remove();
-    if (!sourceSelectBoot.querySelector('option[value="tracker"]')) {
-      const trackerOpt = document.createElement("option");
-      trackerOpt.value = "tracker";
-      trackerOpt.textContent = "Local Tracker";
-      sourceSelectBoot.appendChild(trackerOpt);
-    } else {
-      sourceSelectBoot.querySelector('option[value="tracker"]').textContent = "Local Tracker";
-    }
-    if (!sourceSelectBoot.querySelector('option[value="playlist"]')) {
-      const opt = document.createElement("option");
-      opt.value = "playlist";
-      opt.textContent = "Playlist Endpoint";
-      sourceSelectBoot.appendChild(opt);
-    }
-  }
-  const subBoot = host.querySelector(".cw-sub");
-  if (subBoot) subBoot.textContent = "Edit your current state or playlist endpoints";
-
-  const trackerNoticeBoot = document.createElement("div");
-  trackerNoticeBoot.id = "cw-tracker-notice";
-  trackerNoticeBoot.className = "cw-state-hint";
-  trackerNoticeBoot.style.display = "none";
-  trackerNoticeBoot.innerHTML =
-    "<strong>Local Tracker</strong> stores data inside CrossWatch. Changes here affect future syncs from Local Tracker but only for one-way syncs.";
-  host.querySelector(".cw-controls")?.insertAdjacentElement("afterend", trackerNoticeBoot);
-
-  host.querySelectorAll("input,select,textarea").forEach((field, idx) => {
-    if (!field.name) field.name = field.id || `cw-field-${idx + 1}`;
-  });
+  editorChrome.wireStaticLabels(host);
+  editorChrome.prepareSourceOptions(host);
+  editorChrome.addTrackerNotice(host);
+  editorChrome.ensureFieldNames(host);
 
   const $ = id => document.getElementById(id);
   const pickEls = spec => Object.fromEntries(Object.entries(spec).map(([key, id]) => [key, $(id)]));
   const {
     sourceSel, kindSel, pairLabel, pairSel, snapLabel, snapSel, instanceLabel, instanceSel,
-    filterInput, reloadBtn, addBtn, saveBtn, tbody, empty, statusEl, tag, tagLabel,
+    filterInput, pageSizeSel, reloadBtn, addBtn, saveBtn, tbody, empty, statusEl, tag, tagLabel,
     summaryVisible, summaryTotal, summaryMovies, summaryShows, summarySeasons, summaryEpisodes,
     summaryStateFiles, summarySnapshots, stateHint, pager, prevBtn, nextBtn, pageInfo,
     typeFilterWrap, backupCard, blockedOnlyBtn, downloadBtn, uploadBtn, uploadInput,
@@ -730,6 +210,7 @@
     instanceLabel: "cw-instance-label",
     instanceSel: "cw-instance",
     filterInput: "cw-filter",
+    pageSizeSel: "cw-page-size",
     reloadBtn: "cw-reload",
     addBtn: "cw-add",
     saveBtn: "cw-save",
@@ -792,190 +273,62 @@
     bulkUnblockTypeBtn: "cw-bulk-unblock-type",
   });
 
+  const columnsBtn = document.createElement("button");
+  columnsBtn.id = "cw-columns-btn";
+  columnsBtn.className = "cw-btn cw-columns-btn";
+  columnsBtn.type = "button";
+  columnsBtn.title = "Columns";
+  columnsBtn.setAttribute("aria-label", "Columns");
+  columnsBtn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">filter_alt</span>`;
+  pageSizeSel?.closest(".cw-page-size-control")?.insertAdjacentElement("afterend", columnsBtn);
+
+  const wideBtn = document.createElement("button");
+  wideBtn.id = "cw-wide-btn";
+  wideBtn.className = "cw-btn cw-wide-btn";
+  wideBtn.type = "button";
+  wideBtn.title = "Wide view";
+  wideBtn.setAttribute("aria-label", "Wide view");
+  wideBtn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">fullscreen</span>`;
+  columnsBtn.insertAdjacentElement("afterend", wideBtn);
+
+  const bulkSendBtn = document.createElement("button");
+  bulkSendBtn.id = "cw-bulk-send";
+  bulkSendBtn.className = "cw-btn";
+  bulkSendBtn.type = "button";
+  bulkWrap?.insertBefore(bulkSendBtn, bulkRemoveBtn || bulkClearBtn || null);
+
   if (backupCard) backupCard.remove();
   [summaryStateFiles, summarySnapshots].forEach(el => el?.closest(".metric")?.remove());
 
-  function decorateImportPanel() {
-    const details = document.getElementById("cw-import-details");
-    if (!details || details.dataset.decorated === "1") return;
-    details.dataset.decorated = "1";
-    details.classList.add("cw-import-panel");
-
-    const summary = details.querySelector("summary");
-    if (summary) {
-      summary.classList.add("cw-import-summary");
-      summary.innerHTML =
-        '<span class="cw-import-title">Import provider state</span>' +
-        '<span class="cw-import-help material-symbol" title="Imports selected Watchlist, History, Ratings, or Progress data from a configured provider profile into Current State. Replace baseline refreshes those datasets from the provider; Merge keeps existing baseline rows and adds or updates provider rows. Provider accounts are not changed." aria-label="Import provider state help">help</span>';
-    }
-
-    const body = summary ? summary.nextElementSibling : null;
-    if (body instanceof HTMLElement) {
-      body.classList.add("cw-import-body");
-      body.style.cssText = "";
-      const rows = Array.from(body.children).filter(el => el instanceof HTMLElement);
-      const fields = rows[0];
-      const actions = rows[1];
-      if (fields instanceof HTMLElement) {
-        fields.classList.add("cw-import-fields");
-        fields.style.cssText = "";
-      }
-      if (actions instanceof HTMLElement) {
-        actions.classList.add("cw-import-actions");
-        actions.style.cssText = "";
-      }
-    }
-
-    const wrapField = (el, label) => {
-      if (!(el instanceof HTMLElement) || el.parentElement?.classList.contains("cw-import-field")) return;
-      const field = document.createElement("label");
-      field.className = "cw-import-field";
-      const text = document.createElement("span");
-      text.className = "cw-import-field-label";
-      text.textContent = label;
-      el.parentNode.insertBefore(field, el);
-      field.append(text, el);
-    };
-
-    wrapField(importProviderSel, "Provider");
-    wrapField(importInstanceSel, "Profile");
-    wrapField(importModeSel, "Mode");
-
-    const featureWrap = document.createElement("div");
-    featureWrap.className = "cw-import-features";
-    [importWatchlistWrap, importHistoryWrap, importRatingsWrap, importProgressFeatWrap].forEach(wrap => {
-      if (!(wrap instanceof HTMLElement)) return;
-      wrap.classList.add("cw-import-feature");
-      wrap.style.cssText = "";
-      featureWrap.append(wrap);
-    });
-
-    const runRow = document.createElement("div");
-    runRow.className = "cw-import-run-row";
-    if (importRunBtn) runRow.append(importRunBtn);
-
-    const actions = details.querySelector(".cw-import-actions");
-    if (actions) {
-      actions.textContent = "";
-      actions.append(featureWrap, runRow);
-    }
-
-    if (importProgressWrap) importProgressWrap.classList.add("cw-import-progress-row");
-  }
-
-  decorateImportPanel();
-
-  function decoratePolicyBackupPanel() {
-    if (!stateBackupCard || stateBackupCard.dataset.decorated === "1") return;
-    stateBackupCard.dataset.decorated = "1";
-    stateBackupCard.className = "ins-row cw-policy-row";
-    if (importRow && importRow.parentNode && stateBackupCard.parentNode !== importRow.parentNode) {
-      importRow.insertAdjacentElement("afterend", stateBackupCard);
-    }
-
-    const details = document.createElement("details");
-    details.id = "cw-policy-details";
-    details.className = "cw-collapse cw-policy-panel";
-    details.style.width = "100%";
-
-    const summary = document.createElement("summary");
-    summary.className = "cw-import-summary";
-    summary.innerHTML =
-      '<span class="cw-import-title">Policy backup</span>' +
-      '<span class="cw-import-help material-symbol" title="Exports or imports the local Current State policy JSON used by manual baseline edits and block rules. It does not change provider accounts." aria-label="Policy backup help">help</span>';
-
-    const body = document.createElement("div");
-    body.className = "cw-policy-body";
-
-    const copy = document.createElement("div");
-    copy.className = "cw-policy-copy";
-    copy.textContent = "Export or import the local Current State policy as JSON.";
-
-    const actions = document.createElement("div");
-    actions.className = "cw-policy-actions";
-
-    const exportAction = document.createElement("div");
-    exportAction.className = "cw-policy-action";
-    exportAction.innerHTML = "<span>Export</span>";
-    if (stateDownloadBtn) exportAction.append(stateDownloadBtn);
-
-    const importAction = document.createElement("div");
-    importAction.className = "cw-policy-action";
-    importAction.innerHTML = "<span>Import</span>";
-    if (stateUploadBtn) importAction.append(stateUploadBtn);
-    if (stateUploadInput) importAction.append(stateUploadInput);
-
-    actions.append(exportAction, importAction);
-    body.append(copy, actions);
-    details.append(summary, body);
-    stateBackupCard.textContent = "";
-    stateBackupCard.append(details);
-  }
-
-  decoratePolicyBackupPanel();
-
-  function decorateEditorChrome() {
-    const typeIcons = {
-      movie: "movie",
-      show: "tv",
-      anime: "theater_comedy",
-      season: "layers",
-      episode: "play_circle",
-      blocked: "block",
-    };
-    const setButtonIcon = (btn, icon, label) => {
-      if (!btn) return;
-      btn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">${icon}</span><span>${label}</span>`;
-      btn.setAttribute("aria-label", label);
-    };
-
-    setButtonIcon(addBtn, "add", "Add row");
-    setButtonIcon(saveBtn, "check", "Save changes");
-
-    if (typeFilterWrap && typeFilterWrap.dataset.decorated !== "1") {
-      typeFilterWrap.dataset.decorated = "1";
-      const field = typeFilterWrap.closest(".ins-kv");
-      const label = field?.querySelector(".field-label");
-      if (field && label) {
-        const shell = document.createElement("div");
-        shell.className = "cw-type-filter-shell";
-        const head = document.createElement("div");
-        head.className = "cw-type-filter-head";
-        const title = document.createElement("div");
-        title.className = "field-label";
-        title.textContent = label.textContent || "Types";
-        const clear = document.createElement("button");
-        clear.type = "button";
-        clear.className = "cw-type-filter-clear";
-        clear.innerHTML = 'Clear <span class="material-symbol" aria-hidden="true">filter_alt</span>';
-        clear.setAttribute("aria-label", "Clear type filters");
-        clear.addEventListener("click", () => {
-          ["movie", "show", "anime", "season", "episode"].forEach(t => {
-            state.typeFilter[t] = true;
-          });
-          state.blockedOnly = false;
-          syncTypeFilterUI();
-          state.page = 0;
-          persistUIState();
-          renderRows();
-        });
-        head.append(title, clear);
-        label.replaceWith(shell);
-        shell.append(head, typeFilterWrap);
-      }
-
-      typeFilterWrap.querySelectorAll("button").forEach(btn => {
-        const type = btn.dataset.type || (btn.id === "cw-blocked-only" ? "blocked" : "");
-        const text = (btn.textContent || "").trim();
-        btn.innerHTML =
-          `<span class="material-symbol cw-type-icon" aria-hidden="true">${typeIcons[type] || "category"}</span>` +
-          `<span>${_escapeHtml(text)}</span>`;
-      });
-    }
-  }
-
-  decorateEditorChrome();
-  const sortHeaders = Array.from(host.querySelectorAll(".cw-table th[data-sort]"));
+  editorChrome.decorateImportPanel({
+    importProviderSel,
+    importInstanceSel,
+    importModeSel,
+    importWatchlistWrap,
+    importHistoryWrap,
+    importRatingsWrap,
+    importProgressFeatWrap,
+    importRunBtn,
+    importProgressWrap,
+  });
+  editorChrome.decoratePolicyBackupPanel({
+    stateBackupCard,
+    importRow,
+    stateDownloadBtn,
+    stateUploadBtn,
+    stateUploadInput,
+  });
+  editorChrome.decorateEditorChrome({
+    addBtn,
+    saveBtn,
+    typeFilterWrap,
+    state,
+    syncTypeFilterUI,
+    persistUIState,
+    renderRows,
+  });
+  let sortHeaders = Array.from(host.querySelectorAll(".cw-table th[data-sort]"));
+  let columnLayoutResizeTimer = 0;
   const providerMeta = window.CW?.ProviderMeta || {};
   const providerKey = (name) => String(name || "").trim().toUpperCase();
   const providerLabel = (name, fallback = "") => {
@@ -984,7 +337,7 @@
   };
   function syncProviderIconSelect(selectEl, show) {
     if (!selectEl) return;
-    const helper = window.CW?.IconSelect?.enhance;
+    const helper = window.CW?.ProfileSelect?.enhanceProvider;
     const wrap = selectEl.nextElementSibling && selectEl.nextElementSibling.classList?.contains("cw-icon-select")
       ? selectEl.nextElementSibling
       : null;
@@ -1013,37 +366,137 @@
     if (nextWrap) nextWrap.style.display = "";
   }
 
+  function syncProfileIconSelect(selectEl, show) {
+    if (!selectEl) return;
+    const helper = window.CW?.ProfileSelect?.enhanceProfile;
+    const wrap = selectEl.nextElementSibling && selectEl.nextElementSibling.classList?.contains("cw-icon-select")
+      ? selectEl.nextElementSibling
+      : null;
+    if (!show || typeof helper !== "function") {
+      selectEl.classList.remove("cw-icon-select-native");
+      if (wrap) wrap.style.display = "none";
+      return;
+    }
+    helper(selectEl, {
+      className: "cw-editor-icon-select",
+    });
+    const nextWrap = selectEl.nextElementSibling && selectEl.nextElementSibling.classList?.contains("cw-icon-select")
+      ? selectEl.nextElementSibling
+      : null;
+    if (nextWrap) nextWrap.style.display = "";
+  }
+
+  function syncSnapshotControlVisibility() {
+    return editorSources.syncSnapshotControlVisibility(sourceContext());
+  }
+
+  function sourceContext() {
+    return {
+      state,
+      host,
+      sourceSel,
+      pairLabel,
+      pairSel,
+      snapLabel,
+      snapSel,
+      kindSel,
+      instanceLabel,
+      instanceSel,
+      backupCard,
+      stateBackupCard,
+      blockedOnlyBtn,
+      trackerNotice,
+      stateHint,
+      escapeHtml: _escapeHtml,
+      providerLabel,
+      fetchJSON,
+      syncProviderIconSelect,
+      syncProfileIconSelect,
+      renderInstanceOptions,
+      loadInstanceOptions,
+      persistUIState,
+      syncKindUI,
+      syncTypeFilterUI,
+      syncStateBulkUI,
+      syncImportUI,
+      syncActionButtons,
+      syncHeaderPills,
+    };
+  }
+
+  function importContext() {
+    return {
+      state,
+      importRow,
+      importProviderSel,
+      importInstanceSel,
+      importWatchlistCb,
+      importHistoryCb,
+      importRatingsCb,
+      importProgressCb,
+      importModeSel,
+      importRunBtn,
+      importWatchlistWrap,
+      importHistoryWrap,
+      importRatingsWrap,
+      importProgressFeatWrap,
+      importProgressWrap,
+      importProgressText,
+      providerLabel,
+      fetchJSON,
+      syncProviderIconSelect,
+      syncProfileIconSelect,
+      renderInstanceOptions,
+      persistUIState,
+      setTag,
+      setStatus,
+      setStatusSticky,
+      loadSnapshots,
+      loadState,
+    };
+  }
+
+  function persistenceContext() {
+    return {
+      state,
+      fetchJSON,
+      setTag,
+      setStatus,
+      syncActionButtons,
+      loadState,
+      loadSnapshots,
+      isPolicySource,
+      isProviderPickerSource,
+      isTrackerSource,
+      isManualSource,
+      confirm: message => window.confirm(message),
+    };
+  }
+
   let statusStickyUntil = 0;
 
-  const SOURCES = ["state", "tracker", "playlist"];
-
   function isTrackerSource() {
-    return state.source === "tracker";
+    return editorSources.isTrackerSource(state);
+  }
+
+  function isManualSource() {
+    return editorSources.isManualSource(state);
+  }
+
+  function isProviderPickerSource() {
+    return editorSources.isProviderPickerSource(state);
   }
 
   function isPolicySource() {
-    return state.source === "state" || state.source === "tracker";
+    return editorSources.isPolicySource(state);
   }
 
   function normalizeSource(value) {
-    const s = String(value || "").trim();
-    if (!SOURCES.includes(s)) return "state";
-    return s;
+    return editorSources.normalizeSource(value);
   }
 
   function ensureTrackerOption() {
-    if (!sourceSel) return;
-    const existing = sourceSel.querySelector('option[value="tracker"]');
-    if (existing) {
-      existing.textContent = "Local Tracker";
-      return;
-    }
-    const opt = document.createElement("option");
-    opt.value = "tracker";
-    opt.textContent = "Local Tracker";
-    const playlistOpt = sourceSel.querySelector('option[value="playlist"]');
-    if (playlistOpt) sourceSel.insertBefore(opt, playlistOpt);
-    else sourceSel.appendChild(opt);
+    return editorSources.ensureTrackerOption(sourceSel);
   }
 
   function formatEpisodeVisualTitle(row) {
@@ -1056,20 +509,8 @@
     return `${series} - ${code}`;
   }
 
-  function currentTrackerWorkspace() {
-    const id = String(state.workspace || "").trim();
-    const list = state.trackerWorkspaces || [];
-    return list.find(w => String(w && w.id || "") === id) || list[0] || null;
-  }
-
-  function trackerKinds() {
-    const ws = currentTrackerWorkspace();
-    const feats = (ws && ws.features) || {};
-    return ["watchlist", "history", "ratings", "progress"].filter(k => feats[k]);
-  }
-
   function syncHeaderPills(visible, total) {
-    const srcMap = { state: "Current state", tracker: "Local tracker", playlist: "Playlist endpoint" };
+    const srcMap = { state: "Current state", manual: "Manual overrides", playlist: "Playlist endpoint" };
     const kindMap = { watchlist: "Watchlist", history: "History", ratings: "Ratings", progress: "Progress", playlist: "Playlist" };
     if (pillSource) pillSource.textContent = srcMap[state.source] || "Source";
     if (pillKind) pillKind.textContent = state.source === "playlist" ? "Playlist" : (kindMap[state.kind] || "Kind");
@@ -1108,17 +549,16 @@
     if (/rows visible/i.test(String(statusEl.textContent || ""))) statusEl.textContent = "";
   }
 
-  if (filterInput && state.filter) filterInput.value = state.filter;
+  if (filterInput) {
+    filterInput.placeholder = "Filter by title / S01 / S01E02 / id...";
+    if (state.filter) filterInput.value = state.filter;
+  }
 
   const KIND_LABELS = { watchlist: "Watchlist", history: "History", ratings: "Ratings", progress: "Progress" };
 
   function syncKindUI() {
     if (!kindSel) return;
     let allowed = ["watchlist", "history", "ratings", "progress"];
-    if (isTrackerSource()) {
-      const supported = trackerKinds();
-      if (supported.length) allowed = supported;
-    }
     if (!allowed.includes(state.kind)) state.kind = allowed[0] || "watchlist";
     const current = Array.from(kindSel.options).map(o => o.value);
     if (current.join("|") !== allowed.join("|")) {
@@ -1130,14 +570,11 @@
   }
 
   function currentPlaylistEndpoint() {
-    const id = String(state.snapshot || "").trim();
-    return (state.playlistEndpoints || []).find(ep => String(ep && ep.id || "") === id) || null;
+    return editorSources.currentPlaylistEndpoint(state);
   }
 
   function playlistEditable() {
-    if (state.source !== "playlist") return true;
-    const r = state.playlistResource || {};
-    return !!r && !r.smart && !!(r.can_add || r.can_remove || r.can_reorder);
+    return editorSources.playlistEditable(state);
   }
 
   function syncActionButtons() {
@@ -1160,13 +597,237 @@
       : ["movie", "show", "anime", "season", "episode"];
   }
   function isAnilistMode() {
-    return state.source === "state" && String(state.snapshot || "").trim().toUpperCase() === "ANILIST";
+    return isProviderPickerSource() && String(state.snapshot || "").trim().toUpperCase() === "ANILIST";
+  }
+
+  function normalizeColumnState() {
+    state.columnOrder = normalizeColumnOrder(state.columnOrder);
+    COLUMN_KEYS.forEach(column => {
+      if (isRequiredColumn(column)) state.columnVisibility[column] = true;
+      else if (typeof state.columnVisibility[column] !== "boolean") state.columnVisibility[column] = DEFAULT_COLUMN_VISIBILITY[column] !== false;
+      state.columnWidths[column] = clampColumnWidth(column, state.columnWidths[column]);
+    });
+  }
+
+  function columnWidth(column) {
+    return clampColumnWidth(column, state.columnWidths[column]);
+  }
+
+  function orderedColumns() {
+    normalizeColumnState();
+    return state.columnOrder;
+  }
+
+  function columnSortKey(column) {
+    return COLUMN_KEYS.includes(column) ? column : "";
+  }
+
+  function columnLabel(column) {
+    if (column === "id") return isAnilistMode() ? "MAL" : "TMDB";
+    return (COLUMN_META[column] && COLUMN_META[column].label) || column;
+  }
+
+  function actionColumnWidth() {
+    return isPolicySource() ? 84 : 46;
   }
 
   function syncIdColumnHeaders() {
     const a = $("cw-col-id-a");
     if (!a) return;
-    a.textContent = isAnilistMode() ? "MAL" : "TMDB";
+    const label = a.querySelector(".cw-th-label");
+    if (label) label.textContent = columnLabel("id");
+    else a.textContent = columnLabel("id");
+  }
+
+  function ensureColumnHeader(headRow, column) {
+    let th = headRow.querySelector(`th.cw-col-${column}`);
+    if (!th) {
+      th = document.createElement("th");
+      th.className = `cw-col-${column}`;
+      if (column === "id") th.id = "cw-col-id-a";
+    }
+    th.classList.add("cw-data-col", "cw-resizable");
+    th.dataset.column = column;
+    const sortKey = columnSortKey(column);
+    if (sortKey) {
+      th.classList.add("sortable");
+      th.dataset.sort = sortKey;
+    } else {
+      th.classList.remove("sortable", "sort-asc", "sort-desc");
+      delete th.dataset.sort;
+    }
+    let label = th.querySelector(".cw-th-label");
+    if (!label) {
+      th.textContent = "";
+      const inner = document.createElement("span");
+      inner.className = "cw-th-inner";
+      label = document.createElement("span");
+      label.className = "cw-th-label";
+      inner.appendChild(label);
+      th.appendChild(inner);
+    }
+    label.textContent = columnLabel(column);
+    wireColumnResize(th, column);
+    return th;
+  }
+
+  function applyColumnWidths() {
+    const table = host.querySelector(".cw-table");
+    if (!table) return;
+    const scrollEl = table.parentElement;
+    const selectHead = table.querySelector("thead th:first-child");
+    const actionHead = table.querySelector(".cw-action-head");
+    const visibleColumns = orderedColumns().filter(column => state.columnVisibility[column] !== false);
+    const widths = Object.fromEntries(COLUMN_KEYS.map(column => [column, columnWidth(column)]));
+    let total = 34 + actionColumnWidth();
+    visibleColumns.forEach(column => { total += widths[column]; });
+    const containerWidth = Math.floor((scrollEl && scrollEl.clientWidth) || 0);
+    const availableWidth = Math.max(0, containerWidth - 1);
+    const hasHorizontalOverflow = containerWidth > 0 && total > availableWidth + 1;
+    const renderedTotal = hasHorizontalOverflow ? total : Math.max(total, availableWidth || total);
+    const titleExtra = !hasHorizontalOverflow && renderedTotal > total && visibleColumns.includes("title") ? renderedTotal - total : 0;
+    scrollEl?.classList.toggle("cw-table-overflow-x", hasHorizontalOverflow);
+    syncColumnGroup(table, visibleColumns, widths, titleExtra);
+    if (selectHead) {
+      selectHead.style.width = "34px";
+      selectHead.style.minWidth = "34px";
+    }
+    if (actionHead) {
+      const width = `${actionColumnWidth()}px`;
+      actionHead.style.width = width;
+      actionHead.style.minWidth = width;
+    }
+    COLUMN_KEYS.forEach(column => {
+      const th = table.querySelector(`thead th.cw-col-${column}`);
+      const width = widths[column] + (column === "title" ? titleExtra : 0);
+      if (th) {
+        th.style.width = `${width}px`;
+        th.style.minWidth = `${width}px`;
+      }
+    });
+    table.style.width = hasHorizontalOverflow ? `${total}px` : "100%";
+    table.style.minWidth = hasHorizontalOverflow ? `${total}px` : "0";
+  }
+
+  function syncColumnGroup(table, visibleColumns, widths, titleExtra) {
+    let group = Array.from(table.children).find(el => el.tagName === "COLGROUP");
+    if (!group) {
+      group = document.createElement("colgroup");
+      table.insertBefore(group, table.firstChild);
+    }
+    group.textContent = "";
+    [
+      ["select", 34],
+      ["actions", actionColumnWidth()],
+      ...visibleColumns.map(column => [column, widths[column] + (column === "title" ? titleExtra : 0)]),
+    ].forEach(([column, width]) => {
+      const col = document.createElement("col");
+      col.dataset.column = column;
+      col.style.width = `${width}px`;
+      group.appendChild(col);
+    });
+  }
+
+  function syncWideViewUI() {
+    const active = !!state.wideView;
+    host.classList.toggle("cw-editor-wide", active);
+    wideBtn.classList.toggle("active", active);
+    wideBtn.title = active ? "Exit wide view" : "Wide view";
+    wideBtn.setAttribute("aria-label", wideBtn.title);
+    const icon = wideBtn.querySelector(".material-symbols-rounded");
+    if (icon) icon.textContent = active ? "fullscreen_exit" : "fullscreen";
+    applyColumnWidths();
+  }
+
+  function applyRenderedRowColumnOrder() {
+    const order = orderedColumns();
+    host.querySelectorAll(".cw-table tbody tr").forEach(tr => {
+      const selectCell = tr.children[0] || null;
+      const actionCell = tr.querySelector(".cw-action-cell") || tr.children[1] || null;
+      const cells = {};
+      COLUMN_KEYS.forEach(column => {
+        const td = tr.querySelector(`td.cw-col-${column}`);
+        if (!td) return;
+        td.dataset.column = column;
+        cells[column] = td;
+      });
+      const frag = document.createDocumentFragment();
+      if (selectCell) frag.appendChild(selectCell);
+      if (actionCell && actionCell !== selectCell) frag.appendChild(actionCell);
+      order.forEach(column => {
+        if (cells[column]) frag.appendChild(cells[column]);
+      });
+      tr.appendChild(frag);
+    });
+  }
+
+  function applyColumnLayout() {
+    normalizeColumnState();
+    const table = host.querySelector(".cw-table");
+    const headRow = table && table.tHead && table.tHead.rows[0];
+    if (!table || !headRow) return;
+    const selectHead = headRow.children[0];
+    const actionHead = headRow.querySelector(".cw-action-head") || headRow.children[1];
+    const headers = {};
+    COLUMN_KEYS.forEach(column => {
+      headers[column] = ensureColumnHeader(headRow, column);
+    });
+    const frag = document.createDocumentFragment();
+    if (selectHead) frag.appendChild(selectHead);
+    if (actionHead && actionHead !== selectHead) frag.appendChild(actionHead);
+    orderedColumns().forEach(column => frag.appendChild(headers[column]));
+    headRow.appendChild(frag);
+    sortHeaders = Array.from(headRow.querySelectorAll("th[data-sort]"));
+    applyColumnWidths();
+    applyRenderedRowColumnOrder();
+    updateSortUI();
+  }
+
+  function wireColumnResize(th, column) {
+    let handle = Array.from(th.children).find(child => child.classList && child.classList.contains("cw-col-resize"));
+    if (!handle) {
+      handle = document.createElement("span");
+      handle.className = "cw-col-resize";
+      handle.setAttribute("role", "separator");
+      handle.setAttribute("aria-orientation", "vertical");
+      th.appendChild(handle);
+    }
+    handle.dataset.column = column;
+    handle.title = `Resize ${columnLabel(column)}`;
+    handle.onpointerdown = ev => startColumnResize(ev, column, th);
+    handle.ondblclick = ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      state.columnWidths[column] = DEFAULT_COLUMN_WIDTHS[column];
+      applyColumnWidths();
+      persistUIState();
+    };
+  }
+
+  function startColumnResize(ev, column, th) {
+    if (!COLUMN_KEYS.includes(column)) return;
+    if (ev.button != null && ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const startX = ev.clientX;
+    const startWidth = columnWidth(column);
+    document.body.classList.add("cw-column-resizing");
+    th.classList.add("cw-resizing");
+    const onMove = moveEv => {
+      state.columnWidths[column] = clampColumnWidth(column, startWidth + moveEv.clientX - startX);
+      applyColumnWidths();
+    };
+    const finish = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", finish);
+      document.removeEventListener("pointercancel", finish);
+      document.body.classList.remove("cw-column-resizing");
+      th.classList.remove("cw-resizing");
+      persistUIState();
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", finish);
+    document.addEventListener("pointercancel", finish);
   }
 
   function enforceKindTypeRules() {
@@ -1192,6 +853,39 @@
     if (blockedOnlyBtn) blockedOnlyBtn.classList.toggle("active", !!state.blockedOnly);
   }
 
+  function syncPageSizeUI() {
+    const value = PAGE_SIZE_OPTIONS.includes(Number(state.pageSize)) ? Number(state.pageSize) : DEFAULT_PAGE_SIZE;
+    state.pageSize = value;
+    if (pageSizeSel) pageSizeSel.value = String(value);
+  }
+
+  function syncColumnVisibilityUI() {
+    const table = host.querySelector(".cw-table");
+    normalizeColumnState();
+    if (COLUMN_KEYS.includes(state.sortKey) && state.columnVisibility[state.sortKey] === false) {
+      state.sortKey = "title";
+      state.sortDir = "asc";
+    }
+    const hiddenCount = COLUMN_KEYS.filter(k => !isRequiredColumn(k) && state.columnVisibility[k] === false).length;
+    const customVisibility = COLUMN_KEYS.some(k => state.columnVisibility[k] !== DEFAULT_COLUMN_VISIBILITY[k]);
+    const customOrder = orderedColumns().join("|") !== DEFAULT_COLUMN_ORDER.join("|");
+    const customWidths = COLUMN_KEYS.some(k => columnWidth(k) !== DEFAULT_COLUMN_WIDTHS[k]);
+    columnsBtn.classList.toggle("active", customVisibility || customOrder || customWidths);
+    columnsBtn.title = hiddenCount > 0 ? `Columns (${hiddenCount} hidden)` : customOrder || customWidths ? "Columns (custom layout)" : "Columns";
+    COLUMN_KEYS.forEach(k => {
+      if (isRequiredColumn(k)) state.columnVisibility[k] = true;
+      else if (typeof state.columnVisibility[k] !== "boolean") state.columnVisibility[k] = DEFAULT_COLUMN_VISIBILITY[k] !== false;
+      const visible = state.columnVisibility[k] !== false;
+      table?.classList.toggle(`cw-hide-col-${k}`, !visible);
+      document.querySelectorAll(`.cw-columns-pop .cw-column-toggle[data-column="${k}"]`).forEach(btn => {
+        btn.classList.toggle("active", visible);
+        btn.setAttribute("aria-pressed", visible ? "true" : "false");
+        btn.disabled = isRequiredColumn(k);
+      });
+    });
+    applyColumnLayout();
+  }
+
   function syncStateBulkUI() {
     if (!stateBulkRow || !bulkTypeSel || !bulkBlockTypeBtn || !bulkUnblockTypeBtn) return;
     const show = isPolicySource() && state.kind !== "watchlist";
@@ -1207,16 +901,7 @@
   }
 
   function setImportBusy(on, message) {
-    if (importProgressWrap) importProgressWrap.style.display = on ? "" : "none";
-    if (importProgressText) importProgressText.textContent = message || "";
-    const disabled = !!on;
-    if (importRunBtn) importRunBtn.disabled = disabled;
-    if (importProviderSel) importProviderSel.disabled = disabled;
-    if (importModeSel) importModeSel.disabled = disabled;
-    if (importWatchlistCb) importWatchlistCb.disabled = disabled || importWatchlistCb.disabled;
-    if (importHistoryCb) importHistoryCb.disabled = disabled || importHistoryCb.disabled;
-    if (importRatingsCb) importRatingsCb.disabled = disabled || importRatingsCb.disabled;
-    if (importProgressCb) importProgressCb.disabled = disabled || importProgressCb.disabled;
+    return editorImporters.setImportBusy(on, message, importContext());
   }
 
   
@@ -1234,15 +919,16 @@
       }))
       .filter(x => x.id);
 
-    if (!norm.some(x => x.id === "default")) norm.unshift({ id: "default", label: "Default" });
+    if (!norm.length) norm.push({ id: "default", label: "Default" });
 
     const ids = norm.map(x => x.id);
     let next = String(current || "");
-    if (!next || !ids.includes(next)) next = "default";
+    if (!next || !ids.includes(next)) next = ids.includes("default") ? "default" : ids[0];
     const opts = norm.map(x => `<option value="${_escapeHtml(x.id)}">${_escapeHtml(x.label || x.id)}</option>`).join("");
     selectEl.innerHTML = opts;
     selectEl.value = next;
     selectEl.disabled = !ids.length;
+    syncProfileIconSelect(selectEl, true);
     return next;
   }
 
@@ -1261,172 +947,26 @@
 
 
   function syncImportUI() {
-    if (!importRow) return;
-    const show = state.source === "state" && state.importEnabled;
-    importRow.style.display = show ? "" : "none";
-    if (!show) return;
-
-    if (importModeSel) importModeSel.value = state.importMode || "replace";
-
-    const all = Array.isArray(state.importProviders) ? state.importProviders : [];
-    const list = all.filter(p => p && p.configured && p.name);
-
-    if (importProviderSel) {
-      const current = importProviderSel.value || state.importProvider || "";
-      const opts = list
-        .map(p => {
-          const name = p && p.name ? String(p.name) : "";
-          const label = providerLabel(name, p && p.label ? String(p.label) : name);
-          return `<option value="${name}">${label}</option>`;
-        })
-        .join("");
-
-      importProviderSel.innerHTML = opts || `<option value="">No configured providers</option>`;
-
-      const names = list.map(p => String(p.name));
-      let next = current;
-
-      if (!next || !names.includes(next)) {
-        next = state.snapshot && names.includes(state.snapshot) ? state.snapshot : "";
-      }
-      if (!next) next = names[0] || "";
-
-      state.importProvider = next;
-      importProviderSel.value = next;
-      importProviderSel.disabled = !names.length;
-      syncProviderIconSelect(importProviderSel, true);
-    }
-
-    const sel = state.importProvider || (importProviderSel ? importProviderSel.value : "");
-    const p = list.find(x => String((x || {}).name || "") === String(sel || ""));
-    const feats = (p && p.features) ? p.features : {};
-
-    if (importInstanceSel) {
-      const ids = (p && Array.isArray(p.instances)) ? p.instances : ["default"];
-      const instObjs = ids.map(x => ({ id: String(x), label: String(x) }));
-      const nextInst = renderInstanceOptions(importInstanceSel, instObjs, state.importProviderInstance);
-      if (nextInst !== state.importProviderInstance) {
-        state.importProviderInstance = nextInst;
-        persistUIState();
-      }
-      const instanceField = importInstanceSel.closest(".cw-import-field");
-      if (instanceField) instanceField.style.display = state.importProvider ? "" : "none";
-      else importInstanceSel.style.display = state.importProvider ? "" : "none";
-    }
-
-    const setCb = (wrap, cb, key) => {
-      const supported = !!feats[key];
-      if (wrap) wrap.style.display = supported ? "" : "none";
-      if (!cb) return;
-      cb.disabled = !supported;
-      if (!supported) cb.checked = false;
-      else if (state.importFeatures && typeof state.importFeatures[key] === "boolean") cb.checked = !!state.importFeatures[key];
-    };
-
-    setCb(importWatchlistWrap, importWatchlistCb, "watchlist");
-    setCb(importHistoryWrap, importHistoryCb, "history");
-    setCb(importRatingsWrap, importRatingsCb, "ratings");
-    setCb(importProgressFeatWrap, importProgressCb, "progress");
-
-    if (importRunBtn) importRunBtn.disabled = !state.importProvider;
+    return editorImporters.syncImportUI(importContext());
   }
 
   async function loadImportProviders() {
-    state.importEnabled = false;
-    state.importProviders = [];
-    if (!importRow) return;
-    try {
-      const data = await fetchJSON("/api/editor/state/import/providers");
-      state.importEnabled = !!(data && data.enabled);
-      state.importProviders = Array.isArray(data && data.providers) ? data.providers : [];
-    } catch (e) {
-      state.importEnabled = false;
-      state.importProviders = [];
-    }
-    syncImportUI();
+    return editorImporters.loadImportProviders(importContext());
   }
 
   function _collectImportFeatures() {
-    const feats = [];
-    if (importWatchlistCb && importWatchlistCb.checked && !importWatchlistCb.disabled) feats.push("watchlist");
-    if (importHistoryCb && importHistoryCb.checked && !importHistoryCb.disabled) feats.push("history");
-    if (importRatingsCb && importRatingsCb.checked && !importRatingsCb.disabled) feats.push("ratings");
-    if (importProgressCb && importProgressCb.checked && !importProgressCb.disabled) feats.push("progress");
-    return feats;
+    return editorImporters.collectImportFeatures(importContext());
   }
 
   async function runStateImport() {
-    if (state.source !== "state") return;
-    const provider = (importProviderSel ? importProviderSel.value : state.importProvider) || "";
-    const features = _collectImportFeatures();
-    const mode = (importModeSel ? importModeSel.value : state.importMode) || "replace";
-
-    if (!provider) {
-      setStatusSticky("Pick a provider first", 3000);
-      return;
-    }
-    if (!features.length) {
-      setStatusSticky("Pick at least one dataset", 3000);
-      return;
-    }
-
-    state.importProvider = provider;
-    state.importMode = mode;
-    state.importFeatures = {
-      watchlist: features.includes("watchlist"),
-      history: features.includes("history"),
-      ratings: features.includes("ratings"),
-      progress: features.includes("progress"),
-    };
-
-    try {
-      const msg = `Importing ${features.join(", ")} from ${provider}…`;
-      setImportBusy(true, msg);
-      setTag("warn", "Importing…");
-      setStatus(msg);
-
-      const res = await fetchJSON("/api/editor/state/import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, provider_instance: state.importProviderInstance || "default", features, mode }),
-      });
-
-      const featsOut = (res && res.features) ? res.features : {};
-      const bits = [];
-      let totalMs = 0;
-
-      for (const k of Object.keys(featsOut)) {
-        const r = featsOut[k] || {};
-        if (r.skipped) continue;
-        if (r.ok) bits.push(`${k}:${r.count}`);
-        if (typeof r.elapsed_ms === "number") totalMs += r.elapsed_ms;
-      }
-
-      let done = "Imported " + (bits.length ? bits.join(" • ") : "done");
-      if (totalMs) done += ` (${(totalMs / 1000).toFixed(1)}s)`;
-
-      setTag("loaded", "Imported");
-      setStatusSticky(done, 6000);
-      if (window.cxToast) window.cxToast(done);
-
-      state.snapshot = provider;
-      state.instance = state.importProviderInstance || "default";
-      persistUIState();
-      await loadSnapshots();
-      await loadState();
-    } catch (e) {
-      console.error(e);
-      setTag("error", "Import failed");
-      setStatus(String(e));
-    } finally {
-      setImportBusy(false, "");
-      syncImportUI();
-    }
+    return editorImporters.runStateImport(importContext());
   }
-
 
   syncKindUI();
   syncTypeFilterUI();
+  syncPageSizeUI();
+  syncWideViewUI();
+  syncColumnVisibilityUI();
   syncStateBulkUI();
 
   function persistUIState() {
@@ -1436,10 +976,15 @@
         source: state.source,
         kind: state.kind,
         snapshot: state.snapshot,
-        workspace: state.workspace,
         instance: state.instance,
         filter: state.filter,
+        pageSize: state.pageSize,
+        wideView: state.wideView,
         typeFilter: state.typeFilter,
+        columnLayoutVersion: COLUMN_LAYOUT_VERSION,
+        columnVisibility: state.columnVisibility,
+        columnOrder: state.columnOrder,
+        columnWidths: state.columnWidths,
         blockedOnly: state.blockedOnly,
         sortKey: state.sortKey,
         sortDir: state.sortDir,
@@ -1460,6 +1005,7 @@
       btn.title = label;
       btn.setAttribute("aria-label", label);
     };
+    setIconOnly(bulkSendBtn, "send", "Send to...");
     if (isPolicySource()) {
       setIconOnly(bulkRemoveBtn, "block", "Block selected");
       setIconOnly(bulkRestoreBtn, "undo", "Unblock selected");
@@ -1470,6 +1016,48 @@
     setIconOnly(bulkClearBtn, "close", "Clear selection");
   }
 
+  function selectedRowsForSend() {
+    const sel = state.selected || new Set();
+    return (state.rows || []).filter(row => sel.has(row._rid) && !row.deleted);
+  }
+
+  function rowToSendItem(row) {
+    const raw = JSON.parse(JSON.stringify(row?.raw || {}));
+    const ids = raw.ids && typeof raw.ids === "object" ? raw.ids : {};
+    if (row.imdb) ids.imdb = row.imdb;
+    if (row.tmdb) ids.tmdb = row.tmdb;
+    if (row.tvdb) ids.tvdb = row.tvdb;
+    if (row.trakt) ids.trakt = row.trakt;
+    if (row.simkl) ids.simkl = row.simkl;
+    if (row.mal) ids.mal = row.mal;
+    if (row.anilist) ids.anilist = row.anilist;
+    raw.ids = ids;
+    raw.key = String(row.key || "").trim();
+    raw.type = row.type || raw.type || null;
+    raw.title = row.title || raw.title || raw.series_title || null;
+    const y = String(row.year || "").trim();
+    if (y) {
+      const n = parseInt(y, 10);
+      raw.year = Number.isFinite(n) ? n : y;
+    }
+    return raw;
+  }
+
+  async function openEditorSendModal() {
+    return editorSendModal.open({
+      state,
+      selectedRowsForSend,
+      rowToSendItem,
+      fetchJSON,
+      escapeHtml: _escapeHtml,
+      currentPlaylistEndpoint,
+      isProviderPickerSource,
+      isTrackerSource,
+      setStatusSticky,
+      clearSelection,
+      loadState,
+    });
+  }
   function clearSelection() {
     if (!state.selected) state.selected = new Set();
     state.selected.clear();
@@ -1507,12 +1095,16 @@
       markChanged();
       renderRows();
       const verb = flag
-        ? isPolicySource()
-          ? "Blocked"
-          : "Deleted"
-        : isPolicySource()
-          ? "Unblocked"
-          : "Restored";
+        ? isManualSource()
+          ? "Removed"
+          : isPolicySource()
+            ? "Blocked"
+            : "Deleted"
+        : isManualSource()
+          ? "Restored"
+          : isPolicySource()
+            ? "Unblocked"
+            : "Restored";
       setStatusSticky(`${verb} ${changed} item${changed === 1 ? "" : "s"}`, 3000);
     }
   }
@@ -1542,77 +1134,11 @@
   }
 
   function syncSourceUI() {
-    state.source = normalizeSource(state.source);
-    if (sourceSel) {
-      sourceSel.querySelector('option[value="pair"]')?.remove();
-      if (!sourceSel.querySelector('option[value="playlist"]')) {
-        sourceSel.insertAdjacentHTML("beforeend", '<option value="playlist">Playlist Endpoint</option>');
-      }
-      ensureTrackerOption();
-    }
-    const isState = state.source === "state";
-    const isTracker = isTrackerSource();
-    const isPlaylist = state.source === "playlist";
-    const policy = isPolicySource();
-    if (sourceSel) sourceSel.value = state.source;
-    if (pairLabel) pairLabel.style.display = "none";
-    if (pairSel) pairSel.style.display = "none";
-    if (snapLabel) snapLabel.textContent = isState ? "Provider" : isTracker ? "Workspace" : "Endpoint";
-    if (kindSel) kindSel.disabled = isPlaylist;
-    if (instanceLabel) instanceLabel.style.display = isState ? "" : "none";
-    if (instanceSel) instanceSel.style.display = isState ? "" : "none";
-    if (backupCard) backupCard.style.display = "none";
-    if (stateBackupCard) stateBackupCard.style.display = policy ? "" : "none";
-    if (blockedOnlyBtn) blockedOnlyBtn.style.display = policy ? "" : "none";
-    if (trackerNotice) trackerNotice.style.display = isTracker ? "block" : "none";
-
-    const sub = host.querySelector(".cw-sub");
-    if (sub) {
-      sub.textContent = isTracker
-        ? "Edit what CrossWatch sends from its local tracker. Connected provider accounts are not changed."
-        : "Edit your current state or playlist endpoints";
-    }
-
-    if (isPlaylist) {
-      state.kind = "watchlist";
-      state.instance = "default";
-    }
-    if (isTracker) state.instance = "default";
-    syncKindUI();
-
-    if (!policy && state.blockedOnly) {
-      state.blockedOnly = false;
-      syncTypeFilterUI();
-      persistUIState();
-    }
-    syncStateBulkUI();
-    syncImportUI();
-    syncTypeFilterUI();
-    syncActionButtons();
-    syncHeaderPills();
+    return editorSources.syncSourceUI(sourceContext());
   }
 
   function showStateHint(mode) {
-    if (!stateHint) return;
-    if (mode === "state") {
-      stateHint.innerHTML =
-        "<strong>No state.json found.</strong> Run a CrossWatch sync once to generate it. After that, your manual adds and blocks will show up here.";
-      stateHint.style.display = "block";
-      return;
-    }
-    if (mode === "playlist") {
-      stateHint.innerHTML =
-        "<strong>No playlist endpoints found.</strong> Create an endpoint on the Playlists page first. Then select it here to edit its items.";
-      stateHint.style.display = "block";
-      return;
-    }
-    if (mode === "tracker") {
-      stateHint.innerHTML =
-        "<strong>No Local Tracker data found.</strong> Run a sync pair that uses Local Tracker first.";
-      stateHint.style.display = "block";
-      return;
-    }
-    stateHint.style.display = "none";
+    return editorSources.showStateHint(mode, sourceContext());
   }
 
   function setTag(mode, label) {
@@ -1688,103 +1214,35 @@
   }
 
   function formatHistoryLabel(iso) {
-    if (!iso) return "";
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    const pad = n => String(n).padStart(2, "0");
-    return (
-      d.getFullYear() +
-      "-" +
-      pad(d.getMonth() + 1) +
-      "-" +
-      pad(d.getDate()) +
-      " " +
-      pad(d.getHours()) +
-      ":" +
-      pad(d.getMinutes())
-    );
+    return editorDateTime.formatHistoryLabel(iso);
   }
+
   function formatSxxEyy(season, episode) {
-    const s = season == null ? NaN : parseInt(String(season), 10);
-    if (!Number.isFinite(s)) return "";
-    const pad = n => String(n).padStart(2, "0");
-    const e = episode == null ? NaN : parseInt(String(episode), 10);
-    if (Number.isFinite(e)) return `S${pad(s)}E${pad(e)}`;
-    return `S${pad(s)}`;
+    return editorDateTime.formatSxxEyy(season, episode);
   }
 
 
 
   function formatMs(ms) {
-    const n = ms == null ? NaN : Number(ms);
-    if (!Number.isFinite(n) || n <= 0) return "";
-    const total = Math.floor(n / 1000);
-    const pad = x => String(x).padStart(2, "0");
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
-    if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
-    return `${m}:${pad(s)}`;
+    return editorDateTime.formatMs(ms);
   }
 
-  const PROGRESS_PERCENT_KEYS = ["progress_percent", "progressPercent", "percent", "position_percent", "resume_percent"];
-  const clampProgressPercent = value => {
-    const n = value == null || value === "" ? NaN : Number(value);
-    return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null;
-  };
+  const clampProgressPercent = value => editorDateTime.clampProgressPercent(value);
 
   function progressPercentValue(raw) {
-    if (!raw) return null;
-    const pm = Number(raw.progress_ms);
-    const dm = Number(raw.duration_ms);
-    if (Number.isFinite(pm) && pm > 0 && Number.isFinite(dm) && dm > 0) return clampProgressPercent((pm / dm) * 100);
-    for (const key of PROGRESS_PERCENT_KEYS) {
-      const n = clampProgressPercent(raw[key]);
-      if (n != null) return n;
-    }
-    return null;
+    return editorDateTime.progressPercentValue(raw);
   }
 
   function formatProgressPercent(value) {
-    const n = clampProgressPercent(value);
-    if (n == null) return "";
-    const rounded = Math.round(n * 10) / 10;
-    return `${Number.isInteger(rounded) ? Math.trunc(rounded) : rounded}%`;
+    return editorDateTime.formatProgressPercent(value);
   }
 
   function parseProgressPercent(v) {
-    const s = (v == null ? "" : String(v)).trim().replace(/%$/, "").trim();
-    return s ? clampProgressPercent(s) : null;
+    return editorDateTime.parseProgressPercent(v);
   }
 
   function parseTimeToMs(v) {
-    const s = (v == null ? "" : String(v)).trim();
-    if (!s) return null;
-
-    const lower = s.toLowerCase();
-    if (lower.endsWith("ms")) {
-      const num = parseFloat(lower.slice(0, -2));
-      return Number.isFinite(num) ? Math.max(0, Math.floor(num)) : null;
-    }
-
-    if (s.includes(":")) {
-      const parts = s.split(":").map(p => p.trim()).filter(Boolean);
-      if (!parts.length) return null;
-      const nums = parts.map(x => parseInt(x, 10));
-      if (nums.some(n => !Number.isFinite(n))) return null;
-
-      let sec = 0;
-      if (nums.length === 3) sec = nums[0] * 3600 + nums[1] * 60 + nums[2];
-      else if (nums.length === 2) sec = nums[0] * 60 + nums[1];
-      else sec = nums[0];
-      return Math.max(0, sec * 1000);
-    }
-
-    const num = parseFloat(s);
-    if (!Number.isFinite(num)) return null;
-    // Heuristic: large numbers are probably milliseconds.
-    if (num >= 100000) return Math.max(0, Math.floor(num));
-    return Math.max(0, Math.floor(num * 1000));
+    return editorDateTime.parseTimeToMs(v);
   }
 
   function appendPopupTitle(pop, text, marginTop = "") {
@@ -1809,12 +1267,133 @@
     pop.appendChild(actions);
   }
 
+  function toggleColumnVisibility(column) {
+    if (!COLUMN_KEYS.includes(column)) return;
+    if (isRequiredColumn(column)) return;
+    state.columnVisibility[column] = state.columnVisibility[column] === false;
+    const sortChanged = state.columnVisibility[column] === false && state.sortKey === column;
+    if (sortChanged) {
+      state.sortKey = "title";
+      state.sortDir = "asc";
+    }
+    syncColumnVisibilityUI();
+    persistUIState();
+    if (sortChanged) renderRows();
+    else updateSortUI();
+  }
+
+  function moveColumn(column, delta) {
+    const order = orderedColumns().slice();
+    const idx = order.indexOf(column);
+    const next = idx + delta;
+    if (idx < 0 || next < 0 || next >= order.length) return;
+    [order[idx], order[next]] = [order[next], order[idx]];
+    state.columnOrder = order;
+    syncColumnVisibilityUI();
+    persistUIState();
+    renderColumnPopupContents(activePopup && activePopup.node);
+  }
+
+  function resetColumnLayout(pop) {
+    state.columnOrder = DEFAULT_COLUMN_ORDER.slice();
+    state.columnWidths = { ...DEFAULT_COLUMN_WIDTHS };
+    COLUMN_KEYS.forEach(column => {
+      state.columnVisibility[column] = DEFAULT_COLUMN_VISIBILITY[column] !== false;
+    });
+    syncColumnVisibilityUI();
+    persistUIState();
+    renderColumnPopupContents(pop);
+  }
+
+  function renderColumnPopupContents(pop) {
+    if (!pop || !pop.classList || !pop.classList.contains("cw-columns-pop")) return;
+    pop.textContent = "";
+    appendPopupTitle(pop, "Columns");
+    const list = document.createElement("div");
+    list.className = "cw-column-popup-list";
+    const order = orderedColumns();
+    order.forEach((column, idx) => {
+      const meta = COLUMN_META[column] || { icon: "view_column", label: column };
+      const row = document.createElement("div");
+      row.className = "cw-column-row";
+      row.dataset.column = column;
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "cw-type-chip cw-column-toggle";
+      toggle.dataset.column = column;
+      toggle.disabled = isRequiredColumn(column);
+      toggle.title = isRequiredColumn(column) ? `${columnLabel(column)} is always shown` : `Show ${columnLabel(column)}`;
+      toggle.innerHTML = `<span class="material-symbol cw-type-icon" aria-hidden="true">${meta.icon}</span><span>${columnLabel(column)}</span>`;
+      toggle.addEventListener("click", () => toggleColumnVisibility(column));
+
+      const left = document.createElement("button");
+      left.type = "button";
+      left.className = "cw-column-move";
+      left.disabled = idx === 0;
+      left.title = `Move ${columnLabel(column)} left`;
+      left.setAttribute("aria-label", left.title);
+      left.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">keyboard_arrow_left</span>`;
+      left.addEventListener("click", ev => {
+        ev.stopPropagation();
+        moveColumn(column, -1);
+      });
+
+      const right = document.createElement("button");
+      right.type = "button";
+      right.className = "cw-column-move";
+      right.disabled = idx === order.length - 1;
+      right.title = `Move ${columnLabel(column)} right`;
+      right.setAttribute("aria-label", right.title);
+      right.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">keyboard_arrow_right</span>`;
+      right.addEventListener("click", ev => {
+        ev.stopPropagation();
+        moveColumn(column, 1);
+      });
+
+      row.appendChild(toggle);
+      row.appendChild(left);
+      row.appendChild(right);
+      list.appendChild(row);
+    });
+    pop.appendChild(list);
+    appendPopupActions(pop, [
+      { label: "Reset", onClick: () => resetColumnLayout(pop) },
+      { label: "Close", kind: "primary", onClick: closePopup },
+    ]);
+    syncColumnVisibilityUI();
+    positionPopup(pop, columnsBtn);
+  }
+
+  function openColumnPopup(anchor) {
+    openPopup(anchor, pop => {
+      pop.classList.add("cw-columns-pop");
+      renderColumnPopupContents(pop);
+    });
+  }
+
   function isRowLocked(row) {
     return isPolicySource() && !!row && row._origin === "baseline";
   }
 
   function isExtraKindEditable() {
     return state.kind === "ratings" || state.kind === "history" || state.kind === "progress";
+  }
+
+  function manualCorrectionKindLabel(kind = state.kind) {
+    const k = String(kind || "").toLowerCase();
+    if (k === "history") return "history date";
+    if (k === "ratings") return "rating";
+    if (k === "progress") return "progress";
+    return "extra field";
+  }
+
+  function extraCorrectionStatus(row, promoted) {
+    if (!isPolicySource() || !row || !isExtraKindEditable()) return "";
+    const label = manualCorrectionKindLabel();
+    if (promoted) return `A local ${label} correction was created. Save changes to use it on the next sync.`;
+    if (row._origin === "manual") return `Updated local ${label} correction. Save changes to use it on the next sync.`;
+    return "";
   }
 
   function promoteBaselineEdit(row) {
@@ -1824,88 +1403,16 @@
     return true;
   }
 
-  const REPLACEABLE_TYPES = ["movie", "show", "anime", "season", "episode"];
-
   function rowType(row) {
     return String((row && row.type) || "").toLowerCase();
   }
 
   function canReplaceRow(row) {
-    if (!isPolicySource()) return false;
-    return REPLACEABLE_TYPES.includes(rowType(row));
+    return !!editorMetadataReplacer.canReplaceRow(row, { isPolicySource });
   }
 
   function usesCoordinateReplacer(row) {
-    const t = rowType(row);
-    return t === "episode" || t === "season";
-  }
-
-  const EPISODE_ID_FIELDS = [
-    { key: "tvdb", label: "TVDB episode ID" },
-    { key: "tmdb", label: "TMDB episode ID" },
-    { key: "simkl", label: "SIMKL episode ID" },
-  ];
-
-  const PROVIDER_HISTORY_ID_FIELDS = [
-    "_trakt_history_id",
-    "history_id",
-    "_simkl_history_id",
-    "_plex_history_id",
-    "watched_id",
-    "play_id",
-  ];
-
-  function coordinateKeyFor(row, season, episode) {
-    const base = String((row && row.key) || "").split("#")[0].trim();
-    if (!base) return "";
-    if (rowType(row) === "season") return `${base}#season:${season}`;
-    const s = String(Math.max(0, season)).padStart(2, "0");
-    const e = String(Math.max(0, episode)).padStart(2, "0");
-    return `${base}#s${s}e${e}`;
-  }
-
-  function carryOverFields(row, drop) {
-    const src = (row && row.raw) || {};
-    const out = {};
-    for (const [k, v] of Object.entries(src)) {
-      if (drop.includes(k) || PROVIDER_HISTORY_ID_FIELDS.includes(k)) continue;
-      out[k] = JSON.parse(JSON.stringify(v === undefined ? null : v));
-    }
-    return out;
-  }
-
-  function correctedEpisodeItem(row, season, episode, watchedAt, extraIds) {
-    const isSeason = rowType(row) === "season";
-    const out = carryOverFields(row, ["ids", "season", "episode", "title"]);
-    out.type = isSeason ? "season" : "episode";
-    out.season = season;
-    if (isSeason) {
-      out.title = `Season ${season}`;
-    } else {
-      out.episode = episode;
-      out.title = `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
-      out.watched_at = watchedAt || null;
-    }
-    const ids = {};
-    for (const [k, v] of Object.entries(extraIds || {})) {
-      const val = String(v || "").trim();
-      if (val) ids[k] = val;
-    }
-    out.ids = ids;
-    return out;
-  }
-
-  function correctedMetadataItem(row, draft) {
-    const out = carryOverFields(row, [
-      "ids", "title", "year", "type",
-      "season", "episode", "series_title", "series_year", "show_ids",
-    ]);
-    const picked = (draft && draft.raw) || {};
-    out.type = picked.type || draft.type || "movie";
-    out.title = picked.title || draft.title || null;
-    out.year = picked.year != null ? picked.year : null;
-    out.ids = { ...(picked.ids || {}) };
-    return out;
+    return !!editorMetadataReplacer.usesCoordinateReplacer(row);
   }
 
   function commitReplacement(row, corrected, key, sameMessage) {
@@ -1928,212 +1435,32 @@
     return "";
   }
 
+  function metadataReplacerContext() {
+    return {
+      isPolicySource,
+      openPopup,
+      appendPopupTitle,
+      appendPopupActions,
+      fetchJSON,
+      updateTypeDisplay,
+      formatEpisodeVisualTitle,
+      setStatusSticky,
+      markChanged,
+      renderRows,
+      commitReplacement,
+    };
+  }
+
   function openItemReplacer(row, anchor) {
-    if (usesCoordinateReplacer(row)) return openEpisodeReplacer(row, anchor);
-    return openMetadataReplacer(row, anchor);
-  }
-
-  function openMetadataReplacer(row, anchor) {
-    const draft = {
-      _rid: -1,
-      key: String(row.key || ""),
-      type: rowType(row),
-      title: String(row.title || ""),
-      year: String(row.year || ""),
-      imdb: "",
-      tmdb: "",
-      trakt: "",
-      mal: "",
-      anilist: "",
-      raw: JSON.parse(JSON.stringify(row.raw || {})),
-      deleted: false,
-      episode: false,
-    };
-    const stub = () => document.createElement("input");
-    const refs = {
-      keyIn: stub(),
-      titleIn: stub(),
-      yearIn: stub(),
-      imdbIn: stub(),
-      tmdbIn: stub(),
-      traktIn: stub(),
-      typeBtn: document.createElement("button"),
-      onApplied: applied => {
-        const key = String(applied.key || "").trim();
-        if (!key) {
-          setStatusSticky("That result has no usable identifier.", 5000);
-          return;
-        }
-        if (key.toLowerCase() === String(row.key || "").trim().toLowerCase()) {
-          setStatusSticky("The corrected item is the same as the current one.", 5000);
-          return;
-        }
-        const corrected = correctedMetadataItem(row, applied);
-        const err = commitReplacement(row, corrected, key, "The corrected local item was updated.");
-        if (err) setStatusSticky(err, 5000);
-      },
-    };
-    openTitleSearchEditor(draft, anchor, refs);
-  }
-
-  function openEpisodeReplacer(row, anchor) {
-    const isSeason = rowType(row) === "season";
-    openPopup(anchor, (pop, close) => {
-      appendPopupTitle(pop, isSeason ? "Replace season" : "Replace episode");
-
-      const raw = (row && row.raw) || {};
-      const curSeason = Number(raw.season || 0);
-      const curEpisode = Number(raw.episode || 0);
-      const seriesTitle = String(raw.series_title || row.title || "").trim() || "Unknown series";
-
-      const info = document.createElement("div");
-      info.className = "cw-search-meta";
-      info.textContent = isSeason
-        ? `${seriesTitle} - currently season ${curSeason}`
-        : `${seriesTitle} - currently S${String(curSeason).padStart(2, "0")}E${String(curEpisode).padStart(2, "0")}`;
-      pop.appendChild(info);
-
-      appendPopupTitle(pop, isSeason ? "Corrected season" : "Corrected episode", "10px");
-
-      const grid = document.createElement("div");
-      grid.className = "cw-datetime-grid";
-      grid.style.gridTemplateColumns = isSeason ? "minmax(0,1fr)" : "minmax(0,1fr) minmax(0,1fr)";
-
-      const seasonIn = document.createElement("input");
-      seasonIn.type = "number";
-      seasonIn.min = "0";
-      seasonIn.placeholder = "Season";
-      seasonIn.value = String(curSeason);
-
-      const episodeIn = document.createElement("input");
-      episodeIn.type = "number";
-      episodeIn.min = "0";
-      episodeIn.placeholder = "Episode";
-      episodeIn.value = String(curEpisode);
-
-      grid.appendChild(seasonIn);
-      if (!isSeason) grid.appendChild(episodeIn);
-      pop.appendChild(grid);
-
-      const dateInput = document.createElement("input");
-      dateInput.type = "date";
-      const timeInput = document.createElement("input");
-      timeInput.type = "time";
-      timeInput.step = 60;
-
-      if (!isSeason) {
-        appendPopupTitle(pop, "Watched at", "10px");
-        const whenGrid = document.createElement("div");
-        whenGrid.className = "cw-datetime-grid";
-        fillDateTimeInputs(raw.watched_at, dateInput, timeInput);
-        whenGrid.appendChild(dateInput);
-        whenGrid.appendChild(timeInput);
-        pop.appendChild(whenGrid);
-      }
-
-      const advanced = document.createElement("details");
-      advanced.className = "cw-collapse";
-      advanced.style.marginTop = "10px";
-      const summary = document.createElement("summary");
-      summary.style.cursor = "pointer";
-      summary.style.fontWeight = "700";
-      summary.style.userSelect = "none";
-      summary.textContent = "Advanced";
-      advanced.appendChild(summary);
-
-      const advGrid = document.createElement("div");
-      advGrid.className = "cw-datetime-grid";
-      advGrid.style.marginTop = "8px";
-      const idInputs = {};
-      EPISODE_ID_FIELDS.forEach(field => {
-        const input = document.createElement("input");
-        input.type = "text";
-        input.placeholder = field.label;
-        idInputs[field.key] = input;
-        advGrid.appendChild(input);
-      });
-      advanced.appendChild(advGrid);
-      pop.appendChild(advanced);
-
-      const status = document.createElement("div");
-      status.className = "cw-search-status";
-      status.style.marginTop = "8px";
-      pop.appendChild(status);
-
-      const apply = () => {
-        const season = parseInt(seasonIn.value, 10);
-        const episode = isSeason ? 0 : parseInt(episodeIn.value, 10);
-        const seasonOk = Number.isFinite(season) && season >= 0;
-        const episodeOk = isSeason || (Number.isFinite(episode) && episode > 0);
-        if (!seasonOk || !episodeOk) {
-          status.textContent = isSeason
-            ? "Enter a valid corrected season."
-            : "Enter a valid corrected season and episode.";
-          return;
-        }
-        if (season === curSeason && (isSeason || episode === curEpisode)) {
-          status.textContent = isSeason
-            ? "The corrected season is the same as the current one."
-            : "The corrected episode is the same as the current one.";
-          return;
-        }
-        const key = coordinateKeyFor(row, season, episode);
-        if (!key) {
-          status.textContent = "This row has no usable series identifier.";
-          return;
-        }
-
-        const watchedAt = dateTimeInputsToIso(dateInput.value, timeInput.value) || raw.watched_at || null;
-        const extraIds = {};
-        EPISODE_ID_FIELDS.forEach(field => {
-          extraIds[field.key] = idInputs[field.key].value;
-        });
-        const corrected = correctedEpisodeItem(row, season, episode, watchedAt, extraIds);
-        const err = commitReplacement(
-          row,
-          corrected,
-          key,
-          isSeason ? "The corrected local season was updated." : "The corrected local episode was updated."
-        );
-        if (err) {
-          status.textContent = err;
-          return;
-        }
-        close();
-      };
-
-      appendPopupActions(pop, [
-        { label: "Close", kind: "ghost", onClick: close },
-        { label: "Replace episode", kind: "primary", onClick: apply },
-      ]);
-
-      seasonIn.focus();
-    });
+    return editorMetadataReplacer.openItemReplacer(row, anchor, metadataReplacerContext());
   }
 
   function applyManualRow(row, item, key) {
-    row.key = key;
-    row.raw = item;
-    row.type = "episode";
-    row.episode = true;
-    row.title = String(item.series_title || row.title || "");
-    row.year = item.series_year != null ? String(item.series_year) : row.year || "";
-    row.imdb = "";
-    row.tmdb = item.ids && item.ids.tmdb ? String(item.ids.tmdb) : "";
-    row.trakt = "";
-    row.deleted = false;
-    row._origin = "manual";
-    return row;
+    return editorRows.applyManualRow(row, item, key);
   }
 
   function buildManualRow(item, key, replacedKey) {
-    const row = applyManualRow(
-      { _rid: state.ridSeq++, mal: "", anilist: "" },
-      item,
-      key
-    );
-    if (replacedKey) row._replacedKey = replacedKey;
-    return row;
+    return editorRows.buildManualRow(item, key, replacedKey, rowBuilderOptions());
   }
 
   function renderLockedPopup(pop, close) {
@@ -2145,31 +1472,23 @@
   }
 
   function fillDateTimeInputs(iso, dateInput, timeInput) {
-    if (!iso) return;
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return;
-    const pad = n => String(n).padStart(2, "0");
-    dateInput.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-    timeInput.value = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    editorDateTime.fillDateTimeInputs(iso, dateInput, timeInput);
   }
 
   function dateTimeInputsToIso(dateValue, timeValue) {
-    if (!dateValue) return null;
-    const parts = dateValue.split("-");
-    const y = parseInt(parts[0], 10);
-    const m = parseInt(parts[1], 10);
-    const dDay = parseInt(parts[2], 10);
-    const [hhRaw, mmRaw] = (timeValue || "").split(":");
-    const hh = parseInt(hhRaw, 10) || 0;
-    const mm = parseInt(mmRaw, 10) || 0;
-    return new Date(y, m - 1, dDay, hh, mm, 0).toISOString().replace(/\.\d{3}Z$/, ".000Z");
+    return editorDateTime.dateTimeInputsToIso(dateValue, timeValue);
+  }
+
+  function appendUtcHint(pop) {
+    editorDateTime.appendUtcHint(pop);
   }
 
   function finishExtraChange(row, displayEl, close) {
     const promoted = promoteBaselineEdit(row);
     updateExtraDisplay(row, displayEl);
     markChanged();
-    if (promoted) setStatusSticky("A local correction was created for this row.", 4500);
+    const status = extraCorrectionStatus(row, promoted);
+    if (status) setStatusSticky(status, 6000);
     close();
     if (promoted) renderRows();
   }
@@ -2180,677 +1499,146 @@
     if (rerender) renderRows();
   }
 
+  function extraEditorContext() {
+    return {
+      state,
+      openPopup,
+      appendPopupTitle,
+      appendPopupActions,
+      finishExtraChange,
+    };
+  }
+
   function updateExtraDisplay(row, el) {
-    let label = "";
-    let placeholder = "";
-    let icon = "";
-    if (state.kind === "ratings") {
-      icon = "star";
-      const r = row.raw && row.raw.rating;
-      if (r == null || r === "") placeholder = "Set rating";
-      else label = String(r) + "/10";
-    } else if (state.kind === "history") {
-      icon = "schedule";
-      const w = row.raw && row.raw.watched_at;
-      if (!w) placeholder = "Set time";
-      else label = formatHistoryLabel(w);
-    } else if (state.kind === "progress") {
-      icon = "play_circle";
-      const p = row.raw && row.raw.progress_ms;
-      const d = row.raw && row.raw.duration_ms;
-      const percent = progressPercentValue(row.raw);
-      const pm = p == null ? NaN : Number(p);
-      const dm = d == null ? NaN : Number(d);
-      if (!Number.isFinite(pm) || pm <= 0) {
-        if (percent != null) label = formatProgressPercent(percent);
-        else placeholder = "Set progress";
-      }
-      else {
-        const left = formatMs(pm);
-        const right = Number.isFinite(dm) && dm > 0 ? formatMs(dm) : "";
-        const pct = percent != null ? ` (${formatProgressPercent(percent)})` : "";
-        label = right ? `${left} / ${right}${pct}` : left;
-      }
-    } else {
-      placeholder = "";
-    }
+    return editorExtraEditors.updateExtraDisplay(row, el, extraEditorContext());
+  }
 
-    el.innerHTML = "";
-    const text = document.createElement("span");
-    text.className = "cw-extra-display-label";
-    if (label) {
-      text.textContent = label;
-      text.classList.add("cw-extra-display-value");
-    } else {
-      text.textContent = placeholder || "";
-      text.classList.add("cw-extra-display-placeholder");
-    }
-    el.appendChild(text);
-
-    if (icon) {
-      const iconEl = document.createElement("span");
-      iconEl.className = "material-symbol cw-extra-display-icon";
-      iconEl.textContent = icon;
-      el.appendChild(iconEl);
-    }
+  function rowEditorContext() {
+    return {
+      state,
+      openPopup,
+      appendPopupTitle,
+      appendPopupActions,
+      allowedTypesForKind,
+      isRowLocked,
+      renderLockedPopup,
+      finishPopupChange,
+      isPolicySource,
+      markChanged,
+      renderRows,
+    };
   }
 
   function updateTypeDisplay(row, el) {
-    let label = "";
-    let icon = "category";
-    const t = (row.type || "").toLowerCase();
-    if (t === "movie") {
-      label = "Movie";
-      icon = "movie";
-    } else if (t === "show") {
-      label = "Show";
-      icon = "monitoring";
-    } else if (t === "anime") {
-      label = "Anime";
-      icon = "auto_awesome";
-    } else if (t === "season") {
-      label = "Season";
-      icon = "layers";
-    } else if (t === "episode") {
-      label = "Episode";
-      icon = "open_in_new";
-    }
-
-    el.innerHTML = "";
-    ["type-movie", "type-show", "type-anime", "type-season", "type-episode"].forEach(cls => el.classList.remove(cls));
-    if (t) el.classList.add(`type-${t}`);
-    const text = document.createElement("span");
-    text.className = "cw-extra-display-label";
-    if (label) {
-      text.textContent = label;
-      text.classList.add("cw-extra-display-value");
-    } else {
-      text.textContent = "Set type";
-      text.classList.add("cw-extra-display-placeholder");
-    }
-    el.appendChild(text);
-
-    const iconEl = document.createElement("span");
-    iconEl.className = "material-symbol cw-extra-display-icon";
-    iconEl.textContent = icon;
-    el.appendChild(iconEl);
+    return editorRowEditor.updateTypeDisplay(row, el);
   }
 
   function imdbFromKey(key) {
-    const s = (key || "") + "";
-    if (!s.startsWith("imdb:")) return "";
-    return s.slice(5).split("#")[0];
+    return editorRows.imdbFromKey(key);
   }
 
   function buildRows(items) {
-    const rows = [];
-    for (const [key, raw] of Object.entries(items || {})) {
-      const ids = raw.ids || {};
-      const showIds = raw.show_ids || {};
-      const type = raw.type || "";
-      const isEpisode = type === "episode";
-      const baseTitle = raw.title || raw.series_title || "";
-      rows.push({
-        _rid: state.ridSeq++,
-        key,
-        type,
-        title: baseTitle,
-        year: raw.year != null ? String(raw.year) : "",
-        imdb: ids.imdb || (type === "season" ? showIds.imdb || imdbFromKey(key) : ""),
-        tmdb: ids.tmdb || showIds.tmdb || "",
-        trakt: ids.trakt || showIds.trakt || "",
-        mal: ids.mal || "",
-        anilist: ids.anilist || "",
-        raw: JSON.parse(JSON.stringify(raw)),
-        deleted: false,
-        episode: isEpisode,
-      });
-    }
-    if (state.source !== "playlist") rows.sort((a, b) => (a.title || "").localeCompare(b.title || ""));
-    return rows;
+    return editorRows.buildRows(items, rowBuilderOptions());
+  }
+
+  function buildManualOverrideRows(items, blocks) {
+    return editorRows.buildManualOverrideRows(items, blocks, rowBuilderOptions());
+  }
+
+  function normalizeSearchText(value) {
+    return editorSearch.normalizeSearchText(value);
+  }
+
+  function parseSeasonEpisodeText(value) {
+    return editorSearch.parseSeasonEpisodeText(value);
+  }
+
+  function rowSeasonEpisode(row) {
+    return editorSearch.rowSeasonEpisode(row);
+  }
+
+  function rowSearchHaystack(row) {
+    return editorSearch.rowSearchHaystack(row, { formatEpisodeVisualTitle, formatSxxEyy });
+  }
+  function tableControllerContext() {
+    return {
+      state,
+      host,
+      pageSize: state.pageSize || DEFAULT_PAGE_SIZE,
+      sortHeaders,
+      tbody,
+      empty,
+      pager,
+      prevBtn,
+      nextBtn,
+      pageInfo,
+      summaryVisible,
+      summaryTotal,
+      summaryMovies,
+      summaryShows,
+      summarySeasons,
+      summaryEpisodes,
+      editorTable,
+      normalizeSearchText,
+      parseSeasonEpisodeText,
+      rowSeasonEpisode,
+      rowSearchHaystack,
+      closePopup,
+      syncIdColumnHeaders,
+      syncColumnVisibilityUI,
+      applyColumnWidths,
+      syncHeaderPills,
+      isPolicySource,
+      isTrackerSource,
+      isAnilistMode,
+      isRowLocked,
+      isExtraKindEditable,
+      canReplaceRow,
+      usesCoordinateReplacer,
+      rowType,
+      markChanged,
+      renderRows,
+      syncBulkBar,
+      syncSelectPageCheckbox,
+      updateTypeDisplay,
+      updateExtraDisplay,
+      formatEpisodeVisualTitle,
+      formatSxxEyy,
+      openTypeEditor,
+      openTitleSearchEditor,
+      openItemReplacer,
+      openRawFieldsModal,
+      openRatingEditor,
+      openHistoryEditor,
+      openProgressEditor,
+      setStatus,
+      setRowsStatus,
+    };
   }
 
   function applyFilter(rows) {
-    const q = (state.filter || "").trim().toLowerCase();
-    const filters = state.typeFilter || {};
-    const hasTypeFilter = filters.movie || filters.show || filters.anime || filters.season || filters.episode;
-
-    return rows.filter(r => {
-      if (hasTypeFilter) {
-        const t = (r.type || "").toLowerCase();
-        const known = t === "movie" || t === "show" || t === "anime" || t === "season" || t === "episode";
-        let allowed = true;
-        if (known) {
-          if (t === "movie") allowed = !!filters.movie;
-          else if (t === "show") allowed = !!filters.show;
-          else if (t === "anime") allowed = !!filters.anime;
-          else if (t === "season") allowed = !!filters.season;
-          else if (t === "episode") allowed = !!filters.episode;
-        }
-        if (!allowed) return false;
-      }
-
-      if (state.blockedOnly && isPolicySource()) {
-        if (!(r.deleted && r._origin === "baseline")) return false;
-      }
-
-      if (!q) return true;
-
-      const parts = [
-        r.key,
-        r.title,
-        r.type,
-        r.year,
-        r.imdb,
-        r.tmdb,
-        r.trakt,
-        r.mal,
-        r.anilist,
-        r.raw && r.raw.series_title ? r.raw.series_title : "",
-      ]
-        .join(" ")
-        .toLowerCase();
-
-      return parts.includes(q);
-    });
+    return editorTableController.applyFilter(rows, tableControllerContext());
   }
 
   function openHistoryEditor(row, anchor, displayEl) {
-    openPopup(anchor, (pop, close) => {
-      appendPopupTitle(pop, "Watched at");
-
-      const grid = document.createElement("div");
-      grid.className = "cw-datetime-grid";
-
-      const dateInput = document.createElement("input");
-      dateInput.type = "date";
-
-      const timeInput = document.createElement("input");
-      timeInput.type = "time";
-      timeInput.step = 60;
-
-      fillDateTimeInputs(row.raw && row.raw.watched_at, dateInput, timeInput);
-
-      grid.appendChild(dateInput);
-      grid.appendChild(timeInput);
-      pop.appendChild(grid);
-
-      appendPopupActions(pop, [
-        { label: "Clear", kind: "ghost", onClick: () => { row.raw.watched_at = null; finishExtraChange(row, displayEl, close); } },
-        { label: "Close", kind: "ghost", onClick: close },
-        { label: "Save", kind: "primary", onClick: () => { row.raw.watched_at = dateTimeInputsToIso(dateInput.value, timeInput.value); finishExtraChange(row, displayEl, close); } },
-      ]);
-
-      dateInput.focus();
-    });
+    return editorExtraEditors.openHistoryEditor(row, anchor, displayEl, extraEditorContext());
   }
 
 
   function openProgressEditor(row, anchor, displayEl) {
-    openPopup(anchor, (pop, close) => {
-      appendPopupTitle(pop, "Progress");
-
-      const makeInput = (type, props = {}) => Object.assign(document.createElement("input"), { type, ...props });
-      const makeField = (label, child, extraClass = "") => {
-        const field = document.createElement("label");
-        field.className = `cw-progress-edit-field ${extraClass}`.trim();
-        const labelEl = Object.assign(document.createElement("span"), { className: "cw-progress-edit-label", textContent: label });
-        field.appendChild(labelEl);
-        field.appendChild(child);
-        return field;
-      };
-
-      const grid = document.createElement("div");
-      grid.className = "cw-progress-edit-grid";
-
-      const curPos = row.raw && row.raw.progress_ms;
-      const curDur = row.raw && row.raw.duration_ms;
-      const curPercent = progressPercentValue(row.raw);
-      const posInput = makeInput("text", { placeholder: "mm:ss", value: curPos != null ? formatMs(curPos) : "" });
-      const durInput = makeInput("text", { placeholder: "mm:ss", value: curDur != null ? formatMs(curDur) : "" });
-
-      grid.appendChild(makeField("Position", posInput));
-      grid.appendChild(makeField("Duration", durInput));
-      pop.appendChild(grid);
-
-      const percentInput = makeInput("number", {
-        min: "0",
-        max: "100",
-        step: "0.1",
-        placeholder: "0-100",
-        value: curPercent != null ? String(Math.round(curPercent * 10) / 10) : "",
-      });
-      const percentWrap = document.createElement("div");
-      percentWrap.className = "cw-progress-percent-wrap";
-      percentWrap.append(percentInput, Object.assign(document.createElement("span"), { className: "cw-progress-percent-suffix", textContent: "%" }));
-      pop.appendChild(makeField("Percent", percentWrap, "cw-progress-percent-field"));
-
-      appendPopupTitle(pop, "Updated at", "10px");
-
-      const whenGrid = document.createElement("div");
-      whenGrid.className = "cw-datetime-grid";
-
-      const dateInput = makeInput("date");
-      const timeInput = makeInput("time", { step: 60 });
-
-      fillDateTimeInputs(row.raw && row.raw.progress_at, dateInput, timeInput);
-
-      whenGrid.appendChild(dateInput);
-      whenGrid.appendChild(timeInput);
-      pop.appendChild(whenGrid);
-
-      const saveProgress = () => {
-        const posMs = parseTimeToMs(posInput.value);
-        const durMs = parseTimeToMs(durInput.value);
-        const percent = parseProgressPercent(percentInput.value);
-
-        row.raw.progress_ms = posMs != null && posMs > 0 ? posMs : null;
-        row.raw.duration_ms = durMs != null && durMs > 0 ? durMs : null;
-        row.raw.progress_percent = row.raw.progress_ms != null && row.raw.duration_ms != null
-          ? Math.round((row.raw.progress_ms / row.raw.duration_ms) * 1000) / 10
-          : percent;
-        row.raw.progress_at = dateTimeInputsToIso(dateInput.value, timeInput.value);
-        if (!row.raw.progress_at && (row.raw.progress_ms != null || row.raw.progress_percent != null)) row.raw.progress_at = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
-        finishExtraChange(row, displayEl, close);
-      };
-
-      appendPopupActions(pop, [
-        {
-          label: "Clear",
-          kind: "ghost",
-          onClick: () => {
-            for (const key of ["progress_ms", "duration_ms", "progress_percent", "progress_at"]) row.raw[key] = null;
-            finishExtraChange(row, displayEl, close);
-          }
-        },
-        { label: "Close", kind: "ghost", onClick: close },
-        { label: "Save", kind: "primary", onClick: saveProgress },
-      ]);
-
-      posInput.focus();
-    });
+    return editorExtraEditors.openProgressEditor(row, anchor, displayEl, extraEditorContext());
   }
 
   function openRatingEditor(row, anchor, displayEl) {
-    openPopup(anchor, (pop, close) => {
-      appendPopupTitle(pop, "Rating");
-
-      const grid = document.createElement("div");
-      grid.className = "cw-rating-grid";
-      const current = row.raw && row.raw.rating != null ? Number(row.raw.rating) : null;
-
-      for (let i = 1; i <= 10; i += 1) {
-        const pill = document.createElement("button");
-        pill.type = "button";
-        pill.className = "cw-rating-pill" + (current === i ? " active" : "");
-        pill.textContent = String(i);
-        pill.onclick = () => {
-          row.raw.rating = i;
-          finishExtraChange(row, displayEl, close);
-        };
-        grid.appendChild(pill);
-      }
-
-      pop.appendChild(grid);
-      appendPopupActions(pop, [
-        { label: "Clear", kind: "ghost", onClick: () => { row.raw.rating = null; finishExtraChange(row, displayEl, close); } },
-        { label: "Close", kind: "ghost", onClick: close },
-      ]);
-    });
+    return editorExtraEditors.openRatingEditor(row, anchor, displayEl, extraEditorContext());
   }
 
   function openTitleSearchEditor(row, anchor, refs) {
-    openPopup(anchor, (pop, close) => {
-      const title = document.createElement("div");
-      title.className = "cw-pop-title";
-      title.textContent = "Search metadata";
-      pop.appendChild(title);
-
-      const bar = document.createElement("div");
-      bar.className = "cw-search-bar";
-
-      const qInput = document.createElement("input");
-      qInput.type = "text";
-      qInput.id = "cw_meta_search_title";
-      qInput.name = qInput.id;
-      qInput.placeholder = "Title...";
-      qInput.value = row.title || "";
-      bar.appendChild(qInput);
-
-      const yearInput = document.createElement("input");
-      yearInput.type = "number";
-      yearInput.id = "cw_meta_search_year";
-      yearInput.name = yearInput.id;
-      yearInput.placeholder = "Year";
-      if (row.year) yearInput.value = row.year;
-      bar.appendChild(yearInput);
-
-      const typeSelect = document.createElement("select");
-      typeSelect.id = "cw_meta_search_type";
-      typeSelect.name = typeSelect.id;
-      [["movie", "Movie"], ["show", "Show"], ["anime", "Anime"]].forEach(([val, label]) => {
-        const opt = document.createElement("option");
-        opt.value = val;
-        opt.textContent = label;
-        typeSelect.appendChild(opt);
-      });
-      typeSelect.value = row.type === "anime" ? "anime" : row.type === "show" || row.type === "episode" ? "show" : "movie";
-      bar.appendChild(typeSelect);
-
-      pop.appendChild(bar);
-
-      const actions = document.createElement("div");
-      actions.className = "cw-pop-actions";
-
-      const searchBtn = document.createElement("button");
-      searchBtn.type = "button";
-      searchBtn.className = "cw-pop-btn primary";
-      searchBtn.textContent = "Search";
-      actions.appendChild(searchBtn);
-
-      const closeBtn = document.createElement("button");
-      closeBtn.type = "button";
-      closeBtn.className = "cw-pop-btn ghost";
-      closeBtn.textContent = "Close";
-      closeBtn.onclick = close;
-      actions.appendChild(closeBtn);
-
-      pop.appendChild(actions);
-
-      const status = document.createElement("div");
-      status.className = "cw-search-status";
-      pop.appendChild(status);
-
-      const resultsBox = document.createElement("div");
-      resultsBox.className = "cw-search-results";
-      pop.appendChild(resultsBox);
-
-      async function doSearch() {
-        const q = (qInput.value || "").trim();
-        const yearVal = parseInt(yearInput.value || "", 10);
-        if (q.length < 2) {
-          status.textContent = "Type at least 2 characters.";
-          resultsBox.innerHTML = "";
-          return;
-        }
-        const typ = String(typeSelect.value || "").toLowerCase();
-        const makeUrl = t => {
-          let u = `/api/metadata/search?q=${encodeURIComponent(q)}&typ=${encodeURIComponent(t)}`;
-          if (!Number.isNaN(yearVal)) u += `&year=${yearVal}`;
-          return u;
-        };
-
-        status.textContent = "Searching...";
-        resultsBox.innerHTML = "";
-        try {
-          let items = [];
-          if (typ === "anime") {
-            const [showRes, movieRes] = await Promise.all([fetchJSON(makeUrl("show")), fetchJSON(makeUrl("movie"))]);
-
-            const showOk = !!(showRes && showRes.ok !== false);
-            const movieOk = !!(movieRes && movieRes.ok !== false);
-
-            if (!showOk && !movieOk) {
-              const msg = (showRes && showRes.error) || (movieRes && movieRes.error) || "Search failed.";
-              status.textContent = msg;
-              return;
-            }
-
-            const a = showOk && Array.isArray(showRes.results) ? showRes.results : [];
-            const b = movieOk && Array.isArray(movieRes.results) ? movieRes.results : [];
-
-            items = [...a.map(x => ({ ...x, _resolve_entity: "show" })), ...b.map(x => ({ ...x, _resolve_entity: "movie" }))];
-
-            const seen = new Set();
-            items = items.filter(it => {
-              const k = `${String(it.tmdb || "")}:${String(it.type || "")}`;
-              if (!k || seen.has(k)) return false;
-              seen.add(k);
-              return true;
-            });
-          } else {
-            const data = await fetchJSON(makeUrl(typ));
-            if (!data || data.ok === false) {
-              status.textContent = data && data.error ? data.error : "Search failed.";
-              return;
-            }
-            items = Array.isArray(data.results) ? data.results : [];
-          }
-          if (!items.length) {
-            resultsBox.innerHTML = '<div class="cw-search-empty">No results.</div>';
-            status.textContent = "";
-            return;
-          }
-
-          resultsBox.innerHTML = "";
-          items.forEach(item => {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.className = "cw-search-item";
-
-            const posterWrap = document.createElement("div");
-            posterWrap.className = "cw-search-poster";
-
-            if (item.poster_path) {
-              const img = document.createElement("img");
-              img.src = `/art/tmdb/${item.type === "show" ? "tv" : "movie"}/${encodeURIComponent(String(item.tmdb))}?size=w92`;
-              img.alt = "";
-              img.onerror = () => {
-                img.remove();
-                const ph = document.createElement("div");
-                ph.className = "cw-search-poster-placeholder";
-                ph.textContent = item.type === "show" ? "TV" : "MOV";
-                posterWrap.appendChild(ph);
-              };
-              posterWrap.appendChild(img);
-            } else {
-              const ph = document.createElement("div");
-              ph.className = "cw-search-poster-placeholder";
-              ph.textContent = item.type === "show" ? "TV" : "MOV";
-              posterWrap.appendChild(ph);
-            }
-
-            btn.appendChild(posterWrap);
-
-            const content = document.createElement("div");
-            content.className = "cw-search-content";
-
-            const titleLine = document.createElement("div");
-            titleLine.className = "cw-search-title-line";
-
-            const t = document.createElement("div");
-            t.className = "cw-search-title";
-            const yearTxt = item.year ? ` (${item.year})` : "";
-            t.textContent = (item.title || "") + yearTxt;
-            titleLine.appendChild(t);
-
-            const tag2 = document.createElement("span");
-            tag2.className = "cw-search-tag";
-            tag2.textContent = item.type === "show" ? "Show" : "Movie";
-            titleLine.appendChild(tag2);
-
-            content.appendChild(titleLine);
-
-            const meta = document.createElement("div");
-            meta.className = "cw-search-meta";
-            const bits = [];
-            if (item.year) bits.push(String(item.year));
-            bits.push(item.type === "show" ? "TV" : "Movie");
-            if (item.tmdb) bits.push(`TMDb ${item.tmdb}`);
-            meta.textContent = bits.join(" - ");
-            content.appendChild(meta);
-
-            if (item.overview) {
-              const ov = document.createElement("div");
-              ov.className = "cw-search-overview";
-              ov.textContent = item.overview;
-              content.appendChild(ov);
-            }
-
-            btn.appendChild(content);
-
-            btn.onclick = async () => {
-              const picked = item;
-              const newTitle = picked.title || row.title || "";
-              row.title = newTitle;
-              row.raw.title = newTitle || null;
-              refs.titleIn.value = formatEpisodeVisualTitle(row) || newTitle;
-
-              if (picked.year) {
-                row.year = String(picked.year);
-                row.raw.year = picked.year;
-                refs.yearIn.value = row.year;
-              }
-
-              const wantsAnime = String(typeSelect.value || "").toLowerCase() === "anime";
-              const pickedType = String(picked.type || "movie").toLowerCase();
-
-              const newType = wantsAnime ? "anime" : pickedType;
-              const resolveEntity = wantsAnime ? picked._resolve_entity || pickedType || "movie" : newType;
-
-              row.type = newType;
-              row.raw.type = newType;
-              row.episode = false;
-              updateTypeDisplay(row, refs.typeBtn);
-
-              const tmdbId = picked.tmdb;
-              if (tmdbId != null) {
-                const tmdbStr = String(tmdbId);
-                row.tmdb = tmdbStr;
-                row.raw.ids = row.raw.ids || {};
-                row.raw.ids.tmdb = tmdbId;
-                if (refs.tmdbIn) refs.tmdbIn.value = tmdbStr;
-                const prevKey = (row.key || "").trim();
-                if (!prevKey || /^(tmdb|imdb|trakt|tvdb|slug):/i.test(prevKey)) {
-                  row.key = `tmdb:${tmdbStr}`;
-                  if (refs.keyIn) refs.keyIn.value = row.key;
-                }
-              }
-
-              if (tmdbId != null) {
-                try {
-                  const metaRes = await fetchJSON("/api/metadata/resolve", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ entity: resolveEntity, ids: { tmdb: tmdbId } }),
-                  });
-
-                  if (metaRes && metaRes.ok && metaRes.result && metaRes.result.ids) {
-                    const ids = metaRes.result.ids || {};
-                    row.raw.ids = row.raw.ids || {};
-
-                    if (ids.imdb) {
-                      row.imdb = ids.imdb;
-                      row.raw.ids.imdb = ids.imdb;
-                      refs.imdbIn.value = ids.imdb;
-                    }
-                    if (ids.tmdb) {
-                      const tVal = String(ids.tmdb);
-                      row.tmdb = tVal;
-                      row.raw.ids.tmdb = ids.tmdb;
-                      if (refs.tmdbIn) refs.tmdbIn.value = tVal;
-                      const prevKey = (row.key || "").trim();
-                      if (!prevKey || /^(tmdb|imdb|trakt|tvdb|slug):/i.test(prevKey)) {
-                        row.key = `tmdb:${tVal}`;
-                        if (refs.keyIn) refs.keyIn.value = row.key;
-                      }
-                    }
-                    if (ids.trakt) {
-                      const trVal = String(ids.trakt);
-                      row.trakt = trVal;
-                      row.raw.ids.trakt = ids.trakt;
-                      if (refs.traktIn) refs.traktIn.value = trVal;
-                    }
-                  }
-                } catch (err) {
-                  console.error("metadata resolve failed", err);
-                }
-              }
-
-              if (typeof refs.onApplied === "function") {
-                close();
-                refs.onApplied(row);
-                return;
-              }
-
-              markChanged();
-              setStatusSticky("Row updated from metadata", 2500);
-              close();
-              renderRows();
-            };
-
-            resultsBox.appendChild(btn);
-          });
-
-          status.textContent = `${items.length} result${items.length === 1 ? "" : "s"} found.`;
-        } catch (err) {
-          console.error("search failed", err);
-          status.textContent = "Search failed.";
-        }
-      }
-
-      searchBtn.onclick = () => doSearch();
-
-      qInput.addEventListener("keydown", ev => {
-        if (ev.key === "Enter") {
-          ev.preventDefault();
-          doSearch();
-        }
-      });
-
-      if ((row.title || "").trim().length >= 3) doSearch();
-      else status.textContent = "Enter a title and press Enter or Search.";
-    });
+    return editorMetadataReplacer.openTitleSearchEditor(row, anchor, refs, metadataReplacerContext());
   }
 
   function openTypeEditor(row, anchor) {
-    const locked = isRowLocked(row);
-
-    openPopup(anchor, (pop, close) => {
-      appendPopupTitle(pop, "Type");
-      if (locked) return renderLockedPopup(pop, close);
-
-      const grid = document.createElement("div");
-      grid.className = "cw-type-grid";
-      const current = (row.type || "").toLowerCase();
-      const allowed = allowedTypesForKind(state.kind);
-      const options = [
-        { key: "movie", label: "Movie" },
-        { key: "show", label: "Show" },
-        { key: "anime", label: "Anime" },
-        { key: "season", label: "Season" },
-        { key: "episode", label: "Episode" },
-      ].filter(o => allowed.includes(o.key));
-
-      options.forEach(opt => {
-        const pill = document.createElement("button");
-        pill.type = "button";
-        pill.className = "cw-type-pill" + (current === opt.key ? " active" : "");
-        pill.textContent = opt.label;
-        pill.onclick = () => {
-          row.type = opt.key;
-          row.raw.type = opt.key;
-          row.episode = opt.key === "episode";
-          finishPopupChange(close, true);
-        };
-        grid.appendChild(pill);
-      });
-
-      pop.appendChild(grid);
-      appendPopupActions(pop, [
-        {
-          label: "Clear",
-          kind: "ghost",
-          onClick: () => {
-            row.type = "";
-            row.raw.type = null;
-            row.episode = false;
-            finishPopupChange(close, true);
-          }
-        },
-        { label: "Close", kind: "ghost", onClick: close },
-      ]);
-    });
+    return editorRowEditor.openTypeEditor(row, anchor, rowEditorContext());
   }
 
   async function openRawFieldsModal(row) {
@@ -2873,415 +1661,20 @@
       if (typeof mod.openModal === "function") await mod.openModal("editor-raw", props);
     } catch (err) {
       console.error("editor raw modal failed", err);
-      setStatusSticky("Could not open raw fields.", 3500);
+      setStatusSticky("Could not open record details.", 3500);
     }
-  }
-
-  function compareValues(aVal, bVal) {
-    if (typeof aVal === "number" && typeof bVal === "number") {
-      if (aVal < bVal) return -1;
-      if (aVal > bVal) return 1;
-      return 0;
-    }
-    const aStr = aVal == null ? "" : String(aVal).toLowerCase();
-    const bStr = bVal == null ? "" : String(bVal).toLowerCase();
-    if (aStr < bStr) return -1;
-    if (aStr > bStr) return 1;
-    return 0;
   }
 
   function sortRows(rows) {
-    const key = state.sortKey;
-    const dir = state.sortDir === "desc" ? -1 : 1;
-    if (!key) return rows;
-    return rows.slice().sort((a, b) => {
-      let av;
-      let bv;
-      if (key === "title") {
-        av = a.title || "";
-        bv = b.title || "";
-      } else if (key === "type") {
-        av = a.type || "";
-        bv = b.type || "";
-      } else if (key === "key") {
-        av = a.key || "";
-        bv = b.key || "";
-      } else if (key === "extra") {
-        if (state.kind === "ratings") {
-          av = a.raw && a.raw.rating != null ? Number(a.raw.rating) : -Infinity;
-          bv = b.raw && b.raw.rating != null ? Number(b.raw.rating) : -Infinity;
-        } else if (state.kind === "history") {
-          const aw = a.raw && a.raw.watched_at;
-          const bw = b.raw && b.raw.watched_at;
-          av = aw ? Date.parse(aw) || 0 : 0;
-          bv = bw ? Date.parse(bw) || 0 : 0;
-        } else {
-          av = "";
-          bv = "";
-        }
-      } else {
-        av = "";
-        bv = "";
-      }
-      return compareValues(av, bv) * dir;
-    });
+    return editorTableController.sortRows(rows, tableControllerContext());
   }
 
   function updateSortUI() {
-    sortHeaders.forEach(th => {
-      const k = th.dataset.sort;
-      th.classList.remove("sort-asc", "sort-desc");
-      if (k === state.sortKey) th.classList.add(state.sortDir === "desc" ? "sort-desc" : "sort-asc");
-    });
+    return editorTableController.updateSortUI(tableControllerContext());
   }
 
   function renderRows() {
-    closePopup();
-    updateSortUI();
-    syncIdColumnHeaders();
-
-    let filtered = applyFilter(state.rows);
-    const totalFiltered = filtered.length;
-    const totalAll = state.rows.length;
-    syncHeaderPills(totalFiltered, totalAll);
-
-    filtered = sortRows(filtered);
-
-    let movies = 0;
-    let shows = 0;
-    let seasons = 0;
-    let episodes = 0;
-    for (const row of state.rows) {
-      const t = (row.type || "").toLowerCase();
-      if (t === "movie") movies += 1;
-      else if (t === "show") shows += 1;
-      else if (t === "season") seasons += 1;
-      else if (t === "episode") episodes += 1;
-    }
-    if (summaryMovies) summaryMovies.textContent = String(movies);
-    if (summaryShows) summaryShows.textContent = String(shows);
-    if (summarySeasons) summarySeasons.textContent = String(seasons);
-    if (summaryEpisodes) summaryEpisodes.textContent = String(episodes);
-
-    if (tbody) tbody.innerHTML = "";
-
-    const actionHead = host.querySelector(".cw-action-head");
-    const wideActions = isPolicySource();
-    if (actionHead) {
-      actionHead.classList.toggle("cw-action-wide", wideActions);
-      actionHead.style.width = wideActions ? "132px" : "46px";
-    }
-
-    if (!totalFiltered) {
-      if (empty) empty.style.display = "block";
-      if (pager) pager.style.display = "none";
-      if (summaryVisible) summaryVisible.textContent = "0";
-      if (summaryTotal) summaryTotal.textContent = String(totalAll || 0);
-      setStatus("0 rows visible");
-      state.pageRids = [];
-      syncSelectPageCheckbox();
-      clearSelection();
-      if (pageInfo) pageInfo.textContent = "";
-      return;
-    }
-
-    if (empty) empty.style.display = "none";
-
-    const pageCount = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
-    if (state.page >= pageCount) state.page = pageCount - 1;
-    if (state.page < 0) state.page = 0;
-
-    const start = state.page * PAGE_SIZE;
-    const end = start + PAGE_SIZE;
-    const rows = filtered.slice(start, end);
-
-    state.pageRids = rows.map(r => r._rid);
-    syncSelectPageCheckbox();
-    syncBulkBar();
-
-    const frag = document.createDocumentFragment();
-    const anilistMode = isAnilistMode();
-    rows.forEach(row => {
-      const tr = document.createElement("tr");
-      const locked = isRowLocked(row);
-      const fieldName = suffix => `cw-row-${row._rid || "new"}-${suffix}`;
-      if (row.episode) tr.classList.add("cw-row-episode");
-      if (row.deleted) tr.classList.add("cw-row-deleted");
-
-      const cell = inner => {
-        const td = document.createElement("td");
-        td.appendChild(inner);
-        return td;
-      };
-
-      const selCb = document.createElement("input");
-      selCb.type = "checkbox";
-      selCb.name = fieldName("selected");
-      selCb.className = "cw-checkbox";
-      selCb.checked = (state.selected || new Set()).has(row._rid);
-      selCb.onchange = () => {
-        if (!state.selected) state.selected = new Set();
-        if (selCb.checked) state.selected.add(row._rid);
-        else state.selected.delete(row._rid);
-        syncBulkBar();
-        syncSelectPageCheckbox();
-      };
-      tr.appendChild(cell(selCb));
-
-      const blockMode = isPolicySource();
-      const baselineRow = blockMode && row._origin === "baseline";
-      const delBtn = document.createElement("button");
-      delBtn.type = "button";
-      delBtn.className = "cw-btn cw-btn-del danger";
-      delBtn.innerHTML = `<span class="material-symbol">${blockMode ? "block" : "delete"}</span>`;
-      delBtn.title = blockMode
-        ? (baselineRow
-            ? (row.deleted ? "Restore for future syncs" : "Block from future syncs")
-            : (row.deleted ? "Restore row" : "Remove manual correction"))
-        : (row.deleted ? "Restore row" : "Delete row");
-      delBtn.onclick = () => {
-        row.deleted = !row.deleted;
-        markChanged();
-        renderRows();
-      };
-      const delTd = cell(delBtn);
-      delTd.className = "cw-action-cell";
-      if (wideActions) delTd.classList.add("cw-action-wide");
-      if (canReplaceRow(row)) {
-        const t = rowType(row);
-        const repBtn = document.createElement("button");
-        repBtn.type = "button";
-        repBtn.className = "cw-btn cw-btn-del";
-        repBtn.innerHTML = '<span class="material-symbol">published_with_changes</span>';
-        repBtn.title = t === "episode" ? "Replace episode" : t === "season" ? "Replace season" : "Replace item";
-        repBtn.style.marginLeft = "4px";
-        repBtn.onclick = () => openItemReplacer(row, repBtn);
-        delTd.appendChild(repBtn);
-      }
-      if (isPolicySource()) {
-        const rawBtn = document.createElement("button");
-        rawBtn.type = "button";
-        rawBtn.className = "cw-btn cw-btn-del";
-        rawBtn.innerHTML = '<span class="material-symbol">data_object</span>';
-        rawBtn.title = "Advanced fields";
-        rawBtn.setAttribute("aria-label", "Advanced fields");
-        rawBtn.style.marginLeft = "4px";
-        rawBtn.onclick = () => openRawFieldsModal(row);
-        delTd.appendChild(rawBtn);
-      }
-      tr.appendChild(delTd);
-
-      const keyIn = document.createElement("input");
-      keyIn.name = fieldName("key");
-      keyIn.value = row.key || "";
-      keyIn.className = "cw-key";
-      keyIn.disabled = locked;
-      keyIn.oninput = e => {
-        row.key = e.target.value;
-        markChanged();
-      };
-      tr.appendChild(cell(keyIn));
-
-      const typeBtn = document.createElement("button");
-      typeBtn.type = "button";
-      typeBtn.className = "cw-extra-display cw-type-display";
-      typeBtn.disabled = locked;
-      if (locked) {
-        typeBtn.style.opacity = "0.6";
-        typeBtn.style.cursor = "not-allowed";
-      }
-      updateTypeDisplay(row, typeBtn);
-      typeBtn.onclick = () => {
-        if (typeBtn.disabled) return;
-        openTypeEditor(row, typeBtn);
-      };
-      tr.appendChild(cell(typeBtn));
-
-      const titleCell = document.createElement("div");
-      titleCell.className = "cw-title-cell";
-
-      const titleRow = document.createElement("div");
-      titleRow.className = "cw-title-row";
-      titleCell.appendChild(titleRow);
-
-      const titleIn = document.createElement("input");
-      titleIn.name = fieldName("title");
-      titleIn.value = formatEpisodeVisualTitle(row) || row.title || "";
-      titleIn.disabled = locked;
-      titleIn.onfocus = () => {
-        const visual = formatEpisodeVisualTitle(row);
-        if (visual) titleIn.value = row.title || "";
-      };
-      titleIn.oninput = e => {
-        row.title = e.target.value;
-        row.raw.title = e.target.value || null;
-        markChanged();
-      };
-      titleIn.onblur = () => {
-        const visual = formatEpisodeVisualTitle(row);
-        if (visual) titleIn.value = visual;
-      };
-      titleRow.appendChild(titleIn);
-
-      const yearIn = document.createElement("input");
-      yearIn.name = fieldName("year");
-      yearIn.value = row.year || "";
-      yearIn.disabled = locked;
-      yearIn.oninput = e => {
-        row.year = e.target.value;
-        const v = e.target.value.trim();
-        const n = v ? parseInt(v, 10) : NaN;
-        row.raw.year = Number.isFinite(n) ? n : null;
-        markChanged();
-      };
-
-      const imdbIn = document.createElement("input");
-      imdbIn.name = fieldName("imdb");
-      imdbIn.value = row.imdb || "";
-      imdbIn.disabled = locked;
-      imdbIn.oninput = e => {
-        row.imdb = e.target.value;
-        row.raw.ids = row.raw.ids || {};
-        if (e.target.value) row.raw.ids.imdb = e.target.value;
-        else delete row.raw.ids.imdb;
-        markChanged();
-      };
-      const idAIn = document.createElement("input");
-      idAIn.name = fieldName(anilistMode ? "mal" : "tmdb");
-      idAIn.value = anilistMode ? (row.mal || "") : (row.tmdb || "");
-      idAIn.placeholder = anilistMode ? "MAL…" : "TMDB…";
-      idAIn.disabled = locked;
-      idAIn.oninput = e => {
-        const v = e.target.value;
-        row.raw.ids = row.raw.ids || {};
-        if (anilistMode) {
-          row.mal = v;
-          if (v) row.raw.ids.mal = v;
-          else delete row.raw.ids.mal;
-        } else {
-          row.tmdb = v;
-          if (v) row.raw.ids.tmdb = v;
-          else delete row.raw.ids.tmdb;
-        }
-        markChanged();
-      };
-
-      const idBIn = document.createElement("input");
-      idBIn.name = fieldName(anilistMode ? "anilist" : "trakt");
-      idBIn.value = anilistMode ? (row.anilist || "") : (row.trakt || "");
-      idBIn.placeholder = anilistMode ? "AniList…" : "Trakt…";
-      idBIn.disabled = locked;
-      idBIn.oninput = e => {
-        const v = e.target.value;
-        row.raw.ids = row.raw.ids || {};
-        if (anilistMode) {
-          row.anilist = v;
-          if (v) row.raw.ids.anilist = v;
-          else delete row.raw.ids.anilist;
-        } else {
-          row.trakt = v;
-          if (v) row.raw.ids.trakt = v;
-          else delete row.raw.ids.trakt;
-        }
-        markChanged();
-      };
-
-      const searchBtn = document.createElement("button");
-      searchBtn.type = "button";
-      searchBtn.className = "cw-title-search-btn";
-      searchBtn.innerHTML = '<span class="material-symbol">search</span>';
-      const searchUsesCorrection = locked && canReplaceRow(row);
-      searchBtn.title = searchUsesCorrection
-        ? (usesCoordinateReplacer(row) ? "Replace episode" : "Search and add correction")
-        : "Search and fill IDs";
-      searchBtn.disabled = locked && !searchUsesCorrection;
-      if (searchBtn.disabled) {
-        searchBtn.style.opacity = "0.6";
-        searchBtn.style.cursor = "not-allowed";
-      }
-      searchBtn.onclick = () => {
-        if (searchBtn.disabled) return;
-        if (searchUsesCorrection) {
-          openItemReplacer(row, searchBtn);
-          return;
-        }
-        openTitleSearchEditor(row, searchBtn, {
-          keyIn,
-          titleIn,
-          yearIn,
-          imdbIn,
-          tmdbIn: anilistMode ? null : idAIn,
-          traktIn: null,
-          typeBtn,
-        });
-      };
-      titleRow.appendChild(searchBtn);
-
-      const subType = (((row.raw && row.raw.type) || row.type || "") + "").toLowerCase();
-      if (subType === "season" && row.raw && row.raw.series_title) {
-        const sub = document.createElement("div");
-        sub.className = "cw-title-sub";
-        let label = row.raw.series_title;
-        const code = subType === "episode" ? formatSxxEyy(row.raw.season, row.raw.episode) : formatSxxEyy(row.raw.season, null);
-        if (code) label += " - " + code;
-        sub.textContent = label;
-        titleCell.appendChild(sub);
-      }
-      if (isTrackerSource() && row._origin !== "baseline") {
-        const origin = document.createElement("div");
-        origin.className = "cw-title-sub";
-        origin.textContent = "Manual correction";
-        titleCell.appendChild(origin);
-      }
-      tr.appendChild(cell(titleCell));
-
-      const yearTd = cell(yearIn);
-      yearTd.className = "cw-col-year";
-      tr.appendChild(yearTd);
-      tr.appendChild(cell(idAIn));
-
-      const extraBtn = document.createElement("button");
-      extraBtn.type = "button";
-      extraBtn.className = "cw-extra-display";
-      updateExtraDisplay(row, extraBtn);
-
-      const extraEditable = isExtraKindEditable();
-      if (!extraEditable) {
-        extraBtn.disabled = true;
-        extraBtn.style.opacity = "0.6";
-        extraBtn.style.cursor = "default";
-      } else if (state.kind === "ratings") {
-        extraBtn.onclick = () => openRatingEditor(row, extraBtn, extraBtn);
-      } else if (state.kind === "history") {
-        extraBtn.onclick = () => openHistoryEditor(row, extraBtn, extraBtn);
-      } else if (state.kind === "progress") {
-        extraBtn.onclick = () => openProgressEditor(row, extraBtn, extraBtn);
-      }
-
-      tr.appendChild(cell(extraBtn));
-
-      frag.appendChild(tr);
-    });
-
-    if (tbody) tbody.appendChild(frag);
-
-    const vis = rows.length;
-    const first = start + 1;
-    const last = start + vis;
-
-    if (summaryVisible) summaryVisible.textContent = String(vis);
-    if (summaryTotal) summaryTotal.textContent = String(totalAll);
-
-    if (pageInfo) pageInfo.textContent = `Page ${state.page + 1} of ${pageCount} • Rows ${first}-${last} of ${totalFiltered}`;
-    if (pager) pager.style.display = pageCount > 1 ? "flex" : "none";
-    if (prevBtn) prevBtn.disabled = state.page <= 0;
-    if (nextBtn) nextBtn.disabled = state.page >= pageCount - 1;
-
-    if (totalFiltered > vis) {
-      setRowsStatus(`${vis} rows visible (rows ${first}-${last} of ${totalFiltered} filtered, ${totalAll} total)`);
-    } else {
-      setRowsStatus(`${vis} rows visible, ${totalAll} total`);
-    }
+    return editorTableController.renderRows(tableControllerContext());
   }
 
   function formatSnapshotLabel(s) {
@@ -3305,578 +1698,77 @@
   }
 
   function playlistEndpointLabel(ep) {
-    if (!ep) return "Endpoint";
-    const name = String(ep.name || ep.id || "Endpoint");
-    const provider = String(ep.provider_label || ep.provider || "").trim();
-    const playlist = String(ep.playlist_name || ep.playlist_id || "").trim();
-    const type = String(ep.playlist_type || ep.resource_kind || ep.kind || "").trim();
-    const parts = [name];
-    if (provider) parts.push(provider);
-    if (playlist && playlist !== name) parts.push(playlist);
-    if (type) parts.push(type);
-    return parts.join(" - ");
+    return editorSources.playlistEndpointLabel(ep);
   }
 
   function rebuildSnapshots() {
-    if (!snapSel) return;
-    const isState = state.source === "state";
-    const isTracker = isTrackerSource();
-    const isPlaylist = state.source === "playlist";
-    if (snapLabel) snapLabel.textContent = isState ? "Provider" : isTracker ? "Workspace" : "Endpoint";
-    if (instanceLabel) instanceLabel.style.display = isState ? "" : "none";
-    if (instanceSel) instanceSel.style.display = isState ? "" : "none";
-
-    if (isTracker) {
-      const list = Array.isArray(state.trackerWorkspaces) ? state.trackerWorkspaces : [];
-      const options = list
-        .map(w => `<option value="${_escapeHtml(w && w.id)}">${_escapeHtml((w && w.label) || "Local tracker")}</option>`)
-        .join("");
-      snapSel.innerHTML = options || `<option value="">No workspaces</option>`;
-      const opts = Array.from(snapSel.options).map(o => o.value);
-      const next = opts.includes(state.workspace) ? state.workspace : opts[0] || "";
-      if (next !== state.workspace) state.workspace = next;
-      snapSel.value = state.workspace || "";
-      syncProviderIconSelect(snapSel, false);
-      return;
-    }
-
-    if (isPlaylist) {
-      const list = Array.isArray(state.playlistEndpoints) ? state.playlistEndpoints : [];
-      const options = list
-        .map(ep => `<option value="${_escapeHtml(ep && ep.id)}">${_escapeHtml(playlistEndpointLabel(ep))}</option>`)
-        .join("");
-      snapSel.innerHTML = options || `<option value="">No endpoints</option>`;
-      const opts = Array.from(snapSel.options).map(o => o.value);
-      const next = opts.includes(state.snapshot) ? state.snapshot : opts[0] || "";
-      if (next !== state.snapshot) state.snapshot = next;
-      snapSel.value = state.snapshot || "";
-      syncProviderIconSelect(snapSel, false);
-      return;
-    }
-
-    if (isState) {
-      const list = Array.isArray(state.snapshots) ? state.snapshots : [];
-      const options = list.map(p => `<option value="${p}">${providerLabel(p, p)}</option>`).join("");
-      snapSel.innerHTML = options;
-      const opts = Array.from(snapSel.options).map(o => o.value);
-      const next = opts.includes(state.snapshot) ? state.snapshot : opts[0] || "";
-      if (next !== state.snapshot) state.snapshot = next;
-      snapSel.value = state.snapshot || "";
-      syncProviderIconSelect(snapSel, isState);
-      return;
-    }
+    return editorSources.rebuildSnapshots(sourceContext());
   }
 
 const on = (el, ev, fn) => el && el.addEventListener(ev, fn);
 
 async function fetchJSON(url, opts) {
-  if (window.cwIsAuthSetupPending?.() === true) throw new Error("auth setup pending");
-  const res = await fetch(url, Object.assign({ cache: "no-store" }, opts || {}));
-  if (!res.ok) {
-    let detail = "";
-    try {
-      const data = await res.json();
-      detail = data && (data.detail || data.error || data.message) ? String(data.detail || data.error || data.message) : "";
-    } catch (_) {}
-    throw new Error(detail || `Request failed: ${res.status}`);
-  }
-  return await res.json();
-}
-
-async function fetchBlob(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-  return await res.blob();
-}
-
-function saveBlob(blob, filename) {
-  const href = URL.createObjectURL(blob);
-  const a = Object.assign(document.createElement("a"), { href, download: filename });
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    URL.revokeObjectURL(href);
-    a.remove();
-  }, 0);
+  return editorFileUtils.fetchJSON(url, opts);
 }
 
 async function downloadFile(url, filename, toast) {
-  try {
-    setTag("warn", "Preparing download…");
-    saveBlob(await fetchBlob(url), filename);
-    setTag("loaded", "Ready");
-    if (toast && window.cxToast) window.cxToast(toast);
-  } catch (e) {
-    console.error(e);
-    setTag("error", "Download failed");
-    setStatus(String(e));
-  }
+  return editorFileUtils.downloadFile(url, filename, toast, { setTag, setStatus });
 }
 
-async function uploadJSON(url, file) {
-  const fd = new FormData();
-  fd.append("file", file);
-  const res = await fetch(url, { method: "POST", body: fd });
-  if (!res.ok) {
-    let msg = `Import failed: ${res.status}`;
-    try {
-      const err = await res.json();
-      if (err && err.detail) msg += ` – ${err.detail}`;
-    } catch (_) {}
-    throw new Error(msg);
-  }
-  return await res.json();
-}
-
-const listParts = (data, defs) => defs.flatMap(([k, label]) => data && data[k] != null ? [`${data[k]} ${label}${data[k] === 1 ? "" : "s"}`] : []);
+const listParts = (data, defs) => editorFileUtils.listParts(data, defs);
 
 function bindFileImport(btn, input, url, done) {
-  if (!btn || !input) return;
-  on(btn, "click", () => input.click());
-  on(input, "change", async () => {
-    const file = input.files && input.files[0];
-    if (!file) return;
-    try {
-      setTag("warn", "Importing…");
-      setStatus("");
-      await done(await uploadJSON(url, file));
-    } catch (e) {
-      console.error(e);
-      setTag("error", "Import failed");
-      setStatus(String(e));
-    } finally {
-      try { input.value = ""; } catch (_) {}
-    }
-  });
+  return editorFileUtils.bindFileImport(btn, input, url, done, { on, setTag, setStatus });
 }
 
-  async function loadTrackerWorkspaces() {
-    try {
-      const data = await fetchJSON("/api/editor/tracker/workspaces");
-      const list = Array.isArray(data && data.workspaces) ? data.workspaces : [];
-      state.trackerWorkspaces = list;
-      state.trackerAvailable = list.length > 0;
-    } catch (_) {
-      state.trackerWorkspaces = [];
-      state.trackerAvailable = false;
-    }
-    ensureTrackerOption();
-    return state.trackerWorkspaces;
+  async function loadSnapshots() {
+    return editorSources.loadSnapshots(sourceContext());
   }
 
-  async function loadSnapshots() {
-    try {
-      if (isTrackerSource()) {
-        await loadTrackerWorkspaces();
-        rebuildSnapshots();
-        syncKindUI();
-        if (!state.trackerWorkspaces.length) showStateHint("tracker");
-        else showStateHint(null);
-        return;
-      }
-      if (state.source === "playlist") {
-        const data = await fetchJSON("/api/editor/playlists/endpoints");
-        state.playlistEndpoints = Array.isArray(data && data.endpoints) ? data.endpoints : [];
-        state.snapshots = state.playlistEndpoints;
-        rebuildSnapshots();
-        if (!state.playlistEndpoints.length) showStateHint("playlist");
-        else showStateHint(null);
-        return;
-      }
-      if (state.source === "state") {
-        const data = await fetchJSON(`/api/editor/state/providers`);
-        state.snapshots = Array.isArray(data.providers) ? data.providers : [];
-        rebuildSnapshots();
-
-        const prov = state.snapshot || (snapSel ? (snapSel.value || "") : "");
-        if (prov) {
-          const nextInst = await loadInstanceOptions(prov, instanceSel, state.instance);
-          if (prov !== state.snapshot || nextInst !== state.instance) {
-            state.snapshot = prov;
-            state.instance = nextInst;
-            persistUIState();
-          }
-        } else {
-          const nextInst = renderInstanceOptions(instanceSel, [{ id: "default", label: "Default" }], "default");
-          if (state.instance !== nextInst) {
-            state.instance = nextInst;
-            persistUIState();
-          }
-        }
-
-        if (!state.snapshots.length) showStateHint("state");
-        else showStateHint(null);
-        return;
-      }
-      state.source = "state";
-      rebuildSnapshots();
-      return;
-    } catch (e) {
-      console.error(e);
-    }
+  function loadControllerContext() {
+    return {
+      state,
+      host,
+      snapSel,
+      instanceSel,
+      isTrackerSource,
+      isProviderPickerSource,
+      isPolicySource,
+      isManualSource,
+      normalizeSource,
+      fetchJSON,
+      buildRows,
+      buildManualOverrideRows,
+      loadSnapshots,
+      renderRows,
+      showStateHint,
+      setTag,
+      setStatus,
+      syncActionButtons,
+      syncHeaderPills,
+      syncProviderIconSelect,
+      syncProfileIconSelect,
+    };
   }
 
   async function settleStateView(maxAttempts = 3, delayMs = 300) {
-    if (state.source !== "state") return;
-    for (let i = 0; i < maxAttempts; i += 1) {
-      const missingProvider = !String(state.snapshot || "").trim();
-      const hasRows = Array.isArray(state.rows) && state.rows.length > 0;
-      const hasSnapshots = Array.isArray(state.snapshots) && state.snapshots.length > 0;
-      if (!missingProvider && (hasRows || !hasSnapshots)) return;
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-      await loadSnapshots();
-      await loadState();
-    }
+    return editorLoadController.settleStateView(loadControllerContext(), maxAttempts, delayMs);
   }
 
   async function loadState() {
-    if (state.source === "playlist") {
-      const endpointId = String(state.snapshot || "").trim();
-      if (!endpointId) {
-        state.items = {};
-        state.rows = [];
-        state.selected = new Set();
-        state.pageRids = [];
-        state.ridSeq = 1;
-        state.hasChanges = false;
-        state.page = 0;
-        state.playlistResource = null;
-        state.playlistWarnings = [];
-        state.playlistOriginalKeys = [];
-        renderRows();
-        showStateHint("playlist");
-        setTag("loaded", "No endpoint");
-        setStatus("");
-        syncActionButtons();
-        return;
-      }
-    }
-    if (isTrackerSource() && !String(state.workspace || "").trim()) {
-      state.baselineItems = {};
-      state.manualAdds = {};
-      state.manualBlocks = [];
-      state.items = {};
-      state.rows = [];
-      state.selected = new Set();
-      state.pageRids = [];
-      state.ridSeq = 1;
-      state.hasChanges = false;
-      state.page = 0;
-      renderRows();
-      showStateHint("tracker");
-      setTag("loaded", "No workspace");
-      setStatus("");
-      syncActionButtons();
-      return;
-    }
-    state.source = normalizeSource(state.source);
-    state.loading = true;
-    setTag("warn", "Loading");
-    try {
-      const params = new URLSearchParams({ kind: state.kind, source: state.source });
-      if (state.source === "state" && state.snapshot) {
-        params.set("provider", state.snapshot);
-        params.set("provider_instance", state.instance || "default");
-      }
-      if (isTrackerSource()) params.set("workspace", state.workspace);
-      if (state.source === "playlist" && state.snapshot) params.set("endpoint", state.snapshot);
-
-      const data = await fetchJSON(`/api/editor?${params.toString()}`);
-      if (data && data.ok === false) throw new Error(data.error || data.detail || "Load failed");
-
-      if (state.source === "playlist") {
-        state.playlistResource = data.resource || null;
-        state.playlistWarnings = Array.isArray(data.resource && data.resource.warnings) ? data.resource.warnings.map(String) : [];
-        state.playlistOriginalKeys = Array.isArray(data.original_keys) ? data.original_keys.map(String) : [];
-        state.items = data.items || {};
-        state.selected = new Set();
-        state.pageRids = [];
-        state.ridSeq = 1;
-        state.rows = buildRows(state.items);
-      } else if (isPolicySource()) {
-        if (state.source === "state" && data && typeof data.provider === "string" && data.provider.trim()) {
-          state.snapshot = data.provider.trim();
-          if (snapSel) {
-            snapSel.value = state.snapshot;
-            syncProviderIconSelect(snapSel, true);
-          }
-        }
-        if (isTrackerSource() && data && typeof data.workspace === "string" && data.workspace.trim()) {
-          state.workspace = data.workspace.trim();
-          if (snapSel) snapSel.value = state.workspace;
-        }
-        state.baselineItems = data.items || {};
-        state.manualAdds = data.manual_adds || {};
-        state.manualBlocks = Array.isArray(data.manual_blocks) ? data.manual_blocks : [];
-
-        if (state.source === "state" && data && typeof data.provider_instance === "string") {
-          state.instance = data.provider_instance;
-          if (instanceSel) instanceSel.value = state.instance;
-        }
-
-        const merged = Object.assign({}, state.baselineItems || {});
-        const manualKeys = new Set();
-        for (const [k, v] of Object.entries(state.manualAdds || {})) {
-          const key = String(k || "").trim();
-          if (!key) continue;
-          const existingKey = Object.keys(merged).find(x => String(x || "").toLowerCase() === key.toLowerCase());
-          const finalKey = existingKey || key;
-          merged[finalKey] = v;
-          manualKeys.add(finalKey.toLowerCase());
-        }
-
-        state.items = merged;
-        state.selected = new Set();
-        state.pageRids = [];
-        state.ridSeq = 1;
-        state.rows = buildRows(state.items);
-
-        const baselineKeys = new Set(Object.keys(state.baselineItems || {}));
-        const blocked = new Set(
-          (state.manualBlocks || []).map(x => String(x || "").trim()).filter(Boolean)
-        );
-
-        for (const row of state.rows) {
-          const rowKey = String(row.key || "").toLowerCase();
-          row._origin = manualKeys.has(rowKey) ? "manual" : baselineKeys.has(row.key) ? "baseline" : "manual";
-          if (row._origin === "baseline") row.deleted = blocked.has(row.key);
-        }
-      }
-
-      state.hasChanges = false;
-      state.page = 0;
-      renderRows();
-
-      if (isPolicySource()) {
-        const hasBaseline = state.baselineItems && Object.keys(state.baselineItems).length > 0;
-        const hasManual = state.manualAdds && Object.keys(state.manualAdds).length > 0;
-        const hasBlocks = Array.isArray(state.manualBlocks) && state.manualBlocks.length > 0;
-        const emptyMode = isTrackerSource() ? "tracker" : "state";
-        showStateHint(hasBaseline || hasManual || hasBlocks ? null : emptyMode);
-      } else if (state.source === "playlist") {
-        showStateHint(state.snapshot ? null : "playlist");
-      }
-
-      setTag("loaded", "Ready");
-      if (state.source === "playlist" && state.playlistWarnings.length) {
-        setStatus(state.playlistWarnings[0]);
-      }
-    } catch (e) {
-      console.error(e);
-      const msg = String(e || "");
-
-      if (
-        isTrackerSource() &&
-        (msg.includes("404") || /local tracker/i.test(msg) || /workspace/i.test(msg))
-      ) {
-        showStateHint("tracker");
-        state.baselineItems = {};
-        state.manualAdds = {};
-        state.manualBlocks = [];
-        state.items = {};
-        state.rows = [];
-        state.selected = new Set();
-        state.pageRids = [];
-        state.ridSeq = 1;
-        state.workspace = "";
-        renderRows();
-        setTag("warn", "No tracker data");
-        setStatus("");
-      } else if (
-        state.source === "state" &&
-        (msg.includes("404") || /state\.json/i.test(msg) || /missing state/i.test(msg))
-      ) {
-        showStateHint("state");
-        state.items = {};
-        state.rows = [];
-        renderRows();
-        setTag("warn", "Missing state");
-        setStatus("");
-      } else {
-        setTag("error", "Load failed");
-        setStatus(msg);
-      }
-    } finally {
-      state.loading = false;
-      syncActionButtons();
-    }
+    return editorLoadController.loadState(loadControllerContext());
   }
 
   function findRowsMissingKey() {
-    const missing = [];
-    for (const row of state.rows) {
-      if (row.deleted) continue;
-      const key = (row.key || "").trim();
-      if (key) continue;
-
-      const hasOther =
-        (row.title && row.title.trim()) ||
-        (row.type && row.type.trim()) ||
-        (row.year && String(row.year).trim()) ||
-        (row.imdb && row.imdb.trim()) ||
-        (row.tmdb && row.tmdb.trim()) ||
-        (row.trakt && row.trakt.trim());
-
-      if (hasOther) missing.push(row);
-    }
-    return missing;
+    return editorPersistence.findRowsMissingKey(state);
   }
 
   async function saveState() {
-    if (state.saving) return;
-
-    const missing = findRowsMissingKey();
-    if (missing.length) {
-      setTag("error", "Missing key");
-      setStatus(
-        `Cannot save: ${missing.length} row${missing.length === 1 ? "" : "s"} have data but no Key. Fill the Key or remove the row.`
-      );
-      if (window.cxToast) window.cxToast("Fill Key for all rows with data before saving");
-      return;
-    }
-
-    state.saving = true;
-    setTag("warn", "Saving");
-    syncActionButtons();
-
-    try {
-      const items = {};
-      const blocks = [];
-      const seenBlocks = new Set();
-
-      for (const row of state.rows) {
-        if (row.deleted) {
-          if (isPolicySource() && row._origin === "baseline") {
-            const k = (row.key || "").trim();
-            if (k) {
-              const kl = k.toLowerCase();
-              if (!seenBlocks.has(kl)) {
-                seenBlocks.add(kl);
-                blocks.push(k);
-              }
-            }
-          }
-          continue;
-        }
-
-        if (isPolicySource() && row._origin === "baseline") continue;
-
-        if (isPolicySource() && row._replacedKey) {
-          const rk = String(row._replacedKey).trim();
-          const rkl = rk.toLowerCase();
-          if (rk && !seenBlocks.has(rkl)) {
-            seenBlocks.add(rkl);
-            blocks.push(rk);
-          }
-        }
-
-        const key = (row.key || "").trim();
-        if (!key) continue;
-
-        const raw = row.raw || {};
-        const ids = raw.ids || {};
-
-        if (row.imdb) ids.imdb = row.imdb;
-        else delete ids.imdb;
-
-        if (row.tmdb) ids.tmdb = row.tmdb;
-        else delete ids.tmdb;
-
-        if (row.trakt) ids.trakt = row.trakt;
-        else delete ids.trakt;
-
-        raw.ids = ids;
-        raw.type = row.type || raw.type || null;
-        raw.title = row.title ? row.title : raw.title || null;
-
-        const y = (row.year || "").trim();
-        const n = y ? parseInt(y, 10) : NaN;
-        raw.year = Number.isFinite(n) ? n : null;
-
-        items[key] = raw;
-      }
-
-      const payload = { kind: state.kind, source: state.source, items };
-      if (state.source === "state") {
-        payload.provider = state.snapshot;
-        payload.provider_instance = state.instance || "default";
-        payload.blocks = blocks;
-      }
-      if (isTrackerSource()) {
-        payload.workspace = state.workspace;
-        payload.blocks = blocks;
-      }
-      if (state.source === "playlist") {
-        payload.endpoint = state.snapshot;
-        const currentKeys = new Set((state.playlistOriginalKeys || []).map(String));
-        const nextKeys = new Set(Object.keys(items));
-        const removals = Array.from(currentKeys).filter(k => !nextKeys.has(k)).length;
-        if (removals && state.playlistWarnings.length) {
-          const text = state.playlistWarnings.join("\n");
-          if (!window.confirm(`${text}\n\nRemove ${removals} item${removals === 1 ? "" : "s"} from this playlist endpoint?`)) {
-            state.saving = false;
-            setTag("warn", "Unsaved changes");
-            setStatus("Save cancelled");
-            syncActionButtons();
-            return;
-          }
-        }
-      }
-
-      const res = await fetchJSON("/api/editor", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      state.hasChanges = false;
-      setTag("warn", "Saved");
-      if (state.source === "playlist") {
-        const added = Number(res.added || 0);
-        const removed = Number(res.removed || 0);
-        const reordered = Number(res.reordered || 0);
-        const unresolved = Number(res.unresolved_count || 0);
-        const parts = [`+${added}`, `-${removed}`];
-        if (reordered) parts.push(`${reordered} reordered`);
-        if (unresolved) parts.push(`${unresolved} unresolved`);
-        setStatus(`Applied playlist changes: ${parts.join(", ")}`);
-        await loadState();
-      } else if (isTrackerSource()) {
-        setStatus(`Saved ${res.count || Object.keys(items).length} corrections`);
-        await loadState();
-      } else {
-        setStatus(`Saved ${res.count || Object.keys(items).length} items`);
-        await loadSnapshots();
-      }
-    } catch (e) {
-      console.error(e);
-      setTag("error", "Save failed");
-      setStatus(String(e));
-    } finally {
-      state.saving = false;
-      syncActionButtons();
-    }
+    return editorPersistence.saveState(persistenceContext());
   }
 
   function addRow() {
-    const raw = { ids: {}, type: "movie", title: "", year: null };
-    state.rows.unshift({
-      _rid: state.ridSeq++,
-      key: "",
-      type: raw.type,
-      title: "",
-      year: "",
-      imdb: "",
-      tmdb: "",
-      trakt: "",
-      raw,
-      deleted: false,
-      episode: false,
-      _origin: isPolicySource() ? "manual" : "playlist",
-    });
-    state.page = 0;
-    markChanged();
-    renderRows();
+    return editorRowEditor.addRow(rowEditorContext());
   }
 
   on(prevBtn, "click", () => {
@@ -3886,24 +1778,47 @@ function bindFileImport(btn, input, url, done) {
   });
 
   on(nextBtn, "click", () => {
-    const pageCount = Math.max(1, Math.ceil(applyFilter(state.rows).length / PAGE_SIZE));
+    const pageCount = Math.max(1, Math.ceil(applyFilter(state.rows).length / (state.pageSize || DEFAULT_PAGE_SIZE)));
     if (state.page >= pageCount - 1) return;
     state.page += 1;
     renderRows();
   });
 
-  sortHeaders.forEach(th => {
-    th.addEventListener("click", () => {
-      const key = th.dataset.sort;
-      if (!key) return;
-      if (state.sortKey === key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
-      else {
-        state.sortKey = key;
-        state.sortDir = "asc";
-      }
-      persistUIState();
-      renderRows();
-    });
+  on(host.querySelector(".cw-table thead"), "click", e => {
+    if (e.target.closest(".cw-col-resize") || e.target.closest(".cw-checkbox")) return;
+    const th = e.target.closest("th[data-sort]");
+    if (!th || !host.contains(th)) return;
+    const key = th.dataset.sort;
+    if (!key) return;
+    if (state.sortKey === key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+    else {
+      state.sortKey = key;
+      state.sortDir = "asc";
+    }
+    persistUIState();
+    renderRows();
+  });
+
+  on(pageSizeSel, "change", () => {
+    const next = Number(pageSizeSel.value);
+    state.pageSize = PAGE_SIZE_OPTIONS.includes(next) ? next : DEFAULT_PAGE_SIZE;
+    state.page = 0;
+    syncPageSizeUI();
+    persistUIState();
+    renderRows();
+  });
+
+  on(columnsBtn, "click", () => openColumnPopup(columnsBtn));
+  on(wideBtn, "click", () => {
+    state.wideView = !state.wideView;
+    closePopup();
+    syncWideViewUI();
+    persistUIState();
+  });
+
+  on(window, "resize", () => {
+    window.clearTimeout(columnLayoutResizeTimer);
+    columnLayoutResizeTimer = window.setTimeout(applyColumnWidths, 80);
   });
 
   if (typeFilterWrap) {
@@ -3943,10 +1858,6 @@ function bindFileImport(btn, input, url, done) {
         state.kind = "watchlist";
         state.instance = "default";
       }
-      if (isTrackerSource()) {
-        state.workspace = "";
-        state.instance = "default";
-      }
       persistUIState();
       syncSourceUI();
       clearSelection();
@@ -3975,7 +1886,7 @@ function bindFileImport(btn, input, url, done) {
       syncTypeFilterUI();
       syncStateBulkUI();
       clearSelection();
-      if (state.source !== "state" && !isTrackerSource()) state.snapshot = "";
+      if (!isProviderPickerSource()) state.snapshot = "";
       state.page = 0;
       persistUIState();
       await loadSnapshots();
@@ -3987,25 +1898,14 @@ function bindFileImport(btn, input, url, done) {
 
   if (snapSel) {
     snapSel.addEventListener("change", async () => {
-      if (isTrackerSource()) {
-        state.workspace = snapSel.value || "";
-        state.page = 0;
-        clearSelection();
-        syncKindUI();
-        syncTypeFilterUI();
-        syncStateBulkUI();
-        persistUIState();
-        await loadState();
-        return;
-      }
       state.snapshot = snapSel.value || "";
-      if (state.source === "state") syncProviderIconSelect(snapSel, true);
-      if (state.source === "state") {
+      if (isProviderPickerSource()) syncProviderIconSelect(snapSel, true);
+      if (isProviderPickerSource()) {
         state.instance = await loadInstanceOptions(state.snapshot, instanceSel, state.instance);
         persistUIState();
       }
       state.page = 0;
-      if (state.source !== "state") persistUIState();
+      if (!isProviderPickerSource()) persistUIState();
       await loadState();
     });
   }
@@ -4052,43 +1952,25 @@ if (importProviderSel) {
     filterInput.addEventListener("input", () => {
       state.filter = filterInput.value || "";
       state.page = 0;
-      clearSelection();
       persistUIState();
       renderRows();
     });
   }
 
   function editorIsVisible() {
-    return !!host && !!document.getElementById("page-editor") && host.getClientRects().length > 0;
+    return editorLoadController.editorIsVisible(loadControllerContext());
   }
 
   function syncSelectedScopeFromControls() {
-    if (isTrackerSource()) {
-      state.workspace = (snapSel && snapSel.value) ? snapSel.value : state.workspace || "";
-      state.snapshot = "";
-      state.instance = "default";
-      return;
-    }
-    if (state.source === "state") {
-      state.snapshot = (snapSel && snapSel.value) ? snapSel.value : state.snapshot || "";
-      state.instance = (instanceSel && instanceSel.value) ? instanceSel.value : state.instance || "default";
-      return;
-    }
-    if (state.source === "playlist") {
-      state.snapshot = (snapSel && snapSel.value) ? snapSel.value : state.snapshot || "";
-      state.instance = "default";
-    }
+    return editorLoadController.syncSelectedScopeFromControls(loadControllerContext());
   }
 
   async function refreshEditor({ force = false } = {}) {
-    if (!force && (!editorIsVisible() || state.hasChanges || state.loading || state.saving)) return;
-    syncSelectedScopeFromControls();
-    state.page = 0;
-    await loadSnapshots();
-    await loadState();
-    await settleStateView();
-    state.lastSyncAt = Date.now();
-    syncHeaderPills();
+    return editorLoadController.refreshEditor(loadControllerContext(), { force });
+  }
+
+  function queueEditorRefresh(delay = 250) {
+    return editorLoadController.queueEditorRefresh(loadControllerContext(), delay);
   }
 
   if (reloadBtn) {
@@ -4106,15 +1988,6 @@ if (importProviderSel) {
         syncActionButtons();
       }
     });
-  }
-
-  let deferredRefreshTimer = null;
-  function queueEditorRefresh(delay = 250) {
-    if (deferredRefreshTimer) window.clearTimeout(deferredRefreshTimer);
-    deferredRefreshTimer = window.setTimeout(() => {
-      deferredRefreshTimer = null;
-      refreshEditor().catch(e => console.warn("[editor] refresh failed", e));
-    }, delay);
   }
 
   window.addEventListener("sync-complete", () => queueEditorRefresh(350));
@@ -4136,6 +2009,7 @@ if (importProviderSel) {
   on(bulkRemoveBtn, "click", () => bulkSetDeletedForSelected(true));
   on(bulkRestoreBtn, "click", () => bulkSetDeletedForSelected(false));
   on(bulkClearBtn, "click", () => { clearSelection(); renderRows(); });
+  on(bulkSendBtn, "click", () => openEditorSendModal());
   on(bulkBlockTypeBtn, "click", () => bulkSetBlocksByType(bulkTypeSel && bulkTypeSel.value, true));
   on(bulkUnblockTypeBtn, "click", () => bulkSetBlocksByType(bulkTypeSel && bulkTypeSel.value, false));
 
@@ -4159,12 +2033,10 @@ if (importProviderSel) {
   });
 
   (async () => {
-    await loadTrackerWorkspaces();
     const wanted = state.source;
     state.source = normalizeSource(wanted);
     if (state.source !== wanted) {
       state.snapshot = "";
-      state.workspace = "";
       state.instance = "default";
       persistUIState();
     }
@@ -4172,11 +2044,9 @@ if (importProviderSel) {
     await loadImportProviders();
     setTag(
       "warn",
-      isTrackerSource()
-        ? "Loading Local Tracker…"
-        : state.source === "state"
-          ? "Loading current state…"
-          : "Loading playlist endpoint…"
+      state.source === "state"
+        ? "Loading current state..."
+        : "Loading playlist endpoint..."
     );
     await loadSnapshots();
     await loadState();

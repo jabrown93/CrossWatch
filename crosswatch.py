@@ -38,16 +38,33 @@ from api.appAuthAPI import (
     COOKIE_NAME as APP_AUTH_COOKIE,
     api_key_authenticated as app_api_key_authenticated,
     auth_required as app_auth_required,
+    current_user as app_current_user,
     is_authenticated as app_is_authenticated,
+    non_admin_api_allowed as app_non_admin_api_allowed,
+    _origin_allowed as app_origin_allowed,
+    _origin_blocked_response as app_origin_blocked_response,
     setup_lock_required as app_auth_setup_lock_required,
     register_app_auth,
 )
+from cw_platform.access_policy import clean_managed_permissions
+from cw_platform.event_archive.audit import record_audit
 
 from _logging import log as LOG, BLUE, GREEN, DIM, RED, YELLOW, RESET  # type: ignore
 BACKUP_LOG = LOG.child("BACKUP")
 
 def _c(text: str, color: str) -> str:
     return f"{color}{text}{RESET}" if LOG.use_color else text
+
+def _fmt_bytes(value: Any) -> str:
+    try:
+        size = float(value or 0)
+    except Exception:
+        size = 0.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "0 B"
 
 from api.versionAPI import CURRENT_VERSION
 from services import register as register_services
@@ -89,14 +106,10 @@ if str(ROOT) not in sys.path:
 STATE_DIR = CONFIG_DIR
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_PATH      = (STATE_DIR / "state.json").resolve()
-TOMBSTONES_PATH = (STATE_DIR / "tombstones.json").resolve()
-LAST_SYNC_PATH  = (STATE_DIR / "last_sync.json").resolve()
-
-REPORT_DIR = (CONFIG_DIR / "sync_reports"); REPORT_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR = CONFIG_DIR / "sync_reports"
 CACHE_DIR  = (CONFIG_DIR / "cache");        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_PATHS = [CONFIG_DIR / "state.json", ROOT / "state.json"]
 CW_STATE_DIR = (CONFIG_DIR / ".cw_state"); CW_STATE_DIR.mkdir(parents=True, exist_ok=True)
+TOMBSTONES_PATH = (CW_STATE_DIR / "tombstones.json").resolve()
 
 _METADATA: Any = None
 scheduler: Optional[SyncScheduler] = None
@@ -382,7 +395,7 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
 # API
 _apply_auth_reset_env_once()
 _ensure_setup_token()
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 # CORS: deny all cross-origin requests by default
@@ -396,6 +409,119 @@ app.add_middleware(
 )
 
 from api.scrobbleAPI import WebhookAuthError
+
+def _non_admin_permission_allowed(user: dict, path: str, method: str = "GET") -> bool:
+    if not path.startswith("/api/"):
+        return True
+    perms = clean_managed_permissions(user.get("permissions") if isinstance(user, dict) else {})
+    write = bool(perms.get("write"))
+    m = str(method or "GET").upper()
+    if path == "/api/profile" or path.startswith("/api/profile/"):
+        return True
+    if path == "/api/metadata/bulk":
+        return bool(perms.get("dashboard") or perms.get("watchlist") or perms.get("playback"))
+    if path in {"/api/metadata/search", "/api/metadata/resolve"}:
+        return write
+    if m in {"POST", "PUT", "PATCH", "DELETE"}:
+        if not write:
+            return False
+        if path.startswith("/api/watchlist"):
+            return bool(perms.get("watchlist"))
+        if path.startswith("/api/playback_progress/"):
+            return bool(perms.get("playback"))
+        if path.startswith("/api/activity/"):
+            return bool(perms.get("dashboard"))
+        return True
+    if path.startswith("/api/watchlist"):
+        return bool(perms.get("watchlist"))
+    if path in {"/api/playback_progress/providers", "/api/playback_progress/settings", "/api/playback_progress/items"}:
+        return bool(perms.get("playback"))
+    if path == "/api/insights":
+        return bool(perms.get("dashboard"))
+    if path.startswith("/api/dashboard/") or path.startswith("/api/state/wall") or path.startswith("/api/activity/") or path == "/api/watch/currently_watching":
+        return bool(perms.get("dashboard"))
+    if path in {"/api/status", "/api/sync/providers", "/api/sync/providers/counts"}:
+        return bool(perms.get("dashboard"))
+    if path == "/api/logs/stream":
+        return write
+    if path == "/api/logs/watcher":
+        return False
+    if path == "/api/pairs":
+        return bool(perms.get("dashboard"))
+    if path.startswith("/api/pairs/") or path.startswith("/api/run"):
+        return write
+    for prefix in (
+        "/api/analyzer",
+        "/api/events",
+        "/api/export",
+        "/api/import",
+        "/api/editor",
+        "/api/playlists",
+        "/api/snapshots",
+        "/api/manual",
+    ):
+        if path == prefix or path.startswith(prefix + "/"):
+            return write
+    return True
+
+def _unsafe_api_origin_blocked(cfg: dict, request: Request, token: str | None) -> bool:
+    method = str(getattr(request, "method", "") or "").upper()
+    path = request.url.path or "/"
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    if not path.startswith("/api/") or path.startswith("/api/app-auth/"):
+        return False
+    if not app_auth_required(cfg) or not token or not app_is_authenticated(cfg, token):
+        return False
+    return not app_origin_allowed(request)
+
+def _audit_api_action(request: Request, response: Response, user: dict[str, Any]) -> None:
+    method = str(getattr(request, "method", "") or "").upper()
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return
+    path = request.url.path or "/"
+    if not path.startswith("/api/") or path.startswith("/api/app-auth/"):
+        return
+    areas = (
+        ("/api/run", "sync"),
+        ("/api/analyzer", "analyzer"),
+        ("/api/events", "events"),
+        ("/api/import", "import_export"),
+        ("/api/export", "import_export"),
+        ("/api/watchlist", "watchlist"),
+        ("/api/playback", "playback"),
+        ("/api/playlists", "playlists"),
+        ("/api/editor", "editor"),
+        ("/api/snapshots", "captures"),
+        ("/api/manual", "manual_entry"),
+        ("/api/pairs", "sync_pairs"),
+        ("/api/config", "settings"),
+        ("/api/provider-instances", "providers"),
+        ("/api/user-profiles", "profiles"),
+    )
+    area = ""
+    for prefix, label in areas:
+        if path == prefix or path.startswith(prefix + "/"):
+            area = label
+            break
+    if not area:
+        return
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    ok = 200 <= status_code < 400
+    try:
+        record_audit(
+            "api_action",
+            actor=user,
+            request=request,
+            status="success" if ok else "failed",
+            target_type=area,
+            target_id=path,
+            message=f"{user.get('username') or 'User'} used {area.replace('_', ' ')}",
+            fields={"method": method, "status_code": status_code},
+            source_kind="api",
+        )
+    except Exception:
+        pass
 
 @app.exception_handler(WebhookAuthError)
 async def _handle_webhook_auth_error(request: Request, exc: WebhookAuthError) -> JSONResponse:
@@ -508,7 +634,27 @@ async def app_auth_gate(request: Request, call_next):
 
     token = request.cookies.get(APP_AUTH_COOKIE)
     if app_is_authenticated(cfg, token):
-        return await call_next(request)
+        if _unsafe_api_origin_blocked(cfg, request, token):
+            return app_origin_blocked_response()
+        user = app_current_user(cfg, token)
+        if user is None:
+            if path.startswith("/api/"):
+                return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
+            return RedirectResponse(url="/login", status_code=302)
+        try:
+            request.state.cw_user = user
+        except Exception:
+            pass
+        if not user.get("is_admin"):
+            if not app_non_admin_api_allowed(path, request.method) or not _non_admin_permission_allowed(user, path, request.method):
+                if path.startswith("/api/"):
+                    return JSONResponse({"ok": False, "error": "Administrator access required"}, status_code=403, headers={"Cache-Control": "no-store"})
+                if path != "/profile":
+                    return RedirectResponse(url="/profile", status_code=302)
+                return PlainTextResponse("Forbidden", status_code=403, headers={"Cache-Control": "no-store"})
+        response = await call_next(request)
+        _audit_api_action(request, response, user)
+        return response
 
     if app_api_key_authenticated(cfg, request):
         return await call_next(request)
@@ -547,6 +693,7 @@ WATCH_LOG_TAGS = {
     "PLEX-WATCH",
     "JELLYFIN-WATCH",
     "EMBY-WATCH",
+    "KODI-WATCH",
     "TRAKT-SCROBBLE",
     "SIMKL-SCROBBLE",
     "MDBLIST-SCROBBLE",
@@ -559,6 +706,7 @@ WATCH_LOG_DEFAULT_TAGS = [
     "PLEX-WATCH",
     "JELLYFIN-WATCH",
     "EMBY-WATCH",
+    "KODI-WATCH",
     "TRAKT-SCROBBLE",
     "SIMKL-SCROBBLE",
     "MDBLIST-SCROBBLE",
@@ -891,6 +1039,14 @@ app.router.lifespan_context = _lifespan
 async def cache_headers_for_api(request: Request, call_next):
     resp = await call_next(request)
     path = request.url.path
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://image.tmdb.org https://www.themoviedb.org https://media.trakt.tv; connect-src 'self'; font-src 'self'; frame-src 'self' https://wiki.crosswatch.app https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    )
 
     if path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
@@ -943,15 +1099,38 @@ async def api_logs_stream_initial(
     tag: str = Query("SYNC"),
     tail: int | None = Query(None, ge=1, le=MAX_LOG_LINES),
     since: int | None = Query(None, ge=1),
+    max_backlog: int | None = Query(None, ge=1, le=MAX_LOG_LINES),
     plain: bool = Query(False),
 ):
     tag = _norm_log_tag(tag)
+    try:
+        user = getattr(getattr(request, "state", None), "cw_user", None)
+    except Exception:
+        user = None
+    managed = isinstance(user, dict) and not user.get("is_admin")
+    if managed and tag != "SYNC":
+        return JSONResponse({"ok": False, "error": "Administrator access required"}, status_code=403, headers={"Cache-Control": "no-store"})
+
+    def _run_visible() -> bool:
+        if not managed:
+            return True
+        try:
+            from api.syncAPI import run_log_visible_to_user
+
+            return run_log_visible_to_user(load_config() or {}, user)
+        except Exception:
+            return False
 
     async def agen():
+        visible = _run_visible()
+        if not visible:
+            yield "event: scope\ndata: 1\n\n"
         buf = list(_get_log_buf(tag, create=False))
         base = int(LOG_BASE_SEQ.get(tag, int(LOG_NEXT_SEQ.get(tag, 1))))
         if since is not None:
             last_seq = max(int(since), base - 1)
+        elif not visible:
+            last_seq = base + len(buf) - 1
         else:
             buf_len = len(buf)
             start = max(0, buf_len - int(tail)) if tail else 0
@@ -970,10 +1149,22 @@ async def api_logs_stream_initial(
             base = int(LOG_BASE_SEQ.get(tag, int(LOG_NEXT_SEQ.get(tag, 1))))
             if last_seq < base - 1:
                 last_seq = base - 1
+            if not _run_visible():
+                last_seq = max(last_seq, base + len(new_buf) - 1)
+                if time.time() - last > 15:
+                    yield "event: ping\ndata: 1\n\n"
+                    last = time.time()
+                await asyncio.sleep(0.25)
+                continue
             start_seq = max(last_seq + 1, base)
             start_idx = int(start_seq - base)
             if start_idx < 0:
                 start_idx = 0
+            if max_backlog:
+                backlog = len(new_buf) - start_idx
+                if backlog > max_backlog:
+                    start_idx = max(0, len(new_buf) - int(max_backlog))
+                    last_seq = base + start_idx - 1
             for i in range(start_idx, len(new_buf)):
                 line = new_buf[i]
                 seq = base + i
@@ -1002,8 +1193,16 @@ async def api_logs_watcher(
     request: Request,
     tail: int = Query(200, ge=1, le=3000),
     tags: str = Query("", description="Optional CSV override"),
+    max_backlog: int | None = Query(None, ge=1, le=3000),
+    skip_backlog: bool = Query(False),
     plain: bool = Query(False),
 ):
+    try:
+        user = getattr(getattr(request, "state", None), "cw_user", None)
+    except Exception:
+        user = None
+    if isinstance(user, dict) and not user.get("is_admin"):
+        return JSONResponse({"ok": False, "error": "Administrator access required"}, status_code=403, headers={"Cache-Control": "no-store"})
     tags_sel = _watch_log_selection(tags)
 
     async def agen():
@@ -1011,10 +1210,11 @@ async def api_logs_watcher(
 
         for t in tags_sel:
             buf = _get_log_buf(t, create=False)
-            start = max(0, len(buf) - int(tail))
-            for line in buf[start:]:
-                safe = _log_stream_text(line, plain)
-                yield f"event: {t}\ndata: {safe}\n\n"
+            if not skip_backlog:
+                start = max(0, len(buf) - int(tail))
+                for line in buf[start:]:
+                    safe = _log_stream_text(line, plain)
+                    yield f"event: {t}\ndata: {safe}\n\n"
             base = int(LOG_BASE_SEQ.get(t, int(LOG_NEXT_SEQ.get(t, 1))))
             last_seq[t] = base + len(buf) - 1
 
@@ -1033,6 +1233,11 @@ async def api_logs_watcher(
                 start_idx = int(start_seq - base)
                 if start_idx < 0:
                     start_idx = 0
+                if max_backlog:
+                    backlog = len(buf) - start_idx
+                    if backlog > max_backlog:
+                        start_idx = max(0, len(buf) - int(max_backlog))
+                        seen = base + start_idx - 1
                 for i in range(start_idx, len(buf)):
                     line = buf[i]
                     safe = _log_stream_text(line, plain)
@@ -1275,20 +1480,77 @@ def main(host: str = "0.0.0.0", port: int = 8787) -> None:
     boot.info("")
     boot.info(f"  {_c('Cache:', DIM)}      {CACHE_DIR}")
     boot.info(f"  {_c('CW_STATE:', DIM)}   {CW_STATE_DIR}")
-    boot.info(f"  {_c('Reports:', DIM)}    {REPORT_DIR}")
-    boot.info(f"  {_c('Last Sync:', DIM)}  {LAST_SYNC_PATH} (JSON)")
     boot.info(f"  {_c('Tombstones:', DIM)} {TOMBSTONES_PATH} (JSON)")
-    boot.info(f"  {_c('State:', DIM)}      {STATE_PATH} (JSON)")
     boot.info(f"  {_c('Config:', DIM)}     {CONFIG_DIR / 'config.json'} (JSON)")
 
+    db_path: Any = None
     try:
-        from cw_platform.event_archive import boot_check as _events_boot_check, events_db_path
+        from cw_platform.local_db import crosswatch_db_path
+
+        db_path = crosswatch_db_path(CONFIG_DIR)
+    except Exception:
+        db_path = CONFIG_DIR / ".cw_databases" / "crosswatch.sqlite3"
+    boot.info(f"  {_c('Database:', DIM)}   {db_path} (SQLite)")
+
+    try:
+        from cw_platform.local_db.diagnostics import diagnostics as _runtime_db_diagnostics
+
+        rt = _runtime_db_diagnostics(CONFIG_DIR)
+        if rt.get("ok"):
+            raw_counts = rt.get("table_counts")
+            counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+            version = rt.get("schema_version") or rt.get("expected_schema_version") or "?"
+            size = _fmt_bytes(
+                int(rt.get("size_bytes") or 0)
+                + int(rt.get("wal_size_bytes") or 0)
+                + int(rt.get("shm_size_bytes") or 0)
+            )
+            state_blocks = int(counts.get("provider_feature_state") or 0)
+            baseline_items = int(counts.get("baseline_items") or 0)
+            status = "Ready" if rt.get("healthy") else "Warning"
+            color = GREEN if rt.get("healthy") else YELLOW
+            runtime_msg = f"Runtime DB: {status} - schema v{version} - {state_blocks:,} feature blocks - {baseline_items:,} items - {size}"
+            boot.info(f"              {_c(runtime_msg, color)}")
+        else:
+            runtime_msg = f"Runtime DB: error - {rt.get('error') or 'unavailable'}"
+            boot.info(f"              {_c(runtime_msg, RED)}")
+    except Exception as exc:
+        boot.info(f"              {_c(f'Runtime DB: error - {exc}', RED)}")
+
+    try:
+        from cw_platform.event_archive import boot_check as _events_boot_check
+
         ev = _events_boot_check(state_dir=CW_STATE_DIR, reports_dir=REPORT_DIR)
         ev_color = GREEN if ev.get("status") in ("ready", "created") else (RED if not ev.get("ok") else YELLOW)
-        boot.info(f"  {_c('Events DB:', DIM)}  {ev.get('path') or events_db_path()} (SQLite)")
-        boot.info(f"              {_c(ev.get('message') or 'unknown', ev_color)}")
+        ev_status = str(ev.get("status") or "unknown").capitalize()
+        ev_version = ev.get("schema_version") or "?"
+        ev_events = int(ev.get("events") or 0)
+        ev_size = _fmt_bytes(ev.get("size_bytes") or 0)
+        boot.info(f"              {_c(f'Event archive: {ev_status} - schema v{ev_version} - {ev_events:,} events - {ev_size}', ev_color)}")
     except Exception as exc:
-        boot.info(f"  {_c('Events DB:', DIM)}  {_c(f'error — {exc}', RED)}")
+        boot.info(f"              {_c(f'Event archive: error - {exc}', RED)}")
+
+    try:
+        from cw_platform.anime_mapping import boot_check as _anime_boot_check
+
+        am = _anime_boot_check(cfg=cfg)
+        am_status = str(am.get("status") or "unknown")
+        am_color = GREEN if am.get("ok") else RED
+        if am_status in ("disabled", "missing"):
+            am_color = DIM
+        elif am_status == "reindexed":
+            am_color = YELLOW
+        if am_status in ("ready", "reindexed"):
+            am_msg = (
+                f"Anime mapping: {am_status.capitalize()} - schema v{am.get('expected_schema_version')} - "
+                f"{int(am.get('source_count') or 0):,} sources - {int(am.get('edge_count') or 0):,} edges - "
+                f"{_fmt_bytes(am.get('size_bytes') or 0)}"
+            )
+        else:
+            am_msg = f"Anime mapping: {am.get('message') or am_status}"
+        boot.info(f"              {_c(am_msg, am_color)}")
+    except Exception as exc:
+        boot.info(f"              {_c(f'Anime mapping: error - {exc}', RED)}")
     boot.info("")
 
     debug = bool((cfg.get("runtime") or {}).get("debug"))

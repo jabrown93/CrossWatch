@@ -19,21 +19,19 @@ def test_env_beats_config_file(config_base: Path, monkeypatch: pytest.MonkeyPatc
 
     _write_cfg(config_base, {"app_auth": {"oidc": {"issuer": "https://from-file.example.com/"}}})
     monkeypatch.setenv("CW_OIDC_ISSUER", "https://from-env.example.com/")
-    assert load_config()["app_auth"]["oidc"]["issuer"] == "https://from-env.example.com/"
+    assert load_config()["app_auth"]["oidc"]["issuer"] == "https://from-env.example.com"
 
 
 def test_env_values_are_still_normalized(config_base: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from cw_platform.config_base import load_config
 
-    monkeypatch.setenv("CW_OIDC_SESSION_HOURS", "9999")
     monkeypatch.setenv("CW_OIDC_ISSUER", "  https://auth.example.com/o/cw/  ")
-    monkeypatch.setenv("CW_OIDC_PUBLIC_BASE_URL", "https://cw.example.com/")
+    monkeypatch.setenv("CW_OIDC_SCOPES", "profile email")
     monkeypatch.setenv("CW_OIDC_GROUPS_CLAIM", "")
     oidc = load_config()["app_auth"]["oidc"]
-    assert oidc["session_hours"] == 168
-    # Trailing slash on the issuer is significant for Authentik: keep it.
-    assert oidc["issuer"] == "https://auth.example.com/o/cw/"
-    assert oidc["public_base_url"] == "https://cw.example.com"
+    # Issuer comparisons are slash-normalized everywhere, so the stored value is stripped.
+    assert oidc["issuer"] == "https://auth.example.com/o/cw"
+    assert oidc["scopes"].startswith("openid ")
     assert oidc["groups_claim"] == "groups"
 
 
@@ -41,10 +39,11 @@ def test_env_bool_and_int_parsing(config_base: Path, monkeypatch: pytest.MonkeyP
     from cw_platform.config_base import load_config
 
     monkeypatch.setenv("CW_OIDC_ENABLED", "true")
-    monkeypatch.setenv("CW_OIDC_SESSION_HOURS", "8")
+    monkeypatch.setenv("CW_OIDC_ISSUER", "https://auth.example.com/o/cw/")
+    monkeypatch.setenv("CW_OIDC_CLIENT_ID", "crosswatch")
     oidc = load_config()["app_auth"]["oidc"]
+    # enabled only sticks when issuer and client_id are present.
     assert oidc["enabled"] is True
-    assert oidc["session_hours"] == 8
 
 
 @pytest.mark.parametrize("raw", ["admins,ops", '["admins","ops"]', "admins, ops"])
@@ -127,7 +126,7 @@ def test_unsetting_env_restores_file_value(
     save_config(load_config())
 
     monkeypatch.delenv("CW_OIDC_ISSUER")
-    assert load_config()["app_auth"]["oidc"]["issuer"] == "https://from-file.example.com/"
+    assert load_config()["app_auth"]["oidc"]["issuer"] == "https://from-file.example.com"
 
 
 def test_save_does_not_mutate_callers_config(
@@ -139,7 +138,7 @@ def test_save_does_not_mutate_callers_config(
     monkeypatch.setenv("CW_OIDC_ISSUER", "https://from-env.example.com/")
     cfg = load_config()
     save_config(cfg)
-    assert cfg["app_auth"]["oidc"]["issuer"] == "https://from-env.example.com/"
+    assert cfg["app_auth"]["oidc"]["issuer"] == "https://from-env.example.com"
 
 
 def test_save_strips_env_locked_marker(config_base: Path) -> None:

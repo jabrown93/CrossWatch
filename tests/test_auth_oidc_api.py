@@ -9,29 +9,27 @@ def _auth_cfg() -> dict:
     from api import appAuthAPI as auth
 
     salt = b"0123456789abcdef"
+    password = "secrett1"
     return {
         "security": {},
         "app_auth": {
             "enabled": True,
             "username": "admin",
             "reset_required": False,
-            "remember_session_enabled": False,
-            "remember_session_days": 30,
+            "remember_session_enabled": True,
+            "remember_session_days": 45,
             "oidc": {
                 "enabled": True,
-                "issuer": "https://idp.test/application/o/crosswatch/",
-                "client_id": "cw-client",
-                "client_secret": "cw-secret",
-                "public_base_url": "https://cw.test",
-                "groups_claim": "groups",
-                "allowed_groups": ["crosswatch"],
-                "session_hours": 2,
+                "issuer": "https://accounts.google.com",
+                "client_id": "client-abc",
+                "client_secret": "shh",
+                "scopes": "openid profile email",
             },
             "password": {
                 "scheme": "pbkdf2_sha256",
                 "iterations": 260_000,
                 "salt": auth._b64e(salt),
-                "hash": auth._b64e(auth._pbkdf2_hash("secrett1", salt, iterations=260_000)),
+                "hash": auth._b64e(auth._pbkdf2_hash(password, salt, iterations=260_000)),
             },
             "session": {"token_hash": "", "expires_at": 0},
             "sessions": [],
@@ -40,24 +38,77 @@ def _auth_cfg() -> dict:
     }
 
 
-def _request(path: str, *, query: str = "", headers: dict[str, str] | None = None) -> Request:
-    raw_headers = [(b"host", b"testserver")]
+def _admin_identity_record(sub: str = "google-admin") -> dict:
+    return {
+        "iss": "https://accounts.google.com",
+        "sub": sub,
+        "username": "adminoidc",
+        "email": "admin@example.com",
+        "picture": "https://img/admin",
+        "linked_at": 1_700_000_000,
+    }
+
+
+def _managed_user(oidc: dict | None = None) -> dict:
+    raw = {
+        "username": "pascal",
+        "enabled": True,
+        "role": "user",
+        "profile_id": "profile-1",
+        "permissions": {"dashboard": True, "watchlist": True, "playback": True, "write": False},
+    }
+    if oidc is not None:
+        raw["oidc"] = oidc
+    return raw
+
+
+def _managed_identity_record(sub: str = "google-managed") -> dict:
+    return {
+        "iss": "https://accounts.google.com",
+        "sub": sub,
+        "username": "pascaloidc",
+        "email": "pascal@example.com",
+        "picture": "https://img/pascal",
+        "linked_at": 1_700_000_100,
+    }
+
+
+def _request(
+    path: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    client: tuple[str, int] = ("127.0.0.1", 12345),
+) -> Request:
+    raw_headers = [(b"host", b"testserver"), (b"sec-fetch-site", b"same-origin")]
     for k, v in (headers or {}).items():
         raw_headers.append((str(k).lower().encode("latin-1"), str(v).encode("latin-1")))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
-        "method": "GET",
+        "method": method,
         "scheme": "http",
         "path": path,
         "raw_path": path.encode("latin-1"),
-        "query_string": query.encode("latin-1"),
+        "query_string": b"",
         "headers": raw_headers,
-        "client": ("127.0.0.1", 12345),
+        "client": client,
         "server": ("testserver", 80),
     }
     return Request(scope)
+
+
+def _bind_config(monkeypatch, oidc_api, cfg: dict) -> None:
+    from api import appAuthAPI as auth
+
+    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+
+def _json_body(resp) -> dict:
+    return json.loads(resp.body.decode("utf-8"))
 
 
 def _all_set_cookie_headers(resp) -> str:
@@ -68,464 +119,333 @@ def _all_set_cookie_headers(resp) -> str:
     )
 
 
-def test_issue_session_honors_ttl_override() -> None:
+def _login_admin(cfg: dict) -> str:
     from api import appAuthAPI as auth
 
+    token, _exp = auth._issue_session(cfg, _request("/api/app-auth/login", method="POST"))
+    return token
+
+
+def _login_managed(cfg: dict, user_id: str) -> str:
+    from api import appAuthAPI as auth
+
+    raw = cfg["app_auth"]["users"][user_id]
+    token, _exp = auth._issue_session(cfg, _request("/api/app-auth/login", method="POST"), auth._public_user(user_id, raw))
+    return token
+
+
+def _status(oidc_api, token: str | None = None):
+    from api import appAuthAPI as auth
+
+    headers = {"cookie": f"{auth.COOKIE_NAME}={token}"} if token else None
+    return oidc_api.api_oidc_status(_request("/api/app-auth/oidc/status", headers=headers))
+
+
+def test_oidc_status_reports_admin_linked_identity(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
     cfg = _auth_cfg()
-    req = _request("/api/app-auth/login")
-    _token, exp = auth._issue_session(cfg, req, ttl_sec=7200)
-    assert 0 < exp - auth._now() <= 7200
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    body = _json_body(_status(oidc_api, _login_admin(cfg)))
+
+    assert body["linked"] is True
+    assert body["configured"] is True
+    assert body["login_available"] is True
+    assert body["issuer"] == "https://accounts.google.com"
+    assert body["linked_username"] == "adminoidc"
+    assert body["linked_email"] == "admin@example.com"
+    assert body["linked_picture"] == "https://img/admin"
+    assert body["linked_at"] == 1_700_000_000
 
 
-def test_oidc_login_redirects_to_idp_and_sets_flow_cookie(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
+def test_oidc_status_admin_without_identity_is_not_linked(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
 
     cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    body = _json_body(_status(oidc_api, _login_admin(cfg)))
+
+    assert body["linked"] is False
+    assert body["configured"] is True
+    assert body["login_available"] is False
+    assert body["linked_username"] == ""
+    assert body["linked_email"] == ""
+    assert body["linked_at"] == 0
+
+
+def test_oidc_status_admin_never_reads_provider_config_as_identity(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc"].update({"iss": "https://accounts.google.com", "sub": "not-an-identity", "username": "bogus"})
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    body = _json_body(_status(oidc_api, _login_admin(cfg)))
+
+    assert body["linked"] is False
+    assert body["linked_username"] == ""
+
+
+def test_oidc_status_reports_managed_user_link(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["users"] = {"u1": _managed_user(_managed_identity_record())}
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    body = _json_body(_status(oidc_api, _login_managed(cfg, "u1")))
+
+    assert body["linked"] is True
+    assert body["issuer"] == ""
+    assert body["linked_username"] == "pascaloidc"
+    assert body["linked_email"] == "pascal@example.com"
+    assert body["linked_at"] == 1_700_000_100
+
+
+def test_oidc_status_managed_user_does_not_inherit_admin_link(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    cfg["app_auth"]["users"] = {"u1": _managed_user()}
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    body = _json_body(_status(oidc_api, _login_managed(cfg, "u1")))
+
+    assert body["linked"] is False
+    assert body["linked_username"] == ""
+    assert body["linked_email"] == ""
+
+
+def test_oidc_status_hides_identity_fields_when_signed_out(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    body = _json_body(_status(oidc_api))
+
+    assert body["linked"] is True
+    assert body["issuer"] == ""
+    assert body["linked_username"] == ""
+    assert body["linked_email"] == ""
+    assert body["linked_at"] == 0
+
+
+def test_oidc_link_check_persists_admin_identity(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    _bind_config(monkeypatch, oidc_api, cfg)
     monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "start_flow",
-        lambda *_a, **_k: {"ok": True, "state": "st", "auth_url": "https://idp.test/authorize?x=1"},
-    )
-
-    resp = oidc_api.api_oidc_login(_request("/api/app-auth/oidc/login", query="next=/watchlist"))
-
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "https://idp.test/authorize?x=1"
-    assert f"{oidc_api.FLOW_COOKIE_NAME}=" in _all_set_cookie_headers(resp)
-
-
-def test_oidc_login_falls_back_to_local_when_start_fails(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-
-    def _boom(*_a, **_k):
-        raise RuntimeError("idp down")
-
-    monkeypatch.setattr(oidc_api.authOIDC, "start_flow", _boom)
-
-    resp = oidc_api.api_oidc_login(_request("/api/app-auth/oidc/login"))
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "/login?local=1&oidc_error=start_failed"
-
-
-def test_oidc_login_sanitizes_next(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    seen: dict = {}
-
-    def _start(_cfg, *, next_path, flow_nonce_hash):
-        seen["next"] = next_path
-        return {"ok": True, "state": "st", "auth_url": "https://idp.test/authorize"}
-
-    monkeypatch.setattr(oidc_api.authOIDC, "start_flow", _start)
-
-    oidc_api.api_oidc_login(_request("/api/app-auth/oidc/login", query="next=https://evil.example"))
-    assert seen["next"] == "/"
-    oidc_api.api_oidc_login(_request("/api/app-auth/oidc/login", query="next=//evil.example"))
-    assert seen["next"] == "/"
-
-
-def test_oidc_callback_success_sets_session_cookie(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    saved: dict = {}
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    monkeypatch.setattr(oidc_api, "save_config", lambda c: saved.setdefault("cfg", c))
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {
+        oidc_api.authOidc,
+        "consume_link",
+        lambda *_args, **_kwargs: {
             "ok": True,
-            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-nonce"),
-            "next": "/watchlist",
-            "identity": {"sub": "user-1", "username": "jared", "email": "j@x.com", "groups": ["crosswatch"]},
+            "pending": False,
+            "target_user_id": "",
+            "identity": {"iss": "https://accounts.google.com", "sub": "google-admin", "username": "adminoidc", "email": "admin@example.com", "picture": ""},
         },
     )
 
-    req = _request(
-        "/api/app-auth/oidc/callback",
-        query="code=abc&state=st",
-        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"},
+    token = _login_admin(cfg)
+    req = _request("/api/app-auth/oidc/link/check", method="POST", headers={"cookie": f"{auth.COOKIE_NAME}={token}"})
+    resp = oidc_api.api_oidc_link_check(req, {"state": "ok"})
+
+    assert resp.status_code == 200
+    body = _json_body(resp)
+    assert body["ok"] is True
+    assert body["linked"] is True
+    assert cfg["app_auth"]["oidc_identity"]["sub"] == "google-admin"
+    assert "sub" not in cfg["app_auth"]["oidc"]
+    assert _json_body(_status(oidc_api, token))["linked"] is True
+
+
+def test_oidc_link_check_persists_managed_identity(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["users"] = {"u1": _managed_user()}
+    _bind_config(monkeypatch, oidc_api, cfg)
+    monkeypatch.setattr(
+        oidc_api.authOidc,
+        "consume_link",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "pending": False,
+            "target_user_id": "u1",
+            "identity": {"iss": "https://accounts.google.com", "sub": "google-managed", "username": "pascaloidc", "email": "pascal@example.com", "picture": ""},
+        },
     )
-    resp = oidc_api.api_oidc_callback(req)
+
+    token = _login_admin(cfg)
+    req = _request("/api/app-auth/oidc/link/check", method="POST", headers={"cookie": f"{auth.COOKIE_NAME}={token}"})
+    resp = oidc_api.api_oidc_link_check(req, {"state": "ok"})
+
+    assert resp.status_code == 200
+    assert _json_body(resp)["linked"] is True
+    assert cfg["app_auth"]["users"]["u1"]["oidc"]["sub"] == "google-managed"
+    assert "oidc_identity" not in cfg["app_auth"]
+    assert _json_body(_status(oidc_api, _login_managed(cfg, "u1")))["linked_username"] == "pascaloidc"
+
+
+def test_oidc_link_check_rejects_identity_linked_to_another_account(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["users"] = {"u1": _managed_user(_managed_identity_record("google-shared"))}
+    _bind_config(monkeypatch, oidc_api, cfg)
+    monkeypatch.setattr(
+        oidc_api.authOidc,
+        "consume_link",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "pending": False,
+            "target_user_id": "",
+            "identity": {"iss": "https://accounts.google.com", "sub": "google-shared", "username": "adminoidc", "email": "admin@example.com", "picture": ""},
+        },
+    )
+
+    token = _login_admin(cfg)
+    req = _request("/api/app-auth/oidc/link/check", method="POST", headers={"cookie": f"{auth.COOKIE_NAME}={token}"})
+    resp = oidc_api.api_oidc_link_check(req, {"state": "ok"})
+
+    assert resp.status_code == 409
+    assert _json_body(resp)["error"] == oidc_api._oidc_link_conflict_error()
+    assert "oidc_identity" not in cfg["app_auth"]
+
+
+def test_oidc_link_check_requires_existing_app_session(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    resp = oidc_api.api_oidc_link_check(_request("/api/app-auth/oidc/link/check", method="POST"), {"state": "missing"})
+
+    assert resp.status_code == 401
+    assert _json_body(resp)["error"] == "Unauthorized"
+
+
+def test_oidc_unlink_clears_admin_identity(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    token = _login_admin(cfg)
+    req = _request("/api/app-auth/oidc/unlink", method="POST", headers={"cookie": f"{auth.COOKIE_NAME}={token}"})
+    resp = oidc_api.api_oidc_unlink(req, {})
+
+    assert resp.status_code == 200
+    assert _json_body(resp)["linked"] is False
+    assert "oidc_identity" not in cfg["app_auth"]
+    assert _json_body(_status(oidc_api, token))["linked"] is False
+
+
+def test_oidc_unlink_clears_managed_identity(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    cfg["app_auth"]["users"] = {"u1": _managed_user(_managed_identity_record())}
+    _bind_config(monkeypatch, oidc_api, cfg)
+
+    token = _login_managed(cfg, "u1")
+    req = _request("/api/app-auth/oidc/unlink", method="POST", headers={"cookie": f"{auth.COOKIE_NAME}={token}"})
+    resp = oidc_api.api_oidc_unlink(req, {})
+
+    assert resp.status_code == 200
+    assert _json_body(resp)["linked"] is False
+    assert "oidc" not in cfg["app_auth"]["users"]["u1"]
+    assert cfg["app_auth"]["oidc_identity"]["sub"] == "google-admin"
+
+
+def _bind_callback(monkeypatch, oidc_api, identity: dict) -> None:
+    monkeypatch.setattr(oidc_api.authOidc, "flow_nonce_hash", lambda *_a, **_k: oidc_api.authOidc._sha256_hex("flow-nonce"))
+    monkeypatch.setattr(
+        oidc_api.authOidc,
+        "check_callback",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "pending": False,
+            "intent": "login",
+            "remember_me": True,
+            "target_user_id": "",
+            "next_url": "/",
+            "identity": identity,
+        },
+    )
+
+
+def test_oidc_callback_signs_in_linked_admin(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    _bind_config(monkeypatch, oidc_api, cfg)
+    _bind_callback(monkeypatch, oidc_api, {"iss": "https://accounts.google.com", "sub": "google-admin", "username": "adminoidc", "email": "admin@example.com", "picture": ""})
+
+    req = _request("/api/app-auth/oidc/callback", headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"})
+    resp = oidc_api.api_oidc_callback(req, state="ok", code="code", error="")
 
     assert resp.status_code == 302
-    assert resp.headers["location"] == "/watchlist"
     assert len(cfg["app_auth"]["sessions"]) == 1
-    exp = int(cfg["app_auth"]["sessions"][0]["expires_at"])
-    from api import appAuthAPI as auth
-
-    assert 0 < exp - auth._now() <= 2 * 3600
+    assert cfg["app_auth"]["sessions"][0]["user_id"] == "administrator"
     assert "cw_auth=" in _all_set_cookie_headers(resp)
-    assert saved.get("cfg") is cfg
 
 
-def test_oidc_callback_saves_freshly_loaded_config(monkeypatch) -> None:
-    """The session must land in a config re-loaded after the slow IdP round
-    trips, not in the stale snapshot from the top of the handler."""
-    from api import authOIDCAPI as oidc_api
-
-    loads = [_auth_cfg(), _auth_cfg()]
-    monkeypatch.setattr(oidc_api, "load_config", lambda: loads.pop(0))
-    saved: dict = {}
-    monkeypatch.setattr(oidc_api, "save_config", lambda c: saved.setdefault("cfg", c))
-    stale = loads[0]
-    fresh = loads[1]
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {
-            "ok": True,
-            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-nonce"),
-            "next": "/",
-            "identity": {"sub": "user-1", "username": "jared", "email": "j@x.com", "groups": ["crosswatch"]},
-        },
-    )
-
-    req = _request(
-        "/api/app-auth/oidc/callback",
-        query="code=abc&state=st",
-        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"},
-    )
-    resp = oidc_api.api_oidc_callback(req)
-
-    assert resp.status_code == 302
-    assert saved["cfg"] is fresh
-    assert len(fresh["app_auth"]["sessions"]) == 1
-    assert not stale["app_auth"]["sessions"]
-
-
-def test_oidc_callback_requires_matching_flow_cookie(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
+def test_oidc_callback_signs_in_linked_managed_user(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
 
     cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {
-            "ok": True,
-            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("expected"),
-            "next": "/",
-            "identity": {"sub": "user-1", "username": "jared", "email": "", "groups": []},
-        },
-    )
+    cfg["app_auth"]["users"] = {"u1": _managed_user(_managed_identity_record())}
+    _bind_config(monkeypatch, oidc_api, cfg)
+    _bind_callback(monkeypatch, oidc_api, {"iss": "https://accounts.google.com", "sub": "google-managed", "username": "pascaloidc", "email": "pascal@example.com", "picture": ""})
 
-    resp = oidc_api.api_oidc_callback(_request("/api/app-auth/oidc/callback", query="code=abc&state=st"))
+    req = _request("/api/app-auth/oidc/callback", headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"})
+    resp = oidc_api.api_oidc_callback(req, state="ok", code="code", error="")
+
     assert resp.status_code == 302
-    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
+    assert resp.headers["location"] == "/profile"
+    assert cfg["app_auth"]["sessions"][0]["user_id"] == "u1"
+    assert "cw_auth=" in _all_set_cookie_headers(resp)
+
+
+def test_oidc_callback_rejects_unlinked_identity(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    _bind_config(monkeypatch, oidc_api, cfg)
+    _bind_callback(monkeypatch, oidc_api, {"iss": "https://accounts.google.com", "sub": "stranger", "username": "nope", "email": "", "picture": ""})
+
+    req = _request("/api/app-auth/oidc/callback", headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"})
+    resp = oidc_api.api_oidc_callback(req, state="ok", code="code", error="")
+
+    assert resp.status_code == 403
     assert cfg["app_auth"]["sessions"] == []
 
 
-def _callback_with_policy_change(monkeypatch, mutate_fresh) -> "object":
-    """Run a successful-token callback where the config reloaded before the
-    session save has been changed by mutate_fresh."""
-    from api import authOIDCAPI as oidc_api
-
-    stale = _auth_cfg()
-    fresh = _auth_cfg()
-    mutate_fresh(fresh)
-    loads = [stale, fresh]
-    monkeypatch.setattr(oidc_api, "load_config", lambda: loads.pop(0))
-    saved: dict = {}
-    monkeypatch.setattr(oidc_api, "save_config", lambda c: saved.setdefault("cfg", c))
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {
-            "ok": True,
-            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-nonce"),
-            "next": "/",
-            "identity": {"sub": "user-1", "username": "jared", "email": "", "groups": ["crosswatch"]},
-        },
-    )
-    req = _request(
-        "/api/app-auth/oidc/callback",
-        query="code=abc&state=st",
-        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-nonce"},
-    )
-    resp = oidc_api.api_oidc_callback(req)
-    assert saved == {}  # nothing may be written when policy rechecks fail
-    assert not fresh["app_auth"]["sessions"]
-    return resp
-
-
-def test_oidc_callback_rejects_when_oidc_disabled_mid_flow(monkeypatch) -> None:
-    def _disable(fresh):
-        fresh["app_auth"]["oidc"]["enabled"] = False
-
-    resp = _callback_with_policy_change(monkeypatch, _disable)
-    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
-
-
-def test_oidc_callback_rejects_when_group_revoked_mid_flow(monkeypatch) -> None:
-    def _revoke(fresh):
-        fresh["app_auth"]["oidc"]["allowed_groups"] = ["other-team"]
-
-    resp = _callback_with_policy_change(monkeypatch, _revoke)
-    assert resp.headers["location"] == "/login?local=1&oidc_error=denied"
-
-
-def test_oidc_callback_rejects_when_groups_claim_changed_mid_flow(monkeypatch) -> None:
-    """Groups in the identity were extracted under the old claim; a changed
-    claim invalidates them even if the allowlist still matches."""
-
-    def _swap_claim(fresh):
-        fresh["app_auth"]["oidc"]["groups_claim"] = "roles"
-
-    resp = _callback_with_policy_change(monkeypatch, _swap_claim)
-    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
-
-
-def test_oidc_callback_rejects_when_issuer_changed_mid_flow(monkeypatch) -> None:
-    def _swap(fresh):
-        fresh["app_auth"]["oidc"]["issuer"] = "https://new-idp.test/application/o/crosswatch/"
-
-    resp = _callback_with_policy_change(monkeypatch, _swap)
-    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
-
-
-def test_oidc_callback_mismatch_keeps_newer_flow_cookie(monkeypatch) -> None:
-    """A stale callback losing the cookie race (two login tabs) must not
-    delete the cookie that the newer pending flow still needs."""
-    from api import authOIDCAPI as oidc_api
+def test_oidc_callback_requires_matching_flow_cookie(monkeypatch) -> None:
+    from api import authOidcAPI as oidc_api
 
     cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {
-            "ok": True,
-            "flow_nonce_hash": oidc_api.authOIDC._sha256_hex("flow-a-nonce"),
-            "next": "/",
-            "identity": {"sub": "user-1", "username": "jared", "email": "", "groups": []},
-        },
-    )
+    cfg["app_auth"]["oidc_identity"] = _admin_identity_record()
+    _bind_config(monkeypatch, oidc_api, cfg)
+    _bind_callback(monkeypatch, oidc_api, {"iss": "https://accounts.google.com", "sub": "google-admin", "username": "adminoidc", "email": "", "picture": ""})
 
-    req = _request(
-        "/api/app-auth/oidc/callback",
-        query="code=abc&state=st",
-        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-b-nonce"},
-    )
-    resp = oidc_api.api_oidc_callback(req)
+    resp = oidc_api.api_oidc_callback(_request("/api/app-auth/oidc/callback"), state="ok", code="code", error="")
 
-    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
-    assert oidc_api.FLOW_COOKIE_NAME not in _all_set_cookie_headers(resp)
-
-
-def test_oidc_callback_failure_keeps_flow_cookie(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {"ok": False, "error": "expired", "code": "failed"},
-    )
-
-    req = _request(
-        "/api/app-auth/oidc/callback",
-        query="code=abc&state=st",
-        headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=flow-b-nonce"},
-    )
-    resp = oidc_api.api_oidc_callback(req)
-
-    assert resp.headers["location"] == "/login?local=1&oidc_error=failed"
-    assert oidc_api.FLOW_COOKIE_NAME not in _all_set_cookie_headers(resp)
-
-
-def test_oidc_callback_denied_maps_to_denied_code(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    monkeypatch.setattr(
-        oidc_api.authOIDC,
-        "complete_flow",
-        lambda *_a, **_k: {"ok": False, "error": "nope", "code": "denied"},
-    )
-
-    resp = oidc_api.api_oidc_callback(
-        _request(
-            "/api/app-auth/oidc/callback",
-            query="code=abc&state=st",
-            headers={"cookie": f"{oidc_api.FLOW_COOKIE_NAME}=n"},
-        )
-    )
-    assert resp.headers["location"] == "/login?local=1&oidc_error=denied"
-
-
-def test_oidc_callback_idp_error_redirects_local(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-
-    resp = oidc_api.api_oidc_callback(_request("/api/app-auth/oidc/callback", query="error=access_denied"))
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "/login?local=1&oidc_error=denied"
-
-
-def test_oidc_status_reports_availability(monkeypatch) -> None:
-    from api import authOIDCAPI as oidc_api
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(oidc_api, "load_config", lambda: cfg)
-    resp = oidc_api.api_oidc_status(_request("/api/app-auth/oidc/status"))
-    body = json.loads(resp.body.decode("utf-8"))
-    assert body["login_available"] is True
-
-
-def _login_route(monkeypatch, cfg):
-    """Register routes on a throwaway FastAPI app and return the /login endpoint."""
-    from fastapi import FastAPI
-
-    from api import appAuthAPI as auth
-
-    monkeypatch.setattr(auth, "load_config", lambda: cfg)
-    monkeypatch.setattr(auth, "save_config", lambda *_a, **_k: None)
-    app = FastAPI()
-    auth.register_app_auth(app)
-    for route in app.routes:
-        if getattr(route, "path", "") == "/login" and "GET" in getattr(route, "methods", set()):
-            return route.endpoint
-    raise AssertionError("/login route not registered")
-
-
-def test_login_auto_redirects_to_oidc(monkeypatch) -> None:
-    from services import authOIDC
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
-    endpoint = _login_route(monkeypatch, cfg)
-
-    resp = endpoint(_request("/login", query="next=/watchlist"))
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2Fwatchlist"
-
-
-def test_login_local_escape_hatch_renders_form(monkeypatch) -> None:
-    from services import authOIDC
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
-    endpoint = _login_route(monkeypatch, cfg)
-
-    resp = endpoint(_request("/login", query="local=1"))
-    assert resp.status_code == 200
-    body = resp.body.decode("utf-8")
-    assert 'id="p"' in body
-    assert "/api/app-auth/oidc/login" in body
-
-
-def test_login_falls_back_to_form_when_issuer_down(monkeypatch) -> None:
-    from services import authOIDC
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: False)
-    endpoint = _login_route(monkeypatch, cfg)
-
-    resp = endpoint(_request("/login"))
-    assert resp.status_code == 200
-    assert 'id="p"' in resp.body.decode("utf-8")
-
-
-def test_login_shows_mapped_error_not_raw_query(monkeypatch) -> None:
-    from services import authOIDC
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
-    endpoint = _login_route(monkeypatch, cfg)
-
-    resp = endpoint(_request("/login", query="oidc_error=%3Cscript%3E"))
-    assert resp.status_code == 200
-    body = resp.body.decode("utf-8")
-    assert "<script>alert" not in body
-    assert "Single sign-on failed" in body
-    assert 'class="cw-msg show"' in body
-
-
-def test_login_no_redirect_when_oidc_disabled(monkeypatch) -> None:
-    cfg = _auth_cfg()
-    cfg["app_auth"]["oidc"]["enabled"] = False
-    endpoint = _login_route(monkeypatch, cfg)
-
-    resp = endpoint(_request("/login"))
-    assert resp.status_code == 200
-    body = resp.body.decode("utf-8")
-    assert "/api/app-auth/oidc/login" not in body
-
-
-def test_login_sanitizes_malicious_next_paths(monkeypatch) -> None:
-    from services import authOIDC
-
-    cfg = _auth_cfg()
-    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
-    endpoint = _login_route(monkeypatch, cfg)
-
-    # Protocol-relative URL should be sanitized to "/"
-    resp = endpoint(_request("/login", query="next=//evil.example"))
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2F"
-
-    # Absolute URL should be sanitized to "/"
-    resp = endpoint(_request("/login", query="next=https://evil.example"))
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "/api/app-auth/oidc/login?next=%2F"
-
-
-def _logout_route(monkeypatch, cfg):
-    """Register routes on a throwaway FastAPI app and return the /logout endpoint."""
-    from fastapi import FastAPI
-
-    from api import appAuthAPI as auth
-
-    monkeypatch.setattr(auth, "load_config", lambda: cfg)
-    monkeypatch.setattr(auth, "save_config", lambda *_a, **_k: None)
-    app = FastAPI()
-    auth.register_app_auth(app)
-    for route in app.routes:
-        if getattr(route, "path", "") == "/logout" and "GET" in getattr(route, "methods", set()):
-            return route.endpoint
-    raise AssertionError("/logout route not registered")
-
-
-def test_logout_with_oidc_redirects_to_local_login(monkeypatch) -> None:
-    from api import appAuthAPI as auth
-
-    cfg = _auth_cfg()
-    endpoint = _logout_route(monkeypatch, cfg)
-
-    # Seed a session in config so auth_required still returns True after logout
-    cfg["app_auth"]["sessions"].append({
-        "token_hash": "test-hash",
-        "expires_at": auth._now() + 3600,
-    })
-
-    token = "test-token"
-    resp = endpoint(_request("/logout", headers={"cookie": f"{auth.COOKIE_NAME}={token}"}))
-
-    assert resp.status_code in (302, 307)
-    assert resp.headers["location"] == "/login?local=1"
-
-
-def test_login_guards_oidc_redirect_during_reset(monkeypatch) -> None:
-    from services import authOIDC
-
-    cfg = _auth_cfg()
-    cfg["app_auth"]["reset_required"] = True
-    monkeypatch.setattr(authOIDC, "issuer_reachable", lambda _cfg: True)
-    endpoint = _login_route(monkeypatch, cfg)
-
-    resp = endpoint(_request("/login"))
-    assert resp.status_code == 200
-    body = resp.body.decode("utf-8")
-    assert 'id="p"' in body
+    assert resp.status_code == 400
+    assert cfg["app_auth"]["sessions"] == []

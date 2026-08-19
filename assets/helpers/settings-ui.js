@@ -16,80 +16,8 @@ function formatCwSnapshotLabel(name) {
   return `${year}-${month}-${day} - ${hour}:${min}`;
 }
 
-async function loadCrossWatchSnapshots(cfg) {
-  const cw = (cfg && cfg.crosswatch) || {};
-  const desired = {
-    watchlist: (cw.restore_watchlist || "latest").trim() || "latest",
-    history:   (cw.restore_history   || "latest").trim() || "latest",
-    ratings:   (cw.restore_ratings   || "latest").trim() || "latest",
-  };
-
-  try {
-    const res = await fetch("/api/files?path=/config/.cw_provider/snapshots");
-    if (!res.ok) {
-      console.warn("CrossWatch snapshot list HTTP", res.status);
-      return;
-    }
-
-    const files = await res.json();
-    const list = (Array.isArray(files) ? files : []).filter(
-      (f) => f && typeof f.name === "string" && f.name.endsWith(".json")
-    );
-
-    
-    const groups = {
-      watchlist: [],
-      history:   [],
-      ratings:   [],
-    };
-
-    for (const f of list) {
-      const name = f.name;
-      if (name.endsWith("-watchlist.json")) groups.watchlist.push(name);
-      else if (name.endsWith("-history.json")) groups.history.push(name);
-      else if (name.endsWith("-ratings.json")) groups.ratings.push(name);
-    }
-    Object.keys(groups).forEach((k) => groups[k].sort());
-
-    const idMap = {
-      watchlist: "cw_restore_watchlist",
-      history:   "cw_restore_history",
-      ratings:   "cw_restore_ratings",
-    };
-
-    for (const key of ["watchlist", "history", "ratings"]) {
-      const sel = document.getElementById(idMap[key]);
-      if (!sel) continue;
-
-      const names = groups[key];
-      sel.innerHTML = "";
-
-      
-      const baseOpt = document.createElement("option");
-      baseOpt.value = "latest";
-      baseOpt.textContent = "Latest (default)";
-      sel.appendChild(baseOpt);
-
-      for (const name of names) {
-        const o = document.createElement("option");
-        o.value = name;
-        o.textContent = formatCwSnapshotLabel(name);
-        sel.appendChild(o);
-      }
-
-      const wanted = desired[key] || "latest";
-      const hasWanted = names.includes(wanted);
-      sel.value = hasWanted ? wanted : "latest";
-    }
-  } catch (e) {
-    console.warn("CrossWatch snapshot list failed", e);
-  }
-}
-
 /*! Settings */
 
-
-/* Settings Hub: UI / Security / Local Tracker */
 
 const UI_SETTINGS_TAB_KEY = "cw.ui.settings.tab.v1";
 
@@ -122,7 +50,6 @@ function cwUiSettingsSelect(tab, opts = {}) {
 
 function cwUiSettingsHubUpdate() {
   const aaRememberEnabled = (document.getElementById("app_auth_remember_enabled")?.value || "").toString() === "true";
-  const cwEnabled = (document.getElementById("cw_enabled")?.value || "").toString() !== "false";
 
   const authFields = document.getElementById("app_auth_fields");
   if (authFields) authFields.classList.remove("cw-disabled");
@@ -133,9 +60,6 @@ function cwUiSettingsHubUpdate() {
   const rememberDays = document.getElementById("app_auth_remember_days");
   if (rememberDays) rememberDays.disabled = !aaRememberEnabled;
   try { cwValidateAppAuthRememberDays(); } catch {}
-
-  const trackerFields = document.getElementById("cw_restore_fields");
-  if (trackerFields) trackerFields.classList.toggle("cw-disabled", !cwEnabled);
 }
 
 function _cwTrustedProxiesEl() {
@@ -213,14 +137,8 @@ function cwUiSettingsHubInit() {
     "app_auth_password2",
     "app_auth_remember_enabled",
     "app_auth_remember_days",
-    "trusted_proxies",
-    "cw_enabled",
-    "cw_retention_days",
-    "cw_auto_snapshot",
-    "cw_max_snapshots",
-    "cw_restore_watchlist",
-    "cw_restore_history",
-    "cw_restore_ratings"
+    "app_auth_totp_code",
+    "trusted_proxies"
   ];
 
   ids.forEach((id) => {
@@ -242,7 +160,7 @@ function cwUiSettingsHubInit() {
   let tab = "ui";
   try {
     const saved = (localStorage.getItem(UI_SETTINGS_TAB_KEY) || "").toLowerCase();
-    if (["ui","security","tracker"].includes(saved)) tab = saved;
+    if (["ui","security"].includes(saved)) tab = saved;
   } catch {}
 
   cwUiSettingsSelect(tab, { persist: false });
@@ -265,7 +183,7 @@ async function cwAppAuthPlexRefreshStatus() {
     if (label) {
       if (!st || !st.linked) label.textContent = "Not linked";
       else {
-        const who = [st.linked_username, st.linked_email].filter(Boolean).join(" · ");
+        const who = [st.linked_username, st.linked_email].filter(Boolean).join(" - ");
         label.textContent = who || "Linked";
       }
     }
@@ -345,6 +263,277 @@ window.cwAppAuthPlexUnlink = async function cwAppAuthPlexUnlink() {
     try { _cwShowToast?.("Plex sign-in unlinked", true); } catch {}
   } catch (e) {
     try { _cwShowToast?.(String(e?.message || e || "Plex unlink failed"), false); } catch {}
+  }
+};
+
+function cwSetSelectValue(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.value = String(value);
+}
+
+function cwSetInputValue(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.value = String(value || "");
+}
+
+async function cwAppAuthOidcRefreshStatus() {
+  let cfg = null;
+  try {
+    const cr = await fetch("/api/app-auth/oidc/config", { cache: "no-store", credentials: "same-origin" });
+    cfg = cr.ok ? await cr.json() : null;
+    if (cfg?.ok) {
+      cwSetSelectValue("app_auth_oidc_enabled", cfg.enabled ? "true" : "false");
+      cwSetInputValue("app_auth_oidc_issuer", cfg.issuer || "");
+      cwSetInputValue("app_auth_oidc_client_id", cfg.client_id || "");
+      cwSetInputValue("app_auth_oidc_client_secret", "");
+      cwSetInputValue("app_auth_oidc_scopes", cfg.scopes || "openid profile email");
+      const secret = document.getElementById("app_auth_oidc_client_secret");
+      if (secret) secret.placeholder = cfg.client_secret_configured ? "(leave blank to keep)" : "Client secret";
+    }
+  } catch {}
+  try {
+    const r = await fetch("/api/app-auth/oidc/status", { cache: "no-store", credentials: "same-origin" });
+    const st = r.ok ? await r.json() : null;
+    const label = document.getElementById("app_auth_oidc_state");
+    if (label) {
+      if (!cfg?.configured && !st?.configured) label.textContent = "Not configured";
+      else if (!st?.linked) label.textContent = "Configured, not linked";
+      else {
+        const who = [st.linked_username, st.linked_email].filter(Boolean).join(" - ");
+        label.textContent = who || "Linked";
+      }
+    }
+    const linkBtn = document.getElementById("btn-app-auth-oidc-link");
+    const unlinkBtn = document.getElementById("btn-app-auth-oidc-unlink");
+    if (linkBtn) linkBtn.disabled = !(cfg?.configured || st?.configured);
+    if (unlinkBtn) unlinkBtn.disabled = !(st && st.linked);
+    return st;
+  } catch {
+    const label = document.getElementById("app_auth_oidc_state");
+    if (label) label.textContent = "Unavailable";
+    return null;
+  }
+}
+
+window.cwAppAuthOidcSaveConfig = async function cwAppAuthOidcSaveConfig() {
+  const btn = document.getElementById("btn-app-auth-oidc-save");
+  const original = btn?.textContent || "Save OIDC";
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Saving...";
+    }
+    const secret = document.getElementById("app_auth_oidc_client_secret");
+    const body = {
+      enabled: String(document.getElementById("app_auth_oidc_enabled")?.value || "false") === "true",
+      issuer: document.getElementById("app_auth_oidc_issuer")?.value || "",
+      client_id: document.getElementById("app_auth_oidc_client_id")?.value || "",
+      client_secret: secret?.value || "",
+      keep_client_secret: !(secret?.value || "").trim(),
+      scopes: document.getElementById("app_auth_oidc_scopes")?.value || "openid profile email",
+    };
+    const r = await fetch("/api/app-auth/oidc/config", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.ok) throw new Error(data?.error || `OIDC save failed (${r.status})`);
+    if (secret) secret.value = "";
+    await cwAppAuthOidcRefreshStatus();
+    try { _cwShowToast?.("OIDC configuration saved", true); } catch {}
+  } catch (e) {
+    try { _cwShowToast?.(String(e?.message || e || "OIDC save failed"), false); } catch {}
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+};
+
+window.cwAppAuthOidcLink = async function cwAppAuthOidcLink() {
+  const btn = document.getElementById("btn-app-auth-oidc-link");
+  const original = btn?.textContent || "Link OIDC account";
+  const popup = window.open("about:blank", "cw_oidc_link", "width=720,height=760,popup=yes");
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Waiting for OIDC...";
+    }
+    const r = await fetch("/api/app-auth/oidc/link/start", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.ok || !data?.state || !data?.auth_url) {
+      if (popup && !popup.closed) popup.close();
+      throw new Error(data?.error || `OIDC link failed (${r.status})`);
+    }
+    if (popup && !popup.closed) popup.location.href = data.auth_url;
+    else window.open(data.auth_url, "_blank", "noopener,noreferrer");
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const pr = await fetch("/api/app-auth/oidc/link/check", {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state: data.state }),
+      });
+      const pd = await pr.json().catch(() => null);
+      if (pr.ok && pd?.ok && pd.pending === true) continue;
+      if (!pr.ok || !pd?.ok) throw new Error(pd?.error || `OIDC link failed (${pr.status})`);
+      if (popup && !popup.closed) popup.close();
+      await cwAppAuthOidcRefreshStatus();
+      try { _cwShowToast?.("OIDC sign-in linked", true); } catch {}
+      return;
+    }
+  } catch (e) {
+    if (popup && !popup.closed) popup.close();
+    try { _cwShowToast?.(String(e?.message || e || "OIDC link failed"), false); } catch {}
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+};
+
+window.cwAppAuthOidcUnlink = async function cwAppAuthOidcUnlink() {
+  const ok = window.confirm("Unlink OIDC sign-in from this CrossWatch admin?");
+  if (!ok) return;
+  try {
+    const r = await fetch("/api/app-auth/oidc/unlink", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.ok) throw new Error(data?.error || `OIDC unlink failed (${r.status})`);
+    await cwAppAuthOidcRefreshStatus();
+    try { _cwShowToast?.("OIDC sign-in unlinked", true); } catch {}
+  } catch (e) {
+    try { _cwShowToast?.(String(e?.message || e || "OIDC unlink failed"), false); } catch {}
+  }
+};
+
+function cwAppAuthTotpRender(st) {
+  const enabled = !!st?.totp_enabled;
+  const state = document.getElementById("app_auth_totp_state");
+  const setup = document.getElementById("app_auth_totp_setup");
+  const setupBtn = document.getElementById("btn-app-auth-totp-setup");
+  const verifyBtn = document.getElementById("btn-app-auth-totp-verify");
+  const disableBtn = document.getElementById("btn-app-auth-totp-disable");
+  const secret = document.getElementById("app_auth_totp_secret");
+  const code = document.getElementById("app_auth_totp_code");
+  const pending = !!(secret && String(secret.value || "").trim());
+  if (state) state.textContent = enabled ? "2FA: on" : (pending ? "2FA: setup pending" : "2FA: off");
+  if (setup) setup.classList.toggle("hidden", !pending);
+  if (setupBtn) setupBtn.classList.toggle("hidden", pending);
+  if (verifyBtn) verifyBtn.classList.toggle("hidden", !pending);
+  if (disableBtn) disableBtn.disabled = !enabled && !pending;
+  if (code && !code.__cwTotpWired) {
+    code.addEventListener("input", () => { code.value = String(code.value || "").replace(/\D+/g, "").slice(0, 6); });
+    code.__cwTotpWired = true;
+  }
+}
+
+window.cwAppAuthTotpSetup = async function cwAppAuthTotpSetup() {
+  const btn = document.getElementById("btn-app-auth-totp-setup");
+  const original = btn?.textContent || "Set up 2FA";
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Creating...";
+    }
+    const r = await fetch("/api/app-auth/totp/setup", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: "administrator" }),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.ok) throw new Error(data?.error || `2FA setup failed (${r.status})`);
+    const secret = document.getElementById("app_auth_totp_secret");
+    const code = document.getElementById("app_auth_totp_code");
+    if (secret) secret.value = data.secret || "";
+    if (code) code.value = "";
+    cwAppAuthTotpRender({ totp_enabled: !!data.enabled });
+    try { code?.focus?.(); } catch {}
+    try { _cwShowToast?.("2FA secret created", true); } catch {}
+  } catch (e) {
+    try { _cwShowToast?.(String(e?.message || e || "2FA setup failed"), false); } catch {}
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+};
+
+window.cwAppAuthTotpVerify = async function cwAppAuthTotpVerify() {
+  const code = String(document.getElementById("app_auth_totp_code")?.value || "").replace(/\D+/g, "").slice(0, 6);
+  if (code.length !== 6) {
+    try { _cwShowToast?.("Enter the 6 digit code", false); } catch {}
+    return;
+  }
+  try {
+    const r = await fetch("/api/app-auth/totp/verify", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: "administrator", code }),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.ok) throw new Error(data?.error || `2FA verify failed (${r.status})`);
+    const secret = document.getElementById("app_auth_totp_secret");
+    const codeEl = document.getElementById("app_auth_totp_code");
+    if (secret) secret.value = "";
+    if (codeEl) codeEl.value = "";
+    await cwRefreshAppAuthStatus();
+    try { _cwShowToast?.("2FA enabled", true); } catch {}
+  } catch (e) {
+    try { _cwShowToast?.(String(e?.message || e || "2FA verify failed"), false); } catch {}
+  }
+};
+
+window.cwAppAuthTotpDisable = async function cwAppAuthTotpDisable() {
+  const btn = document.getElementById("btn-app-auth-totp-disable");
+  if (btn && btn.dataset.confirmTotpDisable !== "1") {
+    btn.dataset.confirmTotpDisable = "1";
+    const original = btn.innerHTML || "Disable 2FA";
+    btn.innerHTML = "Confirm disable";
+    setTimeout(() => { try { delete btn.dataset.confirmTotpDisable; btn.innerHTML = original; } catch {} }, 2200);
+    return;
+  }
+  try {
+    const r = await fetch("/api/app-auth/totp/disable", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: "administrator" }),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.ok) throw new Error(data?.error || `2FA disable failed (${r.status})`);
+    const secret = document.getElementById("app_auth_totp_secret");
+    const code = document.getElementById("app_auth_totp_code");
+    if (secret) secret.value = "";
+    if (code) code.value = "";
+    await cwRefreshAppAuthStatus();
+    try { _cwShowToast?.("2FA disabled", true); } catch {}
+  } catch (e) {
+    try { _cwShowToast?.(String(e?.message || e || "2FA disable failed"), false); } catch {}
   }
 };
 
@@ -539,8 +728,9 @@ function cwSchedSettingsHubUpdate() {
 
   const adv = patch.advanced || {};
   const jobs = Array.isArray(adv.jobs) ? adv.jobs : [];
-  const active = jobs.filter(j => j && j.active !== false).length;
-  const total = jobs.length;
+  const workflows = Array.isArray(adv.workflows) ? adv.workflows : [];
+  const active = jobs.filter(j => j && j.active !== false).length + workflows.filter(w => w && w.active !== false).length;
+  const total = jobs.length + workflows.length;
 
   set("hub_sch_adv", `Plan: ${adv.enabled ? "On" : "Off"}`);
   set("hub_sch_steps", total ? `Steps: ${active}/${total}` : "Steps: —");
@@ -676,6 +866,15 @@ function _cwSetText(id, value) {
   if (el) el.textContent = String(value ?? "");
 }
 
+function _cwSetStat(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const text = String(value ?? "");
+  el.textContent = text;
+  if (text && text !== "-") el.title = text;
+  else el.removeAttribute("title");
+}
+
 function _cwSetChecked(id, value) {
   const el = document.getElementById(id);
   if (el) el.checked = !!value;
@@ -692,15 +891,16 @@ function _cwFormatUtc(value) {
 function _cwAnimeMappingUseForLabel() {
   const cfg = window._cfgCache || {};
   const block = cfg.anime_mapping || {};
-  const raw = Array.isArray(block.use_for_pairs) ? block.use_for_pairs : ["anilist"];
+  const raw = Array.isArray(block.use_for_pairs) ? block.use_for_pairs : ["anilist", "simkl"];
   const vals = raw.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean);
-  if (!vals.length || vals.includes("anilist")) return "AniList pairs";
-  return vals.map((x) => x.toUpperCase()).join(", ");
+  if (!vals.length) return "Anime pairs";
+  if (vals.includes("*")) return "All pairs";
+  return `${vals.map((x) => x.toUpperCase()).join(", ")} pairs`;
 }
 
 function _cwAnimeMappingSetBusy(on, label = "") {
   animeMappingBusy = !!on;
-  ["anime_mapping_enabled", "anime_mapping_auto_update", "btn-anime-mapping-update", "btn-anime-mapping-rebuild"].forEach((id) => {
+  ["anime_mapping_enabled", "anime_mapping_auto_update", "btn-anime-mapping-update", "btn-anime-mapping-rebuild", "btn-anime-mapping-overrides"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = !!on;
   });
@@ -722,12 +922,12 @@ function cwAnimeMappingRenderStatus(st = {}) {
 
   _cwSetChecked("anime_mapping_enabled", enabled);
   _cwSetChecked("anime_mapping_auto_update", autoUpdate);
-  _cwSetText("anime_mapping_used_for", _cwAnimeMappingUseForLabel());
+  _cwSetStat("anime_mapping_used_for", _cwAnimeMappingUseForLabel());
   _cwSetText("anime_mapping_auto_update_state", autoUpdate ? "Daily" : "Manual");
   _cwSetText("anime_mapping_dataset", dataset);
-  _cwSetText("anime_mapping_generated", _cwFormatUtc(st.dataset_generated_on));
+  _cwSetStat("anime_mapping_generated", _cwFormatUtc(st.dataset_generated_on));
   _cwSetText("anime_mapping_index", index);
-  _cwSetText("anime_mapping_counts", installed ? `${Number(st.source_count || 0).toLocaleString()} sources | ${Number(st.edge_count || 0).toLocaleString()} edges` : "-");
+  _cwSetStat("anime_mapping_counts", installed ? `${Number(st.source_count || 0).toLocaleString()} sources | ${Number(st.edge_count || 0).toLocaleString()} edges` : "-");
   _cwSetText("anime_mapping_last_update", _cwFormatUtc(st.dataset_generated_on));
   _cwSetText("anime_mapping_meta_status", err ? "Error" : (installed && ready ? "Up to date" : (installed ? "Needs index" : "Missing")));
   const statusPill = document.getElementById("anime_mapping_meta_status");
@@ -780,7 +980,6 @@ async function cwAnimeMappingSaveSettings() {
         enabled,
         auto_update: autoUpdate,
         provider: "anibridge",
-        use_for_pairs: ["anilist"],
       }),
     });
     const data = await r.json().catch(() => ({}));
@@ -791,7 +990,6 @@ async function cwAnimeMappingSaveSettings() {
       enabled,
       auto_update: autoUpdate,
       provider: "anibridge",
-      use_for_pairs: ["anilist"],
     };
     if (data.status) window.__animeMappingStatus = data.status;
     cwAnimeMappingRenderStatus(data.status || window.__animeMappingStatus || {});
@@ -844,7 +1042,7 @@ function cwBuildAnimeMappingPanel() {
       <span class="chev"></span>
       <div class="cw-meta-provider-head-copy">
         <strong>Anime ID Mapping</strong>
-        <span class="cw-meta-provider-help" title="Only needed for anime-specific providers such as AniList." aria-label="Only needed for anime-specific providers such as AniList.">
+        <span class="cw-meta-provider-help" title="Improves anime matching for AniList and SIMKL pairs. Requires a TMDB metadata key." aria-label="Improves anime matching for AniList and SIMKL pairs. Requires a TMDB metadata key.">
           <span class="material-symbols-rounded cw-meta-provider-help-icon" aria-hidden="true">info</span>
         </span>
       </div>
@@ -856,7 +1054,7 @@ function cwBuildAnimeMappingPanel() {
         <span class="material-symbols-rounded am-hero-icon" aria-hidden="true">shield</span>
         <div class="am-hero-copy">
           <h4>Anime ID Mapping</h4>
-          <p>Enable and manage the local Anime ID Mapping index used for AniList watchlist and ratings pairs.</p>
+          <p>Enable and manage the local Anime ID Mapping index used to match anime across providers.</p>
         </div>
         <span class="am-hero-badge" id="anime_mapping_hero_status">
           <span class="material-symbols-rounded" aria-hidden="true">check_circle</span>
@@ -883,7 +1081,7 @@ function cwBuildAnimeMappingPanel() {
         </div>
         <div class="am-stat">
           <span class="material-symbols-rounded am-stat-icon" aria-hidden="true">group</span>
-          <div><span>Used for</span><strong id="anime_mapping_used_for">AniList pairs</strong></div>
+          <div><span>Used for</span><strong id="anime_mapping_used_for">-</strong></div>
         </div>
       </section>
 
@@ -918,11 +1116,12 @@ function cwBuildAnimeMappingPanel() {
         <h4 class="anime-mapping-section-title"><span class="material-symbols-rounded" aria-hidden="true">description</span>Dataset details</h4>
         <div class="am-details">
           <dl class="am-detail-list">
-            <div><dt>Source</dt><dd><a href="https://github.com/anibridge/anibridge-mappings" target="_blank" rel="noopener noreferrer">aniBridge/anibridge-mappings<span class="material-symbols-rounded" aria-hidden="true">open_in_new</span></a></dd></div>
+            <div><dt>Episodes</dt><dd><a href="https://github.com/anibridge/anibridge-mappings" target="_blank" rel="noopener noreferrer">aniBridge/anibridge-mappings<span class="material-symbols-rounded" aria-hidden="true">open_in_new</span></a></dd></div>
+            <div><dt>Identity</dt><dd><a href="https://github.com/nattadasu/animeApi" target="_blank" rel="noopener noreferrer">nattadasu/animeApi<span class="material-symbols-rounded" aria-hidden="true">open_in_new</span></a></dd></div>
             <div><dt>Status</dt><dd><span class="am-status-pill" id="anime_mapping_meta_status">-</span></dd></div>
             <div><dt>Last update</dt><dd><strong id="anime_mapping_last_update">-</strong></dd></div>
           </dl>
-          <p class="am-details-copy">CrossWatch downloads the AniBridge mappings dataset to translate media identifiers between AniList and TMDB, TVDB, IMDb, MyAnimeList, and AniDB.</p>
+          <p class="am-details-copy">AniBridge handles episode numbering across AniDB, MyAnimeList, AniList, TMDB and TVDB. animeApi adds SIMKL and Kitsu identity.</p>
         </div>
         <div class="auth-card-notes" id="anime_mapping_error"></div>
       </div>
@@ -932,7 +1131,7 @@ function cwBuildAnimeMappingPanel() {
         <div class="am-actions">
           <button class="btn primary" type="button" id="btn-anime-mapping-update">Update now</button>
           <button class="btn" type="button" id="btn-anime-mapping-rebuild">Rebuild index</button>
-          <span>Update downloads the latest dataset.<br>Rebuild recreates the local index from the dataset.</span>
+          <button class="btn" type="button" id="btn-anime-mapping-overrides">Custom mappings</button>
         </div>
       </div>
     </div>
@@ -960,6 +1159,11 @@ function cwBuildAnimeMappingPanel() {
   if (btnRebuild && !btnRebuild.__cwAnimeWired) {
     btnRebuild.addEventListener("click", () => cwAnimeMappingRun("rebuild"));
     btnRebuild.__cwAnimeWired = true;
+  }
+  const btnOverrides = document.getElementById("btn-anime-mapping-overrides");
+  if (btnOverrides && !btnOverrides.__cwAnimeWired) {
+    btnOverrides.addEventListener("click", () => window.openAnimeOverridesModal?.());
+    btnOverrides.__cwAnimeWired = true;
   }
 
   try { cwAnimeMappingRenderStatus(window.__animeMappingStatus || {}); } catch {}
@@ -1076,6 +1280,8 @@ function cwBuildTmdbPanel() {
   });
   keyInput.addEventListener("input", () => {
     keyInput.dataset.verified = "";
+    keyInput.dataset.touched = "1";
+    keyInput.dataset.masked = "0";
     const msg = document.getElementById("tmdb_check_msg");
     if (msg) {
       msg.textContent = "";
@@ -1187,7 +1393,7 @@ function cwMetaSettingsHubUpdate() {
   const chip = document.getElementById("hub_tmdb_key");
 
   const cfg = window._cfgCache || {};
-  const cfgKey = String(cfg?.tmdb?.api_key || "").trim();
+  const cfgKey = String(cfg?.tmdb?.api_key || cfg?.metadata?.tmdb_api_key || "").trim();
   const cfgMasked = cfgKey === "*****" || /^[•]+$/.test(cfgKey);
   const cfgHasKey = cfgKey.length > 0 || cfgMasked;
 
@@ -1226,6 +1432,48 @@ function cwMetaSettingsHubUpdate() {
   }
 
   try { window.syncMetadataProviderDot?.(); } catch {}
+}
+
+async function cwRefreshTmdbMetadataState(opts = {}) {
+  const input = document.getElementById("tmdb_api_key");
+  if (!input) return false;
+
+  const keyFrom = (cfg) => String(cfg?.tmdb?.api_key || cfg?.metadata?.tmdb_api_key || "").trim();
+  let key = keyFrom(window._cfgCache || {});
+  const force = opts?.force === true;
+
+  if ((force || !key) && typeof fetch === "function") {
+    try {
+      const r = await fetch("/api/config", { cache: "no-store", credentials: "same-origin" });
+      if (r.ok) {
+        const fresh = await r.json().catch(() => null);
+        if (fresh && typeof fresh === "object") {
+          window._cfgCache = fresh;
+          key = keyFrom(fresh);
+        }
+      }
+    } catch {}
+  }
+
+  const hasKey = !!key;
+  const touched = input.dataset?.touched === "1";
+  if (!touched || opts?.overwrite === true) {
+    try {
+      if (window.CW?.AuthShared?.maskSecret) window.CW.AuthShared.maskSecret(input, hasKey);
+      else {
+        input.value = hasKey ? "********" : "";
+        input.dataset.masked = hasKey ? "1" : "0";
+        input.dataset.loaded = "1";
+        input.dataset.touched = "";
+        input.dataset.clear = "";
+      }
+    } catch {}
+    input.dataset.verified = hasKey ? "" : "0";
+  }
+
+  try { cwMetaSettingsHubUpdate(); } catch {}
+  try { updateTmdbHint(); } catch {}
+  return hasKey;
 }
 
 function cwMetaSettingsHubInit() {
@@ -1315,16 +1563,41 @@ try {
   window.cwMetaSettingsHubInit = cwMetaSettingsHubInit;
   window.cwMetaSettingsHubUpdate = cwMetaSettingsHubUpdate;
   window.cwMetaSettingsHubEnsure = cwMetaSettingsHubEnsure;
+  window.cwRefreshTmdbMetadataState = cwRefreshTmdbMetadataState;
 } catch {}
 
 async function loadConfig() {
-  const r = await fetch("/api/config", { cache: "no-store", credentials: "same-origin" });
-  if (r.status === 401) {
-    location.href = "/login";
-    return;
+  const waitForAuthBootstrap = async () => {
+    try {
+      const pending = typeof window.cwIsAuthSetupPending === "function" && window.cwIsAuthSetupPending() === true;
+      const boot = window.__cwAuthBootstrapPromise;
+      if (!pending || !boot || typeof boot.then !== "function") return;
+      await Promise.race([
+        boot.catch(() => null),
+        new Promise((resolve) => setTimeout(resolve, 2500)),
+      ]);
+    } catch {}
+  };
+  const fetchConfig = async () => {
+    const r = await fetch("/api/config", { cache: "no-store", credentials: "same-origin" });
+    if (r.status === 401) {
+      location.href = "/login";
+      return null;
+    }
+    if (!r.ok) throw new Error(`GET /api/config ${r.status}`);
+    return await r.json();
+  };
+
+  await waitForAuthBootstrap();
+  let cfg = await fetchConfig();
+  if (!cfg) return;
+  if (!Object.keys(cfg || {}).length) {
+    await waitForAuthBootstrap();
+    if (!(typeof window.cwIsAuthSetupPending === "function" && window.cwIsAuthSetupPending() === true)) {
+      cfg = await fetchConfig();
+      if (!cfg) return;
+    }
   }
-  if (!r.ok) throw new Error(`GET /api/config ${r.status}`);
-  const cfg = await r.json();
   window._cfgCache = cfg;
   try { window.CW?.EnvLock?.apply?.(cfg); } catch {}
 
@@ -1352,7 +1625,9 @@ async function loadConfig() {
   (function(){
     const rt = cfg.runtime || {};
     let mode = 'off';
-    if (rt.debug) mode = (rt.debug_mods && rt.debug_http) ? 'full' : (rt.debug_mods ? 'mods' : 'on');
+    if (rt.debug_mods && rt.debug_http) mode = 'full';
+    else if (rt.debug_mods) mode = 'mods';
+    else if (rt.debug || rt.debug_http) mode = 'on';
     _setSelectValue("debug", mode);
   })();
   _setVal("metadata_locale", cfg.metadata?.locale || "");
@@ -1361,7 +1636,6 @@ async function loadConfig() {
   
   (function () {
     const ui = cfg.ui || cfg.user_interface || {};
-    const cw = cfg.crosswatch || {};
     const aa = cfg.app_auth || {};
 
     
@@ -1518,40 +1792,10 @@ async function loadConfig() {
       tpEl.value = tp.filter((x) => typeof x === "string" && x.trim()).join(";");
     }
 
-
-    
-    {
-      const enabled = (cw.enabled === false) ? "false" : "true";
-      _setSelectValue("cw_enabled", enabled);
-    }
-    const cwRetEl = document.getElementById("cw_retention_days");
-    if (cwRetEl) {
-      const v = Number.isFinite(cw.retention_days) ? cw.retention_days : 30;
-      cwRetEl.value = String(v);
-    }
-    {
-      const on = (cw.auto_snapshot === false) ? "false" : "true";
-      _setSelectValue("cw_auto_snapshot", on);
-    }
-    const cwMaxEl = document.getElementById("cw_max_snapshots");
-    if (cwMaxEl) {
-      const v = Number.isFinite(cw.max_snapshots) ? cw.max_snapshots : 64;
-      cwMaxEl.value = String(v);
-    }
-    const setVal = (id, val) => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.value = val || "latest";
-      _refreshSelectUi(el);
-    };
-    setVal("cw_restore_watchlist", cw.restore_watchlist || "latest");
-    setVal("cw_restore_history", cw.restore_history || "latest");
-    setVal("cw_restore_ratings", cw.restore_ratings || "latest");
   })();
 
   try { cwUiSettingsHubInit?.(); } catch {}
 
-  await loadCrossWatchSnapshots(cfg);
   window.appDebug = !!(cfg?.runtime?.debug || cfg?.runtime?.debug_mods);
 
 
@@ -1580,7 +1824,7 @@ async function loadConfig() {
   setRaw("anilist_client_secret", val(cfg.anilist?.client_secret));
 
   
-  setRaw("tmdb_api_key",        val(cfg.tmdb?.api_key));
+  setRaw("tmdb_api_key",        val(cfg.tmdb?.api_key || cfg.metadata?.tmdb_api_key));
 
   
   setRaw("mdblist_key",         val(cfg.mdblist?.api_key));
@@ -1635,9 +1879,12 @@ async function loadConfig() {
     const btn = document.getElementById("btn-auth-logout");
     if (btn) btn.disabled = !(st && st.authenticated);
     cwRenderOtherSessions(st);
+    cwAppAuthTotpRender(st);
   } catch {}
 
   try { await cwAppAuthPlexRefreshStatus(); } catch {}
+  try { await cwAppAuthOidcRefreshStatus(); } catch {}
+  try { await window.cwAppUsersRefresh?.(); } catch {}
   try { cwUiSettingsHubUpdate?.(); } catch {}
 
   try { window.updateSimklButtonState?.(); } catch {}
@@ -1735,6 +1982,8 @@ async function cwRefreshAppAuthStatus() {
   const btn = document.getElementById("btn-auth-logout");
   if (btn) btn.disabled = !(st && st.authenticated);
   cwRenderOtherSessions(st);
+  cwAppAuthTotpRender(st);
+  try { await window.cwAppUsersRefresh?.(); } catch {}
 }
 
 window.cwAppLogout = async function cwAppLogout() {
@@ -1794,8 +2043,8 @@ function cwReadTmdbKeyForVerify() {
   const input = document.getElementById("tmdb_api_key");
   const value = String(input?.value || "").trim();
   const masked = !!value && (input?.dataset?.masked === "1" || value === "********" || /^[*•]+$/.test(value));
-  if (masked) return { has: true, value: "********" };
-  return { has: !!value, value };
+  if (masked) return { has: true, masked: true, value: "********" };
+  return { has: !!value, masked: false, value };
 }
 
 function cwSetTmdbCheckMessage(ok, text) {
@@ -1820,10 +2069,12 @@ async function cwVerifyTmdbKey() {
   try {
     if (btn) btn.disabled = true;
     cwSetTmdbCheckMessage(true, "Checking...");
-    const r = await fetch("/api/tmdb/verify", {
+    const fresh = !state.masked;
+    const r = await fetch(fresh ? "/api/tmdb/save" : "/api/tmdb/verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       cache: "no-store",
+      credentials: "same-origin",
       body: JSON.stringify({ api_key: state.value }),
     });
     const data = await r.json().catch(() => ({}));
@@ -1832,6 +2083,12 @@ async function cwVerifyTmdbKey() {
     cwSetTmdbCheckMessage(ok, ok ? "Connected" : (data?.error || "TMDb key check failed."));
     try { cwMetaSettingsHubUpdate(); } catch {}
     if (ok) {
+      if (fresh) {
+        try { await cwRefreshTmdbMetadataState({ force: true, overwrite: true }); } catch {}
+        if (input) input.dataset.verified = "1";
+        try { cwMetaSettingsHubUpdate(); } catch {}
+        try { window.dispatchEvent(new CustomEvent("auth-changed")); } catch {}
+      }
       try { document.dispatchEvent(new CustomEvent("cw-provider-connected", { bubbles: true, detail: { provider: "tmdb", key: "TMDB_METADATA" } })); } catch {}
     }
     return ok;
@@ -1895,7 +2152,6 @@ function setTraktSuccess(show) {
 
   const SettingsUI = {
     formatCwSnapshotLabel,
-    loadCrossWatchSnapshots,
     cwUiSettingsSelect,
     cwUiSettingsHubUpdate,
     cwUiSettingsHubInit,
@@ -1917,6 +2173,7 @@ function setTraktSuccess(show) {
     cwAnimeMappingRun,
     cwBuildTmdbPanel,
     cwDeleteTmdbKey,
+    cwRefreshTmdbMetadataState,
     cwMetaSettingsSelect,
     cwMetaSettingsHubUpdate,
     cwMetaSettingsHubInit,

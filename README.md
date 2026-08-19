@@ -1,4 +1,4 @@
-<img width="1410" height="717" alt="CrossWatch" src="https://github.com/user-attachments/assets/bd977f1b-2cbc-425a-80f5-f6551ce145fd" />
+<img width="1672" height="941" alt="CW-new" src="https://github.com/user-attachments/assets/19e8bad7-79d3-450c-b9a7-de086cc68ffd" />
 
 </center>
 
@@ -60,31 +60,35 @@
   <a href="https://wiki.crosswatch.app/" style="margin: 0 6px;">
     <img alt="Wiki" src="https://img.shields.io/badge/Wiki-wiki.crosswatch.app-B026FF?style=for-the-badge">
   </a>
+  <a href="https://www.reddit.com/r/CrossWatchApp/" style="margin: 0 6px;">
+    <img alt="Reddit" src="https://img.shields.io/badge/Reddit-r%2FCrossWatchApp-ff4500?style=for-the-badge&logo=reddit&logoColor=white">
+  </a>
 </p>
 
 
-**CrossWatch/CW** is a synchronization engine that keeps your **Plex, Jellyfin, PublicMetaDB, Emby, SIMKL, Trakt, AniList, TMDb, MDBList, Tautulli and Nuvio** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
+**CrossWatch (CW)** is a synchronization engine that act as a bridge and keeps your **Plex, Jellyfin, Emby, SIMKL, Floppy, Trakt, AniList, TMDb, MDBList, PublicMetaDB, PunchPlay, Scrob, Tautulli, Kodi, Nuvio, Stremio and CW local tracker** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
 
 ### CW in a nutshell:
 * **One brain for all your media syncs** A single place to configure everything.
 * **Be your own Sync Hub** Create profiles for seperate media servers/users/trackers.
+  * Managed user support (multi-users)
 * **Multi media-server** and **multi tracker** support with profiles.
 * **Synchronization**
-  * Watchlists, ratings, History and Progress
-  * Anime ID mapping (powered AniBridge) for better AniList matching across providers.
+  * Watchlists, Ratings, History and Progress
+  * Rewatches: keep separate plays in sync for supported trackers.
+  * Anime ID mapping (powered by AniBridge and animeApi) for AniList and SIMKL pairs, with custom mappings.
 * **Scrobble (tracks your activity)**
-  * **Watcher** (Plex/Emby/Jellyfin to Trakt/SIMKL/MDBList)
-    * Does not require any Plex Pass, Emby Premiere,etc.  
-  * **Webhooks** (Plex/Emby/Jellyfin to Trakt/SIMKL/MDBList)
+  * **Watcher** (Plex/Emby/Jellyfin/Kodi/Scrob to supported trackers)
+    * Does not require Plex Pass or Emby Premiere. Yay!
+  * **Webhooks** (Plex/Emby/Jellyfin to supported trackers)
 * **Tools**
   * Analyzer: Finds items that are **stuck** or inconsistent between providers.
   * Playback Progress Manager: View and edit unfinished playback sessions across providers.
   * Editor: Inspect and adjust your items and add or block items.
   * Events Viewer: Search and inspect sync runs.
   * Captures: Rollback tool for provider watchlist, ratings, and history.
-  * Backup & Restore: Create, validate, import and restore configuration.
 
-And much more...such as:
+And much, much more...such as:
 * Simple and advanced scheduling: From standard to more detailed pair schedules
 * CW Tracker Keeps snapshots/backups from your media servers and trackers.
 * Unified Watchlist: View all watchlist items in one place.
@@ -205,5 +209,3 @@ Every cent goes to the <b>ALS Foundation</b> in the Netherlands</center>
 <p align="center">
   Huge thanks to our sponsors for keeping this project moving.
 </p>
-
-

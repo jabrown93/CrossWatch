@@ -7,7 +7,7 @@
   const key = cfg?.tmdb?.api_key;
   const hasTmdb = typeof key === "string" ? key.trim().length > 0 : !!key;
   if (cfg && (cfg.ui?.show_playingcard === false || !hasTmdb)) {
-    document.head.insertAdjacentHTML("beforeend", `<style>#playing-card{display:none!important}</style>`);
+    document.documentElement.classList.add("cw-playing-card-disabled");
   }
 })();
 
@@ -130,11 +130,15 @@
   };
 
   const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
+  const managedReadOnly = () => document.documentElement?.dataset?.cwRole === "user" && document.documentElement?.dataset?.cwPermWrite !== "on";
 
   const ensureOpsStatusDock = () => {
-    const row = document.querySelector("#ops-card .action-row");
-    if (!row || row.querySelector(".cw-status-dock")) return;
-    row.appendChild(Object.assign(document.createElement("div"), { className: "cw-status-dock" }));
+    const card = document.querySelector("#ops-card");
+    const row = card?.querySelector?.(".action-row");
+    if (!card || !row) return;
+    let dock = Array.from(card.children || []).find((node) => node?.classList?.contains("cw-status-dock")) || row.querySelector(".cw-status-dock");
+    if (!dock) dock = Object.assign(document.createElement("div"), { className: "cw-status-dock" });
+    if (dock.parentElement !== card || dock.previousElementSibling !== row) row.insertAdjacentElement("afterend", dock);
   };
   ensureOpsStatusDock();
   window.addEventListener("cw:ops-layout-refresh", ensureOpsStatusDock);
@@ -303,8 +307,12 @@
     const hiddenCount = orderedFeats(true).filter((feat) => feat.layout.hidden).length + (window.CW?.DashboardWidgets?.hiddenCount?.() || 0);
     const unhideAll = hubLayoutHost.querySelector("[data-layout-action='show-all']");
     if (unhideAll) {
+      const label = hiddenCount ? `Unhide ${hiddenCount} hidden block${hiddenCount === 1 ? "" : "s"}` : "No hidden blocks";
       unhideAll.disabled = hiddenCount === 0;
-      unhideAll.title = hiddenCount ? "Unhide all blocks" : "No hidden blocks";
+      unhideAll.title = label;
+      unhideAll.setAttribute("aria-label", label);
+      unhideAll.dataset.hiddenCount = String(hiddenCount);
+      unhideAll.classList.toggle("has-hidden", hiddenCount > 0);
     }
     hubLayoutHost.classList.toggle("has-hidden", hiddenCount > 0);
   };
@@ -355,6 +363,7 @@
     renderHubLayoutStrip();
   };
   window.addEventListener("cw:dashboard-widgets-layout-changed", renderHubLayoutStrip);
+  window.addEventListener("load", renderHubLayoutStrip);
 
   const createLaneControls = (feat) => {
     const iconButton = (icon, title, cls = "") => {
@@ -433,6 +442,11 @@
       }
       lastCounts[feat.key] = total;
 
+      const watermark = Object.assign(document.createElement("div"), { className: "lane-watermark" });
+      watermark.setAttribute("aria-hidden", "true");
+      watermark.innerHTML = `<span class="material-symbols-rounded">${feat.icon}</span>`;
+      lane.appendChild(watermark);
+
       const chipState = laneState(feat.key);
       const header = Object.assign(document.createElement("div"), { className: "lane-h" });
       header.innerHTML = `<div class="lane-ico"><span class="material-symbols-rounded material-symbol" aria-hidden="true">${feat.icon}</span></div><div class="lane-title">${feat.label}</div><div class="lane-badges"><span class="delta"><b>${fmtDelta(added, removed, updated)}</b></span><span class="chip ${chipState}">${!enabled ? "Disabled" : chipState === "err" ? "Failed" : chipState === "ok" ? "Synced" : chipState === "run" ? "Running" : "Skipped"}</span></div>`;
@@ -494,6 +508,7 @@
     if (!arr.length) return void (enabledFromPairs = EMPTY_ENABLED());
     const enabled = EMPTY_ENABLED();
     for (const pair of arr) {
+      if (pair?.enabled === false) continue;
       const feats = pair?.features || {};
       for (const key of FEAT_KEYS) if (feats[key] && (feats[key].enable === true || feats[key].enabled === true)) enabled[key] = true;
     }
@@ -710,6 +725,8 @@
       const url = new URL("/api/run/summary/stream", document.baseURI);
       url.searchParams.set("_ts", String(nowTs()));
       if (lastSummarySeq) url.searchParams.set("since", lastSummarySeq);
+      const viewAs = String(window.CW?.OverviewProfile?.id || "").trim();
+      if (viewAs) url.searchParams.set("user_profile", viewAs);
       esSummary = new EventSource(url.toString());
       window.esSum = esSummary;
       esSummary.onmessage = (ev) => {
@@ -783,6 +800,12 @@
     pullSummary().then(renderAll);
   });
 
+  window.addEventListener("cw:overview-profile-changed", () => {
+    safe(() => window.openSummaryStream?.());
+    safe(() => pullSummary());
+    safe(queuePairsRefresh);
+  });
+
   window.addEventListener("cw-auth-setup-pending", (ev) => {
     if (ev?.detail?.pending) {
       try { esSummary?.close?.(); } catch {}
@@ -826,17 +849,16 @@
   }
 
   renderAll();
-  wireRunButton();
-  openSummaryStream();
-  openLogStream();
   queuePairsRefresh();
-  tick();
+  if (!managedReadOnly()) {
+    wireRunButton();
+    openSummaryStream();
+    openLogStream();
+    tick();
+  }
 })();
 
 (() => {
-  document.getElementById("preview-guard-css")?.remove();
-  document.head.appendChild(Object.assign(document.createElement("style"), { id: "preview-guard-css", textContent: `html:not([data-tab="main"]) #placeholder-card{display:none!important;}` }));
-
   const DOC = document.documentElement;
   DOC.dataset.tab ||= "main";
   const isMain = () => DOC.dataset.tab === "main";
@@ -866,7 +888,6 @@
 
 (() => {
   const ROOT_ID = "cw-quick-add";
-  const STYLE_ID = "cw-quick-add-style";
   const SESSION_KEY = "cw.quick_add.desktop_peek.v1";
   const DESKTOP_POS_KEY = "cw.quick_add.desktop_top.v1";
   const MOBILE_POS_KEY = "cw.quick_add.mobile_bottom.v1";
@@ -875,12 +896,23 @@
   let closeTimer = 0;
   let peekTimer = 0;
   let dragState = null;
+  let authWriteAllowed = window.CW?.AuthState?.read?.()?.isManaged ? window.CW.AuthState.read().permissions.write === true : null;
 
   const currentTab = () => String(DOC.dataset.tab || document.body?.dataset?.tab || "main").trim().toLowerCase();
+  const canWrite = () => {
+    const auth = window.CW?.AuthState?.read?.();
+    if (auth?.isManaged) return auth.permissions.write === true;
+    return authWriteAllowed === true || (authWriteAllowed === null && DOC.dataset.cwRole !== "user");
+  };
   const onMainTab = () => currentTab() === "main";
   const uiCfg = () => (window._cfgCache && typeof window._cfgCache === "object" ? window._cfgCache.ui || {} : {});
-  const desktopEnabled = () => uiCfg().show_quick_add_desktop !== false;
-  const mobileEnabled = () => uiCfg().show_quick_add_mobile !== false;
+  const accountQuickAddEnabled = () => {
+    const auth = window.CW?.AuthState?.read?.();
+    const prefs = auth?.preferences || auth?.user?.preferences || {};
+    return prefs.quick_add !== false;
+  };
+  const desktopEnabled = () => uiCfg().show_quick_add_desktop !== false && accountQuickAddEnabled();
+  const mobileEnabled = () => uiCfg().show_quick_add_mobile !== false && accountQuickAddEnabled();
   const canOpen = () => typeof window.openManualWatchedModal === "function";
   const hasTmdbMetadata = () => {
     const cfg = window._cfgCache && typeof window._cfgCache === "object" ? window._cfgCache : {};
@@ -914,37 +946,8 @@
     return false;
   };
 
-  const ensureStyle = () => {
-    if (document.getElementById(STYLE_ID)) return;
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
-#${ROOT_ID}{position:fixed;z-index:70;pointer-events:none}
-#${ROOT_ID}.hidden{display:none!important}
-#${ROOT_ID} .cw-qa-shell{pointer-events:auto}
-#${ROOT_ID} .cw-qa-desktop{position:fixed;right:0;top:var(--cw-qa-desktop-top,66%);transform:translateY(-50%);display:flex;align-items:center;justify-content:flex-end;filter:drop-shadow(0 14px 26px rgba(0,0,0,.28))}
-#${ROOT_ID} .cw-qa-tab{width:28px;height:60px;padding:0 14px;border-radius:18px 0 0 18px;border:1px solid rgba(255,255,255,.08);border-right:0;background:linear-gradient(180deg,rgba(20,24,34,.98),rgba(7,9,14,.99));color:#eef2ff;display:flex;align-items:center;justify-content:flex-end;gap:12px;cursor:pointer;overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 8px 20px rgba(0,0,0,.16);transition:width .2s ease,background .18s ease,box-shadow .18s ease,border-color .18s ease}
-#${ROOT_ID} .cw-qa-tab:hover,#${ROOT_ID} .cw-qa-tab:focus-visible{background:linear-gradient(180deg,rgba(24,28,40,.985),rgba(10,12,18,.995));border-color:rgba(255,255,255,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 10px 24px rgba(0,0,0,.2);outline:none}
-#${ROOT_ID} .cw-qa-tab .cw-qa-grip{font-size:17px;opacity:.38;margin-left:2px;color:rgba(214,221,240,.72)}
-#${ROOT_ID} .cw-qa-tab-text{font-size:14px;font-weight:850;letter-spacing:.015em;white-space:nowrap;color:rgba(241,244,252,.94);opacity:0;transform:translateX(-6px);transition:opacity .16s ease,transform .18s ease}
-#${ROOT_ID}.is-open .cw-qa-tab,#${ROOT_ID}.is-peek .cw-qa-tab{width:156px}
-#${ROOT_ID}.is-open .cw-qa-tab-text,#${ROOT_ID}.is-peek .cw-qa-tab-text{opacity:1;transform:translateX(0)}
-#${ROOT_ID} .cw-qa-fab{position:fixed;right:18px;bottom:var(--cw-qa-mobile-bottom,22px);min-width:0;height:50px;padding:0 16px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(18,22,30,.98),rgba(8,10,16,.995));color:#f3f6ff;display:inline-flex;align-items:center;gap:9px;font-size:14px;font-weight:850;box-shadow:0 14px 28px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.07);cursor:pointer;pointer-events:auto}
-#${ROOT_ID} .cw-qa-fab:hover,#${ROOT_ID} .cw-qa-fab:focus-visible{background:linear-gradient(180deg,rgba(22,26,36,.99),rgba(9,11,17,.998));border-color:rgba(255,255,255,.12);outline:none}
-#${ROOT_ID} .cw-qa-fab .material-symbols-rounded{font-size:20px;line-height:1;color:rgba(226,232,246,.9)}
-#${ROOT_ID}:not(.is-desktop) .cw-qa-desktop{display:none}
-#${ROOT_ID}:not(.is-mobile) .cw-qa-fab{display:none}
-#${ROOT_ID}.is-dragging .cw-qa-tab,#${ROOT_ID}.is-dragging .cw-qa-fab{cursor:grabbing;transition:none}
-@media (prefers-reduced-motion:reduce){
-  #${ROOT_ID} .cw-qa-tab,#${ROOT_ID} .cw-qa-tab-text{transition:none}
-}
-    `;
-    document.head.appendChild(style);
-  };
-
   const ensureRoot = () => {
     if (root && root.isConnected) return root;
-    ensureStyle();
     root = document.createElement("div");
     root.id = ROOT_ID;
     root.className = "hidden";
@@ -1073,8 +1076,8 @@
     const el = ensureRoot();
     const mobile = isMobileLayout();
     const tmdbReady = hasTmdbMetadata();
-    const showDesktop = !mobile && onMainTab() && desktopEnabled() && tmdbReady;
-    const showMobile = mobile && onMainTab() && mobileEnabled() && tmdbReady;
+    const showDesktop = canWrite() && !mobile && onMainTab() && desktopEnabled() && tmdbReady;
+    const showMobile = canWrite() && mobile && onMainTab() && mobileEnabled() && tmdbReady;
     const showAny = showDesktop || showMobile;
     el.classList.toggle("hidden", !showAny);
     el.classList.toggle("is-desktop", showDesktop);
@@ -1084,14 +1087,31 @@
     if (showDesktop) maybePeek();
   };
 
+  const refreshAuthAccess = async () => {
+    try {
+      const res = await fetch("/api/app-auth/status", { cache: "no-store", credentials: "same-origin" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const status = await res.json();
+      const auth = window.CW?.AuthState?.apply?.(status);
+      authWriteAllowed = auth?.isManaged ? auth.permissions.write === true : null;
+    } catch {
+      const auth = window.CW?.AuthState?.read?.();
+      authWriteAllowed = auth?.isManaged ? auth.permissions.write === true : null;
+    }
+    syncVisibility();
+  };
+
   const refreshSoon = () => syncVisibility();
   window.addEventListener("resize", syncVisibility, { passive: true });
   document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && syncVisibility());
   document.addEventListener("tab-changed", syncVisibility);
   document.addEventListener("config-saved", syncVisibility);
+  window.addEventListener("cw:auth-state-changed", syncVisibility);
+  window.addEventListener("auth-changed", refreshAuthAccess);
   window.addEventListener("load", syncVisibility, { once: true });
   // Safety net only — resize/visibility/tab/config events above cover every
   // known state change, so poll slowly and never while hidden.
   window.setInterval(() => { if (!document.hidden) syncVisibility(); }, 10000);
+  refreshAuthAccess();
   refreshSoon();
 })();
