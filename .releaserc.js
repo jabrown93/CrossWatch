@@ -38,10 +38,17 @@ module.exports = {
     ["@semantic-release/changelog", { changelogFile: "CHANGELOG.md" }],
     "@semantic-release/github",
     [
-      "@semantic-release/git",
+      "@semantic-release/exec",
       {
-        assets: ["CHANGELOG.md"],
-        message: "chore(release): v${nextRelease.version} [skip ci]",
+        // Version-bump commit via GitHub's GraphQL createCommitOnBranch
+        // instead of @semantic-release/git: API commits are signed by GitHub
+        // and show as Verified, which a local git commit from the CI bot
+        // never can be. The script hard-resets the checkout to the new
+        // commit so the release tag semantic-release creates points at it.
+        prepareCmd:
+          "node scripts/release-commit.mjs --branch ${branch.name}" +
+          " --message 'chore(release): v${nextRelease.version} [skip ci]' --" +
+          " CHANGELOG.md",
       },
     ],
   ],
