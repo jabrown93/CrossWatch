@@ -7,7 +7,7 @@ websocket-client==1.9.0
 websockets==16.0
 python-multipart==0.0.31
 packaging==25.0
-cryptography==46.0.5
+cryptography==50.0.0
 defusedxml==0.7.1
 authlib==1.7.2
 qrcode==8.2
