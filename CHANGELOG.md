@@ -1,3 +1,11 @@
+## [1.3.6](https://github.com/jabrown93/CrossWatch/compare/v1.3.5...v1.3.6) (2026-08-22)
+
+
+### Bug Fixes
+
+* **deps:** update digest updates ([cc1eff6](https://github.com/jabrown93/CrossWatch/commit/cc1eff6a51b138db8ede8ea831ec012e61232a36))
+* **security:** update dependency python-multipart to v0.0.31 [security] ([#90](https://github.com/jabrown93/CrossWatch/issues/90)) ([e54db90](https://github.com/jabrown93/CrossWatch/commit/e54db9056ca812d89dcc120a13dc0d51bc521be3))
+
 ## [1.3.5](https://github.com/jabrown93/CrossWatch/compare/v1.3.4...v1.3.5) (2026-08-19)
 
 
