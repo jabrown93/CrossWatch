@@ -6,7 +6,7 @@ plexapi==4.17.2
 websocket-client==1.9.0
 websockets==16.0
 python-multipart==0.0.32
-packaging==25.0
+packaging==26.3
 cryptography==50.0.0
 defusedxml==0.7.1
 authlib==1.7.2
