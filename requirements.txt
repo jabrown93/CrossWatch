@@ -4,7 +4,7 @@ uvicorn==0.40.0
 requests==2.33.0
 plexapi==4.17.2
 websocket-client==1.9.0
-websockets==16.0
+websockets==16.1.1
 python-multipart==0.0.32
 packaging==25.0
 cryptography==50.0.0
