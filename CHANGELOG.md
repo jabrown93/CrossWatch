@@ -1,3 +1,11 @@
+## [1.3.7](https://github.com/jabrown93/CrossWatch/compare/v1.3.6...v1.3.7) (2026-08-22)
+
+
+### Bug Fixes
+
+* **security:** update dependency cryptography to v50 [security] ([#92](https://github.com/jabrown93/CrossWatch/issues/92)) ([d61c41b](https://github.com/jabrown93/CrossWatch/commit/d61c41b8b95d5d56706ccb385dbda93c5f05d9e1))
+* **security:** update dependency requests to v2.33.0 [security] ([#91](https://github.com/jabrown93/CrossWatch/issues/91)) ([d336b2a](https://github.com/jabrown93/CrossWatch/commit/d336b2a2b28af851ee2837dc14a80af9f781f87a))
+
 ## [1.3.6](https://github.com/jabrown93/CrossWatch/compare/v1.3.5...v1.3.6) (2026-08-22)
 
 
