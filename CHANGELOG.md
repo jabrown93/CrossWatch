@@ -1,3 +1,11 @@
+## [1.3.8](https://github.com/jabrown93/CrossWatch/compare/v1.3.7...v1.3.8) (2026-08-23)
+
+
+### Bug Fixes
+
+* **deps:** update digest updates ([#96](https://github.com/jabrown93/CrossWatch/issues/96)) ([e2b8ed6](https://github.com/jabrown93/CrossWatch/commit/e2b8ed6fa2569be4933589ace9e3d83cd29da011))
+* **docker:** drop the tracked alpine minor from the python tags ([#104](https://github.com/jabrown93/CrossWatch/issues/104)) ([a379f39](https://github.com/jabrown93/CrossWatch/commit/a379f394e86e9d0724c40f0dcd5aa3eca2ff7a6d))
+
 ## [1.3.7](https://github.com/jabrown93/CrossWatch/compare/v1.3.6...v1.3.7) (2026-08-22)
 
 
