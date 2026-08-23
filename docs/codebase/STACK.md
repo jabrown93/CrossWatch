@@ -7,7 +7,7 @@
 | Area | Value | Evidence |
 |------|-------|----------|
 | Primary language | Python | requirements.txt; crosswatch.py; cw_platform/, api/, providers/, services/ are all `.py` |
-| Runtime + version | CPython 3.14 (3.14.6 in Docker image; CI matrix pins "3.14") | Dockerfile:8 (`FROM dhi.io/python:3.14.6-alpine3.24-dev AS builder`), Dockerfile:34 (runtime stage `FROM dhi.io/python:3.14.6-alpine3.24`), .github/workflows/ci.yml:23 (`python-version: ["3.14"]`). No `pyproject.toml`/`setup.py`/`setup.cfg` exists in repo root, so there is no `python_requires` declaration outside Docker/CI. |
+| Runtime + version | CPython 3.14 (3.14.7 in Docker image; CI matrix pins "3.14") | Dockerfile:8 (`FROM dhi.io/python:3.14.7-alpine-dev AS builder`), Dockerfile:34 (runtime stage `FROM dhi.io/python:3.14.7-alpine`), .github/workflows/ci.yml:23 (`python-version: ["3.14"]`). No `pyproject.toml`/`setup.py`/`setup.cfg` exists in repo root, so there is no `python_requires` declaration outside Docker/CI. |
 | Package manager | pip, driven by plain `requirements.txt` files (no lockfile, no Poetry/pipenv/uv) | requirements.txt, requirements-dev.txt, Dockerfile:26-30 (`pip install -r requirements.txt` into a venv) |
 | Module/build system | None (no packaging config) for Python — it runs as a flat script tree via `PYTHONPATH=/app`; for the JS frontend there is no bundler (vanilla JS assets served as static files); for Android, Gradle (Kotlin DSL build scripts, Java app source) | Dockerfile:47 (`ENV PYTHONPATH=/app`), package.json (only devDependencies, no build script), android-companion/build.gradle.kts, android-companion/settings.gradle.kts |
 
@@ -81,7 +81,7 @@ npx prettier --check .
   - `CW_LOG_FORMAT`, `CW_LOG_COLOR`, `NO_COLOR` — logging output controls (`_logging.py`).
 - Env vars set in the Dockerfile but **not referenced anywhere in the Python source**: `WEB_HOST`, `WEB_PORT`, `WEBINTERFACE`, `RUNTIME_DIR`. `main()` hardcodes `host="0.0.0.0", port=8787`. `[TODO]` — these look like vestigial/aspirational env vars from a removed shell entrypoint; see CONCERNS.md.
 - `RELEASE_DEPS` — optional env var read by `.releaserc.js` to promote dependency-bump commits to a release (`.releaserc.js:16`).
-- Deployment/runtime constraints: Runtime Docker image (`dhi.io/python:3.14.6-alpine3.24`, a Docker Hardened Image) is shell-less and runs as a fixed nonroot user — bind-mounted `/config` must be pre-chowned to the nonroot UID on the host. Container HEALTHCHECK is a pure-Python TCP probe of port 8787 (no `curl`/`wget` available). Per SECURITY.md, the app is explicitly designed for LAN/VPN-only use, not public internet exposure.
+- Deployment/runtime constraints: Runtime Docker image (`dhi.io/python:3.14.7-alpine`, a Docker Hardened Image) is shell-less and runs as a fixed nonroot user — bind-mounted `/config` must be pre-chowned to the nonroot UID on the host. Container HEALTHCHECK is a pure-Python TCP probe of port 8787 (no `curl`/`wget` available). Per SECURITY.md, the app is explicitly designed for LAN/VPN-only use, not public internet exposure.
 
 ### 6) Evidence
 
