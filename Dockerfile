@@ -5,7 +5,7 @@
 # runs as root, so we use it only to install dependencies. Nothing from
 # this stage ships except the venv and a few data files copied below.
 # =====================================================================
-FROM dhi.io/python:3.14.7-alpine-dev@sha256:f7a11549fe8460ec0753f1f084457bf0e539c53576f427d95f9f7625428c6499 AS builder
+FROM dhi.io/python:3.14.7-alpine-dev@sha256:4c27fe333bbfb2d53b4c6c9408daa7b4d57a6a3cd8990becdd990ced99ddbb51 AS builder
 
 USER root
 
