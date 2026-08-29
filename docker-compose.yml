@@ -1,6 +1,6 @@
 services:
   crosswatch:
-    image: ghcr.io/cenodude/crosswatch:latest@sha256:94cca52b4eccf1af7f1f6279509ca4270478d802db5fb0f3449ef6a4af3f80a3
+    image: ghcr.io/cenodude/crosswatch:latest@sha256:115b5eeae330a3040a617892f0159eb1fce5e57f722bc01fce4f3030a46f3800
     container_name: crosswatch
     ports:
       - "${CROSSWATCH_PORT:-8787}:8787"
