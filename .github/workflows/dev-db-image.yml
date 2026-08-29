@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign attest of the CycloneDX SBOM
     steps:
       - name: Check branch
         if: github.ref_name != 'dev-db'
@@ -59,6 +60,7 @@ jobs:
             type=sha,prefix=dev-db-
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build
         with:
           context: .
           push: true
@@ -67,5 +69,41 @@ jobs:
             APP_VERSION=${{ steps.ver.outputs.app_version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # buildx `sbom: true` above attaches SPDX -- BuildKit's SBOM attestation is
+      # SPDX-only and cannot emit CycloneDX. This adds the CycloneDX half so the dev
+      # image is inspectable the same way a released one is.
+      #
+      # syft resolves the multi-arch index to a single manifest, so this half
+      # describes one architecture; the image differs by compiled arch, not packages.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          # Default `owned-by-package` emits a purl-less, license-less `type: file`
+          # component per package-owned file -- pure ballast.
+          SYFT_FILE_METADATA_SELECTION: none
+          # Resolve licenses upstream for ecosystems shipping none in-image.
+          # Best-effort: an unreachable registry degrades coverage, never fails build.
+          SYFT_ENRICH: golang,javascript,python
+          # `enrich: python` also drives guess-unpinned-requirements, which invents
+          # versions for unpinned entries; keep it explicitly off.
+          SYFT_PYTHON_GUESS_UNPINNED_REQUIREMENTS: 'false'
+        with:
+          # Digest, never the tag: `dev`/`dev-db` float and can move between push
+          # and scan.
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attach CycloneDX SBOM attestation (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "${IMAGE}@${DIGEST}"
