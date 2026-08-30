@@ -119,6 +119,44 @@ def assert_server_url_safe(url: str, field_name: str = "server_url") -> None:
         raise ValueError("; ".join(warnings))
 
 
+def _is_public_ip(host: str) -> bool:
+    """True if *host* (a literal IP string) is globally routable."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_global)
+
+
+def assert_public_https_url(url: str, field_name: str = "url") -> None:
+    """Raise ValueError unless *url* is https and every address it resolves to
+    is globally routable.
+
+    Deliberately stricter than assert_server_url_safe, which permits RFC1918 and
+    loopback because that is exactly where a media server lives. For a URL that
+    an untrusted party supplies (an IdP profile claim, say), a private or
+    loopback target is the attack rather than the normal case, so the whole
+    non-public range is refused instead of just link-local/metadata. Resolution
+    failure is refused too: this guards a live fetch, not a config-save warning.
+    """
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme != "https":
+        raise ValueError(f"{field_name}: must be https, got '{parsed.scheme}'")
+    host = (parsed.hostname or "").strip("[]")
+    if not host:
+        raise ValueError(f"{field_name}: no hostname found in URL")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError) as e:
+        raise ValueError(f"{field_name}: hostname ({host}) does not resolve") from e
+    addrs = [info[4][0] for info in infos if info[4]]
+    if not addrs or not all(_is_public_ip(str(a)) for a in addrs):
+        raise ValueError(f"{field_name}: hostname ({host}) resolves to a non-public address")
+
+
 def _redirect_stays_on_host(current: str, target: str) -> bool:
     """True if *target* is the same host as *current* and doesn't downgrade
     https to http.
@@ -184,6 +222,7 @@ def guarded_request(
     field_name: str = "server_url",
     max_redirects: int = 5,
     allow_cross_host: bool = False,
+    require_public: bool = False,
     **kwargs: Any,
 ):
     """requests.request() wrapper that re-validates the target host on every
@@ -203,6 +242,12 @@ def guarded_request(
     still validated by assert_server_url_safe; only the same-host requirement
     is lifted, and credentials are stripped before the hop regardless. Leave it
     False for anything that authenticates to the configured server.
+
+    require_public additionally demands https and a globally routable address on
+    every hop. Pair it with allow_cross_host whenever the URL came from an
+    untrusted party: lifting the same-host rule on its own would otherwise let a
+    redirect reach loopback or RFC1918, which assert_server_url_safe permits by
+    design because that is where media servers live.
     """
     import requests
 
@@ -212,6 +257,8 @@ def guarded_request(
     body_kwargs.pop("allow_redirects", None)
     for _ in range(max_redirects + 1):
         assert_server_url_safe(current_url, field_name)
+        if require_public:
+            assert_public_https_url(current_url, field_name)
         resp = requests.request(current_method, current_url, allow_redirects=False, **body_kwargs)
         if not resp.is_redirect:
             return resp

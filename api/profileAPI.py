@@ -189,8 +189,12 @@ def _avatar_response(raw: dict[str, Any]) -> Response:
                 from cw_platform.url_validation import guarded_request
 
                 # allow_cross_host: avatar services legitimately redirect to a
-                # CDN, and this fetch carries no credentials. Every hop is still
-                # validated, so the redirect cannot reach a metadata address.
+                # CDN, and this fetch carries no credentials.
+                # require_public: the URL is an IdP claim a low-privilege user
+                # can set, so every hop must be https and globally routable.
+                # Without it, lifting the same-host rule would let a redirect
+                # reach loopback/RFC1918, which the server-URL check allows by
+                # design for LAN media servers.
                 # stream=True means the response must be closed on every path.
                 with guarded_request(
                     "GET",
@@ -200,6 +204,7 @@ def _avatar_response(raw: dict[str, Any]) -> Response:
                     timeout=8,
                     stream=True,
                     allow_cross_host=True,
+                    require_public=True,
                 ) as res:
                     content_type = str(res.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
                     if content_type in AVATAR_TYPES:

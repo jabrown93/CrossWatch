@@ -416,3 +416,74 @@ def test_intermediate_redirect_responses_are_closed(monkeypatch) -> None:
     assert len(made) == 2
     assert made[0].closed is True, "redirect hop leaked its connection"
     assert final is made[1] and made[1].closed is False, "final response must stay open for the caller"
+
+
+# --- Codex PR #116 third-pass follow-ups --------------------------------------
+
+
+def _fake_dns(monkeypatch, mapping: dict[str, str]) -> None:
+    """Resolve only the hosts named; anything else raises like real DNS would."""
+    import socket
+
+    def fake_getaddrinfo(host, *_a, **_k):
+        if host in mapping:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (mapping[host], 0))]
+        raise socket.gaierror(f"no such host {host}")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+class TestPublicOnlyFetch:
+    """assert_server_url_safe permits RFC1918/loopback on purpose (media servers
+    live there). A URL supplied by an untrusted IdP claim must not."""
+
+    def test_loopback_is_refused(self, monkeypatch) -> None:
+        from cw_platform.url_validation import assert_public_https_url
+
+        _fake_dns(monkeypatch, {"evil.example.com": "127.0.0.1"})
+        with pytest.raises(ValueError, match="non-public"):
+            assert_public_https_url("https://evil.example.com/x", "avatar_url")
+
+    def test_rfc1918_is_refused(self, monkeypatch) -> None:
+        from cw_platform.url_validation import assert_public_https_url
+
+        _fake_dns(monkeypatch, {"evil.example.com": "192.168.1.10"})
+        with pytest.raises(ValueError, match="non-public"):
+            assert_public_https_url("https://evil.example.com/x", "avatar_url")
+
+    def test_http_is_refused(self, monkeypatch) -> None:
+        from cw_platform.url_validation import assert_public_https_url
+
+        _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
+        with pytest.raises(ValueError, match="must be https"):
+            assert_public_https_url("http://cdn.example.com/x", "avatar_url")
+
+    def test_public_https_passes(self, monkeypatch) -> None:
+        from cw_platform.url_validation import assert_public_https_url
+
+        _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
+        assert_public_https_url("https://cdn.example.com/x", "avatar_url")
+
+    def test_unresolvable_is_refused(self, monkeypatch) -> None:
+        from cw_platform.url_validation import assert_public_https_url
+
+        _fake_dns(monkeypatch, {})
+        with pytest.raises(ValueError, match="does not resolve"):
+            assert_public_https_url("https://nope.example.com/x", "avatar_url")
+
+    @responses.activate
+    def test_redirect_to_private_address_is_blocked_mid_chain(self, monkeypatch) -> None:
+        """The regression Codex caught: allow_cross_host alone would have
+        followed this hop, because the server-URL check permits RFC1918."""
+        from cw_platform.url_validation import guarded_request
+
+        _fake_dns(monkeypatch, {"idp.example.com": "93.184.216.34", "internal.example.com": "10.0.0.5"})
+        responses.add(
+            responses.GET, "https://idp.example.com/pic",
+            status=302, headers={"Location": "https://internal.example.com/admin"},
+        )
+        with pytest.raises(ValueError, match="non-public"):
+            guarded_request(
+                "GET", "https://idp.example.com/pic", field_name="avatar_url",
+                allow_cross_host=True, require_public=True,
+            )
