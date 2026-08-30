@@ -1,3 +1,12 @@
+## [1.3.9](https://github.com/jabrown93/CrossWatch/compare/v1.3.8...v1.3.9) (2026-08-30)
+
+
+### Bug Fixes
+
+* close the four draft security advisories from the architecture review ([#116](https://github.com/jabrown93/CrossWatch/issues/116)) ([4425e1a](https://github.com/jabrown93/CrossWatch/commit/4425e1ad9a6d20fae5a703b32197cd387b243132)), closes [#117](https://github.com/jabrown93/CrossWatch/issues/117)
+* **deps:** update digest updates ([3e5a305](https://github.com/jabrown93/CrossWatch/commit/3e5a305223e60a393a594d9d0549a293889a77a9))
+* **deps:** update digest updates ([ec182ec](https://github.com/jabrown93/CrossWatch/commit/ec182ec2e542b99be797010d8a0f9a41bddf7245))
+
 ## [1.3.8](https://github.com/jabrown93/CrossWatch/compare/v1.3.7...v1.3.8) (2026-08-23)
 
 
