@@ -278,6 +278,58 @@ def media_account_allowlist_for_profile(cfg: Mapping[str, Any], profile_id: Any)
     return out
 
 
+def media_account_scope_allows(
+    account_filter: Any,
+    provider: Any,
+    instance: Any,
+    *,
+    account: Any = "",
+    account_id: Any = "",
+    account_uuid: Any = "",
+    name_only: bool = False,
+) -> bool:
+    """Apply a profile's per-(provider, instance) media-account allowlist.
+
+    Shared so every surface that shows account-attributed items answers this the
+    same way. An instance the profile scopes but with no usable allowlist denies,
+    which is what distinguishes it from an instance the profile never scoped.
+
+    name_only is for callers whose rows may store an account name and nothing
+    else. It only takes effect when the row actually lacks identifiers: a row
+    carrying account_id/account_uuid is matched in full. An allowlist made only
+    of id:/uuid: entries denies rather than falls open — see the comment below.
+    """
+    from .account_match import media_account_allowed
+
+    prov = provider_display_key(provider)
+    inst = normalize_instance_id(instance)
+    allow: Any = []
+    explicit_account_scope = False
+    if isinstance(account_filter, Mapping):
+        by_provider = account_filter.get(prov)
+        if isinstance(by_provider, Mapping):
+            explicit_account_scope = inst in by_provider
+            allow = by_provider.get(inst) or []
+    if not allow:
+        return not explicit_account_scope
+    if name_only and not (str(account_id or "").strip() or str(account_uuid or "").strip()):
+        # An allowlist may use the id:<v> / uuid:<v> forms, but a caller holding
+        # only an account name can never satisfy those. Drop them so the name
+        # entries alongside them still filter normally.
+        #
+        # If that leaves nothing, the profile restricted this instance purely by
+        # identifier and the row cannot be attributed, so deny. Failing open here
+        # would show every account's rows to a profile that asked to see one,
+        # which is the exact boundary this function exists to hold.
+        # ponytail: the surface stays empty for an id:-only profile until the
+        # identifiers are persisted on the row; ScrobbleEvent carries `account`
+        # alone and drops accountID/accountUUID after the route filter.
+        allow = [e for e in allow if not str(e or "").strip().lower().startswith(("id:", "uuid:"))]
+        if not allow:
+            return False
+    return media_account_allowed(allow, account, account_id=account_id, account_uuid=account_uuid)
+
+
 def decorate_pair_profile(cfg: Mapping[str, Any], pair: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(pair)
     pid = pair_profile_id(pair)

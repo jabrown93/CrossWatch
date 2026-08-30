@@ -10,7 +10,6 @@ import re
 import secrets
 import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Request
@@ -183,11 +182,33 @@ def _avatar_response(raw: dict[str, Any]) -> Response:
         linked_url, _version = _linked_avatar_source(raw)
         if linked_url:
             try:
-                req = urllib.request.Request(linked_url, headers={"User-Agent": "CrossWatch/0.11"})
-                with urllib.request.urlopen(req, timeout=8) as res:
+                # linked_url comes from an IdP claim (OIDC "picture") that a
+                # low-privilege IdP user can usually set. guarded_request re-validates
+                # every redirect hop, so an https URL cannot bounce this server-side
+                # fetch onto a metadata or link-local address.
+                from cw_platform.url_validation import guarded_request
+
+                # allow_cross_host: avatar services legitimately redirect to a
+                # CDN, and this fetch carries no credentials.
+                # require_public: the URL is an IdP claim a low-privilege user
+                # can set, so every hop must be https and globally routable.
+                # Without it, lifting the same-host rule would let a redirect
+                # reach loopback/RFC1918, which the server-URL check allows by
+                # design for LAN media servers.
+                # stream=True means the response must be closed on every path.
+                with guarded_request(
+                    "GET",
+                    linked_url,
+                    field_name="avatar_url",
+                    headers={"User-Agent": "CrossWatch/0.11"},
+                    timeout=8,
+                    stream=True,
+                    allow_cross_host=True,
+                    require_public=True,
+                ) as res:
                     content_type = str(res.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
                     if content_type in AVATAR_TYPES:
-                        data = res.read(MAX_AVATAR_BYTES + 1)
+                        data = res.raw.read(MAX_AVATAR_BYTES + 1, decode_content=True)
                         if len(data) <= MAX_AVATAR_BYTES:
                             return Response(content=data, media_type=content_type, headers={"Cache-Control": "private, max-age=300"})
             except Exception:

@@ -905,10 +905,48 @@ class WatchService:
         name = str(ident.get("name") or "").strip()
         return name or None
 
+    def _stamp_account_identity(self, ev: ScrobbleEvent) -> None:
+        """Record the session's account identifiers on ev.raw.
+
+        A flat Plex alert carries no PlaySessionStateNotification, so the
+        accountID/accountUUID the session lookup already resolved would never
+        reach the activity row and an id:/uuid: scoped profile would lose it.
+        Written in the Account shape the webhook path uses so one extractor
+        covers every source. The identity lookup is cached, so this is free
+        after the first alert for a session.
+        """
+        raw = getattr(ev, "raw", None)
+        if not isinstance(raw, dict):
+            return
+        account = raw.get("Account") if isinstance(raw.get("Account"), dict) else {}
+        have_id = str(account.get("id") or "").strip()
+        have_uuid = str(account.get("uuid") or "").strip()
+        if have_id and have_uuid:
+            return
+        ident = self._resolve_session_identity(ev.session_key)
+        if not isinstance(ident, dict):
+            return
+        acc_id = have_id or str(ident.get("account_id") or "").strip()
+        acc_uuid = have_uuid or str(ident.get("account_uuid") or "").strip()
+        if not acc_id and not acc_uuid:
+            return
+        # Merge rather than replace: an alert can carry a title-only Account
+        # block, which would otherwise short-circuit this and leave the row
+        # unattributed. Existing values always win.
+        merged = dict(account)
+        if acc_id:
+            merged["id"] = acc_id
+        if acc_uuid:
+            merged["uuid"] = acc_uuid
+        raw["Account"] = merged
+
     def _enrich_event_with_plex(self, ev: ScrobbleEvent) -> ScrobbleEvent | None:
         try:
             if not self._plex:
                 return ev
+            # Stamp before any return below: every event leaves this method
+            # through one of them, and they all share the same raw dict.
+            self._stamp_account_identity(ev)
             acc = self._resolve_account_from_session(ev.session_key)
             if acc and _norm_user(acc) != _norm_user(ev.account or ""):
                 ev = ScrobbleEvent(**{**ev.__dict__, "account": acc})

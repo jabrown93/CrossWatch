@@ -161,7 +161,7 @@ Single sign-on and machine access have short names:
 | `CW_OIDC_CLIENT_SECRET` | Client secret |
 | `CW_OIDC_PUBLIC_BASE_URL` | External base URL of this instance |
 | `CW_OIDC_GROUPS_CLAIM` | ID token claim holding group membership (default `groups`) |
-| `CW_OIDC_ALLOWED_GROUPS` | Groups allowed to sign in — **empty denies every OIDC login** |
+| `CW_OIDC_ALLOWED_GROUPS` | Groups allowed to sign in — **empty means no group restriction**: every account the IdP authenticates may sign in |
 | `CW_OIDC_SESSION_HOURS` | Lifetime of an OIDC session, 1–168 |
 | `CW_API_KEY` | Static key accepted in the `X-API-Key` header |
 

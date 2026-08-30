@@ -119,6 +119,71 @@ def assert_server_url_safe(url: str, field_name: str = "server_url") -> None:
         raise ValueError("; ".join(warnings))
 
 
+def _is_public_ip(host: str) -> bool:
+    """True if *host* (a literal IP string) is globally routable."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_global)
+
+
+def assert_public_https_url(url: str, field_name: str = "url") -> None:
+    """Raise ValueError unless *url* is https and every address it resolves to
+    is globally routable.
+
+    Deliberately stricter than assert_server_url_safe, which permits RFC1918 and
+    loopback because that is exactly where a media server lives. For a URL that
+    an untrusted party supplies (an IdP profile claim, say), a private or
+    loopback target is the attack rather than the normal case, so the whole
+    non-public range is refused instead of just link-local/metadata. Resolution
+    failure is refused too: this guards a live fetch, not a config-save warning.
+    """
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme != "https":
+        raise ValueError(f"{field_name}: must be https, got '{parsed.scheme}'")
+    host = (parsed.hostname or "").strip("[]")
+    if not host:
+        raise ValueError(f"{field_name}: no hostname found in URL")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError) as e:
+        raise ValueError(f"{field_name}: hostname ({host}) does not resolve") from e
+    addrs = [info[4][0] for info in infos if info[4]]
+    if not addrs or not all(_is_public_ip(str(a)) for a in addrs):
+        raise ValueError(f"{field_name}: hostname ({host}) resolves to a non-public address")
+
+
+def _assert_peer_is_public(resp: Any, field_name: str) -> None:
+    """Check the address actually connected to, not the one we resolved earlier.
+
+    assert_public_https_url resolves the hostname, then requests resolves it
+    again when opening the socket. An attacker serving a short-TTL record can
+    answer public the first time and loopback/RFC1918 the second (DNS
+    rebinding), so validation alone proves nothing about the live connection.
+    Reads the peer off the open socket and refuses if it is not public. Requires
+    stream=True, which is the only mode this runs under; an unavailable peer is
+    refused rather than assumed good.
+    """
+    raw = getattr(resp, "raw", None)
+    conn = getattr(raw, "connection", None) or getattr(raw, "_connection", None)
+    sock = getattr(conn, "sock", None)
+    peer = None
+    if sock is not None:
+        try:
+            peer = sock.getpeername()
+        except OSError:
+            peer = None
+    addr = str(peer[0]) if peer else ""
+    if not addr or not _is_public_ip(addr):
+        raise ValueError(
+            f"{field_name}: connected to a non-public address ({addr or 'peer unavailable'})"
+        )
+
+
 def _redirect_stays_on_host(current: str, target: str) -> bool:
     """True if *target* is the same host as *current* and doesn't downgrade
     https to http.
@@ -161,7 +226,32 @@ def _rebuild_redirect(method: str, kwargs: dict[str, Any], status: int) -> tuple
     return method, kwargs
 
 
-def guarded_request(method: str, url: str, *, field_name: str = "server_url", max_redirects: int = 5, **kwargs: Any):
+# Anything that could authenticate the caller to the *new* host. Dropped before
+# an allow_cross_host hop so a redirect cannot walk credentials somewhere else.
+_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "cookie", "x-plex-token", "x-emby-token", "x-mediabrowser-token", "x-api-key"}
+)
+
+
+def _strip_credentials(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop credential-bearing kwargs/headers before leaving the current host."""
+    out = {k: v for k, v in kwargs.items() if k not in ("params", "auth")}
+    headers = out.get("headers")
+    if isinstance(headers, dict):
+        out["headers"] = {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADERS}
+    return out
+
+
+def guarded_request(
+    method: str,
+    url: str,
+    *,
+    field_name: str = "server_url",
+    max_redirects: int = 5,
+    allow_cross_host: bool = False,
+    require_public: bool = False,
+    **kwargs: Any,
+):
     """requests.request() wrapper that re-validates the target host on every
     redirect hop, not just the initial URL.
 
@@ -173,8 +263,33 @@ def guarded_request(method: str, url: str, *, field_name: str = "server_url", ma
     validates + follows each hop manually, raising ValueError (like
     assert_server_url_safe) if any hop is unsafe, leaves the configured host
     (see _redirect_stays_on_host), or the chain is too long.
+
+    allow_cross_host is for fetches that carry no credentials and legitimately
+    redirect off-host, such as an avatar image served from a CDN. Every hop is
+    still validated by assert_server_url_safe; only the same-host requirement
+    is lifted, and credentials are stripped before the hop regardless. Leave it
+    False for anything that authenticates to the configured server.
+
+    require_public additionally demands https and a globally routable address on
+    every hop. Pair it with allow_cross_host whenever the URL came from an
+    untrusted party: lifting the same-host rule on its own would otherwise let a
+    redirect reach loopback or RFC1918, which assert_server_url_safe permits by
+    design because that is where media servers live.
     """
     import requests
+
+    def _send(method_: str, url_: str, **kw: Any):
+        if not require_public:
+            return requests.request(method_, url_, allow_redirects=False, **kw)
+        # An environment proxy would put the proxy on the other end of the
+        # socket, so the peer check would vet the proxy instead of the origin:
+        # a private corporate proxy blocks every avatar, and a public one passes
+        # while resolving the origin itself, leaving the boundary unchecked.
+        # requests.request() builds a trust_env session per call; do the same
+        # with env proxies off so the peer really is the origin.
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.request(method_, url_, allow_redirects=False, **kw)
 
     current_method = method
     current_url = url
@@ -182,19 +297,32 @@ def guarded_request(method: str, url: str, *, field_name: str = "server_url", ma
     body_kwargs.pop("allow_redirects", None)
     for _ in range(max_redirects + 1):
         assert_server_url_safe(current_url, field_name)
-        resp = requests.request(current_method, current_url, allow_redirects=False, **body_kwargs)
+        if require_public:
+            assert_public_https_url(current_url, field_name)
+        resp = _send(current_method, current_url, **body_kwargs)
+        if require_public:
+            try:
+                _assert_peer_is_public(resp, field_name)
+            except ValueError:
+                resp.close()
+                raise
         if not resp.is_redirect:
             return resp
         location = resp.headers.get("Location")
         if not location:
             return resp
         next_url = urljoin(current_url, location)
+        # A stream=True hop holds its connection until read or closed, and this
+        # response is discarded either way from here on.
+        resp.close()
         if not _redirect_stays_on_host(current_url, next_url):
-            raise ValueError(
-                f"{field_name}: refusing to follow a redirect off the configured host "
-                f"({urlparse(current_url).hostname} -> {urlparse(next_url).hostname or location}) "
-                "— this request carries credentials"
-            )
+            if not allow_cross_host:
+                raise ValueError(
+                    f"{field_name}: refusing to follow a redirect off the configured host "
+                    f"({urlparse(current_url).hostname} -> {urlparse(next_url).hostname or location}) "
+                    "— this request carries credentials"
+                )
+            body_kwargs = _strip_credentials(body_kwargs)
         current_method, body_kwargs = _rebuild_redirect(current_method, body_kwargs, resp.status_code)
         current_url = next_url
     raise ValueError(f"{field_name}: exceeded {max_redirects} redirects while validating target host")

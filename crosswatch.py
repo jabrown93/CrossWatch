@@ -657,7 +657,12 @@ async def app_auth_gate(request: Request, call_next):
         return response
 
     if app_api_key_authenticated(cfg, request):
-        return await call_next(request)
+        # The key is unrestricted admin, so its mutations have to land in the
+        # audit log too — otherwise a leaked key edits config and deletes pairs
+        # with no forensic trail, unlike the cookie branch above.
+        response = await call_next(request)
+        _audit_api_action(request, response, {"username": "api-key", "is_admin": True})
+        return response
 
     if path.startswith("/api/"):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
