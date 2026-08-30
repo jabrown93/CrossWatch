@@ -252,7 +252,7 @@
   -v crosswatch_config:/config \
   -e TZ=Europe/Amsterdam \
   --restart unless-stopped \
-  ghcr.io/cenodude/crosswatch:latest</code></pre>
+  ghcr.io/jabrown93/crosswatch:latest</code></pre>
   </div>
 </section>
 
