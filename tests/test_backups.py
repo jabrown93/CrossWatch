@@ -123,6 +123,36 @@ def test_restore_drops_stale_wal_sidecar(tmp_path: Path, monkeypatch) -> None:
         con.close()
 
 
+def test_restore_suspends_database_connections_while_swapping_files(tmp_path: Path, monkeypatch) -> None:
+    _patch_config_dir(monkeypatch, tmp_path)
+    import services.backups as backups
+    from cw_platform.local_db import db as local_db
+
+    db = tmp_path / ".cw_databases" / "crosswatch.sqlite3"
+    monkeypatch.setenv("CROSSWATCH_DB", str(db))
+    (tmp_path / "config.json").write_text("{}\n", encoding="utf-8")
+    _seed_wal_database(db, "before")
+    res = backups.create_backup(scope="app_state", label="unit", trigger="test")
+    _seed_wal_database(db, "after")
+
+    # get_conn() returning None is what stops a live thread from registering a
+    # handle against the inode os.replace is about to unlink.
+    conn_unavailable: list[bool] = []
+    real_replace = backups.os.replace
+
+    def _spy(src, dst) -> None:
+        conn_unavailable.append(local_db.get_conn() is None)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(backups.os, "replace", _spy)
+    restored = backups.restore_backup(res["path"], create_pre_restore=False)
+
+    assert restored["ok"] is True
+    assert conn_unavailable, "restore never swapped a file"
+    assert all(conn_unavailable), "restore swapped files with connections still open"
+    assert local_db._SUSPEND_DEPTH == 0
+
+
 def test_validate_rejects_archive_member_outside_restore_allowlist(tmp_path: Path, monkeypatch) -> None:
     _patch_config_dir(monkeypatch, tmp_path)
     import services.backups as backups
