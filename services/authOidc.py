@@ -7,17 +7,20 @@ from typing import Any
 
 import base64
 import hashlib
-import json
 import secrets
 import time
 from urllib.parse import urlencode
 
 import requests
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils as asym_utils
-from cryptography.hazmat.primitives import hashes
+from authlib.jose import JsonWebKey, JsonWebToken
+from authlib.jose.errors import ExpiredTokenError
 
 PENDING_TTL_SEC = 10 * 60
 DISCOVERY_TTL_SEC = 15 * 60
+
+# ID tokens are signed asymmetrically; HS* would let a leaked client secret mint tokens.
+ID_TOKEN_ALGS = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"]
+ID_TOKEN_LEEWAY_SEC = 60
 
 _PENDING_FLOWS: dict[str, dict[str, Any]] = {}
 _DISCOVERY_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
@@ -31,12 +34,6 @@ def _now() -> int:
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(value: str) -> bytes:
-    raw = str(value or "").encode("ascii")
-    raw += b"=" * ((4 - len(raw) % 4) % 4)
-    return base64.urlsafe_b64decode(raw)
 
 
 def _sha256_b64url(value: str) -> str:
@@ -252,75 +249,39 @@ def _jwks(jwks_uri: str) -> dict[str, Any]:
     return data
 
 
-def _jwt_parts(token: str) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes]:
-    parts = str(token or "").split(".")
-    if len(parts) != 3:
-        raise RuntimeError("Invalid ID token")
-    header = json.loads(_b64url_decode(parts[0]).decode("utf-8"))
-    claims = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
-    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
-    signature = _b64url_decode(parts[2])
-    return header, claims, signing_input, signature
-
-
-def _hash_for_alg(alg: str) -> hashes.HashAlgorithm:
-    if alg.endswith("384"):
-        return hashes.SHA384()
-    if alg.endswith("512"):
-        return hashes.SHA512()
-    return hashes.SHA256()
-
-
-def _rsa_key(jwk: dict[str, Any]) -> rsa.RSAPublicKey:
-    n = int.from_bytes(_b64url_decode(str(jwk.get("n") or "")), "big")
-    e = int.from_bytes(_b64url_decode(str(jwk.get("e") or "")), "big")
-    return rsa.RSAPublicNumbers(e, n).public_key()
-
-
-def _ec_key(jwk: dict[str, Any]) -> ec.EllipticCurvePublicKey:
-    crv = str(jwk.get("crv") or "")
-    curve = {"P-256": ec.SECP256R1(), "P-384": ec.SECP384R1(), "P-521": ec.SECP521R1()}.get(crv)
-    if curve is None:
-        raise RuntimeError("Unsupported OIDC signing curve")
-    x = int.from_bytes(_b64url_decode(str(jwk.get("x") or "")), "big")
-    y = int.from_bytes(_b64url_decode(str(jwk.get("y") or "")), "big")
-    return ec.EllipticCurvePublicNumbers(x, y, curve).public_key()
-
-
-def _ecdsa_signature(alg: str, signature: bytes) -> bytes:
-    size = {"ES256": 32, "ES384": 48, "ES512": 66}.get(alg, 0)
-    if size <= 0 or len(signature) != size * 2:
-        return signature
-    r = int.from_bytes(signature[:size], "big")
-    s = int.from_bytes(signature[size:], "big")
-    return asym_utils.encode_dss_signature(r, s)
-
-
-def _verify_jwt(id_token: str, oidc: dict[str, Any], disco: dict[str, Any], nonce: str) -> dict[str, Any]:
-    header, claims, signing_input, signature = _jwt_parts(id_token)
-    alg = str(header.get("alg") or "")
-    if alg not in {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}:
-        raise RuntimeError("Unsupported OIDC signing algorithm")
+def _signing_keys(disco: dict[str, Any]) -> Any:
     keys = _jwks(str(disco.get("jwks_uri") or "")).get("keys")
     if not isinstance(keys, list):
         raise RuntimeError("OIDC JWKS missing keys")
-    kid = str(header.get("kid") or "")
-    candidates = [k for k in keys if isinstance(k, dict) and (not kid or str(k.get("kid") or "") == kid)]
-    if not candidates:
+    usable = [
+        k
+        for k in keys
+        if isinstance(k, dict)
+        and str(k.get("kty") or "") in {"RSA", "EC"}
+        and str(k.get("use") or "sig") == "sig"
+    ]
+    if not usable:
         raise RuntimeError("OIDC signing key not found")
-    last_error: Exception | None = None
-    for jwk in candidates:
-        try:
-            if alg.startswith("RS"):
-                _rsa_key(jwk).verify(signature, signing_input, padding.PKCS1v15(), _hash_for_alg(alg))
-            else:
-                _ec_key(jwk).verify(_ecdsa_signature(alg, signature), signing_input, ec.ECDSA(_hash_for_alg(alg)))
-            last_error = None
-            break
-        except Exception as exc:
-            last_error = exc
-    if last_error is not None:
-        raise RuntimeError("OIDC ID token signature invalid") from last_error
+    return JsonWebKey.import_key_set({"keys": usable})
+
+
+def _verify_jwt(id_token: str, oidc: dict[str, Any], disco: dict[str, Any], nonce: str) -> dict[str, Any]:
+    # authlib enforces the alg allowlist, the signature, and RFC 7515 crit rejection.
+    key_set = _signing_keys(disco)
+    try:
+        # exp is essential: authlib skips validation of a claim that is simply absent.
+        claims = JsonWebToken(ID_TOKEN_ALGS).decode(
+            id_token, key_set, claims_options={"exp": {"essential": True}}
+        )
+    except Exception as exc:
+        raise RuntimeError("OIDC ID token signature invalid") from exc
+    try:
+        claims.validate(leeway=ID_TOKEN_LEEWAY_SEC)
+    except ExpiredTokenError as exc:
+        raise RuntimeError("OIDC token expired") from exc
+    except Exception as exc:
+        raise RuntimeError("OIDC token claims invalid") from exc
+    # iss stays a local check: the issuer needs trailing-slash normalisation before compare.
     issuer = _norm_issuer(oidc.get("issuer"))
     aud = claims.get("aud")
     audiences = aud if isinstance(aud, list) else [aud]
@@ -328,13 +289,11 @@ def _verify_jwt(id_token: str, oidc: dict[str, Any], disco: dict[str, Any], nonc
         raise RuntimeError("OIDC token issuer mismatch")
     if str(oidc.get("client_id") or "") not in [str(x or "") for x in audiences]:
         raise RuntimeError("OIDC token audience mismatch")
-    if int(claims.get("exp") or 0) <= _now():
-        raise RuntimeError("OIDC token expired")
     if str(claims.get("nonce") or "") != str(nonce or ""):
         raise RuntimeError("OIDC nonce mismatch")
     if not str(claims.get("sub") or "").strip():
         raise RuntimeError("OIDC token subject missing")
-    return claims
+    return dict(claims)
 
 
 def _fetch_userinfo(disco: dict[str, Any], access_token: str) -> dict[str, Any]:
