@@ -183,3 +183,23 @@ def test_scrobble_and_activity_agree_on_account_scope() -> None:
     assert _matches_user_profile(dict(_ITEM), _INSTANCES, denied) is False
 
 
+# --- GHSA-m99r-g3q7-hf2f: avatar proxy SSRF -----------------------------------
+
+
+def test_avatar_fetch_refuses_a_metadata_address() -> None:
+    """An IdP-supplied picture claim pointing at cloud metadata must not be
+    fetched; the endpoint falls back to the default avatar."""
+    from api.profileAPI import _avatar_response
+
+    raw = {"oidc_identity": {"picture": "https://169.254.169.254/latest/meta-data/", "linked_at": 1}}
+    resp = _avatar_response(raw)
+    assert resp.media_type == "image/svg+xml"
+
+
+def test_guarded_request_is_what_blocks_the_hop() -> None:
+    from cw_platform.url_validation import guarded_request
+
+    with pytest.raises(ValueError):
+        guarded_request("GET", "https://169.254.169.254/latest/meta-data/", field_name="avatar_url", timeout=1)
+
+
