@@ -286,12 +286,16 @@ def media_account_scope_allows(
     account: Any = "",
     account_id: Any = "",
     account_uuid: Any = "",
+    name_only: bool = False,
 ) -> bool:
     """Apply a profile's per-(provider, instance) media-account allowlist.
 
     Shared so every surface that shows account-attributed items answers this the
     same way. An instance the profile scopes but with no usable allowlist denies,
     which is what distinguishes it from an instance the profile never scoped.
+
+    name_only is for callers whose rows store an account name and nothing else.
+    See the comment below for why those callers cannot enforce id:/uuid: entries.
     """
     from .account_match import media_account_allowed
 
@@ -306,6 +310,18 @@ def media_account_scope_allows(
             allow = by_provider.get(inst) or []
     if not allow:
         return not explicit_account_scope
+    if name_only:
+        # An allowlist may use the id:<v> / uuid:<v> forms, but a caller holding
+        # only an account name can never satisfy those, so keeping them would
+        # reject every row instead of filtering it. Drop them and match on the
+        # name entries. If that leaves nothing, the restriction is unenforceable
+        # against what this surface stores, so defer to the instance decision
+        # that already passed rather than blanking the surface entirely.
+        # ponytail: enforcing id:/uuid: here needs the identifiers persisted on
+        # the row; ScrobbleEvent carries only `account` and drops them today.
+        allow = [e for e in allow if not str(e or "").strip().lower().startswith(("id:", "uuid:"))]
+        if not allow:
+            return True
     return media_account_allowed(allow, account, account_id=account_id, account_uuid=account_uuid)
 
 

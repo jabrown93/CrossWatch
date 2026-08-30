@@ -351,3 +351,37 @@ class TestCrossHostRedirects:
         )
         with pytest.raises(ValueError, match="off the configured host"):
             guarded_request("GET", "https://media.example.com/x", field_name="test")
+
+
+# --- Codex PR #116 second-pass follow-ups -------------------------------------
+
+
+def test_activity_id_form_allowlist_does_not_blank_the_feed() -> None:
+    """The activity table stores only an account name, so an id:/uuid: entry can
+    never match. Treating that as a failed match hid every row from profiles
+    using the supported `id:<value>` syntax."""
+    from api.activityAPI import _matches_user_profile
+
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["id:42"]}}) is True
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["uuid:abc"]}}) is True
+
+
+def test_activity_name_entries_still_filter_alongside_id_entries() -> None:
+    """A mixed allowlist keeps filtering on the part that is evaluatable."""
+    from api.activityAPI import _matches_user_profile
+
+    mixed = {"PLEX": {"default": ["alice", "id:42"]}}
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, mixed) is True
+    bob = {**_ITEM, "account": "bob"}
+    assert _matches_user_profile(bob, _INSTANCES, mixed) is False
+
+
+def test_scrobble_still_enforces_id_form_allowlists() -> None:
+    """currently-watching carries the identifiers, so it must NOT relax them."""
+    from api.scrobbleAPI import _currently_watching_matches_user
+
+    allowlist = {"instances": _INSTANCES, "accounts": {"PLEX": {"default": ["id:42"]}}}
+    match = {"source": "plex", "provider_instance": "default", "account": "alice", "account_id": "42"}
+    miss = {"source": "plex", "provider_instance": "default", "account": "bob", "account_id": "7"}
+    assert _currently_watching_matches_user(match, allowlist) is True
+    assert _currently_watching_matches_user(miss, allowlist) is False
