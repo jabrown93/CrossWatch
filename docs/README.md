@@ -242,7 +242,7 @@
     <p>The web UI is exposed at <code>http://localhost:8787</code>. Keep your config in a Docker volume and update with the latest image when you are ready.</p>
     <div class="cw-actions">
       <a class="cw-button is-primary" href="https://wiki.crosswatch.app/getting-started/installation">Installation guide</a>
-      <a class="cw-button" href="https://hub.docker.com/r/cenodude/crosswatch">Docker Hub</a>
+      <a class="cw-button" href="https://github.com/jabrown93/CrossWatch/pkgs/container/crosswatch">GitHub Container Registry</a>
     </div>
   </div>
   <div class="cw-code-panel">
