@@ -1,3 +1,10 @@
+## [1.3.10](https://github.com/jabrown93/CrossWatch/compare/v1.3.9...v1.3.10) (2026-08-30)
+
+
+### Bug Fixes
+
+* point deploy paths at the fork's own image ([#118](https://github.com/jabrown93/CrossWatch/issues/118)) ([58911c7](https://github.com/jabrown93/CrossWatch/commit/58911c7ad9fcbfa472d26f47c53b9ed30084a9b4)), closes [#110](https://github.com/jabrown93/CrossWatch/issues/110)
+
 ## [1.3.9](https://github.com/jabrown93/CrossWatch/compare/v1.3.8...v1.3.9) (2026-08-30)
 
 
