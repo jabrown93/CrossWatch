@@ -64,6 +64,8 @@ def _row_item(row: Any, ids: Mapping[str, dict[str, str]]) -> dict[str, Any]:
         "episode": row["episode"],
         "progress": row["progress"],
         "account": row["account"],
+        "account_id": row["account_id"],
+        "account_uuid": row["account_uuid"],
         "watched_at": row["watched_at"],
         "captured_at": row["captured_at"],
         "ids": ids.get(str(row["event_id"] or "")) or {},
@@ -84,12 +86,13 @@ def save_event(base_path: str | Path | None, item: Mapping[str, Any], *, limit: 
     with conn:
         conn.execute(
             "INSERT INTO activity_events(event_id,kind,method,event,status,source,source_instance,target,target_instance,"
-            "media_type,title,year,season,episode,progress,account,watched_at,captured_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "media_type,title,year,season,episode,progress,account,account_id,account_uuid,watched_at,captured_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(event_id) DO UPDATE SET kind=excluded.kind,method=excluded.method,event=excluded.event,"
             "status=excluded.status,source=excluded.source,source_instance=excluded.source_instance,target=excluded.target,"
             "target_instance=excluded.target_instance,media_type=excluded.media_type,title=excluded.title,year=excluded.year,"
             "season=excluded.season,episode=excluded.episode,progress=excluded.progress,account=excluded.account,"
+            "account_id=excluded.account_id,account_uuid=excluded.account_uuid,"
             "watched_at=excluded.watched_at,captured_at=excluded.captured_at,updated_at=excluded.updated_at",
             (
                 event_id,
@@ -108,6 +111,8 @@ def save_event(base_path: str | Path | None, item: Mapping[str, Any], *, limit: 
                 _i(item.get("episode")),
                 _i(item.get("progress")),
                 _s(item.get("account")),
+                _s(item.get("account_id")),
+                _s(item.get("account_uuid")),
                 _i(item.get("watched_at")),
                 _i(item.get("captured_at")),
                 ts,

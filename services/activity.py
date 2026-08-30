@@ -160,6 +160,12 @@ def _event_id(item: Mapping[str, Any]) -> str:
         "event": item.get("event"),
         "watched_at": item.get("watched_at"),
         "ids": item.get("ids"),
+        # Account identity belongs in the key: save_event() upserts on event_id,
+        # so two accounts finishing the same title through the same route in the
+        # same second would collide and the second would overwrite the first.
+        "account": item.get("account"),
+        "account_id": item.get("account_id"),
+        "account_uuid": item.get("account_uuid"),
     }
     raw = json.dumps(stable, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
@@ -199,6 +205,11 @@ def _group_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
         _as_int(item.get("episode")),
         None if is_scrobble_stop else _as_int(item.get("progress")),
         str(item.get("account") or "").strip().lower(),
+        # Two accounts can share a display name; without the identifiers they
+        # would merge into one group and profile filtering would then judge the
+        # whole group by whichever row happened to represent it.
+        str(item.get("account_id") or "").strip().lower(),
+        str(item.get("account_uuid") or "").strip().lower(),
         ids_key,
     )
 
@@ -261,6 +272,8 @@ def add_event(event: Mapping[str, Any], *, limit: int = DEFAULT_LIMIT) -> dict[s
         "episode": _as_int(event.get("episode")) if media_type == "episode" else None,
         "progress": _as_int(event.get("progress")),
         "account": str(event.get("account") or "").strip(),
+        "account_id": str(event.get("account_id") or "").strip(),
+        "account_uuid": str(event.get("account_uuid") or "").strip().lower(),
         "watched_at": _as_int(event.get("watched_at")) or captured_at,
         "captured_at": captured_at,
         "ids": _compact_dict(event.get("ids")),
@@ -275,6 +288,18 @@ def add_event(event: Mapping[str, Any], *, limit: int = DEFAULT_LIMIT) -> dict[s
         cap = max(1, int(limit or DEFAULT_LIMIT))
         sqlite_activity.save_event(_activity_base_path(), item, limit=cap)
     return item
+
+
+def _account_identifiers(ev: Any) -> tuple[str, str]:
+    """Plex hides accountID/accountUUID in the raw notification, not on the
+    event. Persist them so an id:/uuid: allowlist can be matched against a
+    stored row later; other providers yield ("", "") and stay name-only."""
+    try:
+        from providers.scrobble.scrobble import account_identifiers
+
+        return account_identifiers(getattr(ev, "raw", None))
+    except Exception:
+        return "", ""
 
 
 def record_scrobble_event(
@@ -316,6 +341,7 @@ def record_scrobble_event(
             "episode": getattr(ev, "number", None),
             "progress": progress if progress is not None else getattr(ev, "progress", None),
             "account": getattr(ev, "account", None),
+            **dict(zip(("account_id", "account_uuid"), _account_identifiers(ev))),
             "watched_at": captured_at or _now(),
             "captured_at": captured_at or _now(),
             "ids": getattr(ev, "ids", None) or {},

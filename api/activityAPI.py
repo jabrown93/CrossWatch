@@ -49,14 +49,16 @@ def _matches_user_profile(
     # Activity rows carry the media-server account the event belongs to, so an
     # instance-level match alone would show one profile another profile's user.
     # Gate on the source pair, which is the side "account" describes.
-    # name_only: the activity table stores the account name and nothing else
-    # (cw_platform/local_db/activity.py), so id:/uuid: allowlist entries are not
-    # evaluatable here and must not be treated as a failed match.
+    # name_only is a fallback for rows recorded before account_id/account_uuid
+    # were persisted: those cannot satisfy an id:/uuid: entry, so such an
+    # allowlist denies rather than matching every row by accident.
     return media_account_scope_allows(
         account_filter,
         item.get("source") or item.get("provider"),
         item.get("source_instance") or item.get("provider_instance") or item.get("instance"),
         account=item.get("account") or item.get("username") or item.get("user") or "",
+        account_id=item.get("account_id") or item.get("user_id") or "",
+        account_uuid=item.get("account_uuid") or item.get("user_uuid") or "",
         name_only=True,
     )
 
