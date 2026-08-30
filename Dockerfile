@@ -13,24 +13,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Toolchain + libs as a fallback for any dependency that lacks a
-# musllinux wheel (cryptography, pydantic-core, etc. normally ship them).
 # tzdata/ca-certificates are harvested for the shell-less runtime stage.
+# Runtime dependencies must have wheels; allowing source builds would fetch
+# unhashed build dependencies outside requirements.txt.
 RUN apk add --no-cache \
-      build-base \
-      libffi-dev \
-      openssl-dev \
-      cargo \
-      rust \
       ca-certificates \
       tzdata
 
-# Install Python deps into an isolated venv we can copy wholesale.
+# Install the hash-locked production graph into an isolated venv we can copy.
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m venv /opt/venv \
- && /opt/venv/bin/python -m pip install --upgrade pip setuptools wheel \
- && /opt/venv/bin/pip install -r /tmp/requirements.txt
+ && /opt/venv/bin/pip install \
+      --only-binary=:all: \
+      --require-hashes \
+      -r /tmp/requirements.txt
 
 # Empty skeleton used to materialize /config in the runtime stage with
 # nonroot ownership (the runtime stage has no shell to chown).
