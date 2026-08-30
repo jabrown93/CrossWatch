@@ -157,6 +157,33 @@ def assert_public_https_url(url: str, field_name: str = "url") -> None:
         raise ValueError(f"{field_name}: hostname ({host}) resolves to a non-public address")
 
 
+def _assert_peer_is_public(resp: Any, field_name: str) -> None:
+    """Check the address actually connected to, not the one we resolved earlier.
+
+    assert_public_https_url resolves the hostname, then requests resolves it
+    again when opening the socket. An attacker serving a short-TTL record can
+    answer public the first time and loopback/RFC1918 the second (DNS
+    rebinding), so validation alone proves nothing about the live connection.
+    Reads the peer off the open socket and refuses if it is not public. Requires
+    stream=True, which is the only mode this runs under; an unavailable peer is
+    refused rather than assumed good.
+    """
+    raw = getattr(resp, "raw", None)
+    conn = getattr(raw, "connection", None) or getattr(raw, "_connection", None)
+    sock = getattr(conn, "sock", None)
+    peer = None
+    if sock is not None:
+        try:
+            peer = sock.getpeername()
+        except OSError:
+            peer = None
+    addr = str(peer[0]) if peer else ""
+    if not addr or not _is_public_ip(addr):
+        raise ValueError(
+            f"{field_name}: connected to a non-public address ({addr or 'peer unavailable'})"
+        )
+
+
 def _redirect_stays_on_host(current: str, target: str) -> bool:
     """True if *target* is the same host as *current* and doesn't downgrade
     https to http.
@@ -260,6 +287,12 @@ def guarded_request(
         if require_public:
             assert_public_https_url(current_url, field_name)
         resp = requests.request(current_method, current_url, allow_redirects=False, **body_kwargs)
+        if require_public:
+            try:
+                _assert_peer_is_public(resp, field_name)
+            except ValueError:
+                resp.close()
+                raise
         if not resp.is_redirect:
             return resp
         location = resp.headers.get("Location")

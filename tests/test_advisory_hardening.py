@@ -514,3 +514,68 @@ def test_config_save_rejects_short_api_key_using_the_shared_floor(monkeypatch) -
         cfg_api.api_config_save(_stub_request(), {"security": {"api_key": short}})
     assert exc.value.status_code == 400
     assert not saved
+
+
+class _Peer:
+    """requests.Response stand-in exposing a peer address, as urllib3 does."""
+
+    def __init__(self, ip: str) -> None:
+        sock = SimpleNamespace(getpeername=lambda: (ip, 443))
+        self.raw = SimpleNamespace(connection=SimpleNamespace(sock=sock))
+        self.status_code = 200
+        self.is_redirect = False
+        self.headers: dict[str, str] = {}
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_dns_rebinding_is_caught_at_the_socket(monkeypatch) -> None:
+    """DNS answers public during validation, then loopback when the socket is
+    opened. Only the connected peer proves where the bytes came from."""
+    import requests
+
+    from cw_platform.url_validation import guarded_request
+
+    _fake_dns(monkeypatch, {"rebind.example.com": "93.184.216.34"})
+    rebound = _Peer("127.0.0.1")
+    monkeypatch.setattr(requests, "request", lambda *_a, **_k: rebound)
+
+    with pytest.raises(ValueError, match="non-public address"):
+        guarded_request(
+            "GET", "https://rebind.example.com/pic", field_name="avatar_url",
+            allow_cross_host=True, require_public=True, stream=True,
+        )
+    assert rebound.closed is True, "refused response must not leak its socket"
+
+
+def test_public_peer_is_accepted(monkeypatch) -> None:
+    import requests
+
+    from cw_platform.url_validation import guarded_request
+
+    _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
+    good = _Peer("93.184.216.34")
+    monkeypatch.setattr(requests, "request", lambda *_a, **_k: good)
+    assert guarded_request(
+        "GET", "https://cdn.example.com/pic", field_name="avatar_url",
+        allow_cross_host=True, require_public=True, stream=True,
+    ) is good
+
+
+def test_missing_peer_fails_closed(monkeypatch) -> None:
+    """No socket to inspect means no proof; refuse rather than assume good."""
+    import requests
+
+    from cw_platform.url_validation import guarded_request
+
+    _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
+    blind = _Peer("93.184.216.34")
+    blind.raw = SimpleNamespace(connection=None)
+    monkeypatch.setattr(requests, "request", lambda *_a, **_k: blind)
+    with pytest.raises(ValueError, match="peer unavailable"):
+        guarded_request(
+            "GET", "https://cdn.example.com/pic", field_name="avatar_url",
+            allow_cross_host=True, require_public=True, stream=True,
+        )
