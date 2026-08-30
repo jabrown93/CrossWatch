@@ -356,14 +356,15 @@ class TestCrossHostRedirects:
 # --- Codex PR #116 second-pass follow-ups -------------------------------------
 
 
-def test_activity_id_form_allowlist_does_not_blank_the_feed() -> None:
+def test_activity_id_only_allowlist_denies_rather_than_falls_open() -> None:
     """The activity table stores only an account name, so an id:/uuid: entry can
-    never match. Treating that as a failed match hid every row from profiles
-    using the supported `id:<value>` syntax."""
+    never be evaluated. A profile that scoped an instance purely by identifier
+    gets nothing rather than everyone -- falling open would leak exactly what
+    GHSA-c24r is about. The feed stays empty until identifiers are persisted."""
     from api.activityAPI import _matches_user_profile
 
-    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["id:42"]}}) is True
-    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["uuid:abc"]}}) is True
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["id:42"]}}) is False
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["uuid:abc"]}}) is False
 
 
 def test_activity_name_entries_still_filter_alongside_id_entries() -> None:

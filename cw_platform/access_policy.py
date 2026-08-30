@@ -295,7 +295,8 @@ def media_account_scope_allows(
     which is what distinguishes it from an instance the profile never scoped.
 
     name_only is for callers whose rows store an account name and nothing else.
-    See the comment below for why those callers cannot enforce id:/uuid: entries.
+    Such a caller cannot evaluate id:/uuid: entries, and an allowlist made only
+    of those denies rather than falls open — see the comment below.
     """
     from .account_match import media_account_allowed
 
@@ -312,16 +313,19 @@ def media_account_scope_allows(
         return not explicit_account_scope
     if name_only:
         # An allowlist may use the id:<v> / uuid:<v> forms, but a caller holding
-        # only an account name can never satisfy those, so keeping them would
-        # reject every row instead of filtering it. Drop them and match on the
-        # name entries. If that leaves nothing, the restriction is unenforceable
-        # against what this surface stores, so defer to the instance decision
-        # that already passed rather than blanking the surface entirely.
-        # ponytail: enforcing id:/uuid: here needs the identifiers persisted on
-        # the row; ScrobbleEvent carries only `account` and drops them today.
+        # only an account name can never satisfy those. Drop them so the name
+        # entries alongside them still filter normally.
+        #
+        # If that leaves nothing, the profile restricted this instance purely by
+        # identifier and the row cannot be attributed, so deny. Failing open here
+        # would show every account's rows to a profile that asked to see one,
+        # which is the exact boundary this function exists to hold.
+        # ponytail: the surface stays empty for an id:-only profile until the
+        # identifiers are persisted on the row; ScrobbleEvent carries `account`
+        # alone and drops accountID/accountUUID after the route filter.
         allow = [e for e in allow if not str(e or "").strip().lower().startswith(("id:", "uuid:"))]
         if not allow:
-            return True
+            return False
     return media_account_allowed(allow, account, account_id=account_id, account_uuid=account_uuid)
 
 
