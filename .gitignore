@@ -124,3 +124,6 @@ pytest-cache-files-*/
 # build-time version stamp (written by Dockerfile)
 VERSION
 .pi/
+
+# Architecture review reports cite unpatched vulnerability locations; public repo
+ARCHITECTURE-REVIEW*.md
