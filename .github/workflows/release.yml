@@ -20,7 +20,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Publishing is gated on a human approving the `release` environment. The gate
+  # is a separate job because `environment:` is not an allowed key on a job that
+  # calls a reusable workflow with `uses:`, and the build/push/sign steps live
+  # in jabrown93/ci, not here, so this is the only point in this repo that can
+  # hold them. It runs ahead of semantic-release rather than just before image
+  # push: a denied or expired approval then leaves no tag and no GitHub Release,
+  # instead of stranding a tagged-but-imageless one.
+  #
+  # Fires on every trigger, including the Monday dependency roll-up.
+  approval:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - run: echo "Release approved."
+
   release:
+    needs: approval
     uses: jabrown93/ci/.github/workflows/docker-release.yml@961ef8052b3fe4906b0245c190639af19ed2073b # workflows-v2.1.0
     permissions:
       contents: write
