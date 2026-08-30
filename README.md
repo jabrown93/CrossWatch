@@ -102,7 +102,7 @@ And much, much more...such as:
 *   **Docker:**
 
     ```bash
-    docker pull ghcr.io/cenodude/crosswatch:latest
+    docker pull ghcr.io/jabrown93/crosswatch:latest
     ```
 
 ### Run as Container
@@ -114,7 +114,7 @@ docker run -d \
   -v crosswatch_config:/config \
   -e TZ=Europe/Amsterdam \
   --restart unless-stopped \
-  ghcr.io/cenodude/crosswatch:latest
+  ghcr.io/jabrown93/crosswatch:latest
 ```
 
 or
@@ -122,7 +122,7 @@ or
 ```bash
 services:
   crosswatch:
-    image: ghcr.io/cenodude/crosswatch:latest
+    image: ghcr.io/jabrown93/crosswatch:latest
     container_name: crosswatch
     ports:
       - "8787:8787"
