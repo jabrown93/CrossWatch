@@ -275,6 +275,25 @@ def test_avatar_response_is_closed_when_image_is_oversized(monkeypatch) -> None:
     assert stub.closed is True
 
 
+def test_api_key_success_clears_the_failure_record() -> None:
+    """Mirrors the password success path: a working client's occasional typo
+    must not accumulate toward a lockout, and must not spill onto login."""
+    from api import appAuthAPI as auth
+
+    ip = "10.99.0.9"
+    cfg = {"security": {"api_key": "k" * 40}}
+    saved = dict(auth._LOGIN_FAILS)
+    try:
+        auth._LOGIN_FAILS.pop(ip, None)
+        assert auth.api_key_authenticated(cfg, _request({"x-api-key": "wrong"}, client_ip=ip)) is False
+        assert ip in auth._LOGIN_FAILS
+        assert auth.api_key_authenticated(cfg, _request({"x-api-key": "k" * 40}, client_ip=ip)) is True
+        assert ip not in auth._LOGIN_FAILS
+    finally:
+        auth._LOGIN_FAILS.clear()
+        auth._LOGIN_FAILS.update(saved)
+
+
 class TestCrossHostRedirects:
     """allow_cross_host lifts the same-host rule for credential-free fetches
     (avatar CDNs) without lifting per-hop SSRF validation."""

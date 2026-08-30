@@ -973,6 +973,10 @@ def api_key_authenticated(cfg: dict[str, Any], request: Request) -> bool:
     if not allowed:
         return False
     if hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8")):
+        # Clear the record like the password success path does, so occasional
+        # typos from a working client never accumulate into a lockout, and a
+        # stale count cannot spill onto password login through the shared bucket.
+        _rate_limit_reset(request)
         return True
     _rate_limit_fail(request)
     return False
