@@ -385,3 +385,33 @@ def test_scrobble_still_enforces_id_form_allowlists() -> None:
     miss = {"source": "plex", "provider_instance": "default", "account": "bob", "account_id": "7"}
     assert _currently_watching_matches_user(match, allowlist) is True
     assert _currently_watching_matches_user(miss, allowlist) is False
+
+
+def test_intermediate_redirect_responses_are_closed(monkeypatch) -> None:
+    """stream=True hops hold their connection; guarded_request discards each
+    redirect response while walking the chain, so it has to close them."""
+    import requests
+
+    from cw_platform.url_validation import guarded_request
+
+    made: list[_ClosableStub] = []
+
+    class _Hop(_ClosableStub):
+        def __init__(self, status: int, location: str | None) -> None:
+            super().__init__()
+            self.status_code = status
+            self.is_redirect = location is not None
+            if location:
+                self.headers = {"Location": location}
+
+    def fake_request(_method, url, **_kw):
+        hop = _Hop(302, "https://b.example.com/x") if "a.example.com" in url else _Hop(200, None)
+        made.append(hop)
+        return hop
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    final = guarded_request("GET", "https://a.example.com/x", field_name="test", allow_cross_host=True, stream=True)
+
+    assert len(made) == 2
+    assert made[0].closed is True, "redirect hop leaked its connection"
+    assert final is made[1] and made[1].closed is False, "final response must stay open for the caller"

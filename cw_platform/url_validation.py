@@ -219,6 +219,9 @@ def guarded_request(
         if not location:
             return resp
         next_url = urljoin(current_url, location)
+        # A stream=True hop holds its connection until read or closed, and this
+        # response is discarded either way from here on.
+        resp.close()
         if not _redirect_stays_on_host(current_url, next_url):
             if not allow_cross_host:
                 raise ValueError(
