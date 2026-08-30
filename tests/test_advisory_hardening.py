@@ -203,3 +203,22 @@ def test_guarded_request_is_what_blocks_the_hop() -> None:
         guarded_request("GET", "https://169.254.169.254/latest/meta-data/", field_name="avatar_url", timeout=1)
 
 
+# --- GHSA-8w95-pmpp-pff2: OIDC group allowlist semantics ----------------------
+
+
+def test_empty_oidc_allowlist_permits_every_authenticated_account() -> None:
+    """Pins the behaviour the README used to describe backwards. If this ever
+    becomes fail-closed, the README table must change in the same commit."""
+    from services.authOidc import group_allowed
+
+    assert group_allowed({}, {"groups": []}) is True
+    assert group_allowed({"allowed_groups": []}, {"groups": ["anything"]}) is True
+
+
+def test_populated_oidc_allowlist_still_restricts() -> None:
+    from services.authOidc import group_allowed
+
+    oidc = {"allowed_groups": ["crosswatch-admins"]}
+    assert group_allowed(oidc, {"groups": ["crosswatch-admins"]}) is True
+    assert group_allowed(oidc, {"groups": ["someone-else"]}) is False
+    assert group_allowed(oidc, {"groups": []}) is False
