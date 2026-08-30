@@ -1,3 +1,10 @@
+## [1.3.12](https://github.com/jabrown93/CrossWatch/compare/v1.3.11...v1.3.12) (2026-08-30)
+
+
+### Bug Fixes
+
+* verify OIDC id tokens with authlib instead of hand-rolled JOSE ([#120](https://github.com/jabrown93/CrossWatch/issues/120)) ([d92f5a0](https://github.com/jabrown93/CrossWatch/commit/d92f5a0da50ce2f9d8c4b6ef6327b82db65e0de6)), closes [#114](https://github.com/jabrown93/CrossWatch/issues/114)
+
 ## [1.3.11](https://github.com/jabrown93/CrossWatch/compare/v1.3.10...v1.3.11) (2026-08-30)
 
 
