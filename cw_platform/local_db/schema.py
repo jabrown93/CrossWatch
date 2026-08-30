@@ -456,6 +456,8 @@ CREATE TABLE IF NOT EXISTS activity_events (
     episode          INTEGER,
     progress         INTEGER,
     account          TEXT,
+    account_id       TEXT,
+    account_uuid     TEXT,
     watched_at       INTEGER,
     captured_at      INTEGER,
     updated_at       INTEGER NOT NULL
@@ -597,6 +599,29 @@ _INDEXES = (
 )
 
 
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """Idempotent ALTER for columns added after a database was first created.
+
+    Every CREATE here is IF NOT EXISTS, so an existing database never picks up a
+    new column on its own. SQLite has no ADD COLUMN IF NOT EXISTS, so compare
+    against PRAGMA table_info and add what is missing. Safe to run on every
+    connect, which is when apply_schema() runs.
+    """
+    have = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name in have:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        except sqlite3.OperationalError as e:
+            # Connections are per thread and apply_schema() runs on each one, so
+            # two threads can both read the column as absent before either ALTER
+            # lands. The loser would otherwise fail the whole connect, and
+            # get_conn() turns that into None and drops the caller's write.
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+
 def apply_schema(conn: sqlite3.Connection) -> int:
     with conn:
         conn.execute(_CREATE_SCHEMA_MIGRATIONS)
@@ -634,6 +659,7 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute(_CREATE_SYNC_RUN_PROVIDER_COUNTS)
         conn.execute(_CREATE_SYNC_RUN_FEATURE_LANES)
         conn.execute(_CREATE_SYNC_RUN_SPOTLIGHT_ITEMS)
+        _add_missing_columns(conn, "activity_events", {"account_id": "TEXT", "account_uuid": "TEXT"})
         for stmt in _INDEXES:
             conn.execute(stmt)
         conn.execute(

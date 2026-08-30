@@ -294,9 +294,10 @@ def media_account_scope_allows(
     same way. An instance the profile scopes but with no usable allowlist denies,
     which is what distinguishes it from an instance the profile never scoped.
 
-    name_only is for callers whose rows store an account name and nothing else.
-    Such a caller cannot evaluate id:/uuid: entries, and an allowlist made only
-    of those denies rather than falls open — see the comment below.
+    name_only is for callers whose rows may store an account name and nothing
+    else. It only takes effect when the row actually lacks identifiers: a row
+    carrying account_id/account_uuid is matched in full. An allowlist made only
+    of id:/uuid: entries denies rather than falls open — see the comment below.
     """
     from .account_match import media_account_allowed
 
@@ -311,7 +312,7 @@ def media_account_scope_allows(
             allow = by_provider.get(inst) or []
     if not allow:
         return not explicit_account_scope
-    if name_only:
+    if name_only and not (str(account_id or "").strip() or str(account_uuid or "").strip()):
         # An allowlist may use the id:<v> / uuid:<v> forms, but a caller holding
         # only an account name can never satisfy those. Drop them so the name
         # entries alongside them still filter normally.

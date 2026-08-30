@@ -145,6 +145,74 @@ def _progress(state: str, view_offset: int, duration: int) -> tuple[float, Scrob
     return pct, act
 
 
+def _pssn_score(d: dict[str, Any]) -> int:
+    """Rank PlaySessionStateNotification entries by how complete they look.
+
+    A payload can carry several; the event is built from the best one, so
+    anything else reading that payload has to agree on which entry that is or it
+    will mix one session's media with another session's account.
+    """
+    s = 0
+    if d.get("sessionKey") is not None:
+        s += 5
+    if d.get("ratingKey") is not None:
+        s += 4
+    if d.get("guid"):
+        s += 3
+    if d.get("state"):
+        s += 2
+    if d.get("viewOffset") is not None or d.get("view_offset") is not None:
+        s += 2
+    if d.get("duration") is not None:
+        s += 1
+    return s
+
+
+def account_identifiers(raw: Any) -> tuple[str, str]:
+    """Return (account_id, account_uuid) from a raw Plex notification payload.
+
+    The identifiers live in the PlaySessionStateNotification block rather than on
+    the event itself. Anything that needs to match an id:/uuid: allowlist entry
+    has to dig them out of ev.raw, so the digging lives here instead of being
+    re-inlined per caller. Other providers do not carry them; ("", "") means
+    name-only matching.
+    """
+
+    def find_psn(o: Any) -> list[dict[str, Any]] | None:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(k, str) and k.lower() == "playsessionstatenotification":
+                    return v if isinstance(v, list) else [v]
+            for v in o.values():
+                r = find_psn(v)
+                if r:
+                    return r
+        elif isinstance(o, list):
+            for v in o:
+                r = find_psn(v)
+                if r:
+                    return r
+        return None
+
+    found = find_psn(raw or {}) or []
+    n = max(found, key=_pssn_score) if found else {}
+    acc_id = str(n.get("accountID") or "").strip()
+    acc_uuid = str(n.get("accountUUID") or "").strip().lower()
+    if isinstance(raw, dict) and not (acc_id and acc_uuid):
+        # Webhooks carry the same identifiers under a flat Account block instead
+        # of a PlaySessionStateNotification (providers/webhooks/plex.py), and the
+        # watcher stamps that block too. Each field falls back independently: a
+        # PSSN can supply the id while only Account knows the uuid, and an
+        # all-or-nothing check would drop the half that is available.
+        account = raw.get("Account")
+        if isinstance(account, dict):
+            if not acc_id:
+                acc_id = str(account.get("id") or "").strip()
+            if not acc_uuid:
+                acc_uuid = str(account.get("uuid") or "").strip().lower()
+    return acc_id, acc_uuid
+
+
 def _event_from_meta(meta: dict[str, Any], raw: dict[str, Any]) -> ScrobbleEvent:
     ids = _ids_from_meta(meta)
     pct, act = _progress(meta.get("state", ""), meta.get("viewOffset", 0) or 0, meta.get("duration", 0) or 0)
@@ -224,23 +292,7 @@ def from_plex_pssn(payload: dict[str, Any], defaults: dict[str, Any] | None = No
     if not items:
         return None
 
-    def score(d: dict[str, Any]) -> int:
-        s = 0
-        if d.get("sessionKey") is not None:
-            s += 5
-        if d.get("ratingKey") is not None:
-            s += 4
-        if d.get("guid"):
-            s += 3
-        if d.get("state"):
-            s += 2
-        if d.get("viewOffset") is not None or d.get("view_offset") is not None:
-            s += 2
-        if d.get("duration") is not None:
-            s += 1
-        return s
-
-    n = max(items, key=score)
+    n = max(items, key=_pssn_score)
     meta = {
         "guid": n.get("guid"),
         "grandparentGuid": n.get("grandparentGuid"),
@@ -412,25 +464,7 @@ class Dispatcher:
                         return uid
             return ""
 
-        def find_psn(o: Any) -> list[dict[str, Any]] | None:
-            if isinstance(o, dict):
-                for k, v in o.items():
-                    if isinstance(k, str) and k.lower() == "playsessionstatenotification":
-                        return v if isinstance(v, list) else [v]
-                for v in o.values():
-                    r = find_psn(v)
-                    if r:
-                        return r
-            elif isinstance(o, list):
-                for v in o:
-                    r = find_psn(v)
-                    if r:
-                        return r
-            return None
-
-        n = (find_psn(ev.raw or {}) or [None])[0] or {}
-        acc_id = str(n.get("accountID") or "")
-        acc_uuid = str(n.get("accountUUID") or "").lower()
+        acc_id, acc_uuid = account_identifiers(ev.raw)
         user_id = find_user_id(ev.raw or {})
 
         def _allow() -> bool:
