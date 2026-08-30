@@ -188,19 +188,24 @@ def _avatar_response(raw: dict[str, Any]) -> Response:
                 # fetch onto a metadata or link-local address.
                 from cw_platform.url_validation import guarded_request
 
-                res = guarded_request(
+                # allow_cross_host: avatar services legitimately redirect to a
+                # CDN, and this fetch carries no credentials. Every hop is still
+                # validated, so the redirect cannot reach a metadata address.
+                # stream=True means the response must be closed on every path.
+                with guarded_request(
                     "GET",
                     linked_url,
                     field_name="avatar_url",
                     headers={"User-Agent": "CrossWatch/0.11"},
                     timeout=8,
                     stream=True,
-                )
-                content_type = str(res.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                if content_type in AVATAR_TYPES:
-                    data = res.raw.read(MAX_AVATAR_BYTES + 1, decode_content=True)
-                    if len(data) <= MAX_AVATAR_BYTES:
-                        return Response(content=data, media_type=content_type, headers={"Cache-Control": "private, max-age=300"})
+                    allow_cross_host=True,
+                ) as res:
+                    content_type = str(res.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                    if content_type in AVATAR_TYPES:
+                        data = res.raw.read(MAX_AVATAR_BYTES + 1, decode_content=True)
+                        if len(data) <= MAX_AVATAR_BYTES:
+                            return Response(content=data, media_type=content_type, headers={"Cache-Control": "private, max-age=300"})
             except Exception:
                 pass
         return Response(content=DEFAULT_AVATAR_SVG, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import responses
 from fastapi import HTTPException
 from starlette.requests import Request
 
@@ -222,3 +223,112 @@ def test_populated_oidc_allowlist_still_restricts() -> None:
     assert group_allowed(oidc, {"groups": ["crosswatch-admins"]}) is True
     assert group_allowed(oidc, {"groups": ["someone-else"]}) is False
     assert group_allowed(oidc, {"groups": []}) is False
+
+
+# --- Codex PR #116 review follow-ups ------------------------------------------
+
+
+class _ClosableStub:
+    """Minimal requests.Response stand-in that records close()."""
+
+    def __init__(self, content_type: str = "image/png", body: bytes = b"x") -> None:
+        self.headers = {"Content-Type": content_type}
+        self.closed = False
+        self._body = body
+        self.raw = SimpleNamespace(read=lambda *_a, **_k: self._body)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_avatar_response_is_closed_on_unsupported_content_type(monkeypatch) -> None:
+    """stream=True holds a socket; an unusable content type must still release it."""
+    from api import profileAPI
+
+    stub = _ClosableStub(content_type="text/html")
+    monkeypatch.setattr(
+        "cw_platform.url_validation.guarded_request", lambda *_a, **_k: stub
+    )
+    resp = profileAPI._avatar_response(
+        {"oidc_identity": {"picture": "https://cdn.example.com/a.png", "linked_at": 1}}
+    )
+    assert stub.closed is True
+    assert resp.media_type == "image/svg+xml"
+
+
+def test_avatar_response_is_closed_when_image_is_oversized(monkeypatch) -> None:
+    from api import profileAPI
+
+    stub = _ClosableStub(body=b"x" * (profileAPI.MAX_AVATAR_BYTES + 1))
+    monkeypatch.setattr(
+        "cw_platform.url_validation.guarded_request", lambda *_a, **_k: stub
+    )
+    profileAPI._avatar_response(
+        {"oidc_identity": {"picture": "https://cdn.example.com/a.png", "linked_at": 1}}
+    )
+    assert stub.closed is True
+
+
+class TestCrossHostRedirects:
+    """allow_cross_host lifts the same-host rule for credential-free fetches
+    (avatar CDNs) without lifting per-hop SSRF validation."""
+
+    @responses.activate
+    def test_cross_host_redirect_is_followed_when_allowed(self) -> None:
+        from cw_platform.url_validation import guarded_request
+
+        responses.add(
+            responses.GET, "https://idp.example.com/pic",
+            status=302, headers={"Location": "https://cdn.example.com/pic.png"},
+        )
+        responses.add(responses.GET, "https://cdn.example.com/pic.png", body=b"img", status=200)
+        r = guarded_request("GET", "https://idp.example.com/pic", field_name="avatar_url", allow_cross_host=True)
+        assert r.status_code == 200
+
+    @responses.activate
+    def test_cross_host_redirect_still_blocks_a_metadata_target(self) -> None:
+        from cw_platform.url_validation import guarded_request
+
+        responses.add(
+            responses.GET, "https://idp.example.com/pic",
+            status=302, headers={"Location": "http://169.254.169.254/latest/meta-data/"},
+        )
+        with pytest.raises(ValueError):
+            guarded_request("GET", "https://idp.example.com/pic", field_name="avatar_url", allow_cross_host=True)
+
+    @responses.activate
+    def test_cross_host_hop_drops_credentials(self) -> None:
+        """Opting into cross-host must not walk an Authorization header or
+        query-string token to the new host."""
+        from cw_platform.url_validation import guarded_request
+
+        responses.add(
+            responses.GET, "https://idp.example.com/pic",
+            status=302, headers={"Location": "https://cdn.example.com/pic.png"},
+        )
+        responses.add(responses.GET, "https://cdn.example.com/pic.png", body=b"img", status=200)
+        guarded_request(
+            "GET", "https://idp.example.com/pic", field_name="avatar_url", allow_cross_host=True,
+            headers={"Authorization": "Bearer secret", "User-Agent": "CrossWatch"},
+            params={"apikey": "secret"},
+        )
+        second = responses.calls[1].request
+        assert "authorization" not in {k.lower() for k in second.headers}
+        assert "apikey" not in (second.url.split("?", 1)[1] if "?" in second.url else "")
+
+    @responses.activate
+    def test_default_still_refuses_cross_host(self) -> None:
+        from cw_platform.url_validation import guarded_request
+
+        responses.add(
+            responses.GET, "https://media.example.com/x",
+            status=302, headers={"Location": "https://other.example.com/x"},
+        )
+        with pytest.raises(ValueError, match="off the configured host"):
+            guarded_request("GET", "https://media.example.com/x", field_name="test")

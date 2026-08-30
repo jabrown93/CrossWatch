@@ -161,7 +161,31 @@ def _rebuild_redirect(method: str, kwargs: dict[str, Any], status: int) -> tuple
     return method, kwargs
 
 
-def guarded_request(method: str, url: str, *, field_name: str = "server_url", max_redirects: int = 5, **kwargs: Any):
+# Anything that could authenticate the caller to the *new* host. Dropped before
+# an allow_cross_host hop so a redirect cannot walk credentials somewhere else.
+_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "cookie", "x-plex-token", "x-emby-token", "x-mediabrowser-token", "x-api-key"}
+)
+
+
+def _strip_credentials(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop credential-bearing kwargs/headers before leaving the current host."""
+    out = {k: v for k, v in kwargs.items() if k not in ("params", "auth")}
+    headers = out.get("headers")
+    if isinstance(headers, dict):
+        out["headers"] = {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADERS}
+    return out
+
+
+def guarded_request(
+    method: str,
+    url: str,
+    *,
+    field_name: str = "server_url",
+    max_redirects: int = 5,
+    allow_cross_host: bool = False,
+    **kwargs: Any,
+):
     """requests.request() wrapper that re-validates the target host on every
     redirect hop, not just the initial URL.
 
@@ -173,6 +197,12 @@ def guarded_request(method: str, url: str, *, field_name: str = "server_url", ma
     validates + follows each hop manually, raising ValueError (like
     assert_server_url_safe) if any hop is unsafe, leaves the configured host
     (see _redirect_stays_on_host), or the chain is too long.
+
+    allow_cross_host is for fetches that carry no credentials and legitimately
+    redirect off-host, such as an avatar image served from a CDN. Every hop is
+    still validated by assert_server_url_safe; only the same-host requirement
+    is lifted, and credentials are stripped before the hop regardless. Leave it
+    False for anything that authenticates to the configured server.
     """
     import requests
 
@@ -190,11 +220,13 @@ def guarded_request(method: str, url: str, *, field_name: str = "server_url", ma
             return resp
         next_url = urljoin(current_url, location)
         if not _redirect_stays_on_host(current_url, next_url):
-            raise ValueError(
-                f"{field_name}: refusing to follow a redirect off the configured host "
-                f"({urlparse(current_url).hostname} -> {urlparse(next_url).hostname or location}) "
-                "— this request carries credentials"
-            )
+            if not allow_cross_host:
+                raise ValueError(
+                    f"{field_name}: refusing to follow a redirect off the configured host "
+                    f"({urlparse(current_url).hostname} -> {urlparse(next_url).hostname or location}) "
+                    "— this request carries credentials"
+                )
+            body_kwargs = _strip_credentials(body_kwargs)
         current_method, body_kwargs = _rebuild_redirect(current_method, body_kwargs, resp.status_code)
         current_url = next_url
     raise ValueError(f"{field_name}: exceeded {max_redirects} redirects while validating target host")
