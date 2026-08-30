@@ -22,11 +22,8 @@
   <a href="https://github.com/cenodude/CrossWatch/releases/latest">
     <img src="https://img.shields.io/github/v/release/cenodude/CrossWatch?display_name=release&amp;sort=semver&amp;logo=github&amp;label=Latest%20Release&amp;style=for-the-badge" alt="Latest Release">
   </a>
-  <a href="https://hub.docker.com/r/cenodude/crosswatch">
-    <img src="https://img.shields.io/docker/pulls/cenodude/crosswatch?style=for-the-badge&amp;logo=docker&amp;label=Docker%20Pulls" alt="Docker Pulls">
-  </a>
-  <a href="https://github.com/cenodude/CrossWatch/pkgs/container/crosswatch">
-    <img src="https://img.shields.io/badge/dynamic/json?url=https://ghcr-badge.elias.eu.org/api/cenodude/CrossWatch/crosswatch&amp;query=%24.downloadCount&amp;style=for-the-badge&amp;logo=github&amp;label=GHCR%20Pulls" alt="GHCR Pulls">
+  <a href="https://github.com/jabrown93/CrossWatch/pkgs/container/crosswatch">
+    <img src="https://img.shields.io/badge/dynamic/json?url=https://ghcr-badge.elias.eu.org/api/jabrown93/CrossWatch/crosswatch&amp;query=%24.downloadCount&amp;style=for-the-badge&amp;logo=github&amp;label=GHCR%20Pulls" alt="GHCR Pulls">
   </a>
   <a href="https://wiki.crosswatch.app/getting-started/first-time-setup">
     <img src="https://img.shields.io/badge/Quick%20Start-Must%20read!-d93c4a?style=for-the-badge&amp;logo=gitbook" alt="Must-read: Quick Start">
@@ -242,7 +239,7 @@
     <p>The web UI is exposed at <code>http://localhost:8787</code>. Keep your config in a Docker volume and update with the latest image when you are ready.</p>
     <div class="cw-actions">
       <a class="cw-button is-primary" href="https://wiki.crosswatch.app/getting-started/installation">Installation guide</a>
-      <a class="cw-button" href="https://hub.docker.com/r/cenodude/crosswatch">Docker Hub</a>
+      <a class="cw-button" href="https://github.com/jabrown93/CrossWatch/pkgs/container/crosswatch">GitHub Container Registry</a>
     </div>
   </div>
   <div class="cw-code-panel">
@@ -252,7 +249,7 @@
   -v crosswatch_config:/config \
   -e TZ=Europe/Amsterdam \
   --restart unless-stopped \
-  ghcr.io/cenodude/crosswatch:latest</code></pre>
+  ghcr.io/jabrown93/crosswatch:latest</code></pre>
   </div>
 </section>
 

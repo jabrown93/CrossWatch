@@ -35,21 +35,11 @@
   <a href="https://github.com/cenodude/CrossWatch/releases/latest">
     <img src="https://img.shields.io/github/v/release/cenodude/CrossWatch?display_name=release&amp;sort=semver&amp;logo=github&amp;label=Latest%20Release&amp;style=for-the-badge" alt="Latest Release">
   </a>
-  <a href="https://github.com/cenodude/CrossWatch/pkgs/container/crosswatch">
-    <img src="https://img.shields.io/badge/dynamic/json?url=https://ghcr-badge.elias.eu.org/api/cenodude/CrossWatch/crosswatch&amp;query=%24.downloadCount&amp;style=for-the-badge&amp;logo=github&amp;label=GHCR%20Pulls" alt="GHCR Pulls">
+  <a href="https://github.com/jabrown93/CrossWatch/pkgs/container/crosswatch">
+    <img src="https://img.shields.io/badge/dynamic/json?url=https://ghcr-badge.elias.eu.org/api/jabrown93/CrossWatch/crosswatch&amp;query=%24.downloadCount&amp;style=for-the-badge&amp;logo=github&amp;label=GHCR%20Pulls" alt="GHCR Pulls">
   </a>
   <a href="https://wiki.crosswatch.app/getting-started/first-time-setup">
     <img src="https://img.shields.io/badge/Quick%20Start-Must%20read!-d93c4a?style=for-the-badge&amp;logo=gitbook" alt="Must-read: Quick Start">
-  </a>
-  <br>
-  <a href="https://hub.docker.com/r/cenodude/crosswatch">
-    <img src="https://img.shields.io/docker/pulls/cenodude/crosswatch?style=for-the-badge&amp;logo=docker&amp;label=Docker%20Pulls" alt="Docker Pulls">
-  </a>
-  <a href="https://hub.docker.com/r/cenodude/crosswatch">
-    <img src="https://img.shields.io/docker/image-size/cenodude/crosswatch/latest?style=for-the-badge&amp;logo=docker&amp;label=Image%20Size" alt="Image Size">
-  </a>
-  <a href="https://hub.docker.com/r/cenodude/crosswatch/tags">
-    <img src="https://img.shields.io/docker/v/cenodude/crosswatch?sort=semver&amp;style=for-the-badge&amp;logo=docker&amp;label=Docker%20Version" alt="Docker Version">
   </a>
 </p>
 <p align="center">
@@ -102,7 +92,7 @@ And much, much more...such as:
 *   **Docker:**
 
     ```bash
-    docker pull ghcr.io/cenodude/crosswatch:latest
+    docker pull ghcr.io/jabrown93/crosswatch:latest
     ```
 
 ### Run as Container
@@ -114,7 +104,7 @@ docker run -d \
   -v crosswatch_config:/config \
   -e TZ=Europe/Amsterdam \
   --restart unless-stopped \
-  ghcr.io/cenodude/crosswatch:latest
+  ghcr.io/jabrown93/crosswatch:latest
 ```
 
 or
@@ -122,7 +112,7 @@ or
 ```bash
 services:
   crosswatch:
-    image: ghcr.io/cenodude/crosswatch:latest
+    image: ghcr.io/jabrown93/crosswatch:latest
     container_name: crosswatch
     ports:
       - "8787:8787"
