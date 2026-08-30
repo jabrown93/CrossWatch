@@ -1,3 +1,10 @@
+## [1.3.11](https://github.com/jabrown93/CrossWatch/compare/v1.3.10...v1.3.11) (2026-08-30)
+
+
+### Bug Fixes
+
+* suspend db connections during backup restore ([#119](https://github.com/jabrown93/CrossWatch/issues/119)) ([b23e43b](https://github.com/jabrown93/CrossWatch/commit/b23e43b46b162d16c8135d1dcdbb2ffb35b7474a)), closes [#109](https://github.com/jabrown93/CrossWatch/issues/109)
+
 ## [1.3.10](https://github.com/jabrown93/CrossWatch/compare/v1.3.9...v1.3.10) (2026-08-30)
 
 
