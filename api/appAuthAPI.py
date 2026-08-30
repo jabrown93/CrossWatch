@@ -53,6 +53,11 @@ MAX_SESSIONS = 10
 MAX_REMEMBER_SESSION_DAYS = 365
 DEFAULT_REMEMBER_ME_DAYS = 60
 MIN_PASSWORD_LENGTH = 8
+# security.api_key is unrestricted admin, so a guessable one is refused outright.
+# Enforced at authentication rather than only at config-save, because the key can
+# also arrive via CW_API_KEY or a hand-edited config.json, neither of which goes
+# through the save path.
+MIN_API_KEY_LENGTH = 32
 FORGOT_HELP_URL = "https://wiki.crosswatch.app/"
 ADMIN_USER_ID = "administrator"
 TOTP_ISSUER = "CrossWatch"
@@ -962,6 +967,9 @@ def api_key_authenticated(cfg: dict[str, Any], request: Request) -> bool:
     want = str((sec or {}).get("api_key") or "").strip() if isinstance(sec, dict) else ""
     if not want:
         return False
+    if len(want) < MIN_API_KEY_LENGTH:
+        _warn_short_api_key_once()
+        return False
     got = str(request.headers.get(API_KEY_HEADER) or "").strip()
     if not got:
         return False
@@ -980,6 +988,22 @@ def api_key_authenticated(cfg: dict[str, Any], request: Request) -> bool:
         return True
     _rate_limit_fail(request)
     return False
+
+
+_SHORT_API_KEY_WARNED = False
+
+
+def _warn_short_api_key_once() -> None:
+    """Say why the key is being ignored; a silent 401 is unreadable in ops."""
+    global _SHORT_API_KEY_WARNED
+    if _SHORT_API_KEY_WARNED:
+        return
+    _SHORT_API_KEY_WARNED = True
+    _LOG.warning(
+        "security.api_key is shorter than %d characters and is being ignored; "
+        "set a longer key (this grants unrestricted admin access)",
+        MIN_API_KEY_LENGTH,
+    )
 
 
 def _rate_limit_ok(request: Request) -> tuple[bool, int]:

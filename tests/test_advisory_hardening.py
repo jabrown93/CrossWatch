@@ -487,3 +487,30 @@ class TestPublicOnlyFetch:
                 "GET", "https://idp.example.com/pic", field_name="avatar_url",
                 allow_cross_host=True, require_public=True,
             )
+
+
+# --- Codex PR #116 fourth-pass follow-ups -------------------------------------
+
+
+def test_env_supplied_short_api_key_is_refused() -> None:
+    """CW_API_KEY is injected straight into security.api_key and never passes
+    through api_config_save(), so the length floor has to hold at the
+    authentication choke point that every source routes through."""
+    from api import appAuthAPI as auth
+
+    assert auth.api_key_authenticated({"security": {"api_key": "test"}}, _request({"x-api-key": "test"})) is False
+    ok = "k" * auth.MIN_API_KEY_LENGTH
+    assert auth.api_key_authenticated({"security": {"api_key": ok}}, _request({"x-api-key": ok})) is True
+
+
+def test_config_save_rejects_short_api_key_using_the_shared_floor(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import configAPI as cfg_api
+
+    saved: dict = {}
+    _stub_env(monkeypatch, cfg_api, lambda: {}, lambda cfg: saved.update(cfg))
+    short = "k" * (auth.MIN_API_KEY_LENGTH - 1)
+    with pytest.raises(HTTPException) as exc:
+        cfg_api.api_config_save(_stub_request(), {"security": {"api_key": short}})
+    assert exc.value.status_code == 400
+    assert not saved

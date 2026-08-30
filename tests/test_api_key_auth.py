@@ -26,16 +26,26 @@ def _request(headers: dict[str, str] | None = None) -> Request:
 def test_api_key_matches() -> None:
     from api import appAuthAPI as auth
 
-    cfg = {"security": {"api_key": "machine-key-123"}}
-    assert auth.api_key_authenticated(cfg, _request({"x-api-key": "machine-key-123"})) is True
+    cfg = {"security": {"api_key": "machine-key-123-padded-to-min-length"}}
+    assert auth.api_key_authenticated(cfg, _request({"x-api-key": "machine-key-123-padded-to-min-length"})) is True
 
 
 def test_api_key_rejects_wrong_or_missing() -> None:
     from api import appAuthAPI as auth
 
-    cfg = {"security": {"api_key": "machine-key-123"}}
+    cfg = {"security": {"api_key": "machine-key-123-padded-to-min-length"}}
     assert auth.api_key_authenticated(cfg, _request({"x-api-key": "nope"})) is False
     assert auth.api_key_authenticated(cfg, _request()) is False
+
+
+def test_api_key_rejected_when_below_min_length() -> None:
+    """security.api_key is unrestricted admin, so a guessable key is ignored
+    outright -- including one injected via CW_API_KEY, which never passes
+    through api_config_save()."""
+    from api import appAuthAPI as auth
+
+    cfg = {"security": {"api_key": "test"}}
+    assert auth.api_key_authenticated(cfg, _request({"x-api-key": "test"})) is False
 
 
 def test_api_key_disabled_when_unset() -> None:
@@ -56,7 +66,7 @@ def test_middleware_accepts_api_key(monkeypatch) -> None:
 
     # Config: auth enabled + credentials + api_key set
     cfg = {
-        "security": {"api_key": "test-key-123"},
+        "security": {"api_key": "test-key-123-padded-to-min-length-ok"},
         "app_auth": {
             "enabled": True,
             "username": "admin",
@@ -82,7 +92,7 @@ def test_middleware_accepts_api_key(monkeypatch) -> None:
     assert resp.status_code == 401, f"Expected 401, got {resp.status_code}: {resp.text}"
 
     # Test 2: no cookie + correct API key → NOT 401 (gate passes)
-    resp = client.get("/api/watchlist", headers={"X-API-Key": "test-key-123"})
+    resp = client.get("/api/watchlist", headers={"X-API-Key": "test-key-123-padded-to-min-length-ok"})
     assert resp.status_code != 401, f"Expected non-401, got {resp.status_code}: {resp.text}"
 
     # Test 3: no cookie + wrong API key → 401 (gate blocks)
