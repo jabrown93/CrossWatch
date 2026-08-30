@@ -278,6 +278,37 @@ def media_account_allowlist_for_profile(cfg: Mapping[str, Any], profile_id: Any)
     return out
 
 
+def media_account_scope_allows(
+    account_filter: Any,
+    provider: Any,
+    instance: Any,
+    *,
+    account: Any = "",
+    account_id: Any = "",
+    account_uuid: Any = "",
+) -> bool:
+    """Apply a profile's per-(provider, instance) media-account allowlist.
+
+    Shared so every surface that shows account-attributed items answers this the
+    same way. An instance the profile scopes but with no usable allowlist denies,
+    which is what distinguishes it from an instance the profile never scoped.
+    """
+    from .account_match import media_account_allowed
+
+    prov = provider_display_key(provider)
+    inst = normalize_instance_id(instance)
+    allow: Any = []
+    explicit_account_scope = False
+    if isinstance(account_filter, Mapping):
+        by_provider = account_filter.get(prov)
+        if isinstance(by_provider, Mapping):
+            explicit_account_scope = inst in by_provider
+            allow = by_provider.get(inst) or []
+    if not allow:
+        return not explicit_account_scope
+    return media_account_allowed(allow, account, account_id=account_id, account_uuid=account_uuid)
+
+
 def decorate_pair_profile(cfg: Mapping[str, Any], pair: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(pair)
     pid = pair_profile_id(pair)

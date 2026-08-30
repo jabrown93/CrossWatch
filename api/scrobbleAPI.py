@@ -15,8 +15,7 @@ from fastapi import APIRouter, Query, Request, HTTPException, Body
 from fastapi.responses import JSONResponse
 from urllib.parse import parse_qs
 
-from cw_platform.account_match import media_account_allowed
-from cw_platform.access_policy import media_account_allowlist_for_profile
+from cw_platform.access_policy import media_account_allowlist_for_profile, media_account_scope_allows
 from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import build_provider_config_view, instances_for_user_profile, list_instance_ids, normalize_instance_id
 from cw_platform.provider_usage import webhook_source_enabled
@@ -1134,18 +1133,11 @@ def _currently_watching_matches_user(item: dict[str, Any], user_filter: dict[str
     allowed = {normalize_instance_id(v) for v in instance_filter.get(provider, [])} if isinstance(instance_filter, dict) else set()
     if not bool(provider and instance in allowed):
         return False
-    allow = []
-    explicit_account_scope = False
-    if isinstance(account_filter, dict):
-        by_provider = account_filter.get(provider)
-        if isinstance(by_provider, dict):
-            explicit_account_scope = instance in by_provider
-            allow = by_provider.get(instance) or []
-    if not allow:
-        return not explicit_account_scope
-    return media_account_allowed(
-        allow,
-        item.get("account") or item.get("username") or item.get("user") or "",
+    return media_account_scope_allows(
+        account_filter,
+        provider,
+        instance,
+        account=item.get("account") or item.get("username") or item.get("user") or "",
         account_id=item.get("account_id") or item.get("user_id") or "",
         account_uuid=item.get("account_uuid") or item.get("user_uuid") or "",
     )

@@ -139,3 +139,47 @@ def test_config_save_does_not_relitigate_an_existing_short_key(monkeypatch) -> N
     assert saved["security"]["api_key"] == "legacy-short"
 
 
+# --- GHSA-c24r-xxq7-rfq3: per-profile media-account visibility -----------------
+
+_ITEM = {"source": "plex", "source_instance": "default", "account": "alice"}
+_INSTANCES = {"PLEX": ["default"]}
+
+
+def test_activity_hides_an_account_the_profile_may_not_see() -> None:
+    from api.activityAPI import _matches_user_profile
+
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["bob"]}}) is False
+
+
+def test_activity_shows_an_allowed_account() -> None:
+    from api.activityAPI import _matches_user_profile
+
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {"PLEX": {"default": ["alice"]}}) is True
+
+
+def test_activity_unscoped_instance_is_unaffected() -> None:
+    """No account allowlist for that instance means the profile never scoped it."""
+    from api.activityAPI import _matches_user_profile
+
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, {}) is True
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, None) is True
+
+
+def test_activity_still_filters_by_instance() -> None:
+    from api.activityAPI import _matches_user_profile
+
+    assert _matches_user_profile(dict(_ITEM), {"PLEX": ["other"]}, {}) is False
+
+
+def test_scrobble_and_activity_agree_on_account_scope() -> None:
+    """The divergence the advisory was about: both surfaces answer via the same
+    helper, so they cannot drift again."""
+    from api.activityAPI import _matches_user_profile
+    from api.scrobbleAPI import _currently_watching_matches_user
+
+    denied = {"PLEX": {"default": ["bob"]}}
+    scrobble_item = {"source": "plex", "provider_instance": "default", "account": "alice"}
+    assert _currently_watching_matches_user(scrobble_item, {"instances": _INSTANCES, "accounts": denied}) is False
+    assert _matches_user_profile(dict(_ITEM), _INSTANCES, denied) is False
+
+

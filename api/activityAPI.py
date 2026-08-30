@@ -8,7 +8,7 @@ from typing import Any, cast
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
-from cw_platform.access_policy import request_user
+from cw_platform.access_policy import media_account_allowlist_for_profile, media_account_scope_allows, request_user
 from cw_platform.config_base import load_config
 from cw_platform.provider_instances import instances_for_user_profile, normalize_instance_id, provider_display_key
 from services.activity import clear_events, list_events
@@ -16,7 +16,11 @@ from services.activity import clear_events, list_events
 router = APIRouter(prefix="/api/activity", tags=["activity"])
 
 
-def _matches_user_profile(item: dict[str, Any], user_filter: dict[str, list[str]]) -> bool:
+def _matches_user_profile(
+    item: dict[str, Any],
+    user_filter: dict[str, list[str]],
+    account_filter: dict[str, dict[str, list[str]]] | None = None,
+) -> bool:
     if not user_filter:
         return True
     wanted = {
@@ -28,29 +32,47 @@ def _matches_user_profile(item: dict[str, Any], user_filter: dict[str, list[str]
         prov = provider_display_key(provider)
         return bool(prov) and normalize_instance_id(instance) in wanted.get(prov, set())
 
-    if hit(item.get("source"), item.get("source_instance")):
-        return True
-    if hit(item.get("provider"), item.get("provider_instance") or item.get("instance")):
-        return True
-    targets = item.get("targets")
-    if isinstance(targets, list):
-        for target in targets:
-            if isinstance(target, dict) and hit(target.get("target") or target.get("provider"), target.get("target_instance") or target.get("instance")):
-                return True
-    return hit(item.get("target"), item.get("target_instance"))
+    matched = hit(item.get("source"), item.get("source_instance"))
+    if not matched:
+        matched = hit(item.get("provider"), item.get("provider_instance") or item.get("instance"))
+    if not matched:
+        targets = item.get("targets")
+        if isinstance(targets, list):
+            for target in targets:
+                if isinstance(target, dict) and hit(target.get("target") or target.get("provider"), target.get("target_instance") or target.get("instance")):
+                    matched = True
+                    break
+    if not matched:
+        matched = hit(item.get("target"), item.get("target_instance"))
+    if not matched:
+        return False
+    # Activity rows carry the media-server account the event belongs to, so an
+    # instance-level match alone would show one profile another profile's user.
+    # Gate on the source pair, which is the side "account" describes.
+    return media_account_scope_allows(
+        account_filter,
+        item.get("source") or item.get("provider"),
+        item.get("source_instance") or item.get("provider_instance") or item.get("instance"),
+        account=item.get("account") or item.get("username") or item.get("user") or "",
+        account_id=item.get("account_id") or item.get("user_id") or "",
+        account_uuid=item.get("account_uuid") or item.get("user_uuid") or "",
+    )
 
 
 def _apply_user_profile(payload: dict[str, Any], user_profile: str) -> dict[str, Any]:
     profile = str(user_profile or "").strip()
     if not profile:
         return payload
+    account_filter: dict[str, dict[str, list[str]]] = {}
     try:
-        user_filter = instances_for_user_profile(load_config() or {}, profile)
+        cfg = load_config() or {}
+        user_filter = instances_for_user_profile(cfg, profile)
+        account_filter = media_account_allowlist_for_profile(cfg, profile)
     except Exception:
         user_filter = {}
     if not user_filter:
         return {**payload, "items": [], "total": 0, "user_profile": profile}
-    items = [item for item in (payload.get("items") or []) if isinstance(item, dict) and _matches_user_profile(item, user_filter)]
+    items = [item for item in (payload.get("items") or []) if isinstance(item, dict) and _matches_user_profile(item, user_filter, account_filter)]
     return {**payload, "items": items, "total": len(items), "user_profile": profile}
 
 
