@@ -965,7 +965,17 @@ def api_key_authenticated(cfg: dict[str, Any], request: Request) -> bool:
     got = str(request.headers.get(API_KEY_HEADER) or "").strip()
     if not got:
         return False
-    return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+    # A correct key is unrestricted admin, so a wrong one has to cost the caller
+    # the same lockout a wrong password does. Shares the per-IP _LOGIN_FAILS
+    # bucket with password login, so a brute-forcer cannot dodge one by
+    # switching to the other. An absent header is not a failed attempt.
+    allowed, _retry_after = _rate_limit_ok(request)
+    if not allowed:
+        return False
+    if hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8")):
+        return True
+    _rate_limit_fail(request)
+    return False
 
 
 def _rate_limit_ok(request: Request) -> tuple[bool, int]:

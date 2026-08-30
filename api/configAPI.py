@@ -673,6 +673,18 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # security.api_key is unrestricted admin, so reject a guessable one at the
+    # point it is set. Only a *changed* key is checked: an unchanged key arrives
+    # masked (restored above) and an env-locked CW_API_KEY is not editable here,
+    # so validating either would wedge every unrelated config save.
+    _new_api_key = str(((cfg.get("security") or {}).get("api_key")) or "").strip()
+    _old_api_key = str(((current.get("security") or {}).get("api_key")) or "").strip()
+    if _new_api_key and _new_api_key != _old_api_key and len(_new_api_key) < 32:
+        raise HTTPException(
+            status_code=400,
+            detail="security.api_key: use at least 32 characters — this key grants unrestricted admin access",
+        )
+
     # Scrobble watcher: ensure routes exist when legacy fields are used
     try:
         from providers.scrobble.routes import ensure_routes
