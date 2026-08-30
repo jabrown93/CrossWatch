@@ -531,16 +531,36 @@ class _Peer:
         self.closed = True
 
 
+def _stub_session(monkeypatch, response, seen: dict | None = None):
+    """require_public routes through requests.Session so env proxies can be
+    turned off, so peer-check tests stub the session rather than requests.request."""
+    import requests
+
+    class _Session:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def request(self, *_a, **_k):
+            if seen is not None:
+                seen["trust_env"] = self.trust_env
+            return response
+
+    monkeypatch.setattr(requests, "Session", _Session)
+
+
 def test_dns_rebinding_is_caught_at_the_socket(monkeypatch) -> None:
     """DNS answers public during validation, then loopback when the socket is
     opened. Only the connected peer proves where the bytes came from."""
-    import requests
-
     from cw_platform.url_validation import guarded_request
 
     _fake_dns(monkeypatch, {"rebind.example.com": "93.184.216.34"})
     rebound = _Peer("127.0.0.1")
-    monkeypatch.setattr(requests, "request", lambda *_a, **_k: rebound)
+    _stub_session(monkeypatch, rebound)
 
     with pytest.raises(ValueError, match="non-public address"):
         guarded_request(
@@ -551,13 +571,11 @@ def test_dns_rebinding_is_caught_at_the_socket(monkeypatch) -> None:
 
 
 def test_public_peer_is_accepted(monkeypatch) -> None:
-    import requests
-
     from cw_platform.url_validation import guarded_request
 
     _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
     good = _Peer("93.184.216.34")
-    monkeypatch.setattr(requests, "request", lambda *_a, **_k: good)
+    _stub_session(monkeypatch, good)
     assert guarded_request(
         "GET", "https://cdn.example.com/pic", field_name="avatar_url",
         allow_cross_host=True, require_public=True, stream=True,
@@ -566,16 +584,33 @@ def test_public_peer_is_accepted(monkeypatch) -> None:
 
 def test_missing_peer_fails_closed(monkeypatch) -> None:
     """No socket to inspect means no proof; refuse rather than assume good."""
-    import requests
-
     from cw_platform.url_validation import guarded_request
 
     _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
     blind = _Peer("93.184.216.34")
     blind.raw = SimpleNamespace(connection=None)
-    monkeypatch.setattr(requests, "request", lambda *_a, **_k: blind)
+    _stub_session(monkeypatch, blind)
     with pytest.raises(ValueError, match="peer unavailable"):
         guarded_request(
             "GET", "https://cdn.example.com/pic", field_name="avatar_url",
             allow_cross_host=True, require_public=True, stream=True,
         )
+
+
+def test_require_public_ignores_environment_proxies(monkeypatch) -> None:
+    """With HTTPS_PROXY set, requests would connect to the proxy, so the peer
+    check would vet the proxy rather than the origin -- blocking every avatar
+    behind a private proxy, and rubber-stamping a public one that resolves the
+    origin itself."""
+    from cw_platform.url_validation import guarded_request
+
+    _fake_dns(monkeypatch, {"cdn.example.com": "93.184.216.34"})
+    monkeypatch.setenv("HTTPS_PROXY", "http://10.0.0.9:3128")
+    seen: dict = {}
+    _stub_session(monkeypatch, _Peer("93.184.216.34"), seen)
+
+    guarded_request(
+        "GET", "https://cdn.example.com/pic", field_name="avatar_url",
+        allow_cross_host=True, require_public=True, stream=True,
+    )
+    assert seen["trust_env"] is False, "env proxy must be off so the peer is the origin"

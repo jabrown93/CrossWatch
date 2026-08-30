@@ -278,6 +278,19 @@ def guarded_request(
     """
     import requests
 
+    def _send(method_: str, url_: str, **kw: Any):
+        if not require_public:
+            return requests.request(method_, url_, allow_redirects=False, **kw)
+        # An environment proxy would put the proxy on the other end of the
+        # socket, so the peer check would vet the proxy instead of the origin:
+        # a private corporate proxy blocks every avatar, and a public one passes
+        # while resolving the origin itself, leaving the boundary unchecked.
+        # requests.request() builds a trust_env session per call; do the same
+        # with env proxies off so the peer really is the origin.
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.request(method_, url_, allow_redirects=False, **kw)
+
     current_method = method
     current_url = url
     body_kwargs = dict(kwargs)
@@ -286,7 +299,7 @@ def guarded_request(
         assert_server_url_safe(current_url, field_name)
         if require_public:
             assert_public_https_url(current_url, field_name)
-        resp = requests.request(current_method, current_url, allow_redirects=False, **body_kwargs)
+        resp = _send(current_method, current_url, **body_kwargs)
         if require_public:
             try:
                 _assert_peer_is_public(resp, field_name)
