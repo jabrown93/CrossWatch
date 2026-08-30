@@ -20,6 +20,7 @@ import zipfile
 
 from _logging import log as BASE_LOG
 from cw_platform.config_base import CONFIG, _current_version_norm
+from cw_platform.local_db import db as local_db
 
 BackupScope = Literal["config_only", "app_state", "full"]
 
@@ -672,44 +673,48 @@ def restore_backup(path: str, *, create_pre_restore: bool = True) -> dict[str, A
 
     restored: list[str] = []
     errors: list[str] = []
-    try:
-        with zipfile.ZipFile(target, "r") as zf:
-            raw_files = manifest.get("files")
-            files = raw_files if isinstance(raw_files, list) else []
-            for row in files:
-                if not isinstance(row, Mapping):
-                    continue
-                member = _safe_rel_path(row.get("path"))
-                dst = _resolve_restore_target(member)
-                tmp = dst.with_suffix(dst.suffix + f".restore.{uuid.uuid4().hex[:8]}.tmp")
-                try:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member, "r") as src, tmp.open("wb") as out:
-                        shutil.copyfileobj(src, out, length=1024 * 1024)
-                    os.replace(tmp, dst)
-                    restored.append(member)
-                except Exception as e:
-                    errors.append(f"{member}: {type(e).__name__}")
+    # Held across both the replace and the sidecar unlink: a thread holding a
+    # connection to the old inode would keep writing into it after os.replace,
+    # and get_conn()'s existence check cannot see that the path was swapped.
+    with local_db.suspended():
+        try:
+            with zipfile.ZipFile(target, "r") as zf:
+                raw_files = manifest.get("files")
+                files = raw_files if isinstance(raw_files, list) else []
+                for row in files:
+                    if not isinstance(row, Mapping):
+                        continue
+                    member = _safe_rel_path(row.get("path"))
+                    dst = _resolve_restore_target(member)
+                    tmp = dst.with_suffix(dst.suffix + f".restore.{uuid.uuid4().hex[:8]}.tmp")
                     try:
-                        tmp.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-    except zipfile.BadZipFile:
-        LOG.warn(f"backup restore failed invalid archive path={rel}")
-        return {"ok": False, "error": "invalid_backup_archive", "restored": restored, "errors": errors}
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member, "r") as src, tmp.open("wb") as out:
+                            shutil.copyfileobj(src, out, length=1024 * 1024)
+                        os.replace(tmp, dst)
+                        restored.append(member)
+                    except Exception as e:
+                        errors.append(f"{member}: {type(e).__name__}")
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+        except zipfile.BadZipFile:
+            LOG.warn(f"backup restore failed invalid archive path={rel}")
+            return {"ok": False, "error": "invalid_backup_archive", "restored": restored, "errors": errors}
 
-    restored_set = set(restored)
-    for member in restored:
-        if not _is_sqlite_db(member):
-            continue
-        for suffix in _SQLITE_SIDECAR_SUFFIXES:
-            sidecar = f"{member}{suffix}"
-            if sidecar in restored_set:
+        restored_set = set(restored)
+        for member in restored:
+            if not _is_sqlite_db(member):
                 continue
-            try:
-                _resolve_restore_target(sidecar).unlink(missing_ok=True)
-            except Exception as e:
-                errors.append(f"{sidecar}: {type(e).__name__}")
+            for suffix in _SQLITE_SIDECAR_SUFFIXES:
+                sidecar = f"{member}{suffix}"
+                if sidecar in restored_set:
+                    continue
+                try:
+                    _resolve_restore_target(sidecar).unlink(missing_ok=True)
+                except Exception as e:
+                    errors.append(f"{sidecar}: {type(e).__name__}")
 
     result = {
         "ok": len(errors) == 0,

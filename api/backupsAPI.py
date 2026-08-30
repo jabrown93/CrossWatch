@@ -143,12 +143,14 @@ def api_backups_validate(body: dict[str, Any] = Body(...)) -> JSONResponse:
 def api_backups_restore(body: dict[str, Any] = Body(...)) -> JSONResponse:
     try:
         path = str(body.get("path") or "").strip()
-        restart = bool(body.get("restart"))
-        LOG.info(f"backup restore requested restart={restart}")
+        LOG.info("backup restore requested")
         res = restore_backup(path, create_pre_restore=True)
-        if res.get("ok") and restart:
+        # Not opt-in: the process holds pre-restore state in memory and in
+        # per-thread database handles, so serving traffic after a restore
+        # without restarting hands back data the restore just replaced.
+        if res.get("ok"):
             res["restart_scheduled"] = True
-            LOG.info("backup restore requested restart scheduled")
+            LOG.info("backup restore restart scheduled")
             _restart_soon()
         return _ok({"result": res}, status_code=200 if res.get("ok") else 400)
     except Exception as e:
