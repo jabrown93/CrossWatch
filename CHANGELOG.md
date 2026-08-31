@@ -1,3 +1,10 @@
+## [1.3.15](https://github.com/jabrown93/CrossWatch/compare/v1.3.14...v1.3.15) (2026-08-31)
+
+
+### Bug Fixes
+
+* **orchestrator:** stop retrying ambiguous writes ([#124](https://github.com/jabrown93/CrossWatch/issues/124)) ([9ae34b9](https://github.com/jabrown93/CrossWatch/commit/9ae34b9d809944bd5515a300f7110937153f7007))
+
 ## [1.3.14](https://github.com/jabrown93/CrossWatch/compare/v1.3.13...v1.3.14) (2026-08-31)
 
 
