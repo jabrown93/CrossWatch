@@ -72,10 +72,6 @@ MIGRATION_OVERRIDE_KEYS: tuple[str, ...] = (
     "emby.history.history_guid_priority",
     "emby.ratings.ratings_query_limit",
 
-    # Sync safety
-    "sync.drop_guard",
-    "sync.allow_mass_delete",
-
     # Runtime
     "runtime.snapshot_ttl_sec",
     "runtime.apply_chunk_size",

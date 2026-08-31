@@ -46,8 +46,30 @@ def maybe_block_mass_delete(
             except Exception:
                 pass
             return []
-    except Exception:
-        return rem_list
+    except Exception as exc:
+        try:
+            emit(
+                "mass_delete:blocked",
+                dst=dst_name,
+                feature=feature,
+                attempted=len(rem_list),
+                baseline=baseline_size,
+                reason="guard_error",
+            )
+        except Exception:
+            pass
+        try:
+            dbg(
+                "mass_delete.guard_error",
+                dst=dst_name,
+                feature=feature,
+                attempted=len(rem_list),
+                baseline=baseline_size,
+                error=type(exc).__name__,
+            )
+        except Exception:
+            pass
+        return []
 
     return rem_list
 

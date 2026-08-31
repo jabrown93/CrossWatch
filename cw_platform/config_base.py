@@ -58,6 +58,7 @@ DEFAULT_SCHEDULER_WEBHOOKS: dict[str, Any] = {
 }
 
 _ENC_PREFIX = "enc:v1:"
+MASS_DELETE_SAFETY_CONFIG_VERSION = 1
 _CONFIG_LOCK = threading.RLock()
 _CONFIG_FILE_LOCK_STATE = threading.local()
 
@@ -687,6 +688,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "write_state_json": True,                       # Write sync state baselines/stats; leave on true
         "drop_guard": True,                             # Guard against sudden inventory shrink (protects from bad/suspect snapshots)
         "allow_mass_delete": False,                     # If False, block large delete plans (e.g., >~10% of baseline)
+        "_mass_delete_safety_version": MASS_DELETE_SAFETY_CONFIG_VERSION,
         "tombstone_ttl_days": 1,                        # How long “observed deletes” (tombstones) stay valid
         "include_observed_deletes": True,               # If False, skip processing “observed deletes” for this run. Delta-trackers (SIMKL) will be turned off to prevent accidental removals
 
@@ -1389,13 +1391,42 @@ def apply_default_overrides(
 
     return data, applied
 
+def _apply_mass_delete_safety_transition(
+    cfg: dict[str, Any],
+    provenance: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    source_raw = provenance.get("sync")
+    source_sync: dict[str, Any] = source_raw if isinstance(source_raw, dict) else {}
+    try:
+        version = int(source_sync.get("_mass_delete_safety_version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    if version >= MASS_DELETE_SAFETY_CONFIG_VERSION:
+        return cfg, []
+
+    # Pre-marker configs cannot distinguish generated unsafe defaults from an
+    # intentional opt-out, so they receive one safe transition. Marker preserves
+    # explicit opt-outs saved afterward.
+    sync = _ensure_dict(cfg, "sync")
+    sync["drop_guard"] = True
+    sync["allow_mass_delete"] = False
+    sync["_mass_delete_safety_version"] = MASS_DELETE_SAFETY_CONFIG_VERSION
+    return cfg, [
+        "sync.drop_guard",
+        "sync.allow_mass_delete",
+        "sync._mass_delete_safety_version",
+    ]
+
+
 def apply_migration_overrides(cfg: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     try:
         from .config_overrides import MIGRATION_OVERRIDE_KEYS
     except Exception:
         MIGRATION_OVERRIDE_KEYS = ()
 
-    return apply_default_overrides(cfg, MIGRATION_OVERRIDE_KEYS)
+    data, applied = apply_default_overrides(cfg, MIGRATION_OVERRIDE_KEYS)
+    data, safety_applied = _apply_mass_delete_safety_transition(data, cfg)
+    return data, applied + safety_applied
 
 
 # Feature normalization
@@ -2805,6 +2836,7 @@ def load_config() -> dict[str, Any]:
             raise RuntimeError(f"Invalid config file: {p}") from e
 
     cfg = _deep_merge(DEFAULT_CFG, user_cfg)
+    cfg, _ = _apply_mass_delete_safety_transition(cfg, user_cfg)
     # Before the normalizers, so env values get the same clamping as file values.
     _log_env_locks(apply_env_overrides(cfg))
     cfg.setdefault("version", _current_version_norm())
