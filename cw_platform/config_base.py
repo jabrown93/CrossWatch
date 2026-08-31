@@ -2990,6 +2990,7 @@ def save_config(cfg: dict[str, Any]) -> None:
 
     final_data = _order_config_for_write(cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw)))
     _revert_env_paths(final_data, prev_raw)
+    final_data, _ = _apply_mass_delete_safety_transition(final_data, prev_raw)
     _write_json_atomic(_cfg_file(), final_data)
 
 

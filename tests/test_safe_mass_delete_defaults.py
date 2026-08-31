@@ -9,6 +9,7 @@ from cw_platform.config_base import (
     MASS_DELETE_SAFETY_CONFIG_VERSION,
     apply_migration_overrides,
     load_config,
+    save_config,
 )
 from cw_platform.orchestrator._pairs_massdelete import maybe_block_mass_delete
 
@@ -35,6 +36,52 @@ def test_unattended_legacy_config_load_enables_delete_guards(config_base: Path) 
     assert effective["drop_guard"] is True
     assert effective["allow_mass_delete"] is False
     assert effective["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+
+def test_env_locked_legacy_transition_persists_safe_disk_values(
+    config_base: Path, monkeypatch: Any
+) -> None:
+    config_path = config_base / "config.json"
+    config_path.write_text(
+        json.dumps({"sync": {"drop_guard": False, "allow_mass_delete": True}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CW_CFG__sync__drop_guard", "true")
+    monkeypatch.setenv("CW_CFG__sync__allow_mass_delete", "false")
+
+    under_env = load_config()
+    assert under_env["sync"]["drop_guard"] is True
+    assert under_env["sync"]["allow_mass_delete"] is False
+    assert under_env["sync"]["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+    save_config(under_env)
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))["sync"]
+    assert persisted["drop_guard"] is True
+    assert persisted["allow_mass_delete"] is False
+    assert persisted["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+    monkeypatch.delenv("CW_CFG__sync__drop_guard")
+    monkeypatch.delenv("CW_CFG__sync__allow_mass_delete")
+    reloaded = load_config()
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))["sync"]
+    assert reloaded["sync"]["drop_guard"] is persisted["drop_guard"] is True
+    assert reloaded["sync"]["allow_mass_delete"] is persisted["allow_mass_delete"] is False
+    assert persisted["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+    reloaded["sync"]["drop_guard"] = False
+    reloaded["sync"]["allow_mass_delete"] = True
+    save_config(reloaded)
+    explicitly_changed = load_config()["sync"]
+    assert explicitly_changed["drop_guard"] is False
+    assert explicitly_changed["allow_mass_delete"] is True
+    assert explicitly_changed["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+    monkeypatch.setenv("CW_CFG__sync__drop_guard", "true")
+    monkeypatch.setenv("CW_CFG__sync__allow_mass_delete", "false")
+    save_config(load_config())
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))["sync"]
+    assert persisted["drop_guard"] is False
+    assert persisted["allow_mass_delete"] is True
 
 
 def test_load_config_preserves_post_migration_delete_guard_opt_out(config_base: Path) -> None:
