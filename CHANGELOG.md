@@ -1,3 +1,10 @@
+## [1.3.16](https://github.com/jabrown93/CrossWatch/compare/v1.3.15...v1.3.16) (2026-08-31)
+
+
+### Bug Fixes
+
+* **scrobble:** offload blocking webhook work ([#126](https://github.com/jabrown93/CrossWatch/issues/126)) ([680cdf4](https://github.com/jabrown93/CrossWatch/commit/680cdf42db602f770b18769aa0e7a5c021507d99))
+
 ## [1.3.15](https://github.com/jabrown93/CrossWatch/compare/v1.3.14...v1.3.15) (2026-08-31)
 
 
