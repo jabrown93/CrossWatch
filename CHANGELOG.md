@@ -1,3 +1,10 @@
+## [1.3.13](https://github.com/jabrown93/CrossWatch/compare/v1.3.12...v1.3.13) (2026-08-31)
+
+
+### Bug Fixes
+
+* **sync:** enable mass-delete safeguards by default ([#125](https://github.com/jabrown93/CrossWatch/issues/125)) ([e663d24](https://github.com/jabrown93/CrossWatch/commit/e663d247bc463d43234a6a194a128c1768b217be))
+
 ## [1.3.12](https://github.com/jabrown93/CrossWatch/compare/v1.3.11...v1.3.12) (2026-08-30)
 
 
