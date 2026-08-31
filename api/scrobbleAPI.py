@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import secrets
@@ -64,6 +65,8 @@ except Exception:
     HAVE_PLEXAPI = False
 
 router = APIRouter(tags=["scrobbler"])
+_WEBHOOK_PROCESS_LOCKS = {provider: asyncio.Lock() for provider in ("jellyfin", "emby", "plex")}
+_SCHEDULER_EVENT_LOCK = asyncio.Lock()
 
 
 class WebhookAuthError(Exception):
@@ -1459,15 +1462,16 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
     )
 
     try:
-        res = await run_in_threadpool(
-            jf_process_webhook,
-            payload=payload,
-            headers=dict(request.headers),
-            raw=raw,
-            logger=log,
-            cfg=target_cfg,
-            provider_instance=provider_instance,
-        )
+        async with _WEBHOOK_PROCESS_LOCKS["jellyfin"]:
+            res = await run_in_threadpool(
+                jf_process_webhook,
+                payload=payload,
+                headers=dict(request.headers),
+                raw=raw,
+                logger=log,
+                cfg=target_cfg,
+                provider_instance=provider_instance,
+            )
     except Exception as e:
         log(f"jf-webhook: process_webhook raised: {e}", "ERROR")
         return JSONResponse({"ok": True, "error": "internal"}, status_code=200)
@@ -1487,7 +1491,8 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
         f"jf-webhook: done action={res.get('action')} status={res.get('status')}",
         "DEBUG",
     )
-    await run_in_threadpool(_emit_scheduler_webhook_event, "jellyfin", payload, res)
+    async with _SCHEDULER_EVENT_LOCK:
+        await run_in_threadpool(_emit_scheduler_webhook_event, "jellyfin", payload, res)
     await run_in_threadpool(_emit_activity_webhook_event, "jellyfin", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
@@ -1619,15 +1624,16 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
     )
 
     try:
-        res = await run_in_threadpool(
-            emby_process_webhook,
-            payload=payload,
-            headers=dict(request.headers),
-            raw=raw,
-            logger=log,
-            cfg=target_cfg,
-            provider_instance=provider_instance,
-        )
+        async with _WEBHOOK_PROCESS_LOCKS["emby"]:
+            res = await run_in_threadpool(
+                emby_process_webhook,
+                payload=payload,
+                headers=dict(request.headers),
+                raw=raw,
+                logger=log,
+                cfg=target_cfg,
+                provider_instance=provider_instance,
+            )
     except Exception as e:
         log(f"emby-webhook: process_webhook raised: {e}", "ERROR")
         return JSONResponse({"ok": True, "error": "internal"}, status_code=200)
@@ -1647,7 +1653,8 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
         f"emby-webhook: done action={res.get('action')} status={res.get('status')}",
         "DEBUG",
     )
-    await run_in_threadpool(_emit_scheduler_webhook_event, "emby", payload, res)
+    async with _SCHEDULER_EVENT_LOCK:
+        await run_in_threadpool(_emit_scheduler_webhook_event, "emby", payload, res)
     await run_in_threadpool(_emit_activity_webhook_event, "emby", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
@@ -1751,15 +1758,16 @@ async def webhook_trakt(request: Request) -> JSONResponse:
     )
 
     try:
-        res = await run_in_threadpool(
-            process_webhook,
-            payload=payload,
-            headers=dict(request.headers),
-            raw=raw,
-            logger=log,
-            cfg=target_cfg,
-            provider_instance=provider_instance,
-        )
+        async with _WEBHOOK_PROCESS_LOCKS["plex"]:
+            res = await run_in_threadpool(
+                process_webhook,
+                payload=payload,
+                headers=dict(request.headers),
+                raw=raw,
+                logger=log,
+                cfg=target_cfg,
+                provider_instance=provider_instance,
+            )
     except Exception as e:
         log(f"webhook: process_webhook raised: {e}", "ERROR")
         return JSONResponse({"ok": True, "error": "internal"}, status_code=200)
@@ -1779,7 +1787,8 @@ async def webhook_trakt(request: Request) -> JSONResponse:
         f"plex-webhook: done action={res.get('action')} status={res.get('status')}",
         "DEBUG",
     )
-    await run_in_threadpool(_emit_scheduler_webhook_event, "plex", payload, res)
+    async with _SCHEDULER_EVENT_LOCK:
+        await run_in_threadpool(_emit_scheduler_webhook_event, "plex", payload, res)
     await run_in_threadpool(_emit_activity_webhook_event, "plex", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
@@ -1858,15 +1867,16 @@ async def webhook_plexwatcher(request: Request) -> JSONResponse:
     if event and event != "media.rate":
         return JSONResponse({"ok": True, "ignored": True}, status_code=200)
 
-    res = await run_in_threadpool(
-        pxw_process,
-        payload,
-        dict(request.headers),
-        raw=raw,
-        logger=log,
-        cfg_override=target_cfg,
-        route_hook=target_hook,
-    )
+    async with _WEBHOOK_PROCESS_LOCKS["plex"]:
+        res = await run_in_threadpool(
+            pxw_process,
+            payload,
+            dict(request.headers),
+            raw=raw,
+            logger=log,
+            cfg_override=target_cfg,
+            route_hook=target_hook,
+        )
 
     if res.get("invalid_signature"):
         log("plexwatcher-webhook: invalid signature", "WARN")
