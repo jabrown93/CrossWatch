@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from cw_platform.config_base import (
+    DEFAULT_CFG,
+    MASS_DELETE_SAFETY_CONFIG_VERSION,
+    apply_migration_overrides,
+    load_config,
+    save_config,
+)
+from cw_platform.orchestrator._pairs_massdelete import maybe_block_mass_delete
+
+
+def test_new_configs_enable_delete_guards_by_default(config_base: Path) -> None:
+    sync_defaults = DEFAULT_CFG["sync"]
+
+    assert sync_defaults["drop_guard"] is True
+    assert sync_defaults["allow_mass_delete"] is False
+
+    effective = load_config()["sync"]
+    assert effective["drop_guard"] is True
+    assert effective["allow_mass_delete"] is False
+
+
+def test_unattended_legacy_config_load_enables_delete_guards(config_base: Path) -> None:
+    (config_base / "config.json").write_text(
+        json.dumps({"sync": {"drop_guard": False, "allow_mass_delete": True}}),
+        encoding="utf-8",
+    )
+
+    effective = load_config()["sync"]
+
+    assert effective["drop_guard"] is True
+    assert effective["allow_mass_delete"] is False
+    assert effective["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+
+def test_env_locked_legacy_transition_persists_safe_disk_values(
+    config_base: Path, monkeypatch: Any
+) -> None:
+    config_path = config_base / "config.json"
+    config_path.write_text(
+        json.dumps({"sync": {"drop_guard": False, "allow_mass_delete": True}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CW_CFG__sync__drop_guard", "true")
+    monkeypatch.setenv("CW_CFG__sync__allow_mass_delete", "false")
+
+    under_env = load_config()
+    assert under_env["sync"]["drop_guard"] is True
+    assert under_env["sync"]["allow_mass_delete"] is False
+    assert under_env["sync"]["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+    save_config(under_env)
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))["sync"]
+    assert persisted["drop_guard"] is True
+    assert persisted["allow_mass_delete"] is False
+    assert persisted["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+    monkeypatch.delenv("CW_CFG__sync__drop_guard")
+    monkeypatch.delenv("CW_CFG__sync__allow_mass_delete")
+    reloaded = load_config()
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))["sync"]
+    assert reloaded["sync"]["drop_guard"] is persisted["drop_guard"] is True
+    assert reloaded["sync"]["allow_mass_delete"] is persisted["allow_mass_delete"] is False
+    assert persisted["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+    reloaded["sync"]["drop_guard"] = False
+    reloaded["sync"]["allow_mass_delete"] = True
+    save_config(reloaded)
+    explicitly_changed = load_config()["sync"]
+    assert explicitly_changed["drop_guard"] is False
+    assert explicitly_changed["allow_mass_delete"] is True
+    assert explicitly_changed["_mass_delete_safety_version"] == MASS_DELETE_SAFETY_CONFIG_VERSION
+
+    monkeypatch.setenv("CW_CFG__sync__drop_guard", "true")
+    monkeypatch.setenv("CW_CFG__sync__allow_mass_delete", "false")
+    save_config(load_config())
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))["sync"]
+    assert persisted["drop_guard"] is False
+    assert persisted["allow_mass_delete"] is True
+
+
+def test_load_config_preserves_post_migration_delete_guard_opt_out(config_base: Path) -> None:
+    (config_base / "config.json").write_text(
+        json.dumps(
+            {
+                "sync": {
+                    "drop_guard": False,
+                    "allow_mass_delete": True,
+                    "_mass_delete_safety_version": MASS_DELETE_SAFETY_CONFIG_VERSION,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    effective_config = load_config()
+    effective = effective_config["sync"]
+
+    assert effective["drop_guard"] is False
+    assert effective["allow_mass_delete"] is True
+
+    migrated, paths = apply_migration_overrides(effective_config)
+    assert migrated["sync"]["drop_guard"] is False
+    assert migrated["sync"]["allow_mass_delete"] is True
+    assert "sync.drop_guard" not in paths
+    assert "sync.allow_mass_delete" not in paths
+
+
+def test_upgrade_migration_replaces_legacy_unsafe_defaults() -> None:
+    migrated, paths = apply_migration_overrides(
+        {"sync": {"drop_guard": False, "allow_mass_delete": True}}
+    )
+
+    assert migrated["sync"]["drop_guard"] is True
+    assert migrated["sync"]["allow_mass_delete"] is False
+    assert "sync.drop_guard" in paths
+    assert "sync.allow_mass_delete" in paths
+    assert "sync._mass_delete_safety_version" in paths
+
+
+def test_effective_default_blocks_mass_delete_plan(config_base: Path) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    removals = [{"ids": {"imdb": f"tt{i:04d}"}} for i in range(11)]
+    sync = load_config()["sync"]
+
+    guarded = maybe_block_mass_delete(
+        removals,
+        baseline_size=100,
+        allow_mass_delete=sync["allow_mass_delete"],
+        suspect_ratio=0.10,
+        emit=lambda event, **data: events.append((event, data)),
+        dbg=lambda *_args, **_kwargs: None,
+        dst_name="PLEX",
+        feature="watchlist",
+    )
+
+    assert guarded == []
+    assert events == [
+        (
+            "mass_delete:blocked",
+            {
+                "dst": "PLEX",
+                "feature": "watchlist",
+                "attempted": 11,
+                "baseline": 100,
+                "threshold": 10,
+            },
+        )
+    ]
+
+
+def test_mass_delete_guard_calculation_error_fails_closed() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    removals = [{"ids": {"imdb": f"tt{i:04d}"}} for i in range(100)]
+
+    guarded = maybe_block_mass_delete(
+        removals,
+        baseline_size=100,
+        allow_mass_delete=False,
+        suspect_ratio=float("inf"),
+        emit=lambda event, **data: events.append((event, data)),
+        dbg=lambda *_args, **_kwargs: None,
+        dst_name="PLEX",
+        feature="watchlist",
+    )
+
+    assert guarded == []
+    assert events == [
+        (
+            "mass_delete:blocked",
+            {
+                "dst": "PLEX",
+                "feature": "watchlist",
+                "attempted": 100,
+                "baseline": 100,
+                "reason": "guard_error",
+            },
+        )
+    ]

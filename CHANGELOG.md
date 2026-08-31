@@ -1,3 +1,24 @@
+## [1.3.15](https://github.com/jabrown93/CrossWatch/compare/v1.3.14...v1.3.15) (2026-08-31)
+
+
+### Bug Fixes
+
+* **orchestrator:** stop retrying ambiguous writes ([#124](https://github.com/jabrown93/CrossWatch/issues/124)) ([9ae34b9](https://github.com/jabrown93/CrossWatch/commit/9ae34b9d809944bd5515a300f7110937153f7007))
+
+## [1.3.14](https://github.com/jabrown93/CrossWatch/compare/v1.3.13...v1.3.14) (2026-08-31)
+
+
+### Bug Fixes
+
+* **scheduler:** recover from tick failures ([#127](https://github.com/jabrown93/CrossWatch/issues/127)) ([417ed99](https://github.com/jabrown93/CrossWatch/commit/417ed99561cb815e0bb8a54197547b250be4cb28))
+
+## [1.3.13](https://github.com/jabrown93/CrossWatch/compare/v1.3.12...v1.3.13) (2026-08-31)
+
+
+### Bug Fixes
+
+* **sync:** enable mass-delete safeguards by default ([#125](https://github.com/jabrown93/CrossWatch/issues/125)) ([e663d24](https://github.com/jabrown93/CrossWatch/commit/e663d247bc463d43234a6a194a128c1768b217be))
+
 ## [1.3.12](https://github.com/jabrown93/CrossWatch/compare/v1.3.11...v1.3.12) (2026-08-30)
 
 

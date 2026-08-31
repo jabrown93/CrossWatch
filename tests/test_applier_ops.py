@@ -175,6 +175,37 @@ def test_apply_add_chunks_items_per_chunk_size():
     assert [len(c) for c in ops.add_calls] == [2, 2, 1]
 
 
+@pytest.mark.parametrize(
+    "op_name, call_attr",
+    [
+        ("apply_add", "add_calls"),
+        ("apply_update", "add_calls"),
+        ("apply_remove", "remove_calls"),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [0, 1])
+def test_apply_op_does_not_retry_ambiguous_mutation_timeout(op_name, call_attr, chunk_size):
+    class CommitThenTimeoutOps(FakeDstOps):
+        def add(self, cfg, items, *, feature, dry_run=False):
+            self.add_calls.append([dict(x) for x in items])
+            raise TimeoutError("commit outcome unknown")
+
+        def remove(self, cfg, items, *, feature, dry_run=False):
+            self.remove_calls.append([dict(x) for x in items])
+            raise TimeoutError("commit outcome unknown")
+
+    ops = CommitThenTimeoutOps()
+    fn = getattr(_applier, op_name)
+
+    with pytest.raises(TimeoutError, match="commit outcome unknown"):
+        fn(
+            dst_ops=ops, cfg={}, dst_name="DST", feature="history", items=ITEMS,
+            dry_run=False, emit=Recorder(), dbg=_dbg, chunk_size=chunk_size, chunk_pause_ms=0,
+        )
+
+    assert len(getattr(ops, call_attr)) == 1
+
+
 def test_apply_add_dry_run_forwarded_to_dst_ops():
     seen_dry_run: list[bool] = []
 
