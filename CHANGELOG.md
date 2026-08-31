@@ -1,3 +1,10 @@
+## [1.3.14](https://github.com/jabrown93/CrossWatch/compare/v1.3.13...v1.3.14) (2026-08-31)
+
+
+### Bug Fixes
+
+* **scheduler:** recover from tick failures ([#127](https://github.com/jabrown93/CrossWatch/issues/127)) ([417ed99](https://github.com/jabrown93/CrossWatch/commit/417ed99561cb815e0bb8a54197547b250be4cb28))
+
 ## [1.3.13](https://github.com/jabrown93/CrossWatch/compare/v1.3.12...v1.3.13) (2026-08-31)
 
 
