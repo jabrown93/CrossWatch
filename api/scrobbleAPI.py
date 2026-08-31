@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from typing import Any, cast
 
 from fastapi import APIRouter, Query, Request, HTTPException, Body
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from urllib.parse import parse_qs
 
@@ -1458,7 +1459,8 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
     )
 
     try:
-        res = jf_process_webhook(
+        res = await run_in_threadpool(
+            jf_process_webhook,
             payload=payload,
             headers=dict(request.headers),
             raw=raw,
@@ -1485,8 +1487,8 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
         f"jf-webhook: done action={res.get('action')} status={res.get('status')}",
         "DEBUG",
     )
-    _emit_scheduler_webhook_event("jellyfin", payload, res)
-    _emit_activity_webhook_event("jellyfin", payload, res)
+    await run_in_threadpool(_emit_scheduler_webhook_event, "jellyfin", payload, res)
+    await run_in_threadpool(_emit_activity_webhook_event, "jellyfin", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,
@@ -1617,7 +1619,8 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
     )
 
     try:
-        res = emby_process_webhook(
+        res = await run_in_threadpool(
+            emby_process_webhook,
             payload=payload,
             headers=dict(request.headers),
             raw=raw,
@@ -1644,8 +1647,8 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
         f"emby-webhook: done action={res.get('action')} status={res.get('status')}",
         "DEBUG",
     )
-    _emit_scheduler_webhook_event("emby", payload, res)
-    _emit_activity_webhook_event("emby", payload, res)
+    await run_in_threadpool(_emit_scheduler_webhook_event, "emby", payload, res)
+    await run_in_threadpool(_emit_activity_webhook_event, "emby", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,
@@ -1748,7 +1751,8 @@ async def webhook_trakt(request: Request) -> JSONResponse:
     )
 
     try:
-        res = process_webhook(
+        res = await run_in_threadpool(
+            process_webhook,
             payload=payload,
             headers=dict(request.headers),
             raw=raw,
@@ -1775,8 +1779,8 @@ async def webhook_trakt(request: Request) -> JSONResponse:
         f"plex-webhook: done action={res.get('action')} status={res.get('status')}",
         "DEBUG",
     )
-    _emit_scheduler_webhook_event("plex", payload, res)
-    _emit_activity_webhook_event("plex", payload, res)
+    await run_in_threadpool(_emit_scheduler_webhook_event, "plex", payload, res)
+    await run_in_threadpool(_emit_activity_webhook_event, "plex", payload, res)
     return JSONResponse(
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,
@@ -1854,7 +1858,8 @@ async def webhook_plexwatcher(request: Request) -> JSONResponse:
     if event and event != "media.rate":
         return JSONResponse({"ok": True, "ignored": True}, status_code=200)
 
-    res = pxw_process(
+    res = await run_in_threadpool(
+        pxw_process,
         payload,
         dict(request.headers),
         raw=raw,
