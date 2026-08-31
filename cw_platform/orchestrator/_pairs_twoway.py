@@ -372,8 +372,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     base_obs = include_observed_cfg if include_observed_override is None else bool(include_observed_override)
     include_obs_A = bool(base_obs)
     include_obs_B = bool(base_obs)
-    drop_guard = bool(sync_cfg.get("drop_guard", False))
-    allow_mass_delete = bool(sync_cfg.get("allow_mass_delete", True))
+    drop_guard = bool(sync_cfg.get("drop_guard", True))
+    allow_mass_delete = bool(sync_cfg.get("allow_mass_delete", False))
     verify_after_write = bool(sync_cfg.get("verify_after_write", False))
     dry_run_flag = bool(ctx.dry_run or sync_cfg.get("dry_run", False))
 

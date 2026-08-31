@@ -246,7 +246,7 @@ function defaultState(){
     jellyfin:{watchlist:{mode:"favorites",playlist_name:"Watchlist"}},
     emby:{watchlist:{mode:"favorites",playlist_name:"Watchlist"}},
     globals:{
-      dry_run:false,verify_after_write:false,drop_guard:false,allow_mass_delete:true,one_way_remove_mode:"source_deletes",
+      dry_run:false,verify_after_write:false,drop_guard:true,allow_mass_delete:false,one_way_remove_mode:"source_deletes",
       tombstone_ttl_days:30,include_observed_deletes:true,
       blackbox:{enabled:true,promote_after:3,cooldown_days:30,pair_scoped:true,block_adds:true,block_removes:true}
     },

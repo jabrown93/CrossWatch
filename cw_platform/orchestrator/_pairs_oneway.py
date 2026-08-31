@@ -1085,7 +1085,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     prev_src = _prev_items(prev_provs, src, src_inst, feature)
     prev_dst = _prev_items(prev_provs, dst, dst_inst, feature)
 
-    drop_guard = bool(sync_cfg.get("drop_guard", False))
+    drop_guard = bool(sync_cfg.get("drop_guard", True))
     suspect_min_prev = int((cfg.get("runtime") or {}).get("suspect_min_prev", 20))
     suspect_ratio = float((cfg.get("runtime") or {}).get("suspect_shrink_ratio", 0.10))
     suspect_debug = bool((cfg.get("runtime") or {}).get("suspect_debug", True))
@@ -1525,7 +1525,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     removes = _maybe_block_mass_delete(
         removes, baseline_size=len(dst_full),
-        allow_mass_delete=bool(sync_cfg.get("allow_mass_delete", True)),
+        allow_mass_delete=bool(sync_cfg.get("allow_mass_delete", False)),
         suspect_ratio=suspect_ratio,
         emit=emit, dbg=dbg, dst_name=dst, feature=feature,
     )
