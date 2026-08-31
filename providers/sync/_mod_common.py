@@ -621,7 +621,7 @@ def request_with_retries(
         api_feature = None
 
     method_upper = str(method).upper()
-    retry_ambiguous = method_upper in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"} or idempotent
+    retry_ambiguous = method_upper in {"GET", "HEAD", "OPTIONS"} or idempotent
     last: Any = None
     for i in range(max(1, int(max_retries))):
         t0 = time.monotonic()

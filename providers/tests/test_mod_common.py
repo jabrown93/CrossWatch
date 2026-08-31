@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
 import requests
 
 
@@ -55,15 +56,29 @@ def test_request_with_retries_retries_read_exception(monkeypatch):
     assert session.calls == 2
 
 
-def test_request_with_retries_does_not_retry_write_5xx(monkeypatch):
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
+def test_request_with_retries_does_not_retry_write_5xx(monkeypatch, method):
     import sync._mod_common as m
 
     session = _SequenceSession(_response(503), _response(200))
     monkeypatch.setattr(m.time, "sleep", lambda _: None)
 
-    response = m.request_with_retries(cast(requests.Session, session), "POST", "https://example.test/items", max_retries=2)
+    response = m.request_with_retries(cast(requests.Session, session), method, "https://example.test/items", max_retries=2)
 
     assert response.status_code == 503
+    assert session.calls == 1
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
+def test_request_with_retries_does_not_retry_write_exception(monkeypatch, method):
+    import sync._mod_common as m
+
+    session = _SequenceSession(requests.Timeout("outcome unknown"), _response(200))
+    monkeypatch.setattr(m.time, "sleep", lambda _: None)
+
+    with pytest.raises(requests.RequestException, match="outcome unknown"):
+        m.request_with_retries(cast(requests.Session, session), method, "https://example.test/items", max_retries=2)
+
     assert session.calls == 1
 
 
