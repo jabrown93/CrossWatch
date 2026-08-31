@@ -609,6 +609,7 @@ def request_with_retries(
     max_retries: int = 3,
     retry_on: tuple[int, ...] = (429, 500, 502, 503, 504),
     backoff_base: float = 0.5,
+    idempotent: bool = False,
     **kwargs: Any,
 ) -> requests.Response:
     api_feature: str | None = None
@@ -619,13 +620,16 @@ def request_with_retries(
     except Exception:
         api_feature = None
 
+    method_upper = str(method).upper()
+    retry_ambiguous = method_upper in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"} or idempotent
     last: Any = None
     for i in range(max(1, int(max_retries))):
+        t0 = time.monotonic()
         try:
-            t0 = time.monotonic()
             resp = session.request(method, url, timeout=timeout, **kwargs)
             dur_ms = int((time.monotonic() - t0) * 1000)
-            if resp.status_code in retry_on and i < max_retries - 1:
+            retry_status = resp.status_code in retry_on and (resp.status_code == 429 or retry_ambiguous)
+            if retry_status and i < max_retries - 1:
                 wait = backoff_base * (2**i)
                 retry_after: float | None = None
                 try:
@@ -682,7 +686,7 @@ def request_with_retries(
             except Exception:
                 dur_ms = None
             last = e
-            if i < max_retries - 1:
+            if retry_ambiguous and i < max_retries - 1:
                 wait = backoff_base * (2**i)
                 _http_log(
                     session,

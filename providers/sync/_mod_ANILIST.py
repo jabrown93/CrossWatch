@@ -166,6 +166,7 @@ class ANILISTClient:
             json=payload,
             timeout=self.cfg.timeout,
             max_retries=self.cfg.max_retries,
+            idempotent=query.lstrip().startswith(("query", "{")),
         )
 
         try:
@@ -295,6 +296,7 @@ class ANILISTModule:
                 json={"query": "query { Viewer { id } }"},
                 timeout=max(3.0, min(self.cfg.timeout, 15.0)),
                 max_retries=max(0, min(self.cfg.max_retries, 3)),
+                idempotent=True,
             )
             code = r.status_code
             if code in (401, 403):
