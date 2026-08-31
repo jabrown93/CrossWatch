@@ -1643,94 +1643,102 @@ class SyncScheduler:
             self._status["running"] = True
         try:
             while not self._stop.is_set():
-                with self._lock:
-                    self._status["last_tick"] = _now_ts()
-
-                sch = self._get_sched_cfg()
-                eff = self._effective(sch)
-                tz = _tz_from_cfg(sch)
-
-                if not eff["enabled"]:
-                    self._update_next(None, effective_mode="disabled")
+                try:
                     with self._lock:
-                        self._std_next_ts = 0
-                        self._std_cfg_key = ""
+                        self._status["last_tick"] = _now_ts()
+
+                    sch = self._get_sched_cfg()
+                    eff = self._effective(sch)
+                    tz = _tz_from_cfg(sch)
+
+                    if not eff["enabled"]:
+                        self._update_next(None, effective_mode="disabled")
+                        with self._lock:
+                            self._std_next_ts = 0
+                            self._std_cfg_key = ""
+                            self._adv_seed_key = ""
+                            self._adv_seed_day = ""
+                        self._sleep_or_poke(1.0)
+                        continue
+
+                    now_local = _as_now_in_tz(tz)
+                    if eff["mode"] == "advanced":
+                        with self._lock:
+                            self._std_next_ts = 0
+                            self._std_cfg_key = ""
+
+                        self._adv_seed_past_due_today(sch, tz)
+                        ran = self._adv_run_due(sch, tz)
+                        now_local = _as_now_in_tz(tz)
+                        nxt = self._adv_next(sch, now_local, tz)
+                        self._update_next(nxt, effective_mode="advanced")
+
+                        if ran:
+                            # after running, re-evaluate
+                            self._sleep_or_poke(0.5)
+                            continue
+
+                        remaining = max(0.0, (nxt - _as_now_in_tz(tz)).total_seconds()) if nxt else 1.0
+                        self._sleep_or_poke(min(30.0, remaining if remaining > 0 else 0.5))
+                        continue
+
+                    # standard
+                    with self._lock:
                         self._adv_seed_key = ""
                         self._adv_seed_day = ""
-                    self._sleep_or_poke(1.0)
-                    continue
+                    std_key = "|".join([
+                        str(eff.get("mode") or ""),
+                        str(sch.get("enabled") or ""),
+                        str(sch.get("mode") or ""),
+                        str(sch.get("every_n_hours") or ""),
+                        str(sch.get("daily_time") or ""),
+                        str(sch.get("custom_interval_minutes") or ""),
+                        str(sch.get("timezone") or ""),
+                        str(sch.get("jitter_seconds") or ""),
+                    ])
 
-                now_local = _as_now_in_tz(tz)
-                if eff["mode"] == "advanced":
+                    now_ts = _now_ts()
                     with self._lock:
-                        self._std_next_ts = 0
-                        self._std_cfg_key = ""
+                        cached_key = self._std_cfg_key
+                        cached_next = int(self._std_next_ts or 0)
 
-                    self._adv_seed_past_due_today(sch, tz)
-                    ran = self._adv_run_due(sch, tz)
-                    now_local = _as_now_in_tz(tz)
-                    nxt = self._adv_next(sch, now_local, tz)
-                    self._update_next(nxt, effective_mode="advanced")
+                    if cached_next <= 0 or cached_key != std_key:
+                        nxt = compute_next_run(now_local, sch)
+                        cached_next = int(nxt.timestamp())
+                        with self._lock:
+                            self._std_cfg_key = std_key
+                            self._std_next_ts = cached_next
+                    else:
+                        nxt = datetime.fromtimestamp(cached_next)
 
-                    if ran:
-                        # after running, re-evaluate
+                    self._update_next(nxt, effective_mode=eff["mode"])
+
+                    if now_ts >= cached_next:
+                        if self.is_sync_running_fn():
+                            self._log("standard: sync is busy; delaying scheduled run", level="INFO")
+                            self._sleep_or_poke(2.0)
+                            continue
+
+                        self._std_run_due()
+
+                        now_local = _as_now_in_tz(tz)
+                        nxt2 = compute_next_run(now_local, sch)
+                        with self._lock:
+                            self._std_next_ts = int(nxt2.timestamp())
+                        self._update_next(nxt2, effective_mode=eff["mode"])
+
                         self._sleep_or_poke(0.5)
                         continue
 
-                    remaining = max(0.0, (nxt - _as_now_in_tz(tz)).total_seconds()) if nxt else 1.0
+                    remaining = max(0.0, (nxt - _as_now_in_tz(tz)).total_seconds())
                     self._sleep_or_poke(min(30.0, remaining if remaining > 0 else 0.5))
+                except Exception as exc:
+                    self._log(
+                        f"scheduler tick failed: {type(exc).__name__}: {exc}; retrying in 5 seconds",
+                        level="ERROR",
+                    )
+                    self._sleep_or_poke(5.0)
                     continue
-
-                # standard
-                with self._lock:
-                    self._adv_seed_key = ""
-                    self._adv_seed_day = ""
-                std_key = "|".join([
-                    str(eff.get("mode") or ""),
-                    str(sch.get("enabled") or ""),
-                    str(sch.get("mode") or ""),
-                    str(sch.get("every_n_hours") or ""),
-                    str(sch.get("daily_time") or ""),
-                    str(sch.get("custom_interval_minutes") or ""),
-                    str(sch.get("timezone") or ""),
-                    str(sch.get("jitter_seconds") or ""),
-                ])
-
-                now_ts = _now_ts()
-                with self._lock:
-                    cached_key = self._std_cfg_key
-                    cached_next = int(self._std_next_ts or 0)
-
-                if cached_next <= 0 or cached_key != std_key:
-                    nxt = compute_next_run(now_local, sch)
-                    cached_next = int(nxt.timestamp())
-                    with self._lock:
-                        self._std_cfg_key = std_key
-                        self._std_next_ts = cached_next
-                else:
-                    nxt = datetime.fromtimestamp(cached_next)
-
-                self._update_next(nxt, effective_mode=eff["mode"])
-
-                if now_ts >= cached_next:
-                    if self.is_sync_running_fn():
-                        self._log("standard: sync is busy; delaying scheduled run", level="INFO")
-                        self._sleep_or_poke(2.0)
-                        continue
-
-                    self._std_run_due()
-
-                    now_local = _as_now_in_tz(tz)
-                    nxt2 = compute_next_run(now_local, sch)
-                    with self._lock:
-                        self._std_next_ts = int(nxt2.timestamp())
-                    self._update_next(nxt2, effective_mode=eff["mode"])
-
-                    self._sleep_or_poke(0.5)
-                    continue
-
-                remaining = max(0.0, (nxt - _as_now_in_tz(tz)).total_seconds())
-                self._sleep_or_poke(min(30.0, remaining if remaining > 0 else 0.5))
         finally:
             with self._lock:
                 self._status["running"] = False

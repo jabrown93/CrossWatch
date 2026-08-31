@@ -3,6 +3,42 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
+def test_scheduler_loop_recovers_after_config_load_failure(monkeypatch) -> None:
+    from services.scheduling import SyncScheduler
+
+    calls = 0
+    logs: list[tuple[str, str]] = []
+    sleeps: list[float] = []
+
+    def load_config() -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("config decrypt failed")
+        return {"scheduling": {"enabled": False, "mode": "disabled"}}
+
+    scheduler = SyncScheduler(
+        load_config=load_config,
+        save_config=lambda _cfg: None,
+        run_sync_fn=lambda _payload=None: True,
+        log_fn=lambda message, level="INFO": logs.append((level, message)),
+    )
+
+    def sleep_or_stop(seconds: float) -> None:
+        sleeps.append(seconds)
+        if seconds == 1.0:
+            scheduler._stop.set()
+
+    monkeypatch.setattr(scheduler, "_sleep_or_poke", sleep_or_stop)
+
+    scheduler._loop()
+
+    assert calls == 3
+    assert sleeps == [5.0, 1.0]
+    assert logs == [("ERROR", "scheduler tick failed: RuntimeError: config decrypt failed; retrying in 5 seconds")]
+    assert scheduler._status["running"] is False
+
+
 def test_normalize_scheduling_clamps_custom_interval_to_minimum() -> None:
     from cw_platform.config_base import _normalize_scheduling
 
