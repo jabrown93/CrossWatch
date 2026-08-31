@@ -22,15 +22,6 @@ _PASSTHROUGH_KEY_LISTS = (
 
 _PASSTHROUGH_KEY_MAPS = ("confirmed_destinations",)
 
-def _retry(fn: Callable[[], Any], *, attempts: int = 3, base_sleep: float = 0.5) -> Any:
-    last = None
-    for i in range(attempts):
-        try: return fn()
-        except Exception as e:
-            last = e
-            __import__("time").sleep(base_sleep * (2 ** i))
-    raise last  # type: ignore
-
 
 def _ui_spotlight_items(
     items: Sequence[Mapping[str, Any]],
@@ -382,7 +373,7 @@ def _apply_chunked(
         return {"ok": True, "attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0, "count": 0, "cancelled": True}
     csize = int(chunk_size or 0)
     if csize <= 0 or total <= csize:
-        raw = _retry(lambda: call(items))
+        raw = call(items)
         return _normalize(raw, items, tag, dst=dst, feature=feature, emit=emit)
 
     done = 0
@@ -407,7 +398,7 @@ def _apply_chunked(
             emit(f"{tag}:cancelled", dst=dst, feature=feature, done=done, total=total)
             break
         chunk = items[i : i + csize]
-        raw = _retry(lambda: call(chunk))
+        raw = call(chunk)
         res = _normalize(raw, chunk, tag, dst=dst, feature=feature, emit=emit)
         agg["ok"] = agg["ok"] and res["ok"]
         agg["attempted"] += res["attempted"]
