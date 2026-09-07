@@ -1,3 +1,12 @@
+## [1.3.17](https://github.com/jabrown93/CrossWatch/compare/v1.3.16...v1.3.17) (2026-09-07)
+
+
+### Bug Fixes
+
+* **deps:** update digest updates ([953e0b1](https://github.com/jabrown93/CrossWatch/commit/953e0b1879fc343c920a06410b1e1730400429ab))
+* **deps:** update digest updates ([#129](https://github.com/jabrown93/CrossWatch/issues/129)) ([5861756](https://github.com/jabrown93/CrossWatch/commit/5861756c77c994213799484621a838e631a9b89a))
+* **deps:** use Renovate-compatible uv headers ([#128](https://github.com/jabrown93/CrossWatch/issues/128)) ([acb44ba](https://github.com/jabrown93/CrossWatch/commit/acb44baddafa7dd5d0f02d85cf39b793565dfebb))
+
 ## [1.3.16](https://github.com/jabrown93/CrossWatch/compare/v1.3.15...v1.3.16) (2026-08-31)
 
 
