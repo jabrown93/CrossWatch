@@ -94,7 +94,7 @@
       const method = activeSimklMethod(blk);
       setSimklMethodUI(method);
       try { setSimklSuccess(!!tok, tok ? (method === "pin" ? "Connected using PIN" : "Connected") : ""); } catch {}
-      if (tok) { try { smqcStop(); } catch (_) {} }
+      if (tok && !simklPinPoller?.isRunning()) { try { smqcStop(); } catch (_) {} }
       try { updateSimklButtonState(); } catch {}
     } catch (e) {
       console.warn("[simkl] hydrate failed", e);
@@ -123,8 +123,8 @@
       const rid = $("redirect_uri_preview");
       if (rid) rid.textContent = computeRedirect();
       const ok = cid.length > 0 && sec.length > 0;
-      if (btn && !simklConnected) btn.disabled = !ok;
       try { Shared.setConnectLocked(["btn-connect-simkl-pin", "btn-simkl-pin-restart", "btn-connect-simkl"], simklConnected); } catch {}
+      if (btn) btn.disabled = !ok || btn.classList.contains("busy");
       if (hint) hint.classList.toggle("hidden", ok);
     } catch (e) {
       console.warn("updateSimklButtonState failed", e);
@@ -341,6 +341,10 @@
     let win = null;
     try { win = w.open("https://simkl.com/", "_blank"); } catch {}
 
+    let authCompleted;
+    try { authCompleted = await Shared.captureAuthCompletion(profile); }
+    catch (e) { try { win?.close(); } catch {} notify(e.message); return; }
+
     try { await w.saveSettings?.(); } catch {}
 
     const origin = location.origin;
@@ -397,7 +401,7 @@
       const base = (cfg?.simkl && typeof cfg.simkl === "object") ? cfg.simkl : {};
       const blk = (inst === "default") ? base : (base.instances && base.instances[inst]) || {};
       const tok = _str(blk.access_token || (inst === "default" ? (cfg?.auth?.simkl?.access_token || "") : ""));
-      if (tok) {
+      if (tok && authCompleted(cfg)) {
         try { setSimklSuccess(true); } catch {}
         cleanup();
         return;

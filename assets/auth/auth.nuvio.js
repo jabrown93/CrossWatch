@@ -302,7 +302,6 @@
   }
 
   async function startLogin() {
-    if (connected) return;
     profileSelectionReady = false;
     renderProfiles([], null, "", false);
     let win = null;
