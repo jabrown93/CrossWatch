@@ -1,3 +1,12 @@
+## [1.3.20](https://github.com/jabrown93/CrossWatch/compare/v1.3.19...v1.3.20) (2026-09-26)
+
+
+### Bug Fixes
+
+* **deps:** update digest updates ([ca05262](https://github.com/jabrown93/CrossWatch/commit/ca05262a9ab5d88f8f6365675d1792593905ff57))
+* **deps:** update digest updates ([ae631e2](https://github.com/jabrown93/CrossWatch/commit/ae631e2eb3e78a9cd7907bd749205731ab71194b))
+* **release:** build and sign image in this repo's workflow ([#131](https://github.com/jabrown93/CrossWatch/issues/131)) ([726f69b](https://github.com/jabrown93/CrossWatch/commit/726f69b5dc995122ae5ce6af5b179dd4ee7a2ad0)), closes [jabrown93/homelab#3190](https://github.com/jabrown93/homelab/issues/3190)
+
 ## [1.3.19](https://github.com/jabrown93/CrossWatch/compare/v1.3.18...v1.3.19) (2026-09-21)
 
 
