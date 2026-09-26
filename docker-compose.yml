@@ -1,6 +1,6 @@
 services:
   crosswatch:
-    image: ghcr.io/jabrown93/crosswatch:latest@sha256:53316781127cb276e69ca502009208f8cdc8a4910206ac2b6a5bb2b825600b53
+    image: ghcr.io/jabrown93/crosswatch:latest@sha256:e67ccc0cabcb25bcd035eec62346735a702b6635eead7681098768a7e6ec8abe
     container_name: crosswatch
     ports:
       - "${CROSSWATCH_PORT:-8787}:8787"
