@@ -381,9 +381,9 @@ packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
     # via -r requirements.in
-plexapi==4.18.2 \
-    --hash=sha256:7ff9f30db57af08407500b2d59e5e57d674d2aa6082dce418086019abb5b8f78 \
-    --hash=sha256:865a90cf44193e750605dec35fc6e1038a15b6f0bda5b3e1779bbe286f7e1da1
+plexapi==4.18.3 \
+    --hash=sha256:6c34977ccf7057b204aa5d904f15ff41ea8831df05fedf51432adaa3124d7551 \
+    --hash=sha256:d59948f1f4b345a58a46e189bfccc7dadd86a6266ec2c97cd072a113a2d3c81d
     # via -r requirements.in
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy' \
     --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
