@@ -4,14 +4,17 @@
 //   * push to `main` -> stable release (feat -> minor, fix/perf -> patch, ! -> major)
 //   * push to `beta` -> prerelease (vX.Y.Z-beta.N)
 //
-// Routine runtime dependency bumps (fix(deps), from Renovate via the shared
-// preset) intentionally do NOT cut a release on ordinary pushes -- fix would
-// otherwise trigger a patch via the default rules, so it is explicitly
-// suppressed here. The weekly scheduled run in .github/workflows/release.yml
-// sets RELEASE_DEPS=true, which promotes the accumulated bumps into one patch
-// release. Vulnerability fixes are typed fix(security) by the preset, not
-// fix(deps), so they are unaffected by the suppression and still release
-// immediately. See jabrown93/.github's README, "Weekly dependency releases".
+// Renovate (via the shared preset) batches routine updates into chore
+// commits by scope: chore(deps) for runtime dependencies (what ships) and
+// chore(dev-deps) for dev/test/CI tooling. chore(dev-deps) never releases
+// (chore doesn't release by default). chore(deps) intentionally does NOT cut
+// a release on ordinary pushes -- it is explicitly suppressed here. The
+// weekly scheduled run in .github/workflows/release.yml sets
+// RELEASE_DEPS=true, which promotes the accumulated chore(deps) bumps into
+// one patch release. fix commits (including fix(deps), when a dependency
+// bump requires manual code changes) release immediately through the
+// default rules, as does fix(security) for vulnerability fixes. See
+// jabrown93/.github's README, "Weekly dependency releases".
 //
 // This file is CommonJS (there is no root package.json with "type": "module");
 // semantic-release loads it via cosmiconfig.
@@ -20,13 +23,11 @@ const releaseDeps = process.env.RELEASE_DEPS === "true";
 
 const depReleaseRules = [
   // Required: commit-analyzer evaluates every matching custom rule and keeps
-  // the highest release type, so without this a breaking fix(deps)! would
+  // the highest release type, so without this a breaking chore(deps)! would
   // match ONLY the suppression rule below and never release. Listed first so
   // the analyzer short-circuits on major.
-  { type: "fix", scope: "deps", breaking: true, release: "major" },
-  releaseDeps
-    ? { type: "fix", scope: "deps", release: "patch" }
-    : { type: "fix", scope: "deps", release: false },
+  { type: "chore", scope: "deps", breaking: true, release: "major" },
+  { type: "chore", scope: "deps", release: releaseDeps ? "patch" : false },
 ];
 
 module.exports = {
