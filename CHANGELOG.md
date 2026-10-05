@@ -1,3 +1,11 @@
+## [1.3.21](https://github.com/jabrown93/CrossWatch/compare/v1.3.20...v1.3.21) (2026-10-05)
+
+
+### Bug Fixes
+
+* **deps:** update digest updates ([8534bfa](https://github.com/jabrown93/CrossWatch/commit/8534bfa988b678e9614a1eb0120104670e806cc5))
+* **deps:** update digest updates ([a17e32f](https://github.com/jabrown93/CrossWatch/commit/a17e32fb4212194e59e26ae16d2b2aac115dcc2f))
+
 ## [1.3.20](https://github.com/jabrown93/CrossWatch/compare/v1.3.19...v1.3.20) (2026-09-26)
 
 
