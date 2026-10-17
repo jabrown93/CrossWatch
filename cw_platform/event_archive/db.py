@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 from ..local_db.db import (
+    SCHEMA_LOCK,
     LocalDatabaseError,
     close_conn,
     connect as _connect,
@@ -17,6 +19,11 @@ from ..local_db.db import (
 )
 
 EventArchiveError = LocalDatabaseError
+
+# Connection the event schema was last applied to, per thread. get_conn() hands
+# back the same per-thread connection on every call, so this skips redoing the
+# schema on every write.
+_APPLIED = threading.local()
 
 __all__ = [
     "EventArchiveError",
@@ -35,7 +42,8 @@ def events_db_path() -> Path:
 def _apply_event_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
     from .schema import apply_schema
 
-    apply_schema(conn)
+    with SCHEMA_LOCK:
+        apply_schema(conn)
     return conn
 
 
@@ -47,7 +55,11 @@ def get_conn() -> sqlite3.Connection | None:
     conn = _get_conn()
     if conn is None:
         return None
+    if getattr(_APPLIED, "conn", None) is conn:
+        return conn
     try:
-        return _apply_event_schema(conn)
+        _apply_event_schema(conn)
     except Exception:
         return None
+    _APPLIED.conn = conn
+    return conn
