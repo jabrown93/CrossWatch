@@ -96,6 +96,67 @@ def test_concurrent_writers_lose_no_events(archive):
     assert count == threads_n * per_thread
 
 
+def test_schema_setup_never_overlaps_across_threads(archive, monkeypatch):
+    """Concurrent CREATE/ALTER on a fresh database fails the other connections
+    with "database schema has changed", which surfaces as a dropped write.
+    """
+    from cw_platform.event_archive import schema as ea_schema
+    from cw_platform.local_db import schema as local_schema
+
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def tracked(real):
+        def apply(conn):
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            try:
+                # Widen the window so overlapping callers would be caught.
+                threading.Event().wait(0.02)
+                return real(conn)
+            finally:
+                with guard:
+                    active -= 1
+
+        return apply
+
+    monkeypatch.setattr(local_schema, "apply_schema", tracked(local_schema.apply_schema))
+    monkeypatch.setattr(ea_schema, "apply_schema", tracked(ea_schema.apply_schema))
+
+    threads_n = 6
+    start = threading.Barrier(threads_n)
+    conns: list[sqlite3.Connection | None] = []
+
+    def grab():
+        start.wait()
+        conns.append(ea_db.get_conn())
+
+    threads = [threading.Thread(target=grab) for _ in range(threads_n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(c is not None for c in conns)
+    assert peak == 1
+
+
+def test_event_schema_applied_once_per_connection(archive, monkeypatch):
+    from cw_platform.event_archive import schema as ea_schema
+
+    conn = ea_db.get_conn()
+    calls = []
+    real = ea_schema.apply_schema
+    monkeypatch.setattr(ea_schema, "apply_schema", lambda c: calls.append(c) or real(c))
+
+    assert ea_db.get_conn() is conn
+    assert ea_db.get_conn() is conn
+    assert calls == []
+
+
 def test_close_conn_drops_other_threads_connections(archive):
     """rebuild() unlinks the database right after close_conn().
 

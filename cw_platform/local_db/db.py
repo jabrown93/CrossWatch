@@ -28,6 +28,12 @@ _GENERATION = 0
 # while the other is still unlinking the database files.
 _SUSPEND_DEPTH = 0
 
+# Serializes schema setup across this process's per-thread connections. On a
+# fresh database, concurrent CREATE/ALTER from several connections makes the
+# others fail with "database schema has changed", which get_conn() reports as
+# an unavailable database and the recorders turn into a dropped write.
+SCHEMA_LOCK = threading.Lock()
+
 _MEMORY_URI = "file:crosswatch_local_mem?mode=memory&cache=shared"
 
 
@@ -114,10 +120,11 @@ def connect(
         conn = sqlite3.connect(str(p), timeout=5.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
-        _apply_pragmas(conn)
         from .schema import apply_schema
 
-        apply_schema(conn)
+        with SCHEMA_LOCK:
+            _apply_pragmas(conn)
+            apply_schema(conn)
     except Exception:
         try:
             conn.close()
