@@ -1,3 +1,10 @@
+## [1.3.23](https://github.com/jabrown93/CrossWatch/compare/v1.3.22...v1.3.23) (2026-10-17)
+
+
+### Bug Fixes
+
+* **local-db:** serialize schema setup across per-thread connections ([#134](https://github.com/jabrown93/CrossWatch/issues/134)) ([3bc48db](https://github.com/jabrown93/CrossWatch/commit/3bc48db33044650cad8a21913d2228de2f14fca2))
+
 ## [1.3.22](https://github.com/jabrown93/CrossWatch/compare/v1.3.21...v1.3.22) (2026-10-12)
 
 ## [1.3.21](https://github.com/jabrown93/CrossWatch/compare/v1.3.20...v1.3.21) (2026-10-05)
