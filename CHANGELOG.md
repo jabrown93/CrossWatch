@@ -1,3 +1,5 @@
+## [1.3.24](https://github.com/jabrown93/CrossWatch/compare/v1.3.23...v1.3.24) (2026-10-19)
+
 ## [1.3.23](https://github.com/jabrown93/CrossWatch/compare/v1.3.22...v1.3.23) (2026-10-17)
 
 
