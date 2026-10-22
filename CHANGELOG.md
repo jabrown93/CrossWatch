@@ -1,3 +1,10 @@
+## [1.3.25](https://github.com/jabrown93/CrossWatch/compare/v1.3.24...v1.3.25) (2026-10-22)
+
+
+### Bug Fixes
+
+* **security:** update dependency certifi to v2026.10.19 [security] ([#135](https://github.com/jabrown93/CrossWatch/issues/135)) ([79077ef](https://github.com/jabrown93/CrossWatch/commit/79077ef2398e9a6ced459ea616edad63ee9d4a80))
+
 ## [1.3.24](https://github.com/jabrown93/CrossWatch/compare/v1.3.23...v1.3.24) (2026-10-19)
 
 ## [1.3.23](https://github.com/jabrown93/CrossWatch/compare/v1.3.22...v1.3.23) (2026-10-17)
