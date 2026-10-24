@@ -1,3 +1,10 @@
+## [1.3.27](https://github.com/jabrown93/CrossWatch/compare/v1.3.26...v1.3.27) (2026-10-24)
+
+
+### Bug Fixes
+
+* **trakt:** log status and allowlisted OAuth error on refresh failure ([#141](https://github.com/jabrown93/CrossWatch/issues/141)) ([c2f1b04](https://github.com/jabrown93/CrossWatch/commit/c2f1b04ae1749b40984d0833587d6f78ddd6068f))
+
 ## [1.3.26](https://github.com/jabrown93/CrossWatch/compare/v1.3.25...v1.3.26) (2026-10-22)
 
 ## [1.3.25](https://github.com/jabrown93/CrossWatch/compare/v1.3.24...v1.3.25) (2026-10-22)
