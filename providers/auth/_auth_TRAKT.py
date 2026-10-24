@@ -19,6 +19,36 @@ try:
 except ImportError:
     _real_log = None
 
+# Allowlists, not redaction: only constants from these sets reach the log, so
+# provider response text (which could echo credentials) never does.
+_OAUTH_ERRORS = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+    }
+)
+# "session not found" is Trakt's reply for refresh tokens predating its auth
+# migration; only a fresh device auth recovers from it.
+_OAUTH_DESCRIPTIONS = frozenset({"session not found"})
+
+
+def _refresh_failure_reason(body: dict[str, Any]) -> str:
+    err = str(body.get("error") or "")
+    if err not in _OAUTH_ERRORS:
+        return "unknown"
+    desc = str(body.get("error_description") or "")
+    return f"{err} ({desc})" if desc in _OAUTH_DESCRIPTIONS else err
+
+
+_PUBLIC_REFRESH_REASONS = frozenset(
+    {"unknown", *_OAUTH_ERRORS, *(f"{e} ({d})" for e in _OAUTH_ERRORS for d in _OAUTH_DESCRIPTIONS)}
+)
+
+
 def _public_log_message(msg: Any) -> str:
     text = str(msg or "")
     if text == "TRAKT: request device code":
@@ -38,6 +68,9 @@ def _public_log_message(msg: Any) -> str:
     if text.startswith("TRAKT: token refresh network error"):
         return "TRAKT: token refresh network error"
     if text.startswith("TRAKT: token refresh failed"):
+        head, _, reason = text.removeprefix("TRAKT: token refresh failed ").partition(": ")
+        if head.isdigit() and len(head) == 3 and reason in _PUBLIC_REFRESH_REASONS:
+            return text
         return "TRAKT: token refresh failed"
     if text.startswith("TRAKT: token refresh invalid JSON"):
         return "TRAKT: token refresh invalid JSON"
@@ -472,7 +505,7 @@ class _TraktProvider:
                 except Exception:
                     body = {}
                 err = str(body.get("error") or "") or str(body.get("error_description") or "") or (r.text or "")[:400]
-                log(f"TRAKT: token refresh failed {r.status_code}: {err}", "ERROR")
+                log(f"TRAKT: token refresh failed {int(r.status_code)}: {_refresh_failure_reason(body)}", "ERROR")
                 return {"ok": False, "status": f"refresh_failed:{r.status_code}", "error": err}
 
             try:
