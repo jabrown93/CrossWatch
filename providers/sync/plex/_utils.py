@@ -151,7 +151,13 @@ def _resource_token_for_connection(token: str, client_id: str | None, baseurl: s
     r.raise_for_status()
     root = ET.fromstring(r.text or "")
 
+    try:
+        want_ip = ipaddress.ip_address(want_host)
+    except ValueError:
+        want_ip = None
+
     best: tuple[int, str | None, str | None] = (-1, None, None)
+    ambiguous = False
     for dev in list(root):
         if (dev.tag or "").lower() != "device":
             continue
@@ -176,14 +182,25 @@ def _resource_token_for_connection(token: str, client_id: str | None, baseurl: s
                 scheme = (cu.scheme or "").strip().lower()
             except Exception:
                 continue
-            if host != want_host or port != want_port:
+            if host == want_host and port == want_port:
+                score = max(score, 100 if scheme == want_scheme else 80)
                 continue
-            score = max(score, 100 if scheme == want_scheme else 80)
+            if want_ip is not None:
+                try:
+                    address = ipaddress.ip_address(str(conn.get("address") or "").strip())
+                    address_port = int(conn.get("port") or port)
+                except ValueError:
+                    continue
+                if address == want_ip and address_port == want_port:
+                    score = max(score, 60)
 
         if score > best[0]:
             best = (score, mid, atok)
+            ambiguous = False
+        elif score >= 0 and score == best[0] and (mid, atok) != best[1:]:
+            ambiguous = True
 
-    return best[1], best[2]
+    return (None, None) if ambiguous else (best[1], best[2])
 
 
 def _norm_base(url: Any) -> str:
@@ -1088,7 +1105,7 @@ def ensure_whitelist_defaults(
     cfg = load_config() if cfg is None else cfg
     plex = _plex(cfg, instance_id)
     changed = False
-    for sec in ("history", "progress", "ratings", "scrobble"):
+    for sec in ("history", "progress", "ratings", "collection", "scrobble"):
         if not isinstance(plex.get(sec), dict):
             plex[sec] = {}
             changed = True
@@ -1102,5 +1119,5 @@ def ensure_whitelist_defaults(
             changed = True
     if changed and persist:
         save_config(cfg)
-        _info("whitelist_defaults_ensured")
+        _dbg("whitelist_defaults_ensured")
     return changed

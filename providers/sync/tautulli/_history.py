@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
+from cw_platform.history_events import history_sync_key, minimal_history_item
 from cw_platform.id_map import canonical_key, ids_from_guid
 
 from ._common import make_logger
@@ -25,6 +26,30 @@ def _cfg_get(adapter: Any, key: str, default: Any = None) -> Any:
         if cur is None:
             return default
     return cur
+
+
+def _rewatches_enabled(adapter: Any) -> bool:
+    cfg = getattr(adapter, "cfg", None)
+    return bool(isinstance(cfg, Mapping) and cfg.get("_cw_history_rewatches"))
+
+
+def _to_float(v: Any) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_is_watched(row: Mapping[str, Any], min_percent: float) -> bool:
+    ws = _to_float(row.get("watched_status"))
+    if ws is not None:
+        return ws >= 1.0
+    pc = _to_float(row.get("percent_complete"))
+    if pc is not None:
+        return pc >= min_percent
+    return True
 
 
 def _to_int(v: Any) -> int | None:
@@ -53,7 +78,7 @@ def _to_int_total(v: Any) -> int | None:
 
 
 def _as_epoch(v: Any) -> int | None:
-    if v is None:
+    if v is None or isinstance(v, bool):
         return None
     try:
         if isinstance(v, (int, float)):
@@ -72,7 +97,8 @@ def _as_epoch(v: Any) -> int | None:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if not dt.tzinfo:
             dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
+        x = int(dt.timestamp())
+        return x if x > 0 else None
     except Exception:
         return None
 
@@ -84,6 +110,14 @@ def _iso_z(epoch: int | None) -> str | None:
         return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat().replace("+00:00", "Z")
     except Exception:
         return None
+
+
+def _watched_at(row: Mapping[str, Any]) -> str | None:
+    for field in ("stopped", "date", "started", "time"):
+        value = _iso_z(_as_epoch(row.get(field)))
+        if value:
+            return value
+    return None
 
 
 def _clean_guid(s: str) -> str:
@@ -229,8 +263,19 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 5000) -> 
     cfg_max_pages = int(_cfg_get(adapter, "tautulli.history.max_pages", max_pages) or max_pages)
     if cfg_max_pages <= 0:
         cfg_max_pages = max_pages
+    watched_only = bool(_cfg_get(adapter, "tautulli.history.watched_only", True))
+    min_percent = _to_float(_cfg_get(adapter, "tautulli.history.min_percent", 90))
+    if min_percent is None:
+        min_percent = 90.0
 
-    _log("index_fetch_counts", per_page=cfg_per_page, max_pages=cfg_max_pages, has_user_id=bool(user_id))
+    _log(
+        "index_fetch_counts",
+        per_page=cfg_per_page,
+        max_pages=cfg_max_pages,
+        has_user_id=bool(user_id),
+        watched_only=watched_only,
+        min_percent=min_percent,
+    )
 
     out: dict[str, dict[str, Any]] = {}
     meta_cache: dict[str, Mapping[str, Any] | None] = {}
@@ -242,8 +287,10 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 5000) -> 
     rows_seen = 0
     rows_kept = 0
     skipped_type = 0
+    skipped_partial = 0
     skipped_no_time = 0
     skipped_no_ids = 0
+    event_mode = _rewatches_enabled(adapter)
 
     def _page_sig(rows: list[dict[str, Any]]) -> str:
         if not rows:
@@ -276,7 +323,14 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 5000) -> 
             _log("index_reconcile", level="warn", reason="max_pages_reached", pages=pages, max_pages=cfg_max_pages)
             break
 
-        params: dict[str, Any] = {"start": start, "length": cfg_per_page, "order_column": "date", "order_dir": "desc"}
+        params: dict[str, Any] = {
+            "start": start,
+            "length": cfg_per_page,
+            "order_column": "date",
+            "order_dir": "desc",
+            "grouping": 1,
+            "include_activity": 0,
+        }
         if user_id:
             params["user_id"] = user_id
 
@@ -319,8 +373,11 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 5000) -> 
                 skipped_type += 1
                 continue
 
-            ts = _as_epoch(row.get("date") or row.get("started") or row.get("time"))
-            watched_at = _iso_z(ts)
+            if watched_only and not _row_is_watched(row, min_percent):
+                skipped_partial += 1
+                continue
+
+            watched_at = _watched_at(row)
             if not watched_at:
                 skipped_no_time += 1
                 continue
@@ -376,10 +433,21 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 5000) -> 
                 if _has_ext_ids(show_ids):
                     item["show_ids"] = show_ids
 
+            if event_mode:
+                key = history_sync_key(item, event_mode=True)
+                if key and key in out:
+                    event_id = str(row.get("row_id") or row.get("reference_id") or row.get("id") or rows_seen).strip()
+                    key = f"{key}~tt{event_id or rows_seen}"
+                if key:
+                    out[key] = minimal_history_item(item, key, event_mode=True)
+                    rows_kept += 1
+                continue
+
             ck = canonical_key(item)
-            if ck and ck not in out:
+            if ck and (ck not in out or watched_at > out[ck]["watched_at"]):
+                if ck not in out:
+                    rows_kept += 1
                 out[ck] = item
-                rows_kept += 1
 
         start += cfg_per_page
         total_i = _to_int_total(total)
@@ -396,6 +464,7 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 5000) -> 
         rows_seen=rows_seen,
         rows_kept=rows_kept,
         skipped_type=skipped_type,
+        skipped_partial=skipped_partial,
         skipped_no_time=skipped_no_time,
         skipped_no_ids=skipped_no_ids,
         meta_cache=len(meta_cache),

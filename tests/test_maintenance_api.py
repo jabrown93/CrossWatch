@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+from importlib import import_module
 from types import SimpleNamespace
+
+import pytest
 
 from api import maintenanceAPI
 from cw_platform.local_db.legacy_files import STATE_JSON, STATISTICS_JSON, legacy_path, legacy_root
@@ -280,6 +283,67 @@ def test_database_health_endpoint_is_read_only(tmp_path, monkeypatch) -> None:
     assert _load_state(tmp_path)["providers"]["TRAKT"]["watchlist"]["baseline"]["items"]["a"]["title"] == "A"
 
 
+def _rebuild_setup(tmp_path, monkeypatch, running: bool = False):
+    import sqlite3
+
+    from cw_platform.local_db.db import close_conn, crosswatch_db_path
+
+    state_dir = tmp_path / ".cw_state"
+    state_dir.mkdir()
+    _save_state(
+        tmp_path,
+        {"providers": {"TRAKT": {"watchlist": {"baseline": {"items": {"a": {"title": "A"}}}}}}},
+    )
+    monkeypatch.setattr(maintenanceAPI, "_cw", lambda: (tmp_path / "cache", tmp_path, state_dir, None, None, None))
+    monkeypatch.setattr("api.syncAPI._is_sync_running", lambda: running)
+    return sqlite3, close_conn, crosswatch_db_path(tmp_path)
+
+
+def test_database_rebuild_needs_confirmation(tmp_path, monkeypatch) -> None:
+    _, _, db_path = _rebuild_setup(tmp_path, monkeypatch)
+
+    assert maintenanceAPI.maintenance_database_rebuild({}) == {"ok": False, "error": "confirmation_required", "confirm": False}
+    assert _load_state(tmp_path)["providers"]["TRAKT"]["watchlist"]["baseline"]["items"]["a"]["title"] == "A"
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_database_rebuild_is_refused_while_a_sync_runs(tmp_path, monkeypatch) -> None:
+    _, _, db_path = _rebuild_setup(tmp_path, monkeypatch, running=True)
+
+    assert maintenanceAPI.maintenance_database_rebuild({"confirm": True}) == {"ok": False, "error": "sync_running"}
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_database_rebuild_backs_up_files_and_starts_fresh(tmp_path, monkeypatch) -> None:
+    sqlite3, close_conn, db_path = _rebuild_setup(tmp_path, monkeypatch)
+
+    result = maintenanceAPI.maintenance_database_rebuild({"confirm": True})
+
+    assert result["ok"] is True
+    backup = result["backup"]
+    assert backup and backup.startswith(str(db_path.parent / "backups" / "crosswatch-"))
+    assert backup in result["moved"]
+    assert _load_state(tmp_path).get("providers") in (None, {})
+    old = sqlite3.connect(backup)
+    try:
+        assert old.execute("SELECT COUNT(*) FROM baseline_items").fetchone()[0] == 1
+    finally:
+        old.close()
+    close_conn()
+
+
+def test_database_rebuild_action_status_describes_the_backup(tmp_path, monkeypatch) -> None:
+    _rebuild_setup(tmp_path, monkeypatch)
+
+    result = maintenanceAPI.maintenance_action_status("database-rebuild")
+    metrics = {item["label"]: item["value"] for item in result["metrics"]}
+
+    assert result["title"] == "Rebuild local database"
+    assert ".cw_databases/backups" in result["note"]
+    assert metrics["Database size"] > 0
+    assert metrics["Active writes"] == 0
+
+
 def test_compact_state_file_creates_backup_and_rewrites_database(tmp_path, monkeypatch) -> None:
     state_dir = tmp_path / ".cw_state"
     state_dir.mkdir()
@@ -440,6 +504,7 @@ def test_clear_provider_cache_preserves_pair_scoped_history_mapping_state(tmp_pa
         "trakt_history.unresolved.pending.one-way_SIMKL_default-TRAKT_default_p1.json",
         "trakt.history.cache.one-way_SIMKL_default-TRAKT_default_p1.json",
         "simkl.history.cache.one-way_SIMKL_default-TRAKT_default_p1.json",
+        "plex_history.playback.owner.digest.cw2_test_pair.json",
         "watermarks.json",
         "tombstones.json",
     }
@@ -491,6 +556,7 @@ def _seed_rebuild_state(state_dir):
         "simkl_history.unresolved.one-way_SIMKL_default-TRAKT_default_p1.json",
         "trakt_history.unresolved.pending.one-way_SIMKL_default-TRAKT_default_p1.json",
         "trakt.history.cache.one-way_SIMKL_default-TRAKT_default_p1.json",
+        "plex_history.playback.owner.digest.cw2_test_pair.json",
         "watermarks.json",
         "tombstones.json",
     }
@@ -595,7 +661,80 @@ def test_crosswatch_tracker_clear_rejects_profile_path_input(tmp_path, monkeypat
 
     assert result["ok"] is True
     assert result["provider_instance"] == "default"
-    assert not (root / "watchlist.json").exists()
+    # Feature state is emptied in place so the tracker cannot restore it from a snapshot.
+    assert (root / "watchlist.json").exists()
+    assert json.loads((root / "watchlist.json").read_text(encoding="utf-8")).get("items") == {}
     assert not (snaps / "20260101T000000Z-watchlist.json").exists()
     assert (profile_root / "watchlist.json").exists()
     assert (outside / "watchlist.json").exists()
+
+
+@pytest.mark.parametrize("feature", ["history", "ratings", "watchlist", "progress", "collection"])
+@pytest.mark.parametrize("pair_scoped", [False, True])
+@pytest.mark.parametrize("instance", ["default", "CW-P01"])
+def test_tracker_clear_keeps_missing_state_empty_with_retained_snapshots(
+    tmp_path, monkeypatch, feature, pair_scoped, instance,
+) -> None:
+    base = tmp_path / ".cw_provider"
+    profile = base / "profiles" / "CW-P01"
+    root, other = (base, profile) if instance == "default" else (profile, base)
+    snapshots = root / "snapshots"
+    snapshots.mkdir(parents=True)
+    other.mkdir(parents=True, exist_ok=True)
+    item = {
+        "type": "movie", "ids": {"tmdb": "1"}, "watched_at": "2026-09-19T12:00:00Z",
+        "rating": 8, "progress_percent": 20,
+    }
+    payload = json.dumps({"ts": 1, "items": {"tmdb:1": item}})
+    snapshot = snapshots / f"20260919T120000Z-{feature}.json"
+    snapshot.write_text(payload, encoding="utf-8")
+    other_state = other / f"{feature}.json"
+    other_state.write_text(payload, encoding="utf-8")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"crosswatch": {"root_dir": str(base), "instances": {"CW-P01": {}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(maintenanceAPI, "_cw", lambda: (tmp_path / "cache", tmp_path, tmp_path / ".cw_state", None, None, None))
+    monkeypatch.setattr(maintenanceAPI, "clear_caches", lambda: None)
+    monkeypatch.setattr(maintenanceAPI, "release_memory", lambda: None)
+    monkeypatch.setenv("CW_CROSSWATCH_PAIR_SCOPED", "1" if pair_scoped else "0")
+    monkeypatch.setenv("CW_PAIR_SCOPE", "test-pair")
+    monkeypatch.setenv("CW_PAIR_SRC", "SIMKL")
+    monkeypatch.delenv("CW_CAPTURE_MODE", raising=False)
+    module = import_module(f"providers.sync.crosswatch._{feature}")
+    adapter = SimpleNamespace(cfg=SimpleNamespace(base_path=root, auto_snapshot=False), config={"_cw_readonly": True})
+    assert module._load_state(adapter)["items"]
+    assert not (root / f"{feature}.json").exists()
+
+    result = maintenanceAPI.crosswatch_tracker_clear(clear_state=True, clear_snapshots=False, provider_instance=instance)
+
+    assert result["ok"] is True
+    assert f"{feature}.json" in result["removed"]["emptied_state_files"]
+    assert module._load_state(adapter)["items"] == {}
+    assert snapshot.read_text(encoding="utf-8") == payload
+    assert other_state.read_text(encoding="utf-8") == payload
+    if feature == "history":
+        adapter.config = {}
+        assert module.add(adapter, [item]) == (1, [])
+        assert len(module.build_index(adapter)) == 1
+
+
+def test_tracker_clear_snapshots_only_preserves_current_state(tmp_path, monkeypatch) -> None:
+    root = tmp_path / ".cw_provider"
+    snapshots = root / "snapshots"
+    snapshots.mkdir(parents=True)
+    payload = json.dumps({"items": {"tmdb:1": {"type": "movie", "ids": {"tmdb": "1"}}}})
+    state = root / "history.json"
+    state.write_text(payload, encoding="utf-8")
+    snapshot = snapshots / "20260919T120000Z-history.json"
+    snapshot.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(maintenanceAPI, "_cw", lambda: (tmp_path / "cache", tmp_path, tmp_path / ".cw_state", None, None, None))
+    monkeypatch.setattr(maintenanceAPI, "clear_caches", lambda: None)
+    monkeypatch.setattr(maintenanceAPI, "release_memory", lambda: None)
+
+    result = maintenanceAPI.crosswatch_tracker_clear(clear_state=False, clear_snapshots=True, provider_instance="default")
+
+    assert result["ok"] is True
+    assert state.read_text(encoding="utf-8") == payload
+    assert not snapshot.exists()
+    assert not (root / "ratings.json").exists()

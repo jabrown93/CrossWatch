@@ -11,7 +11,8 @@ import requests
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
 
-from cw_platform.provider_instances import get_provider_block, ensure_instance_block, ensure_provider_block, normalize_instance_id
+from cw_platform.app_version import user_agent as http_user_agent
+from cw_platform.provider_instances import ensure_instance_block, ensure_provider_block, normalize_instance_id, resolve_provider_block
 
 try:
     from _logging import log as _real_log
@@ -20,7 +21,7 @@ except ImportError:
 
 __VERSION__ = "2.0.0"
 
-UA = "CrossWatch/1.0"
+UA = http_user_agent(override_env="CW_ANILIST_UA")
 AUTH_URL = "https://anilist.co/api/v2/oauth/authorize"
 TOKEN_URL = "https://anilist.co/api/v2/oauth/token"
 GQL_URL = "https://graphql.anilist.co"
@@ -44,7 +45,7 @@ def _blocks(cfg: Any, instance_id: Any) -> tuple[str, dict[str, Any], dict[str, 
 
 
 def _read(cfg: Mapping[str, Any], instance_id: Any) -> dict[str, Any]:
-    return get_provider_block(cfg, "anilist", instance_id)
+    return resolve_provider_block(cfg, "anilist", instance_id)
 
 
 def _gql_viewer(access_token: str) -> dict[str, Any] | None:

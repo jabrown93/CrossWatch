@@ -87,6 +87,22 @@ def _manifest_to_dict(man: Any) -> dict[str, Any]:
     return manifest_to_dict(man)
 
 
+def auth_provider_manifest(name: str) -> dict[str, Any]:
+    from cw_platform.modules_registry import MODULES
+
+    path = MODULES.get("AUTH", {}).get(f"_auth_{str(name or '').strip().upper()}")
+    mod = _safe_import(path) if path else None
+    if mod is None:
+        return {}
+    provider = _provider_from_module(mod)
+    if provider is None:
+        return {}
+    try:
+        return _manifest_to_dict(provider.manifest())
+    except Exception:
+        return {}
+
+
 def auth_providers_manifests() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for mod in _iter_auth_modules():
@@ -138,9 +154,9 @@ def _module_html(mod: ModuleType) -> str:
 def auth_providers_html() -> str:
     groups: list[tuple[str, str, list[str]]] = [
         ("sec-auth-media", "Media servers", ["plex", "jellyfin", "emby"]),
-        ("sec-auth-trackers", "Trackers", ["crosswatch", "trakt", "simkl", "tmdb", "mdblist", "publicmetadb", "anilist", "punchplay", "floppy", "scrob"]),
+        ("sec-auth-trackers", "Trackers", ["crosswatch", "trakt", "simkl", "tmdb", "mdblist", "publicmetadb", "anilist", "myanimelist", "kitsu", "wetrakr", "punchplay", "bingebase", "flicklist", "floppy", "scrob"]),
         ("sec-auth-clients", "Media clients", ["nuvio", "kodi", "stremio"]),
-        ("sec-auth-others", "Others", ["tautulli"]),
+        ("sec-auth-others", "Others", ["tautulli", "tracearr"]),
     ]
 
     by_key: dict[str, str] = {}

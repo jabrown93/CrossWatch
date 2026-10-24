@@ -34,41 +34,64 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      description: Where did you experience the problem?
+      multiple: false
+      options:
+        - Web user interface
+        - Command Line Interface
+      default: 0
+    validations:
+      required: true
+
   - type: checkboxes
     id: providers
     attributes:
       label: Providers involved
       options:
-        - label: Plex
-        - label: Emby
-        - label: Jellyfin
-        - label: MDBList
-        - label: PublicMetaDB
-        - label: Nuvio
-        - label: Kodi
-        - label: Tautulli
         - label: AniList
-        - label: Trakt
+        - label: BingeBase
+        - label: CrossWatch
+        - label: Emby
+        - label: FlickList
+        - label: Floppy
+        - label: Jellyfin
+        - label: Kodi
+        - label: MDBList
+        - label: Nuvio
+        - label: Plex
+        - label: PublicMetaDB
+        - label: PunchPlay
+        - label: Scrob
         - label: SIMKL
-        - label: CrossWatch Internal Tracker
+        - label: Stremio
+        - label: Tautulli
+        - label: Tracearr
+        - label: TMDb
+        - label: Trakt
+        - label: WeTrakr
 
   - type: checkboxes
     id: areas
     attributes:
       label: Affected area
       options:
-        - label: Watchlist or favorites
-        - label: History or watched state
-        - label: Playback progress or resume position
+        - label: Watchlist
+        - label: History
+        - label: Progress or Playback progress
         - label: Ratings
-        - label: Scrobble or webhook
+        - label: Collections
+        - label: Scrobble (watcher/webhook)
         - label: Scheduler
-        - label: Analyzer or item matching
+        - label: Analyzer
         - label: Events
-        - label: Exporter
+        - label: Import/Export
         - label: Metadata or IDs
-        - label: Library selection or duplicate items
         - label: Web UI
+        - label: Command line interface
         - label: Configuration or API
 
   - type: textarea

@@ -13,11 +13,12 @@ from typing import Any
 import requests
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
-from cw_platform.provider_instances import ensure_instance_block, get_provider_block, normalize_instance_id
+from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
 
 __VERSION__ = "0.1"
-UA = "CrossWatch/1.0"
+UA = http_user_agent(override_env="CW_SCROB_UA")
 
 API_PREFIXES: tuple[str, ...] = ("", "/api/proxy")
 DEFAULT_TIMEOUT = 12.0
@@ -74,7 +75,7 @@ def normalize_api_prefix(value: Any) -> str:
 
 
 def _block(cfg: Mapping[str, Any], instance_id: Any = None) -> dict[str, Any]:
-    return get_provider_block(cfg or {}, "scrob", instance_id)
+    return resolve_provider_block(cfg or {}, "scrob", instance_id)
 
 
 def is_configured(block: Mapping[str, Any] | None) -> bool:

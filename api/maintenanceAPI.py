@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -20,6 +21,8 @@ from fastapi import APIRouter, Body, File, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 from cw_platform.local_db import crosswatch_db_path
+from cw_platform.memory_release import clear_caches, release_memory
+from cw_platform.local_db import path_catalog
 from cw_platform.local_db.currently_watching import clear_streams as clear_currently_watching_streams
 from cw_platform.local_db.currently_watching import stream_count as currently_watching_stream_count
 from cw_platform.local_db.diagnostics import diagnostics as local_db_diagnostics
@@ -52,6 +55,7 @@ SYNC_STATE_PATTERNS = (
     "*.unresolved*.json",
     "*history.cache*.json",
     "*_history.index*.json",
+    "plex_history.playback.*.json",
     "*watermark*.json",
     "tombstones.json",
     "*.tombstones.json",
@@ -93,7 +97,7 @@ def _cw() -> tuple[Any, Any, Any, Any, Any, Any]:
 
     def _load_statistics_state() -> dict[str, Any]:
         try:
-            return StateStore(CONFIG_DIR).load_state_features({"watchlist", "history", "ratings", "playlists"}) or {}
+            return StateStore(CONFIG_DIR).load_state_features({"watchlist", "history", "ratings", "playlists", "collection"}) or {}
         except Exception:
             return {}
 
@@ -123,7 +127,7 @@ def _clear_cw_state_files() -> list[str]:
                 continue
             continue
         if p.is_file():
-            if p.name in CW_STATE_KEEP_FILES or _is_sync_state_file(p.name):
+            if p.name in CW_STATE_KEEP_FILES or _is_sync_state_file(p.name) or p.name.startswith("plex_fallback_memo."):
                 continue
             try:
                 p.unlink(missing_ok=True)
@@ -198,6 +202,50 @@ def _json_files_in_dir(root: Path) -> list[Path]:
         return []
     out: list[Path] = []
     for path in safe_root.glob("*.json"):
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(safe_root)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            out.append(resolved)
+    return out
+
+
+_TRACKER_FEATURE_STEMS = ("history", "ratings", "watchlist", "progress", "collection")
+
+
+_TRACKER_SIDECAR_MARKERS = frozenset({
+    "unresolved", "restore_state", "shadow", "blackbox", "flap", "hidden", "tomb", "tombstones", "pending",
+})
+
+
+def _is_tracker_feature_state(path: Path) -> bool:
+    parts = path.name.split(".")
+    if parts[-1] != "json" or parts[0] not in _TRACKER_FEATURE_STEMS:
+        return False
+    if len(parts) == 2:
+        return True
+    return len(parts) == 3 and parts[1] not in _TRACKER_SIDECAR_MARKERS
+
+
+def _empty_tracker_state(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp")
+        tmp.write_text(json.dumps({"ts": int(time.time()), "items": {}}), "utf-8")
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _snapshot_files_in_dir(root: Path) -> list[Path]:
+    safe_root = root.resolve(strict=False)
+    if not safe_root.exists():
+        return []
+    out: list[Path] = []
+    for path in safe_root.rglob("*.json"):
         resolved = path.resolve(strict=False)
         try:
             resolved.relative_to(safe_root)
@@ -353,7 +401,7 @@ def _sync_state_inventory(config_dir: Path) -> tuple[int, int]:
         return 0, 0
 
     baseline_count = 0
-    feature_names = {"history", "ratings", "watchlist", "playlists", "progress"}
+    feature_names = {"history", "ratings", "watchlist", "playlists", "progress", "collection"}
     for provider in providers.values():
         if not isinstance(provider, dict):
             continue
@@ -371,7 +419,7 @@ def _sync_state_baseline_inventory(config_dir: Path) -> dict[str, Any]:
     if not isinstance(providers, dict):
         return {"providers": 0, "baselines": 0, "items": 0, "largest": None}
 
-    feature_names = {"history", "ratings", "watchlist", "playlists", "progress"}
+    feature_names = {"history", "ratings", "watchlist", "playlists", "progress", "collection"}
     baselines = 0
     items_total = 0
     largest: dict[str, Any] | None = None
@@ -415,7 +463,7 @@ def _sync_state_baseline_inventory(config_dir: Path) -> dict[str, Any]:
     }
 
 
-FEATURE_NAMES = {"history", "ratings", "watchlist", "playlists", "progress"}
+FEATURE_NAMES = {"history", "ratings", "watchlist", "playlists", "progress", "collection"}
 
 
 def _feature_item_count(block: Any) -> int:
@@ -609,6 +657,21 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
                 _metric("Last updated", scoped_usage["modified"], "datetime"),
             ],
         )
+    elif action == "pair-state":
+        from cw_platform.local_db.state import pair_state_counts
+
+        cfg = _load_config_for_state_prune(CONFIG_DIR) or {}
+        pairs = [pair for pair in cfg.get("pairs") or [] if isinstance(pair, Mapping)]
+        baselines, items = pair_state_counts(CONFIG_DIR)
+        response.update(
+            title="Reset a sync pair",
+            note="Removes the baselines, history aliases, mapping caches, watermarks and tombstones of one sync pair for the features you select. Other pairs keep their state. On the next sync a two-way pair adds items back that are missing on one side.",
+            metrics=[
+                _metric("Sync pairs", len(pairs)),
+                _metric("Pair baselines", baselines),
+                _metric("Pair baseline items", items),
+            ],
+        )
     elif action in {"state-file", "state-file-prune"}:
         usage = _paths_usage(_sync_state_storage_paths(CONFIG_DIR))
         inv = _sync_state_baseline_inventory(CONFIG_DIR)
@@ -637,11 +700,12 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
                 _metric("Stale instances", stale.get("removed_instances", 0)),
                 _metric("Stale baselines", stale.get("removed_baselines", 0)),
                 _metric("Stale items", stale.get("removed_items", 0)),
+                _metric("Orphaned state files", len(_orphaned_state_files())),
             ])
         response.update(
             title="Prune sync state" if action == "state-file-prune" else "Sync state",
             note=(
-                "Creates an app-state backup, then removes provider or instance baselines that are no longer referenced by configured sync pairs or scrobbler routes."
+                "Creates an app-state backup, then removes provider or instance baselines that are no longer referenced by configured sync pairs or scrobbler routes, plus unresolved, blackbox and flap files left behind by removed pairs."
                 if action == "state-file-prune"
                 else "Inspects the local sync state baseline store."
             ),
@@ -683,20 +747,44 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
         orphans: Mapping[str, Any] = orphans_raw if isinstance(orphans_raw, Mapping) else {}
         stale: Mapping[str, Any] = stale_raw if isinstance(stale_raw, Mapping) else {}
         last_sync: Mapping[str, Any] = last_sync_raw if isinstance(last_sync_raw, Mapping) else {}
+        storage_raw = health.get("storage")
+        storage: Mapping[str, Any] = storage_raw if isinstance(storage_raw, Mapping) else {}
         orphan_total = sum(int(value or 0) for value in orphans.values())
+        note = "Checks the local CrossWatch database integrity, schema, table counts and row consistency. Read-only."
+        if storage.get("network"):
+            note += f" Warning: the database is on a network filesystem ({storage.get('filesystem')}). SQLite locking is unreliable there; move /config to local storage."
         response.update(
             title="Database health",
-            note="Checks the local CrossWatch database integrity, schema, table counts and row consistency. Read-only.",
+            note=note,
             metrics=[
                 _metric("Integrity", health.get("integrity", "unknown"), "text"),
                 _metric("Schema version", health.get("schema_version") or 0),
                 _metric("Database size", int(health.get("size_bytes") or 0), "bytes"),
+                _metric("WAL size", int(health.get("wal_size_bytes") or 0), "bytes"),
+                _metric("Filesystem", storage.get("filesystem") or "unknown", "text"),
                 _metric("Tables", len(tables)),
                 _metric("Feature baselines", int(tables.get("provider_feature_state") or 0)),
                 _metric("Baseline items", int(tables.get("baseline_items") or 0)),
                 _metric("Orphan rows", orphan_total),
                 _metric("Expired TTL rows", int(stale.get("ttl_expired") or 0)),
                 _metric("Last sync", last_sync.get("state_epoch"), "datetime"),
+            ],
+        )
+    elif action == "database-rebuild":
+        from cw_platform.local_db.db import active_writers
+        from cw_platform.local_db.storage import storage_info
+
+        db_path = crosswatch_db_path(CONFIG_DIR)
+        storage = storage_info(db_path)
+        writers = active_writers()
+        response.update(
+            title="Rebuild local database",
+            note="Moves the local database files to .cw_databases/backups and starts a fresh database. Sync baselines, Editor mappings and blocks, Events, statistics, sync reports and hidden watchlist items start empty; config.json and provider logins stay. The next sync works like a first sync: nothing is deleted, but a two-way pair can add back items removed on one side. Use this when the database stays locked or damaged.",
+            metrics=[
+                _metric("Database size", _path_usage(db_path)["bytes"], "bytes"),
+                _metric("WAL size", _path_usage(Path(str(db_path) + "-wal"))["bytes"], "bytes"),
+                _metric("Filesystem", storage.get("filesystem") or "unknown", "text"),
+                _metric("Active writes", len(writers)),
             ],
         )
     elif action == "cache":
@@ -706,9 +794,11 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
         retry_files = sum(1 for item in files if any(token in str(item.get("name") or "").lower() for token in retry_names))
         response.update(
             title="Retry provider items",
-            note="Clears provider runtime caches such as retry guards, phantom records and provider health. Sync aliases, mappings, history indexes, watermarks, tombstones and your custom anime mapping rules stay untouched.",
+            note="Clears provider runtime caches such as retry guards, phantom records, provider health and saved file-path catalogues. File-path catalogues rebuild when next needed. Sync aliases, mappings, history indexes, watermarks, tombstones and your custom anime mapping rules stay untouched.",
             metrics=[
                 _metric("Runtime files", len(files)),
+                _metric("Path catalogues", info["path_catalogues"]["count"]),
+                _metric("Path catalogue storage", info["path_catalogues"]["bytes"], "bytes"),
                 _metric("Retry / guard files", retry_files),
                 _metric("Storage", sum(int(item.get("size") or 0) for item in files), "bytes"),
                 _metric("Preserved files", len(CW_STATE_KEEP_FILES)),
@@ -848,7 +938,7 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
                 _metric("Capture storage kept", captures["bytes"], "bytes"),
             ],
         )
-    elif action in ("events-health", "events-optimize", "events-rebuild"):
+    elif action in ("events-health", "events-optimize", "events-rebuild", "events-purge"):
         from cw_platform import event_archive as _ea
         st = _ea.status()
         db_path = Path(_ea.events_db_path())
@@ -878,6 +968,16 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
                     _metric("Last updated", usage.get("modified"), "datetime"),
                 ],
             )
+        elif action == "events-purge":
+            response.update(
+                title="Clear event data",
+                note="Empties every event category plus the sync activity calendar. Leaves the rest of the local database untouched. This cannot be undone.",
+                metrics=[
+                    _metric("Events removed", events),
+                    _metric("Sync runs removed", runs),
+                    _metric("Acknowledged", acknowledged),
+                ],
+            )
         else:
             response.update(
                 title="Clear archive",
@@ -894,13 +994,14 @@ def maintenance_action_status(action: str) -> dict[str, Any]:
     return response
 
 def _scan_provider_cache() -> dict[str, Any]:
-    _, _, CW_STATE_DIR, *_ = _cw()
+    _, CONFIG_DIR, CW_STATE_DIR, *_ = _cw()
     exists = CW_STATE_DIR.exists()
     out: dict[str, Any] = {
         "exists": exists,
         "root": str(CW_STATE_DIR),
         "files": [],
         "count": 0,
+        "path_catalogues": path_catalog.usage(CONFIG_DIR),
     }
     if not exists:
         return out
@@ -911,7 +1012,7 @@ def _scan_provider_cache() -> dict[str, Any]:
     except Exception:
         candidates = []
     for p in candidates:
-        if p.name in CW_STATE_KEEP_FILES or _is_sync_state_file(p.name):
+        if p.name in CW_STATE_KEEP_FILES or _is_sync_state_file(p.name) or p.name.startswith("plex_fallback_memo."):
             continue
         if p.is_file():
             files.append(_file_meta(p))
@@ -995,13 +1096,12 @@ def _scan_cw_tracker(root: Path) -> dict[str, Any]:
     snaps_dir = root / "snapshots"
     snapshots: list[dict[str, Any]] = []
     if snaps_dir.exists():
-        for p in snaps_dir.glob("*.json"):
-            if p.is_file():
-                snapshots.append(_file_meta(p))
+        for p in _snapshot_files_in_dir(snaps_dir):
+            snapshots.append(_file_meta(p))
 
     state_files.sort(key=lambda x: x.get("name") or "")
     snapshots.sort(key=lambda x: x.get("mtime") or "")
-    core_names = {"history.json", "ratings.json", "watchlist.json", "progress.json"}
+    core_names = {"history.json", "ratings.json", "watchlist.json", "progress.json", "collection.json"}
     state_count = sum(
         1 for f in state_files
         if (f.get("name") or "") in core_names
@@ -1087,6 +1187,8 @@ def clear_state_minimal() -> dict[str, Any]:
             if _safe_remove_path(p):
                 removed_scoped.append(p.name)
         after_usage = _paths_usage(_sync_state_storage_paths(CONFIG_DIR))
+        clear_caches()
+        release_memory()
         return {
             "ok": True,
             "path": str(state_path),
@@ -1180,6 +1282,35 @@ def compact_state_file() -> dict[str, Any]:
     }
 
 
+def _orphaned_state_files() -> list[Path]:
+    try:
+        from services.analyzer import orphaned_state_files
+
+        return list(orphaned_state_files())
+    except Exception:
+        _LOG.exception("orphaned state scan failed")
+        return []
+
+
+def _remove_orphaned_state_files(paths: list[Path]) -> tuple[int, int]:
+    removed = freed = 0
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            _LOG.exception("orphaned state removal failed path=%s", path)
+            continue
+        removed += 1
+        freed += int(size or 0)
+    return removed, freed
+
+
 @router.post("/state-file/prune")
 def prune_state_file() -> dict[str, Any]:
     _, CONFIG_DIR, *_ = _cw()
@@ -1219,7 +1350,9 @@ def prune_state_file() -> dict[str, Any]:
         }
 
     pruned, removed, details = _prune_state_payload(payload, cfg)
+    orphans = _orphaned_state_files()
     if removed.get("removed_baselines", 0) <= 0 and removed.get("removed_instances", 0) <= 0 and removed.get("removed_providers", 0) <= 0:
+        orphan_files, orphan_bytes = _remove_orphaned_state_files(orphans)
         return {
             "ok": True,
             "path": str(state_path),
@@ -1227,9 +1360,10 @@ def prune_state_file() -> dict[str, Any]:
             "backup": None,
             "removed": removed,
             "details": details,
+            "orphaned_state_files": orphan_files,
             "before_bytes": int(before.get("bytes") or 0),
             "after_bytes": int(before.get("bytes") or 0),
-            "summary": {"removed_files": 0, "removed_items": 0, "freed_bytes": 0},
+            "summary": {"removed_files": orphan_files, "removed_items": 0, "freed_bytes": orphan_bytes},
             "inventory": _sync_state_baseline_inventory(CONFIG_DIR),
         }
 
@@ -1263,11 +1397,12 @@ def prune_state_file() -> dict[str, Any]:
             "summary": {"removed_files": 0, "removed_items": 0, "freed_bytes": 0},
         }
 
+    orphan_files, orphan_bytes = _remove_orphaned_state_files(orphans)
     after = _paths_usage(_sync_state_storage_paths(CONFIG_DIR, []))
     summary = {
-        "removed_files": 0,
+        "removed_files": orphan_files,
         "removed_items": int(removed.get("removed_items") or 0),
-        "freed_bytes": max(0, int(before.get("bytes") or 0) - int(after.get("bytes") or 0)),
+        "freed_bytes": max(0, int(before.get("bytes") or 0) - int(after.get("bytes") or 0)) + orphan_bytes,
     }
     return {
         "ok": True,
@@ -1276,6 +1411,7 @@ def prune_state_file() -> dict[str, Any]:
         "backup": backup,
         "removed": removed,
         "details": details,
+        "orphaned_state_files": orphan_files,
         "before_bytes": int(before.get("bytes") or 0),
         "after_bytes": int(after.get("bytes") or 0),
         "summary": summary,
@@ -1292,7 +1428,7 @@ def crosswatch_tracker_clear(
     _, CONFIG_DIR, *_ = _cw()
     inst, root = _cw_tracker_context(CONFIG_DIR, provider_instance)
     state_paths = _json_files_in_dir(root)
-    snapshot_paths = _json_files_in_dir(_cw_tracker_snapshot_dir(root)) if clear_snapshots else []
+    snapshot_paths = _snapshot_files_in_dir(_cw_tracker_snapshot_dir(root)) if clear_snapshots else []
 
     before = _scan_cw_tracker(root)
     selected_before_paths = []
@@ -1304,10 +1440,23 @@ def crosswatch_tracker_clear(
     removed_state: list[str] = []
     removed_snapshots: list[str] = []
 
+    emptied_state: list[str] = []
     if clear_state:
         for p in state_paths:
-            if p.is_file() and _safe_remove_path(p):
+            if not p.is_file():
+                continue
+            # Feature state is emptied, not deleted: a missing file makes the tracker
+            # restore itself from the newest snapshot on the next run.
+            if _is_tracker_feature_state(p):
+                if _empty_tracker_state(p):
+                    emptied_state.append(p.name)
+            elif _safe_remove_path(p):
                 removed_state.append(p.name)
+
+        for stem in _TRACKER_FEATURE_STEMS:
+            path = root / f"{stem}.json"
+            if not path.exists() and not path.is_symlink() and _empty_tracker_state(path):
+                emptied_state.append(path.name)
 
     if clear_snapshots:
         for p in snapshot_paths:
@@ -1319,8 +1468,10 @@ def crosswatch_tracker_clear(
     if clear_state:
         selected_after_paths.extend(_json_files_in_dir(root))
     if clear_snapshots:
-        selected_after_paths.extend(_json_files_in_dir(_cw_tracker_snapshot_dir(root)))
+        selected_after_paths.extend(_snapshot_files_in_dir(_cw_tracker_snapshot_dir(root)))
     after_usage = _paths_usage(list(selected_after_paths))
+    clear_caches()
+    release_memory()
 
     return {
         "ok": True,
@@ -1328,6 +1479,7 @@ def crosswatch_tracker_clear(
         "root": str(root),
         "removed": {
             "state_files": removed_state,
+            "emptied_state_files": emptied_state,
             "snapshots": removed_snapshots,
         },
         "before": before,
@@ -1338,19 +1490,22 @@ def crosswatch_tracker_clear(
 
 @router.post("/clear-cache")
 def clear_cache() -> dict[str, Any]:
-    _, _, CW_STATE_DIR, *_ = _cw()
+    _, CONFIG_DIR, CW_STATE_DIR, *_ = _cw()
 
     before = _scan_provider_cache()
     before_usage = {
         "files": len(before.get("files") or []),
-        "bytes": sum(int(item.get("size") or 0) for item in before.get("files") or []),
+        "bytes": sum(int(item.get("size") or 0) for item in before.get("files") or []) + before["path_catalogues"]["bytes"],
         "modified": None,
     }
+    removed_catalogues = path_catalog.clear(CONFIG_DIR)
     removed = _clear_cw_state_files()
+    clear_caches()
+    release_memory()
     after = _scan_provider_cache()
     after_usage = {
         "files": len(after.get("files") or []),
-        "bytes": sum(int(item.get("size") or 0) for item in after.get("files") or []),
+        "bytes": sum(int(item.get("size") or 0) for item in after.get("files") or []) + after["path_catalogues"]["bytes"],
         "modified": None,
     }
 
@@ -1360,7 +1515,7 @@ def clear_cache() -> dict[str, Any]:
         "removed": removed,
         "before": before,
         "after": after,
-        "summary": _cleanup_summary(before_usage, after_usage),
+        "summary": _cleanup_summary(before_usage, after_usage, removed_items=removed_catalogues),
     }
 
 
@@ -1379,6 +1534,56 @@ def clear_provider_sync_cache() -> dict[str, Any]:
             for key in ("removed_files", "removed_items", "freed_bytes")
         },
     }
+
+@router.post("/clear-pair-state")
+def clear_pair_state_route(
+    pair_id: str = Body(...),
+    features: list[str] | None = Body(None),
+    clear_retry: bool = Body(True),
+) -> dict[str, Any]:
+    from services.pair_state import clear_pair_state, pair_scopes
+
+    _, CONFIG_DIR, CW_STATE_DIR, *_ = _cw()
+    cfg = _load_config_for_state_prune(CONFIG_DIR) or {}
+    scopes = pair_scopes(cfg, pair_id, features)
+    if scopes is None:
+        return {"ok": False, "error": "pair_not_found"}
+    if not scopes:
+        return {"ok": False, "error": "no_features_selected"}
+
+    def keep(name: str) -> bool:
+        if name in CW_STATE_KEEP_FILES:
+            return True
+        if _is_sync_state_file(name):
+            return False
+        return not clear_retry or name.startswith("plex_fallback_memo.")
+
+    result = clear_pair_state(CONFIG_DIR, CW_STATE_DIR, scopes.values(), keep_file=keep)
+    clear_caches()
+    release_memory()
+    errors = list(result.get("errors") or [])
+    if errors:
+        _LOG.warning("pair state reset pair=%s errors=%s", pair_id, errors)
+    response: dict[str, Any] = {
+        "ok": not errors,
+        "pair_id": str(pair_id),
+        "features": sorted(scopes),
+        "removed": {
+            "baselines": result["baselines"],
+            "items": result["items"],
+            "tombstones": result["tombstones"],
+            "files": result["files"],
+        },
+        "summary": {
+            "removed_files": len(result["files"]),
+            "removed_items": int(result["items"]) + int(result["tombstones"]),
+            "freed_bytes": int(result["bytes"]),
+        },
+    }
+    if errors:
+        response["error"] = "clear_pair_state_failed"
+    return response
+
 
 @router.get("/provider-cache")
 def provider_cache_status() -> dict[str, Any]:
@@ -1456,6 +1661,35 @@ def maintenance_database_health() -> dict[str, Any]:
         return {"ok": False, "error": "internal_error"}
 
 
+@router.post("/database-rebuild")
+def maintenance_database_rebuild(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
+    if not bool((payload or {}).get("confirm")):
+        return {"ok": False, "error": "confirmation_required", "confirm": False}
+    _, CONFIG_DIR, *_ = _cw()
+    try:
+        from api.syncAPI import _is_sync_running
+
+        if _is_sync_running():
+            return {"ok": False, "error": "sync_running"}
+    except Exception:
+        pass
+    try:
+        from cw_platform.local_db.db import get_conn, replace_database
+        from cw_platform.local_db.state import _invalidate
+
+        result = replace_database(CONFIG_DIR)
+        if not result.get("ok"):
+            return {"ok": False, "error": "database_busy", "operation": str(result.get("operation") or "")}
+        _invalidate()
+        clear_caches()
+        fresh = get_conn(CONFIG_DIR) is not None
+        _LOG.warning("local database rebuilt; previous files moved to %s", result.get("backup") or "nowhere (no files)")
+        return {"ok": fresh, "path": result["path"], "backup": result["backup"], "moved": result["moved"], **({} if fresh else {"error": "database_unavailable"})}
+    except Exception:
+        _LOG.exception("database-rebuild failed")
+        return {"ok": False, "error": "internal_error"}
+
+
 @router.post("/events-health")
 def maintenance_events_health() -> dict[str, Any]:
     try:
@@ -1486,6 +1720,19 @@ def maintenance_events_rebuild(payload: dict[str, Any] | None = Body(None)) -> d
         return rebuild(reimport=False)
     except Exception:
         _LOG.exception("events-rebuild failed")
+        return {"ok": False, "error": "internal_error"}
+
+
+@router.post("/events-purge")
+def maintenance_events_purge(payload: dict[str, Any] | None = Body(None)) -> dict[str, Any]:
+    if not bool((payload or {}).get("confirm")):
+        return {"ok": False, "error": "confirmation_required", "confirm": False}
+    try:
+        from cw_platform.event_archive.maintenance import purge
+
+        return purge(None)
+    except Exception:
+        _LOG.exception("events-purge failed")
         return {"ok": False, "error": "internal_error"}
 
 

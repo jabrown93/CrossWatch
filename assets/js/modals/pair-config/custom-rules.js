@@ -9,9 +9,36 @@ const RATINGS_TYPE_RULES = {
   SIMKL: { disable: ["seasons", "episodes"] },
   TMDB: { disable: ["seasons"] },
   ANILIST: { disable: ["seasons", "episodes"] },
+  MYANIMELIST: { disable: ["seasons", "episodes"] },
+  KITSU: { disable: ["seasons", "episodes"] },
   STREMIO: { disable: ["seasons", "episodes"] },
-  FLOPPY: { disable: ["seasons", "episodes"] },
+  KODI: { disable: ["shows", "seasons"] },
+  PUBLICMETADB: { disable: ["seasons"] },
 };
+
+const COLLECTION_TYPES = {
+  PLEX: ["movies", "shows", "seasons", "episodes"],
+  EMBY: ["movies", "shows", "seasons", "episodes"],
+  JELLYFIN: ["movies", "shows", "seasons", "episodes"],
+  KODI: ["movies", "episodes"],
+  TRAKT: ["movies", "shows", "seasons", "episodes"],
+  MDBLIST: ["movies", "shows", "seasons", "episodes"],
+  CROSSWATCH: ["movies", "shows", "seasons", "episodes"],
+  PUNCHPLAY: ["movies", "shows", "seasons"],
+  FLOPPY: ["movies", "shows", "seasons", "episodes"],
+  SCROB: ["movies", "shows", "seasons", "episodes"],
+  FLICKLIST: ["movies", "shows", "seasons", "episodes"],
+};
+const COLLECTION_WRITE_TYPES = {
+  FLOPPY: ["movies", "episodes"],
+};
+const COLLECTION_SOURCES = new Set(["PLEX", "EMBY", "JELLYFIN", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
+const COLLECTION_TARGETS = new Set(["TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
+const COLLECTION_ORDER = ["movies", "shows", "seasons", "episodes"];
+
+function providerKey(value) {
+  return String(value || "").trim().toUpperCase();
+}
 
 export function ratingsDisabledForPair(state) {
   const names = [state?.src, state?.dst].map(x => String(x || "").trim().toUpperCase());
@@ -27,18 +54,63 @@ export function stremioRatingsAllowed(state) {
   return same(state?.dst, "stremio") && !same(state?.src, "stremio") && !isTwoWay(state);
 }
 
+export function hasCumulativeAnimeHistory(state) {
+  return [state?.src, state?.dst].some(provider => same(provider, "anilist") || same(provider, "kitsu") || same(provider, "myanimelist"));
+}
+
+export function sourceWatchStatusAllowed(state) {
+  return [state?.src, state?.dst].every(provider => ["simkl", "anilist", "kitsu", "myanimelist"].some(name => same(provider, name)));
+}
+
 export function featureAllowedForPair(state, feature) {
   const key = String(feature || "").trim().toLowerCase();
   if (key === "ratings" && (same(state?.src, "stremio") || same(state?.dst, "stremio"))) {
     return stremioRatingsAllowed(state);
   }
+  if (key === "collection") {
+    return COLLECTION_SOURCES.has(providerKey(state?.src)) && COLLECTION_TARGETS.has(providerKey(state?.dst));
+  }
   return true;
+}
+
+function collectionWriteTypes(name) {
+  const key = providerKey(name);
+  return COLLECTION_WRITE_TYPES[key] || COLLECTION_TYPES[key] || [];
+}
+
+export function collectionTypesForPair(state) {
+  if (!featureAllowedForPair(state, "collection")) return [];
+  const src = isTwoWay(state) ? collectionWriteTypes(state?.src) : (COLLECTION_TYPES[providerKey(state?.src)] || []);
+  const dst = collectionWriteTypes(state?.dst);
+  const dstSet = new Set(dst);
+  return COLLECTION_ORDER.filter(t => src.includes(t) && dstSet.has(t));
+}
+
+export function collectionDisabledForPair(state) {
+  const allowed = new Set(collectionTypesForPair(state));
+  return new Set(COLLECTION_ORDER.filter(t => !allowed.has(t)));
 }
 
 export function sanitizeFeaturesForPair(state, features) {
   const out = features && typeof features === "object" ? features : {};
   if (!featureAllowedForPair(state, "ratings") && out.ratings && typeof out.ratings === "object") {
     Object.assign(out.ratings, { enable: false, add: false, remove: false });
+  }
+  if (out.history && typeof out.history === "object" && hasCumulativeAnimeHistory(state)) {
+    if (!featureAllowedForPair(state, "history")) Object.assign(out.history, { enable: false, add: false, remove: false, rewatches: false });
+    else {
+      out.history.rewatches = false;
+    }
+  }
+  if (out.collection && typeof out.collection === "object") {
+    if (!featureAllowedForPair(state, "collection")) {
+      Object.assign(out.collection, { enable: false, add: false, remove: false, types: ["movies"] });
+    } else {
+      const allowed = collectionTypesForPair(state);
+      const selected = Array.isArray(out.collection.types) ? out.collection.types.map(x => String(x || "").trim().toLowerCase()).filter(Boolean) : ["movies"];
+      const keep = COLLECTION_ORDER.filter(t => selected.includes(t) && allowed.includes(t));
+      out.collection.types = keep.length ? keep : (allowed.includes("movies") ? ["movies"] : allowed.slice(0, 1));
+    }
   }
   return out;
 }
@@ -47,7 +119,7 @@ export function commonFeaturesForPair(state, providerFeatures, isProgressPair) {
   if (!state?.src || !state?.dst) return [];
   const a = providerFeatures(state.src);
   const b = providerFeatures(state.dst);
-  const keys = ["watchlist", "ratings", "history", "progress", "playlists"];
+  const keys = ["watchlist", "ratings", "history", "progress", "collection"];
   return keys.filter(k => {
     if (!featureAllowedForPair(state, k)) return false;
     if (k === "progress") return isProgressPair(state) && !!a.progress && !!b.progress;

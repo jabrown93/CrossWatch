@@ -10,7 +10,10 @@ from typing import Any
 from cw_platform.provider_instances import normalize_instance_id
 from cw_platform.access_policy import webhook_effective_profile_id
 from cw_platform.user_profile_resources import webhook_assigned_profile_id, webhook_resource_id
+from providers.scrobble.anime_mapping import maybe_enrich_event_for_sink
+from providers.scrobble.media_filters import event_ignore_reason, log_media_filter_drop
 from providers.scrobble.scrobble import ScrobbleAction, ScrobbleEvent
+from providers.scrobble.routes import ROUTE_MEDIA_SINKS, same_scrobble_endpoint
 from providers.webhooks.config import sink_configured, webhook_settings, webhook_sink_instance, webhook_sinks
 
 
@@ -25,6 +28,13 @@ class DispatchResponse:
 
 
 _SINKS: dict[tuple[str, str, str], Any] = {}
+
+
+def _anime_mapping_enabled(settings: Mapping[str, Any], sink: str) -> bool:
+    key = str(sink or "").strip().lower()
+    if key not in {"crosswatch", "simkl"}:
+        return False
+    return bool(settings.get(f"anime_mapping_{key}"))
 
 
 def _emit(logger: Callable[..., None] | Any | None, msg: str, level: str = "INFO") -> None:
@@ -63,7 +73,23 @@ def _make_sink(name: str, instance_id: str, cfg_provider: Callable[[], dict[str,
     if key in _SINKS:
         return _SINKS[key]
     cls: Any
-    if sink == "trakt":
+    if sink == "plex":
+        from providers.scrobble.plex.sink import PlexSink
+
+        cls = PlexSink
+    elif sink == "jellyfin":
+        from providers.scrobble.jellyfin.sink import JellyfinSink
+
+        cls = JellyfinSink
+    elif sink == "emby":
+        from providers.scrobble.emby.sink import EmbySink
+
+        cls = EmbySink
+    elif sink == "kodi":
+        from providers.scrobble.kodi.sink import KodiSink
+
+        cls = KodiSink
+    elif sink == "trakt":
         from providers.scrobble.trakt.sink import TraktSink
 
         cls = TraktSink
@@ -87,6 +113,30 @@ def _make_sink(name: str, instance_id: str, cfg_provider: Callable[[], dict[str,
         from providers.scrobble.punchplay.sink import PunchPlaySink
 
         cls = PunchPlaySink
+    elif sink == "bingebase":
+        from providers.scrobble.bingebase.sink import BingeBaseSink
+
+        cls = BingeBaseSink
+    elif sink == "flicklist":
+        from providers.scrobble.flicklist.sink import FlickListSink
+
+        cls = FlickListSink
+    elif sink == "wetrakr":
+        from providers.scrobble.wetrakr.sink import WeTrakrSink
+
+        cls = WeTrakrSink
+    elif sink == "myanimelist":
+        from providers.scrobble.myanimelist.sink import MyAnimeListSink
+
+        cls = MyAnimeListSink
+    elif sink == "kitsu":
+        from providers.scrobble.kitsu.sink import KitsuSink
+
+        cls = KitsuSink
+    elif sink == "anilist":
+        from providers.scrobble.anilist.sink import AniListSink
+
+        cls = AniListSink
     elif sink == "scrob":
         from providers.scrobble.scrob.sink import ScrobSink
 
@@ -134,6 +184,18 @@ def _route_cfg(cfg: dict[str, Any], provider: str, provider_instance: str, sink:
     watch["event_method"] = "webhook"
     watch["route_profile_id"] = assigned_profile_id
     watch["route_effective_profile_id"] = effective_profile_id
+    if sink in {"crosswatch", "simkl"}:
+        watch["route_options"] = {"watch": {"anime_mapping": _anime_mapping_enabled(wh, sink)}}
+    if sink == "simkl":
+        watch["route_options"]["watch"]["simkl_rewatches"] = wh.get("simkl_rewatches") is True
+    if sink in ROUTE_MEDIA_SINKS:
+        libraries = wh.get("destination_libraries")
+        copies = wh.get("update_all_copies")
+        selected = libraries.get(sink) if isinstance(libraries, Mapping) else None
+        destination: dict[str, Any] = {"libraries": [str(x) for x in selected] if isinstance(selected, list) else []}
+        if isinstance(copies, Mapping) and copies.get(sink) is False:
+            destination["update_all_copies"] = False
+        watch["route_options"] = {"destination": destination}
     if provider == "plex":
         watch["filters"] = dict(wh.get("filters_plex") or {})
     elif provider == "emby":
@@ -162,6 +224,11 @@ def _event(
     raw2 = dict(raw or {})
     raw2["_cw_activity_method"] = "webhook"
     raw2["_cw_source_provider"] = provider
+    source_event = str(raw2.get("NotificationType") or raw2.get("Event") or raw2.get("event") or "").lower().replace(".", "").replace("_", "")
+    if source_event in {"mediastop", "mediascrobble", "playbackstop", "playbackstopped", "playbackscrobble", "stop", "stopped", "scrobble"}:
+        raw2["_cw_playback_action"] = "stop"
+    elif source_event in {"mediapause", "playbackpause", "playbackpaused", "pause", "paused"}:
+        raw2["_cw_playback_action"] = "pause"
     return ScrobbleEvent(
         action=_action(path),
         media_type="episode" if str(media_type or "").strip().lower() == "episode" else "movie",
@@ -221,30 +288,56 @@ def dispatch_scrobble(
     dispatched: list[str] = []
     for sink in sinks:
         inst = webhook_sink_instance(wh, sink)
+        if same_scrobble_endpoint(provider_lc, provider_inst, sink, inst):
+            targets.append({"target": sink, "target_instance": inst, "ok": False, "skipped": True, "error": "same_source_destination"})
+            continue
+        route_cfg = _route_cfg(cfg, provider_lc, provider_inst, sink, inst)
+        ignore_reason = event_ignore_reason(ev, route_cfg)
+        if ignore_reason:
+            log_media_filter_drop(ev, ignore_reason)
+            _emit(logger, f"webhook sink {sink}:{inst} skipped by media filter: {ignore_reason}", "DEBUG")
+            targets.append({"target": sink, "target_instance": inst, "ok": True, "skipped": True, "ignored": True, "reason": ignore_reason})
+            continue
         if not sink_configured(cfg, sink, inst):
             targets.append({"target": sink, "target_instance": inst, "ok": False, "skipped": True, "error": "not_configured"})
             _emit(logger, f"webhook sink {sink}:{inst} skipped: not configured in Connections", "WARNING")
             continue
+        from cw_platform.event_archive.playback_recorder import prepare_playback, record_playback
+
+        ev = prepare_playback(ev)
+        record_playback(ev, route_cfg)
         dispatched.append(sink)
-        route_cfg = _route_cfg(cfg, provider_lc, provider_inst, sink, inst)
 
         def _provider(route_cfg: dict[str, Any] = route_cfg) -> dict[str, Any]:
             return route_cfg
 
         target = {"target": sink, "target_instance": inst, "ok": True}
         try:
-            _make_sink(sink, inst, _provider).send(ev, cfg=route_cfg)
+            from providers.scrobble.episode_groups import send_grouped
+
+            def send_event(event):
+                mapped = bool((event.raw or {}).get("_cw_episode_group"))
+                outgoing = event if mapped else maybe_enrich_event_for_sink(event, sink, route_cfg)
+                return _make_sink(sink, inst, _provider).send(outgoing, cfg=route_cfg)
+
+            result = send_grouped(ev, route_cfg, send_event)
+            if isinstance(result, Mapping):
+                target.update({k: result[k] for k in ("ok", "skipped", "reason", "error", "retryable") if k in result})
         except Exception as e:
             target["ok"] = False
             target["error"] = str(e)
             _emit(logger, f"webhook sink {sink}:{inst} failed: {e}", "ERROR")
+        if target.get("ok") is False and not target.get("skipped"):
+            record_playback(ev, route_cfg, delivery="failed", reason=str(target.get("error") or "unknown"))
         targets.append(target)
     ok = not targets or any(bool(t.get("ok")) for t in targets)
+    if any(not bool(t.get("ok")) and not bool(t.get("skipped")) for t in targets):
+        ok = False
     payload = {
         "action": path,
         "status": 200 if ok else 502,
         "route_dispatch": True,
-        "activity_recorded": True,
+        "activity_recorded": any(not bool(t.get("skipped")) and bool(t.get("ok")) for t in targets),
         "targets": targets,
     }
     _emit(logger, f"webhook dispatch {path} -> {','.join(dispatched) or 'none'} status={payload['status']}", "DEBUG")

@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 import sqlite3
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ _BASELINE_ITEM_COLUMNS = [
     *[f"show_ids_{k}" for k in ID_KEYS],
     "watched",
     "watched_at",
+    "collected_at",
     "rating",
     "rated_at",
     "progress_ms",
@@ -55,6 +57,8 @@ _BASELINE_ITEM_COLUMNS = [
     "cw_instance",
     "provider_item_id",
     "provider_event_id",
+    "path_metadata_json",
+    "media_json",
     "updated_at",
 ]
 _BASELINE_ITEM_COMPARE_COLUMNS = _BASELINE_ITEM_COLUMNS[1:-1]
@@ -204,6 +208,7 @@ def _item_to_row(provider_state_id: int, key: str, item: Mapping[str, Any], ts: 
         *show_id_values,
         _b(item.get("watched")) if "watched" in item else None,
         watched_at,
+        _s(item.get("collected_at")),
         _f(item.get("rating")),
         _s(item.get("rated_at")),
         _i(item.get("progress_ms")),
@@ -224,7 +229,9 @@ def _item_to_row(provider_state_id: int, key: str, item: Mapping[str, Any], ts: 
         _b(item.get("_cw_marked")) if "_cw_marked" in item else None,
         _s(item.get("_cw_instance")),
         _s(item.get("provider_item_id")),
-        _s(item.get("provider_event_id") or item.get("_simkl_rewatch_id") or item.get("rewatch_id") or item.get("_publicmetadb_history_id")),
+        _s(item.get("provider_event_id") or item.get("_simkl_rewatch_id") or item.get("rewatch_id") or item.get("_publicmetadb_history_id") or item.get("_wetrakr_history_id")),
+        json.dumps({k: item[k] for k in ("media_paths", "part") if k in item}, separators=(",", ":")) if item.get("media_paths") else None,
+        json.dumps({k: item[k] for k in ("format", "media_info") if item.get(k)}, separators=(",", ":"), sort_keys=True) if item.get("format") or item.get("media_info") else None,
         ts,
     )
 
@@ -239,6 +246,7 @@ def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
         ("episode", "episode"),
         ("series_title", "series_title"),
         ("watched_at", "watched_at"),
+        ("collected_at", "collected_at"),
         ("rated_at", "rated_at"),
         ("progress_at", "progress_at"),
         ("progress_at_source", "progress_at_source"),
@@ -259,6 +267,24 @@ def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
         value = row[col]
         if value not in (None, ""):
             out[key] = value
+    if row["path_metadata_json"]:
+        try:
+            metadata = json.loads(row["path_metadata_json"])
+            if isinstance(metadata, dict):
+                for key in ("media_paths", "part"):
+                    if key in metadata:
+                        out[key] = metadata[key]
+        except (TypeError, ValueError):
+            pass
+    if row["media_json"]:
+        try:
+            media = json.loads(row["media_json"])
+            if isinstance(media, dict):
+                for key in ("format", "media_info"):
+                    if media.get(key):
+                        out[key] = media[key]
+        except (TypeError, ValueError):
+            pass
     if row["watched"] is not None:
         out["watched"] = bool(row["watched"])
     if row["rating"] is not None:
@@ -332,10 +358,10 @@ def _feature_mode(items: Mapping[str, Any]) -> str:
     return "event" if any(_event_parts(str(k))[1] for k in items.keys()) else "collapsed"
 
 
-def _stored_item_compare_map(conn: sqlite3.Connection, provider_state_id: int) -> dict[str, tuple[Any, ...]]:
+def _stored_item_compare_map(conn: sqlite3.Connection, provider_state_id: int, *, pair: bool = False) -> dict[str, tuple[Any, ...]]:
     columns = ",".join(_BASELINE_ITEM_COMPARE_COLUMNS)
     rows = conn.execute(
-        f"SELECT {columns} FROM baseline_items WHERE provider_state_id=?",
+        f"SELECT {columns} FROM {'pair_baseline_items' if pair else 'baseline_items'} WHERE provider_state_id=?",
         (provider_state_id,),
     ).fetchall()
     return {str(row["item_key"]): tuple(row) for row in rows}
@@ -357,7 +383,14 @@ def _replace_feature(
     feature: str,
     block: Mapping[str, Any],
     ts: int,
+    *,
+    pair_scope: str | None = None,
 ) -> bool:
+    def sql(statement: str) -> str:
+        if pair_scope is None:
+            return statement
+        return statement.replace("provider_feature_state", "pair_feature_state").replace("baseline_items", "pair_baseline_items")
+
     provider, instance, feature = _feature_key(provider, instance, feature)
     if not provider or not feature:
         return False
@@ -370,19 +403,24 @@ def _replace_feature(
     mode = _feature_mode(items)
     checkpoint = _scalar_parts(block.get("checkpoint"))
     pfs = conn.execute(
-        "SELECT * FROM provider_feature_state WHERE provider=? AND instance=? AND feature=?",
-        (provider, instance, feature),
+        sql("SELECT * FROM provider_feature_state WHERE provider=? AND instance=? AND feature=?") + (" AND pair_scope=?" if pair_scope is not None else ""),
+        (provider, instance, feature, pair_scope) if pair_scope is not None else (provider, instance, feature),
     ).fetchone()
     cp_text, cp_int, cp_real, cp_type = checkpoint
     if pfs is None:
-        cur = conn.execute(_PFS_INSERT_SQL, (provider, instance, feature, mode, cp_text, cp_int, cp_real, cp_type, ts))
+        statement = sql(_PFS_INSERT_SQL)
+        values: tuple[Any, ...] = (provider, instance, feature, mode, cp_text, cp_int, cp_real, cp_type, ts)
+        if pair_scope is not None:
+            statement = statement.replace("(provider,", "(pair_scope,provider,").replace("VALUES(", "VALUES(?,")
+            values = (pair_scope, *values)
+        cur = conn.execute(statement, values)
         pfs_id_raw = cur.lastrowid
         if pfs_id_raw is None:
             return False
         pfs_id = int(pfs_id_raw)
         if rows:
             conn.executemany(
-                _BASELINE_ITEM_INSERT_SQL,
+                sql(_BASELINE_ITEM_INSERT_SQL),
                 [(pfs_id, *row[1:-1], ts) for row in rows],
             )
         return True
@@ -395,7 +433,7 @@ def _replace_feature(
         pfs["checkpoint_type"],
     )
     metadata_changed = str(pfs["mode"] or "") != mode or current_checkpoint != checkpoint
-    existing = _stored_item_compare_map(conn, pfs_id)
+    existing = _stored_item_compare_map(conn, pfs_id, pair=pair_scope is not None)
     incoming_rows = _incoming_item_row_map(rows)
     incoming_compare = {key: tuple(row[1:-1]) for key, row in incoming_rows.items()}
     existing_keys = set(existing)
@@ -411,24 +449,25 @@ def _replace_feature(
         return False
 
     conn.execute(
-        "UPDATE provider_feature_state SET mode=?,checkpoint_text=?,checkpoint_int=?,"
-        "checkpoint_real=?,checkpoint_type=?,updated_at=? WHERE id=?",
+        sql("UPDATE provider_feature_state SET mode=?,checkpoint_text=?,checkpoint_int=?,"
+        "checkpoint_real=?,checkpoint_type=?,updated_at=? WHERE id=?"),
         (mode, cp_text, cp_int, cp_real, cp_type, ts, pfs_id),
     )
-    if delete_keys:
-        placeholders = ",".join("?" for _ in delete_keys)
+    for offset in range(0, len(delete_keys), 500):
+        chunk = delete_keys[offset:offset + 500]
+        placeholders = ",".join("?" for _ in chunk)
         conn.execute(
-            f"DELETE FROM baseline_items WHERE provider_state_id=? AND item_key IN ({placeholders})",
-            (pfs_id, *delete_keys),
+            sql(f"DELETE FROM baseline_items WHERE provider_state_id=? AND item_key IN ({placeholders})"),
+            (pfs_id, *chunk),
         )
     if insert_rows:
         conn.executemany(
-            _BASELINE_ITEM_INSERT_SQL,
+            sql(_BASELINE_ITEM_INSERT_SQL),
             [(pfs_id, *row[1:-1], ts) for row in insert_rows],
         )
     if update_rows:
         conn.executemany(
-            _BASELINE_ITEM_UPDATE_SQL,
+            sql(_BASELINE_ITEM_UPDATE_SQL),
             [(*row[2:-1], ts, pfs_id, str(row[1])) for row in update_rows],
         )
     return True
@@ -478,7 +517,20 @@ def has_state(base_path: str | Path) -> bool:
     return bool(row and int(row[0] or 0) > 0)
 
 
-def _build_state_from_feature_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> dict[str, Any]:
+_RECENT_ORDER_COLUMNS = {
+    "history": "watched_at",
+    "ratings": "rated_at",
+}
+
+
+def _build_state_from_feature_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    recent_limit: int | None = None,
+    pair: bool = False,
+) -> dict[str, Any]:
+    table = "pair_baseline_items" if pair else "baseline_items"
     providers: dict[str, Any] = {}
     wall: list[dict[str, Any]] = []
     for pfs in rows:
@@ -493,10 +545,17 @@ def _build_state_from_feature_rows(conn: sqlite3.Connection, rows: list[sqlite3.
         checkpoint = _scalar_from_row(pfs, "checkpoint")
         if checkpoint is not None:
             feat_node["checkpoint"] = checkpoint
-        items = conn.execute(
-            "SELECT * FROM baseline_items WHERE provider_state_id=? ORDER BY item_key",
-            (int(pfs["id"]),),
-        ).fetchall()
+        order_column = _RECENT_ORDER_COLUMNS.get(feature) if recent_limit else None
+        if order_column and recent_limit is not None:
+            items = conn.execute(
+                f"SELECT * FROM {table} WHERE provider_state_id=? ORDER BY {order_column} DESC LIMIT ?",
+                (int(pfs["id"]), int(recent_limit)),
+            ).fetchall()
+        else:
+            items = conn.execute(
+                f"SELECT * FROM {table} WHERE provider_state_id=? ORDER BY item_key",
+                (int(pfs["id"]),),
+            ).fetchall()
         for row in items:
             item = _row_to_item(row)
             feat_node["baseline"]["items"][str(row["item_key"])] = item
@@ -529,7 +588,12 @@ def load_state(base_path: str | Path) -> dict[str, Any]:
         return state
 
 
-def load_state_features(base_path: str | Path, features: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
+def load_state_features(
+    base_path: str | Path,
+    features: set[str] | list[str] | tuple[str, ...],
+    *,
+    recent_limit: int | None = None,
+) -> dict[str, Any]:
     wanted = sorted({str(feature or "").strip().lower() for feature in features or [] if str(feature or "").strip()})
     if not wanted:
         return {"providers": {}, "wall": [], "last_sync_epoch": None}
@@ -542,7 +606,7 @@ def load_state_features(base_path: str | Path, features: set[str] | list[str] | 
             f"SELECT * FROM provider_feature_state WHERE feature IN ({placeholders}) ORDER BY provider, instance, feature",
             wanted,
         ).fetchall()
-        return _build_state_from_feature_rows(conn, rows)
+        return _build_state_from_feature_rows(conn, rows, recent_limit=recent_limit)
 
 
 def provider_feature_counts(base_path: str | Path, feature: str = "watchlist") -> dict[str, int]:
@@ -626,9 +690,10 @@ def save_state(base_path: str | Path, state: Mapping[str, Any]) -> None:
         ts = _now()
         blocks = _iter_feature_blocks(state)
         incoming = {_feature_key(provider, instance, feature) for provider, instance, feature, _ in blocks}
-        with conn:
-            for provider, instance, feature, block in blocks:
+        for provider, instance, feature, block in blocks:
+            with conn:
                 _replace_feature(conn, provider, instance, feature, block, ts)
+        with conn:
             existing = conn.execute(
                 "SELECT id,provider,instance,feature FROM provider_feature_state"
             ).fetchall()
@@ -671,6 +736,41 @@ def save_feature_baseline(
         _invalidate()
 
 
+def remove_baseline_items(base_path: str | Path, provider: str, instance: str, feature: str, keys: Iterable[str]) -> None:
+    """Refresh current inventory after a manual removal; retain pair comparison history."""
+    with _LOCK:
+        conn = get_conn(base_path)
+        if conn is None:
+            raise RuntimeError("State database is unavailable")
+        with conn:
+            conn.executemany(
+                "DELETE FROM baseline_items WHERE item_key=? AND provider_state_id IN "
+                "(SELECT id FROM provider_feature_state WHERE provider=? AND instance=? AND feature=?)",
+                [(key, provider, instance, feature) for key in set(keys)],
+            )
+        _invalidate()
+
+
+def remove_feature_states(base_path: str | Path, keys: Iterable[tuple[str, str, str]]) -> tuple[int, int]:
+    wanted = {_feature_key(provider, instance, feature) for provider, instance, feature in keys}
+    if not wanted:
+        return 0, 0
+    with _LOCK:
+        conn = get_conn(base_path)
+        if conn is None:
+            raise RuntimeError("State database is unavailable")
+        rows = conn.execute("SELECT id,provider,instance,feature FROM provider_feature_state").fetchall()
+        ids = [int(row["id"]) for row in rows if _feature_key(row["provider"], row["instance"], row["feature"]) in wanted]
+        if not ids:
+            return 0, 0
+        placeholders = ",".join("?" for _ in ids)
+        items = conn.execute(f"SELECT COUNT(*) FROM baseline_items WHERE provider_state_id IN ({placeholders})", ids).fetchone()[0]
+        with conn:
+            conn.execute(f"DELETE FROM provider_feature_state WHERE id IN ({placeholders})", ids)
+        _invalidate()
+        return len(ids), int(items or 0)
+
+
 def save_feature_blocks(
     base_path: str | Path,
     blocks: Mapping[tuple[str, str, str], Mapping[str, Any]],
@@ -693,6 +793,71 @@ def save_feature_blocks(
         _invalidate()
 
 
+def load_pair_state(base_path: str | Path, pair_scope: str, features: Iterable[str] | None = None) -> dict[str, Any]:
+    with _LOCK:
+        conn = get_conn(base_path)
+        if conn is None:
+            raise RuntimeError("Pair state database is unavailable")
+        params: list[Any] = [pair_scope]
+        query = "SELECT * FROM pair_feature_state WHERE pair_scope=?"
+        if features is not None:
+            wanted = sorted(set(features))
+            if not wanted:
+                return {"providers": {}, "wall": [], "last_sync_epoch": None}
+            query += " AND feature IN (" + ",".join("?" for _ in wanted) + ")"
+            params.extend(wanted)
+        rows = conn.execute(query + " ORDER BY provider,instance,feature", params).fetchall()
+        state = _build_state_from_feature_rows(conn, rows, pair=True)
+        state["last_sync_epoch"] = max((int(row["updated_at"]) for row in rows), default=0) / 1_000_000_000 or None
+        return state
+
+
+def save_pair_blocks(base_path: str | Path, pair_scope: str, blocks: Mapping[tuple[str, str, str], Mapping[str, Any]], *, last_sync_epoch: Any = None) -> None:
+    if not pair_scope:
+        raise ValueError("Pair scope is required")
+    with _LOCK:
+        conn = get_conn(base_path)
+        if conn is None:
+            raise RuntimeError("Pair state database is unavailable")
+        ts = _now()
+        for (provider, instance, feature), block in blocks.items():
+            with conn:
+                _replace_feature(conn, provider, instance, feature, block, ts, pair_scope=pair_scope)
+                _replace_feature(conn, provider, instance, feature, block, ts)
+        if last_sync_epoch is not None:
+            with conn:
+                _set_meta(conn, "last_sync_epoch", last_sync_epoch, ts)
+        _invalidate()
+
+
+def pair_state_counts(base_path: str | Path, pair_scope: str | None = None) -> tuple[int, int]:
+    with _LOCK:
+        conn = get_conn(base_path)
+        if conn is None:
+            return 0, 0
+        where, params = (" WHERE pair_scope=?", (pair_scope,)) if pair_scope is not None else ("", ())
+        baselines = conn.execute(f"SELECT COUNT(*) FROM pair_feature_state{where}", params).fetchone()[0]
+        items = conn.execute(
+            f"SELECT COUNT(*) FROM pair_baseline_items WHERE provider_state_id IN (SELECT id FROM pair_feature_state{where})",
+            params,
+        ).fetchone()[0]
+        return int(baselines or 0), int(items or 0)
+
+
+def clear_pair_state(base_path: str | Path, pair_scope: str) -> tuple[int, int]:
+    with _LOCK:
+        conn = get_conn(base_path)
+        if conn is None:
+            raise RuntimeError("Pair state database is unavailable")
+        removed = pair_state_counts(base_path, pair_scope)
+        with conn:
+            conn.execute("DELETE FROM pair_feature_state WHERE pair_scope=?", (pair_scope,))
+            conn.execute("DELETE FROM episode_group_state WHERE pair_scope=?", (pair_scope,))
+            conn.execute("DELETE FROM episode_group_scrobbles WHERE pair_scope=?", (pair_scope,))
+        _invalidate()
+        return removed
+
+
 def set_last_sync_epoch(base_path: str | Path, value: Any) -> None:
     with _LOCK:
         conn = get_conn(base_path)
@@ -709,6 +874,10 @@ def clear_state(base_path: str | Path) -> None:
         if conn is None:
             return
         with conn:
+            conn.execute("DELETE FROM episode_group_state")
+            conn.execute("DELETE FROM episode_group_scrobbles")
+            conn.execute("DELETE FROM pair_baseline_items")
+            conn.execute("DELETE FROM pair_feature_state")
             conn.execute("DELETE FROM baseline_items")
             conn.execute("DELETE FROM provider_feature_state")
             conn.execute("DELETE FROM state_meta")

@@ -12,10 +12,11 @@ from typing import Any
 
 import requests
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config
 from cw_platform.event_archive import record_watch
 from cw_platform.local_db.ttl_dedupe import once_per_ttl
-from cw_platform.provider_instances import get_provider_block, normalize_instance_id
+from cw_platform.provider_instances import normalize_instance_id, resolve_provider_block
 from services.activity import record_scrobble_event
 
 try:
@@ -30,7 +31,7 @@ try:
     from providers.scrobble.scrobble import ScrobbleEvent, ScrobbleSink, mask_account  # type: ignore
 except ImportError:
     class ScrobbleSink:  # pragma: no cover
-        def send(self, event: Any) -> None: ...
+        def send(self, event: Any) -> dict[str, Any] | None: ...
 
     class ScrobbleEvent:  # pragma: no cover
         ...
@@ -48,7 +49,7 @@ from providers.sync.punchplay._common import (
     request_id_of,
 )
 
-APP_AGENT = "CrossWatch/Watcher/1.0"
+APP_AGENT = http_user_agent("Watcher", override_env="CW_PUNCHPLAY_UA")
 DEFAULT_WATCHED_AT = 90.0
 SESSION_TTL_SEC = 6 * 3600
 _AR_TTL = 60
@@ -133,11 +134,11 @@ def _log(msg: str, lvl: str = "INFO") -> None:
         return
     if BASE_LOG is not None:
         try:
-            BASE_LOG(msg, level=level, module="SCROBBLE")
+            BASE_LOG(msg, level=level, module="PUNCHPLAY-SINK")
             return
         except Exception:
             pass
-    print(f"[SCROBBLE] {level}: {msg}")
+    print(f"[PUNCHPLAY-SINK] {level}: {msg}")
 
 
 def _as_int(value: Any) -> int | None:
@@ -193,7 +194,7 @@ class PunchPlaySink(ScrobbleSink):
         self.session = requests.Session()
         try:
             self.session.headers.setdefault("Accept", "application/json")
-            self.session.headers.setdefault("User-Agent", APP_AGENT)
+            self.session.headers["User-Agent"] = APP_AGENT
         except Exception:
             pass
 
@@ -210,7 +211,7 @@ class PunchPlaySink(ScrobbleSink):
 
     def _block(self, cfg: Mapping[str, Any]) -> dict[str, Any]:
         try:
-            return get_provider_block(cfg, "punchplay", self.instance_id) or {}
+            return resolve_provider_block(cfg, "punchplay", self.instance_id) or {}
         except Exception:
             block = cfg.get("punchplay") if isinstance(cfg, Mapping) else None
             return dict(block) if isinstance(block, Mapping) else {}
@@ -273,27 +274,27 @@ class PunchPlaySink(ScrobbleSink):
             else:
                 _SESSIONS[scope] = before
 
-    def send(self, event: Any) -> None:
+    def send(self, event: Any) -> dict[str, Any] | None:
         cfg = self.config
         block = self._block(cfg)
         if not str(block.get("access_token") or "").strip():
             _log("PUNCHPLAY: skip scrobble, not connected", "DEBUG")
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "not_configured"}
 
         raw_action = str(getattr(event, "action", "") or "").strip().lower()
         if raw_action not in ("start", "pause", "stop"):
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "invalid_action"}
 
         media_type = "episode" if str(getattr(event, "media_type", "") or "").lower() == "episode" else "movie"
         ids_payload = self._ids_payload(event, media_type)
         if not ids_payload:
             _log("PUNCHPLAY: skip scrobble, no supported ids", "DEBUG")
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "missing_external_ids"}
 
         title = str(getattr(event, "title", "") or "").strip()
         if not title:
             _log("PUNCHPLAY: skip scrobble, missing title", "DEBUG")
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "missing_title"}
 
         season = number = None
         if media_type == "episode":
@@ -301,7 +302,7 @@ class PunchPlaySink(ScrobbleSink):
             number = _as_int(getattr(event, "number", None))
             if season is None or number is None:
                 _log("PUNCHPLAY: skip scrobble, episode missing season/episode", "DEBUG")
-                return
+                return {"ok": True, "log_status": "skipped", "reason": "missing_episode_coordinates"}
 
         try:
             progress_pct = max(0.0, min(100.0, float(getattr(event, "progress", 0.0) or 0.0)))
@@ -320,7 +321,7 @@ class PunchPlaySink(ScrobbleSink):
         payload["event_id"] = str(uuid.uuid4())
         payload["playback_session_id"] = session_id
         payload["event_created_at"] = int(now * 1000)
-        payload["client_version"] = APP_AGENT
+        payload["client_version"] = app_version()
         payload["title"] = title
 
         year = _as_int(getattr(event, "year", None))
@@ -357,7 +358,7 @@ class PunchPlaySink(ScrobbleSink):
         ):
             _log(f"PUNCHPLAY: skip scrobble {action}, no position or duration", "DEBUG")
             self._rollback(scope, before)
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "missing_position"}
 
         self._post(cfg, event, action, payload, progress_pct, watched=watched, scope=scope, before=before)
 

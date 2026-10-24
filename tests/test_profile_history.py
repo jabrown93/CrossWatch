@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from api import profileAPI
+from services import dashboard_widgets, profile_history
+
+
+def _history(items: dict[str, Any]) -> dict[str, Any]:
+    return {"history": {"baseline": {"items": items}}}
+
+
+def _ratings(items: dict[str, Any]) -> dict[str, Any]:
+    return {"ratings": {"baseline": {"items": items}}}
+
+
+def _movie(tmdb: int, title: str, year: int, watched_at: str) -> dict[str, Any]:
+    return {"type": "movie", "title": title, "year": year, "ids": {"tmdb": tmdb}, "watched_at": watched_at}
+
+
+TURNING_POINT = _movie(10, "Turning Point", 2026, "2026-09-13T20:29:00Z")
+KUSAMA = _movie(20, "Kusama: Infinity", 2018, "2026-08-01T10:00:00Z")
+TED_LASSO = {
+    "type": "episode",
+    "title": "Ted Lasso",
+    "series_title": "Ted Lasso",
+    "season": 4,
+    "episode": 4,
+    "ids": {"tvdb": 555},
+    "show_ids": {"tmdb": 97546, "tvdb": 383203},
+    "watched_at": "2026-09-08T17:35:00Z",
+}
+HEAT = {"type": "movie", "title": "Heat", "year": 1995, "ids": {"tmdb": 949}, "rating": 9, "rated_at": "2026-09-10T20:00:00Z"}
+MATRIX = {"type": "movie", "title": "The Matrix", "year": 1999, "ids": {"tmdb": 603}, "rating": 8, "rated_at": "2026-08-01T10:00:00Z"}
+PULP = {"type": "movie", "title": "Pulp Fiction", "year": 1994, "ids": {"tmdb": 680}, "rating": 10}
+
+
+def _state() -> dict[str, Any]:
+    return {
+        "providers": {
+            "PLEX": _history({"tmdb:10@2026-09-13T20:29:00Z": TURNING_POINT}),
+            "SIMKL": _history({
+                "tmdb:10@2026-09-13T20:29:00Z": TURNING_POINT,
+                "tvdb:383203:4:4@2026-09-08T17:35:00Z": TED_LASSO,
+            }),
+            "TRAKT": _history({
+                "tmdb:10@2026-09-13T20:29:00Z": TURNING_POINT,
+                "tmdb:20@2026-08-01T10:00:00Z": KUSAMA,
+            }),
+        }
+    }
+
+
+def _ratings_state() -> dict[str, Any]:
+    return {
+        "providers": {
+            "PLEX": _ratings({"tmdb:949": HEAT, "tmdb:603": MATRIX}),
+            "SIMKL": _ratings({"tmdb:949": HEAT, "tmdb:680": PULP}),
+            "TRAKT": _ratings({"tmdb:949": {**HEAT, "rating": 7, "rated_at": "2026-09-11T20:00:00Z"}}),
+        }
+    }
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch):
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", lambda: {})
+    monkeypatch.setattr(dashboard_widgets, "_metadata_manager", lambda: None)
+    profile_history.clear_history_cache()
+    yield
+    profile_history.clear_history_cache()
+
+
+def _synced_index(user_filter: dict[str, Any] | None = None) -> dict[str, Any]:
+    return profile_history.build_history_index("synced", state=_state(), tracker_items={}, user_filter=user_filter or {})
+
+
+def _ratings_index() -> dict[str, Any]:
+    return profile_history.build_history_index("ratings", state=_ratings_state(), tracker_items={}, user_filter={})
+
+
+def test_synced_history_reports_where_each_play_lives() -> None:
+    payload = profile_history.build_history_payload(_synced_index(), resolve_art=False)
+
+    assert payload["source"] == "synced"
+    assert payload["total"] == 3
+    assert [item["title"] for item in payload["items"]] == ["Turning Point", "Ted Lasso", "Kusama: Infinity"]
+    first = payload["items"][0]
+    assert {ref["provider"] for ref in first["present"]} == {"PLEX", "SIMKL", "TRAKT"}
+    assert first["missing"] == []
+    assert all(not key.startswith("_") for key in first)
+    kusama = payload["items"][2]
+    assert kusama["present"] == [{"provider": "TRAKT", "instance": "default"}]
+    assert {ref["provider"] for ref in kusama["missing"]} == {"PLEX", "SIMKL"}
+    assert payload["counts"] == {"all": 3, "movie": 2, "episode": 1}
+    assert payload["stats"] == {"plays": 3, "movies": 2, "episodes": 1, "endpoints": 3, "watches": 3, "full": 1, "partial": 2}
+    assert payload["providers"] == [
+        {"provider": "plex", "count": 1},
+        {"provider": "simkl", "count": 2},
+        {"provider": "trakt", "count": 2},
+    ]
+    assert payload["months"] == [{"month": "2026-09", "count": 2}, {"month": "2026-08", "count": 1}]
+
+
+def test_synced_history_counts_rewatches_once_per_viewing() -> None:
+    watches = {1704916800: "2024-01-10T20:00:00Z", 1739566800: "2025-02-14T21:00:00Z", 1772393400: "2026-03-01T19:30:00Z"}
+    trakt = {f"tmdb:603@{epoch}": _movie(603, "The Matrix", 1999, value) for epoch, value in watches.items()}
+    simkl = {"tmdb:603": _movie(603, "The Matrix", 1999, "2026-03-01T19:32:00Z")}
+    state = {"providers": {"TRAKT": _history(trakt), "SIMKL": _history(simkl), "PLEX": _history({"tmdb:20": KUSAMA})}}
+    payload = profile_history.build_history_payload(
+        profile_history.build_history_index("synced", state=state, tracker_items={}), resolve_art=False)
+
+    kusama, matrix = payload["items"]
+    assert matrix["watch_count"] == 3
+    assert len(matrix["watch_epochs"]) == 3
+    assert kusama["watch_count"] == 1
+    assert "watch_epochs" not in kusama
+    assert payload["stats"]["plays"] == 2
+    assert payload["stats"]["watches"] == 4
+
+
+def test_synced_history_keeps_same_title_shows_apart() -> None:
+    def episode(show_ids: dict[str, Any], watched_at: str) -> dict[str, Any]:
+        return {"type": "episode", "series_title": "Doctor Who", "season": 1, "episode": 1,
+                "show_ids": show_ids, "watched_at": watched_at}
+
+    classic = episode({"tmdb": 57243}, "2014-06-12T01:45:00Z")
+    revival = episode({"tmdb": 239770}, "2024-05-11T20:00:00Z")
+    revival_imdb = episode({"imdb": "tt31433814"}, "2024-05-11T20:00:00Z")
+    state = {"providers": {
+        "TRAKT": _history({"tmdb:57243#s01e01@1": classic, "tmdb:239770#s01e01@2": revival}),
+        "SIMKL": _history({"imdb:tt31433814#s01e01@2": revival_imdb}),
+    }}
+    payload = profile_history.build_history_payload(
+        profile_history.build_history_index("synced", state=state, tracker_items={}), resolve_art=False)
+
+    assert payload["counts"]["episode"] == 2
+    assert payload["stats"]["watches"] == 2
+    revival_row = payload["items"][0]
+    assert {ref["provider"] for ref in revival_row["present"]} == {"TRAKT", "SIMKL"}
+
+
+def test_synced_history_filters_and_jumps_to_month() -> None:
+    index = _synced_index()
+
+    def titles(**kwargs: Any) -> list[str]:
+        return [item["title"] for item in profile_history.build_history_payload(index, resolve_art=False, **kwargs)["items"]]
+
+    assert titles(coverage="full") == ["Turning Point"]
+    assert titles(coverage="partial") == ["Ted Lasso", "Kusama: Infinity"]
+    assert titles(provider="simkl") == ["Turning Point", "Ted Lasso"]
+    assert titles(media_type="episode") == ["Ted Lasso"]
+    assert titles(search="lasso") == ["Ted Lasso"]
+
+    jumped = profile_history.build_history_payload(index, resolve_art=False, page_size=1, month="2026-08")
+    assert jumped["page"] == 3
+    assert jumped["page_count"] == 3
+    assert [item["title"] for item in jumped["items"]] == ["Kusama: Infinity"]
+
+
+def test_synced_history_is_scoped_to_user_profile_endpoints() -> None:
+    payload = profile_history.build_history_payload(_synced_index({"PLEX": ["default"]}), resolve_art=False)
+
+    assert payload["total"] == 1
+    assert payload["endpoints"] == [{"provider": "PLEX", "instance": "default"}]
+    assert payload["items"][0]["missing"] == []
+
+
+def test_scrobble_history_keeps_route_and_hours(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {
+            "ok": True,
+            "items": [
+                {
+                    "id": "event-1",
+                    "kind": "scrobble",
+                    "method": "watcher",
+                    "event": "scrobble_stop",
+                    "media_type": "movie",
+                    "title": "Heat",
+                    "year": 1995,
+                    "source": "plex",
+                    "targets": [
+                        {"target": "trakt", "target_instance": "default"},
+                        {"target": "simkl", "target_instance": "default"},
+                    ],
+                    "ids": {"tmdb": 949},
+                    "runtime_minutes": 170,
+                    "watched_at": 1767225600,
+                    "captured_at": 1767229200,
+                    "status": "ok",
+                },
+                {"id": "event-2", "kind": "sync", "media_type": "movie", "title": "Ignored", "captured_at": 1767229300},
+            ],
+        },
+    )
+
+    index = profile_history.build_history_index("scrobble", user_filter={})
+    payload = profile_history.build_history_payload(index, resolve_art=False)
+
+    assert payload["source"] == "scrobble"
+    assert payload["total"] == 1
+    item = payload["items"][0]
+    assert item["source"] == {"provider": "PLEX", "instance": "default"}
+    assert [target["provider"] for target in item["targets"]] == ["TRAKT", "SIMKL"]
+    assert "present" not in item
+    assert payload["stats"]["hours"] == pytest.approx(2.8)
+
+
+def test_ratings_keep_each_provider_score_and_flag_conflicts() -> None:
+    payload = profile_history.build_history_payload(_ratings_index(), resolve_art=False)
+
+    assert payload["source"] == "ratings"
+    assert [item["title"] for item in payload["items"]] == ["Heat", "The Matrix", "Pulp Fiction"]
+    heat = payload["items"][0]
+    assert heat["rating"] == 7
+    assert heat["agree"] is False
+    assert {ref["provider"]: ref["rating"] for ref in heat["present"]} == {"PLEX": 9, "SIMKL": 9, "TRAKT": 7}
+    assert heat["missing"] == []
+    pulp = payload["items"][2]
+    assert pulp["sort_epoch"] == 0
+    assert pulp["agree"] is True
+    assert {ref["provider"] for ref in pulp["missing"]} == {"PLEX", "TRAKT"}
+    assert payload["counts"]["show"] == 0
+    assert payload["counts"]["ratings"]["10"] == 1
+    assert payload["counts"]["ratings"]["7"] == 1
+    assert payload["stats"]["mismatch"] == 1
+    assert payload["stats"]["full"] == 1
+    assert payload["stats"]["average"] == pytest.approx(8.3)
+    assert payload["months"] == [{"month": "2026-09", "count": 1}, {"month": "2026-08", "count": 1}]
+
+
+def test_ratings_filter_by_score_and_conflict() -> None:
+    index = _ratings_index()
+
+    def titles(**kwargs: Any) -> list[str]:
+        return [item["title"] for item in profile_history.build_history_payload(index, resolve_art=False, **kwargs)["items"]]
+
+    assert titles(coverage="mismatch") == ["Heat"]
+    assert titles(rating="10") == ["Pulp Fiction"]
+    assert titles(coverage="partial") == ["The Matrix", "Pulp Fiction"]
+    assert titles(provider="trakt") == ["Heat"]
+
+
+def test_history_index_is_built_once_per_cache_key() -> None:
+    builds: list[int] = []
+
+    def builder() -> dict[str, Any]:
+        builds.append(1)
+        return _synced_index()
+
+    profile_history.cached_history_index(("synced", "", "v1"), builder)
+    profile_history.cached_history_index(("synced", "", "v1"), builder)
+    assert len(builds) == 1
+
+    profile_history.cached_history_index(("synced", "", "v2"), builder)
+    assert len(builds) == 2
+
+
+def test_profile_history_payload_scopes_unknown_profile_to_nothing(monkeypatch) -> None:
+    monkeypatch.setattr(profileAPI, "_history_state", _state)
+    monkeypatch.setattr(profileAPI, "_ratings_state", _ratings_state)
+    monkeypatch.setattr(profileAPI, "_tracker_feature_items", lambda _kind: {})
+    monkeypatch.setattr(profileAPI, "_dashboard_widgets_version", lambda *_args, **_kwargs: "")
+
+    everyone = profileAPI.build_profile_history_payload({}, source="synced")
+    assert everyone["total"] == 3
+    assert everyone["items"][0]["poster"].startswith("/art/tmdb/")
+    assert profileAPI.build_profile_history_payload({}, profile_id="ghost")["total"] == 0
+
+    ratings = profileAPI.build_profile_history_payload({}, source="ratings", rating="9")
+    assert ratings["source"] == "ratings"
+    assert ratings["total"] == 0
+    assert profileAPI.build_profile_history_payload({}, source="ratings")["total"] == 3
+
+
+def test_profile_timeline_ui_is_registered() -> None:
+    root = Path(__file__).resolve().parents[1]
+    js = (root / "assets/js/profile-page.js").read_text(encoding="utf-8")
+    css = (root / "assets/css/profile-page.css").read_text(encoding="utf-8")
+    widgets = (root / "assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
+    from ui_frontend import get_profile_html
+
+    html = get_profile_html(user={"is_admin": True, "username": "admin"})
+
+    assert 'data-profile-tab="history"' in html
+    assert 'data-profile-tab="ratings"' in html
+    assert html.index('data-profile-tab="history"') < html.index('data-profile-tab="ratings"') < html.index('data-profile-tab="collection"')
+    assert 'id="profile-panel-history"' in html
+    assert 'id="profile-panel-ratings"' in html
+    assert 'data-timeline-source="scrobble"' in html
+    assert 'id="profile-ratings-scores"' in html
+    assert 'value="mismatch"' in html
+    assert 'data-cw-profile-menu-action="ratings"' in html
+    assert "/api/profile/history" in js
+    assert "/api/profile/ratings" in js
+    assert "historyPanel.wire();" in js
+    assert "ratingsPanel.wire();" in js
+    assert ".cw-hist-timeline" in css
+    assert ".cw-hist-scores" in css
+    assert "/profile#history/synced" in widgets
+    assert "/profile#history/scrobble" in widgets
+    assert "/profile#ratings" in widgets
+
+
+@pytest.mark.parametrize("provider", ["NUVIO", "MDBLIST", "TRAKT", "PLEX", "SIMKL", "WETRAKR"])
+@pytest.mark.parametrize("kind", ["show", "season"])
+def test_aggregate_status_does_not_count_as_missing_episode_history(provider: str, kind: str) -> None:
+    show = {"type": kind, "title": "Death Note", "ids": {"tmdb": 13916}, "watched_at": "2020-01-01T12:00:00Z"}
+    episode = {"type": "episode", "title": "Death Note", "show_ids": {"tmdb": 13916}, "season": 1, "episode": 37, "watched_at": "2020-01-01T12:00:00Z"}
+    state = {"providers": {
+        provider: _history({"tmdb:13916": show, "tmdb:13916#s01e37": episode}),
+        "OTHER_A": _history({"tmdb:13916#s01e37": episode}),
+        "OTHER_B": _history({"tmdb:13916#s01e37": episode}),
+    }}
+    index = profile_history.build_history_index("synced", state=state, tracker_items={})
+    payload = profile_history.build_history_payload(index, resolve_art=False)
+    assert payload["total"] == 2
+    marker = next(row for row in payload["items"] if row["type"] == kind)
+    assert marker["coverage_comparable"] is False
+    assert marker["present"] == [{"provider": provider, "instance": "default"}]
+    assert marker["missing"] == []
+    assert payload["stats"]["full"] == 1
+    assert payload["stats"]["partial"] == 0
+    assert payload["stats"]["not_comparable"] == 1
+    assert profile_history.build_history_payload(index, coverage="partial", resolve_art=False)["total"] == 0
+    full = profile_history.build_history_payload(index, coverage="full", resolve_art=False)
+    assert full["total"] == 1 and full["items"][0]["type"] == "episode"
+    state["providers"]["OTHER_B"] = _history({"tmdb:20": KUSAMA})
+    missing_index = profile_history.build_history_index("synced", state=state, tracker_items={})
+    missing = profile_history.build_history_payload(missing_index, coverage="partial", resolve_art=False)
+    assert missing["total"] == 2
+    assert {row["type"] for row in missing["items"]} == {"movie", "episode"}
+
+
+@pytest.mark.parametrize("provider", ["NUVIO", "MDBLIST"])
+def test_show_marker_does_not_require_or_invent_watched_episodes(provider: str) -> None:
+    show = {"type": "show", "title": "Death Note", "ids": {"tmdb": 13916}, "watched_at": "2020-01-01T12:00:00Z"}
+    state = {"providers": {provider: _history({"tmdb:13916": show})}}
+    index = profile_history.build_history_index("synced", state=state, tracker_items={})
+    payload = profile_history.build_history_payload(index, resolve_art=False)
+    assert payload["total"] == 1
+    assert payload["stats"]["episodes"] == 0
+    assert payload["stats"]["full"] == payload["stats"]["partial"] == 0
+    assert payload["items"][0]["coverage_comparable"] is False
+
+
+@pytest.mark.parametrize("kind", ["show", "season"])
+def test_aggregate_ratings_remain_comparable(kind: str) -> None:
+    item = {"type": kind, "title": "Death Note", "ids": {"tmdb": 13916}, "rating": 8}
+    state = {"providers": {
+        "NUVIO": _ratings({"tmdb:13916": item}),
+        "MDBLIST": _ratings({"tmdb:949": HEAT}),
+    }}
+    payload = profile_history.build_history_payload(
+        profile_history.build_history_index("ratings", state=state, tracker_items={}),
+        coverage="partial", resolve_art=False,
+    )
+    row = next(row for row in payload["items"] if row["title"] == "Death Note")
+    assert row.get("coverage_comparable", True)
+    assert row["missing"] == [{"provider": "MDBLIST", "instance": "default"}]
+    assert payload["stats"]["partial"] == 2
+
+
+def test_show_watchlist_remains_comparable() -> None:
+    items = [
+        {"type": "show", "title": "Death Note", "ids": {"tmdb": 13916}, "sources": ["NUVIO"]},
+        {"type": "movie", "title": "Heat", "ids": {"tmdb": 949}, "sources": ["MDBLIST"]},
+    ]
+    payload = profile_history.build_history_payload(
+        profile_history.build_history_index("watchlist", state=items),
+        coverage="partial", resolve_art=False,
+    )
+    row = next(row for row in payload["items"] if row["type"] == "show")
+    assert row.get("coverage_comparable", True)
+    assert row["missing"] == [{"provider": "MDBLIST", "instance": "default"}]
+    assert payload["stats"]["partial"] == 2

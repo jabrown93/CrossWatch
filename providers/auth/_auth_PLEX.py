@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import secrets
 import time
 from collections.abc import Mapping, MutableMapping
 from typing import Any
@@ -12,8 +11,10 @@ from typing import Any
 import requests
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import DEFAULT_CFG, save_config
 from cw_platform.provider_instances import ensure_provider_block, ensure_instance_block, normalize_instance_id
+from providers.sync.plex._common import stable_client_id
 
 try:
     from _logging import log as _real_log
@@ -32,7 +33,7 @@ def log(msg: str, level: str = "INFO", module: str = "AUTH", **_: Any) -> None:
 
 
 PLEX_PIN_URL = "https://plex.tv/api/v2/pins"
-UA = "CrossWatch/1.0"
+UA = http_user_agent(override_env="CW_PLEX_UA")
 HTTP_TIMEOUT = 10
 __VERSION__ = "2.1.0"
 
@@ -85,15 +86,15 @@ class PlexAuth(AuthProvider):
 
         cid = str((base.get("client_id") or plex.get("client_id") or "")).strip()
         if not cid:
-            cid = secrets.token_hex(12)
-            base["client_id"] = cid
+            cid = stable_client_id()
+        base["client_id"] = cid
         plex["client_id"] = cid
 
         headers = {
             "Accept": "application/json",
             "User-Agent": UA,
             "X-Plex-Product": "CrossWatch",
-            "X-Plex-Version": "1.0",
+            "X-Plex-Version": app_version(),
             "X-Plex-Client-Identifier": cid,
             "X-Plex-Platform": "Web",
         }
@@ -125,7 +126,7 @@ class PlexAuth(AuthProvider):
                 "Accept": "application/json",
                 "User-Agent": UA,
                 "X-Plex-Product": "CrossWatch",
-                "X-Plex-Version": "1.0",
+                "X-Plex-Version": app_version(),
                 "X-Plex-Client-Identifier": cid,
                 "X-Plex-Platform": "Web",
             },
@@ -136,6 +137,8 @@ class PlexAuth(AuthProvider):
 
         if j.get("authToken"):
             plex["account_token"] = j["authToken"]
+            plex.pop("pms_token", None)
+            plex.pop("pms_token_server", None)
             plex.pop("_pending_pin", None)
             save_config(cfgd)
             log(f"Plex[{inst}]: token stored", level="SUCCESS", module="AUTH")
@@ -375,11 +378,12 @@ def html() -> str:
           </div>
 
           <div class="cw-subpanel" data-sub="whitelist">
-            <div style="max-width:980px">
+            <div style="width:100%;max-width:none">
               <div id="plex_lib_matrix"></div>
               <select id="plex_lib_history" data-cfg-path="plex.history.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
               <select id="plex_lib_ratings" data-cfg-path="plex.ratings.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
               <select id="plex_lib_progress" data-cfg-path="plex.progress.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
+              <select id="plex_lib_collection" data-cfg-path="plex.collection.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
               <select id="plex_lib_scrobble" data-cfg-path="plex.scrobble.libraries" data-cfg-instance-root="plex" class="lm-hidden" multiple></select>
             </div>
           </div>

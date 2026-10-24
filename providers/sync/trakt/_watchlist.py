@@ -2,6 +2,7 @@
 # TRAKT Module for watchlist sync functions
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+
 import os, json, time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -18,13 +19,16 @@ from ._common import (
     _pair_scope,
     _is_capture_mode,
     _now_iso,
+    _chunk,
+    _last_limit_path,
     _record_limit_error,
     headers_for_adapter,
     resolve_watchlist_limit,
 )
-from .._mod_common import request_with_retries, _chunk_items as _chunk
-from cw_platform.id_map import minimal as id_minimal
+from .._mod_common import request_with_retries
+from cw_platform.id_map import migrate_media_index, minimal as id_minimal
 from .._log import log as cw_log
+from ._pagination import TraktPager
 
 BASE = "https://api.trakt.tv"
 URL_ALL = f"{BASE}/sync/watchlist"
@@ -122,7 +126,11 @@ def _shadow_load() -> dict[str, Any]:
         return {"etag": None, "ts": 0, "items": {}}
     p = _shadow_path()
     try:
-        return json.loads(p.read_text("utf-8"))
+        doc = json.loads(p.read_text("utf-8"))
+        if isinstance(doc, dict) and doc.get("schema") == 1:
+            doc["items"] = migrate_media_index(doc.get("items"))
+            return doc
+        return {"etag": None, "ts": 0, "items": {}}
     except Exception:
         return {"etag": None, "ts": 0, "items": {}}
 
@@ -133,8 +141,11 @@ def _shadow_save(etag: str | None, items: Mapping[str, Any]) -> None:
     try:
         _shadow_path().parent.mkdir(parents=True, exist_ok=True)
         tmp = _shadow_path().with_suffix(".tmp")
+        payload: dict[str, Any] = {"schema": 1, "ts": int(time.time()), "items": dict(items)}
+        if isinstance(etag, str) and etag.strip():
+            payload["etag"] = etag
         tmp.write_text(
-            json.dumps({"etag": etag, "ts": int(time.time()), "items": dict(items)}, ensure_ascii=False),
+            json.dumps(payload, ensure_ascii=False),
             "utf-8",
         )
         os.replace(tmp, _shadow_path())
@@ -175,8 +186,12 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     )
     update_watermarks_from_last_activities(acts)
 
+    per_page = max(1, min(250, _cfg_int(cfg, "watchlist_per_page", 250)))
+    max_pages = max(1, _cfg_int(cfg, "watchlist_max_pages", 1000))
+
     sh = _shadow_load()
-    if use_etag and sh.get("etag"):
+    base_headers = dict(headers)
+    if use_etag and sh.get("etag") and len(sh.get("items") or {}) < per_page:
         fresh = True
         if ttl_h > 0 and sh.get("ts"):
             age = int(time.time()) - int(sh.get("ts", 0))
@@ -189,6 +204,7 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
         "GET",
         URL_ALL,
         headers=headers,
+        params={"page": 1, "limit": per_page},
         timeout=adapter.cfg.timeout,
         max_retries=adapter.cfg.max_retries,
     )
@@ -214,9 +230,39 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
         _info("index_done", count=len(idx), source="shadow_fallback")
         return idx
 
-    data = r.json() if (r.text or "").strip() else []
-    items = [normalize_watchlist_row(x) for x in (data or []) if isinstance(x, dict)]
-    idx: dict[str, dict[str, Any]] = {key_of(m): m for m in items}
+    idx: dict[str, dict[str, Any]] = {}
+    page = 1
+    pager = TraktPager("watchlist", max_pages)
+    while True:
+        rows = pager.read(r, page)
+        for x in rows:
+            if not isinstance(x, dict):
+                continue
+            m = normalize_watchlist_row(x)
+            idx[key_of(m)] = m
+        if not rows:
+            break
+        page += 1
+        r = request_with_retries(
+            sess,
+            "GET",
+            URL_ALL,
+            headers=base_headers,
+            params={"page": page, "limit": per_page},
+            timeout=adapter.cfg.timeout,
+            max_retries=adapter.cfg.max_retries,
+        )
+        if log_rates:
+            _log_rate_headers(r)
+        if r.status_code != 200:
+            _warn("http_failed", op="index", method="GET", url=URL_ALL, page=page, status=r.status_code)
+            idx = dict(sh.get("items") or {})
+            total = len(idx)
+            _tick(prog, 0, total=total, force=True)
+            _tick(prog, total, total=total)
+            _info("index_done", count=len(idx), source="shadow_fallback")
+            return idx
+
     if use_etag:
         _shadow_save(etag, idx)
 
@@ -224,7 +270,7 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     _tick(prog, 0, total=total, force=True)
     _tick(prog, total, total=total)
 
-    _info("index_done", count=len(idx), source="live")
+    _info("index_done", count=len(idx), source="live", pages=page)
     return idx
 
 

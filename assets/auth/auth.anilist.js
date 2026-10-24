@@ -110,15 +110,15 @@
 
     box = d.createElement("div");
     box.id = "anilist_mapping_recommendation";
-    box.className = "anilist-mapping-rec hidden";
+    box.className = "anime-mapping-rec hidden";
     box.innerHTML =
-      '<div class="anilist-mapping-rec-copy">' +
-        '<div class="anilist-mapping-rec-kicker">Recommended for AniList</div>' +
+      '<div class="anime-mapping-rec-copy">' +
+        '<div class="anime-mapping-rec-kicker">Recommended for AniList</div>' +
         '<strong>Use Anime ID Mapping</strong>' +
         '<div class="muted">Improves matching by translating AniList IDs to IDs your media servers and trackers understand.</div>' +
-        '<div class="anilist-mapping-rec-state" id="anilist_mapping_recommendation_state"></div>' +
+        '<div class="anime-mapping-rec-state" id="anilist_mapping_recommendation_state"></div>' +
       '</div>' +
-      '<div class="anilist-mapping-rec-actions">' +
+      '<div class="anime-mapping-rec-actions">' +
         '<button class="btn primary" type="button" id="btn-anilist-enable-mapping">Enable Anime ID Mapping</button>' +
         '<button class="btn" type="button" id="btn-anilist-dismiss-mapping">Not now</button>' +
       '</div>';
@@ -310,8 +310,8 @@
         const next = computeRedirect();
         if (rid.textContent !== next) rid.textContent = next;
       }
-      if (btn && !anilistConnected) btn.disabled = !ok;
       try { Shared.setConnectLocked("btn-connect-anilist", anilistConnected); } catch {}
+      if (btn) btn.disabled = !ok || btn.classList.contains("busy");
       if (hint) hint.classList.toggle("hidden", ok);
       renderMappingRecommendation();
     } catch (e) {
@@ -372,6 +372,7 @@
         cache: "no-store",
       });
       const j = await r.json().catch(() => ({}));
+      if (Shared.reportProviderUsage({ status: r.status, data: j })) return;
 
       if (r.ok && j.ok !== false) {
         if (msg) {
@@ -410,6 +411,10 @@
     const cidState = readSecretField($("anilist_client_id"));
     const secState = readSecretField($("anilist_client_secret"));
     if (!cidState.hasValue || !secState.hasValue) return;
+
+    let authCompleted;
+    try { authCompleted = await Shared.captureAuthCompletion(profile); }
+    catch (e) { notify(e.message); return; }
 
     const payload = {};
     if (cidState.value) payload.client_id = cidState.value;
@@ -465,7 +470,7 @@
 
       const blk = getAniListCfgBlock(cfg || {});
       const tok = String(blk?.access_token || "").trim();
-      if (tok) {
+      if (tok && authCompleted(cfg)) {
         anilistConnected = true;
         setAniListSuccess(true);
 

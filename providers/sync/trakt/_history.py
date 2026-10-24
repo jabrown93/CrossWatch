@@ -21,13 +21,15 @@ from ._common import (
     _pair_scope,
     _is_capture_mode,
     _now_iso,
+    _last_limit_path,
     _record_limit_error,
     headers_for_adapter,
     watch_only_once,
 )
-from .._mod_common import request_with_retries, _chunk_items as _chunked_items
+from .._mod_common import request_with_retries
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 from .._log import log as cw_log
+from ._pagination import TraktPager
 
 BASE = "https://api.trakt.tv"
 URL_HIST_MOV = f"{BASE}/sync/history/movies"
@@ -36,7 +38,7 @@ URL_ADD = f"{BASE}/sync/history"
 URL_REMOVE = f"{BASE}/sync/history/remove"
 URL_COLL_ADD = f"{BASE}/sync/collection"
 RESOLVE_ENABLE = False
-_CACHE_SCHEMA = 2
+_CACHE_SCHEMA = 3
 
 def _int_or_none(x: Any) -> int | None:
     if x is None:
@@ -178,6 +180,11 @@ def _cfg_num(adapter: Any, key: str, default: Any, cast: Callable[[Any], Any] = 
     except Exception:
         return cast(default)
 
+
+def _chunked_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
+    size = max(1, int(n or 1))
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
 
 _NATIVE_ANIME_PROVIDERS = {"SIMKL", "ANILIST"}
@@ -1311,7 +1318,8 @@ def _fetch_history(
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     page = 1
-    total_pages: int | None = None
+    pager = TraktPager("history", max_pages)
+    seen_ids: set[str] = set()
     while True:
         r = request_with_retries(
             sess,
@@ -1322,19 +1330,16 @@ def _fetch_history(
             timeout=timeout,
             max_retries=max_retries,
         )
-        if r.status_code != 200:
-            _warn("http_failed", op="index", url=url, page=page, status=r.status_code)
-            break
-        if total_pages is None:
-            pc = _hdr_int(r.headers, "X-Pagination-Page-Count")
-            if pc is not None:
-                total_pages = pc
-        rows = r.json() or []
+        rows = pager.read(r, page)
         if not rows:
             break
         added = 0
         for row in rows:
             hid = row.get("id")
+            if hid is not None:
+                if str(hid) in seen_ids:
+                    continue
+                seen_ids.add(str(hid))
             w = row.get("watched_at")
             if not w:
                 continue
@@ -1377,17 +1382,10 @@ def _fetch_history(
             except Exception:
                 pass
         page += 1
-        if total_pages is not None and page > total_pages:
-            break
-        if total_pages is None and len(rows) < per_page:
-            break
-        if max_pages and page > max_pages:
-            _warn("index_reconcile", reason="safety_cap_hit", strategy="paged_fetch", max_pages=max_pages)
-            break
     return out
 
 
-def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 100000) -> dict[str, dict[str, Any]]:
+def build_index(adapter: Any, *, per_page: int = 250, max_pages: int = 100000) -> dict[str, dict[str, Any]]:
     prog_mk = getattr(adapter, "progress_factory", None)
     prog: Any = prog_mk("history") if callable(prog_mk) else None
     sess = adapter.client.session
@@ -1395,7 +1393,7 @@ def build_index(adapter: Any, *, per_page: int = 100, max_pages: int = 100000) -
     timeout = float(_cfg_num(adapter, "timeout", 10, float))
     retries = int(_cfg_num(adapter, "max_retries", 3, int))
     cfg_per_page = int(_cfg_num(adapter, "history_per_page", per_page, int))
-    cfg_per_page = max(1, min(100, cfg_per_page))
+    cfg_per_page = max(1, min(250, cfg_per_page))
     cfg_max_pages = int(_cfg_num(adapter, "history_max_pages", max_pages, int))
     if cfg_max_pages <= 0:
         cfg_max_pages = max_pages

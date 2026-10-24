@@ -16,16 +16,27 @@ except Exception:
 
 from cw_platform.config_base import load_config
 from providers.auth._auth_KODI import KodiAuthError, clean_base, jsonrpc_call
+from providers.scrobble._log_dedupe import LogDeduplicator
+from providers.scrobble._show_tmdb import show_tmdb_id
+from providers.scrobble.kodi import addon as kodi_addon
 from providers.scrobble.currently_watching import update_from_event as _cw_update
 from providers.scrobble.currently_watching import update_from_payload as _cw_update_payload
 from providers.scrobble.scrobble import Dispatcher, ScrobbleEvent, ScrobbleSink, mask_account
+from providers.scrobble.routes import watch_poll_seconds
 from providers.scrobble.sources import source_enabled
-from providers.sync.kodi._common import path_scope_status
+from providers.sync.kodi._common import (
+    EXTERNAL_ID_KEYS,
+    is_placeholder_id,
+    path_scope_status,
+    strip_path_userinfo,
+    uniqueid_name,
+    uniqueid_namespace,
+)
 
-BASE_POLL_SECONDS = 1.75
+BASE_POLL_SECONDS = 10.0
 MIN_POLL_SECONDS = 1.5
-MAX_BASE_POLL_SECONDS = 2.0
-MAX_IDLE_POLL_SECONDS = 6.0
+MAX_BASE_POLL_SECONDS = 60.0
+MAX_IDLE_POLL_SECONDS = 30.0
 OFFLINE_INITIAL_RETRY_SECONDS = 30.0
 OFFLINE_MAX_RETRY_SECONDS = 300.0
 OFFLINE_TIMEOUT_SECONDS = 2.0
@@ -45,6 +56,28 @@ def _log(msg: str, level: str = "INFO") -> None:
         print(f"[KODI-WATCH:{lvl}] {msg}")
     except Exception:
         pass
+
+
+def _ids_desc(ids: Mapping[str, Any] | None) -> str:
+    d = ids or {}
+    for k in ("tmdb", "tvdb", "imdb", "trakt"):
+        if d.get(k):
+            return f"{k}:{d[k]}"
+    for k in ("tmdb_show", "tvdb_show", "imdb_show", "trakt_show"):
+        if d.get(k):
+            return f"{k.replace('_show', '')}:{d[k]}"
+    return "none"
+
+
+def _media_name(ev: ScrobbleEvent) -> str:
+    if (ev.media_type or "").lower() == "episode":
+        s = ev.season if isinstance(ev.season, int) else None
+        n = ev.number if isinstance(ev.number, int) else None
+        base = ev.title or "?"
+        if s is not None and n is not None:
+            return f"{base} S{s:02}E{n:02}"
+        return base
+    return ev.title or "?"
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -111,7 +144,7 @@ def _stable_server_uuid(server: str) -> str:
 
 
 def _norm_unique_key(key: Any) -> str:
-    return "".join(ch for ch in str(key or "").strip().lower() if ch.isalnum())
+    return uniqueid_name(key)
 
 
 def _normalize_uniqueids(uniqueid: Any, media_type: str) -> dict[str, str]:
@@ -125,17 +158,11 @@ def _normalize_uniqueids(uniqueid: Any, media_type: str) -> dict[str, str]:
 
     for key, value in raw.items():
         text = str(value or "").strip()
-        if not text:
+        if is_placeholder_id(text):
             continue
         nk = _norm_unique_key(key)
         is_show = media_type == "episode" and any(part in nk for part in ("show", "tvshow", "series"))
-        target = None
-        if "imdb" in nk or text.lower().startswith("tt"):
-            target = "imdb"
-        elif "tmdb" in nk or "themoviedb" in nk:
-            target = "tmdb"
-        elif "tvdb" in nk or "thetvdb" in nk:
-            target = "tvdb"
+        target = uniqueid_namespace(nk, text)
         if target:
             if media_type == "episode":
                 put(f"{target}_show" if is_show else f"{target}_episode", text)
@@ -150,7 +177,7 @@ def _has_show_ids(ids: Mapping[str, Any]) -> bool:
 
 def _show_ids_from_uniqueids(uniqueid: Any) -> dict[str, str]:
     base = _normalize_uniqueids(uniqueid, "movie")
-    return {f"{key}_show": value for key, value in base.items() if key in {"imdb", "tmdb", "tvdb"} and value}
+    return {f"{key}_show": value for key, value in base.items() if key in EXTERNAL_ID_KEYS and value}
 
 
 def _item_identity(item: Mapping[str, Any], media_type: str) -> str:
@@ -199,7 +226,9 @@ class KodiWatchService:
         self._cfg_provider = cfg_provider
         self._instance_id = str(instance_id or "default").strip() or "default"
         self._dispatch = dispatcher or Dispatcher(list(sinks or []), cfg_provider=self._active_cfg)
-        self._base_poll = _clamp_float(poll_secs, BASE_POLL_SECONDS, MIN_POLL_SECONDS, MAX_BASE_POLL_SECONDS)
+        self._default_poll = _clamp_float(poll_secs, BASE_POLL_SECONDS, MIN_POLL_SECONDS, MAX_BASE_POLL_SECONDS)
+        self._base_poll = self._default_poll
+        self._max_idle_poll = MAX_IDLE_POLL_SECONDS
         self._stop = threading.Event()
         self._bg: threading.Thread | None = None
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -209,6 +238,8 @@ class KodiWatchService:
         self._profile: tuple[float, str | None] = (0.0, None)
         self._last_error: tuple[str, float] = ("", 0.0)
         self._last_filter: dict[str, float] = {}
+        self._route_filter_logs = LogDeduplicator()
+        self._event_logs = LogDeduplicator()
         self._quiet_startup = bool(quiet_startup)
         self._show_ids_cache: dict[int, dict[str, str] | None] = {}
         self._offline = False
@@ -234,6 +265,21 @@ class KodiWatchService:
     def _configured(self, cfg: Mapping[str, Any]) -> bool:
         kodi = self._kodi_cfg(cfg)
         return bool(str(kodi.get("server") or "").strip() and kodi.get("connection_verified") is True)
+
+    def _addon_enabled(self, cfg: Mapping[str, Any]) -> bool:
+        return kodi_addon.instance_enabled(cfg, self._instance_id)
+
+    def _addon_active(self, cfg: Mapping[str, Any]) -> bool:
+        return self._addon_enabled(cfg) and kodi_addon.is_active(self._instance_id)
+
+    def _server_uuid(self, cfg: Mapping[str, Any]) -> str:
+        device = kodi_addon.device_uuid(self._instance_id) if self._addon_enabled(cfg) else None
+        return device or _stable_server_uuid(str(self._kodi_cfg(cfg).get("server") or ""))
+
+    def _drop_sessions(self) -> None:
+        self._sessions.clear()
+        self._player_session.clear()
+        self._empty_success_polls = 0
 
     def _rpc(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
         cfg = self._active_cfg()
@@ -380,33 +426,49 @@ class KodiWatchService:
         if meta.get("media_type") != "episode":
             return
         ids = meta.get("ids")
-        if not isinstance(ids, dict) or _has_show_ids(ids):
+        if not isinstance(ids, dict):
             return
-        tvshow_id = self._episode_tvshow_id(item)
-        if not tvshow_id:
-            return
-        details = self._tvshow_details(tvshow_id)
-        show_ids = _show_ids_from_uniqueids(_dict(details).get("uniqueid")) if details else {}
-        ids.update(show_ids)
-        if details:
-            if not meta.get("title"):
-                meta["title"] = str(details.get("title") or "").strip() or meta.get("title")
-            if meta.get("year") is None:
-                meta["year"] = _to_int(details.get("year"))
+        if not _has_show_ids(ids):
+            tvshow_id = self._episode_tvshow_id(item)
+            details = self._tvshow_details(tvshow_id) if tvshow_id else None
+            show_ids = _show_ids_from_uniqueids(_dict(details).get("uniqueid")) if details else {}
+            ids.update(show_ids)
+            if details:
+                if not meta.get("title"):
+                    meta["title"] = str(details.get("title") or "").strip() or meta.get("title")
+                if meta.get("year") is None:
+                    meta["year"] = _to_int(details.get("year"))
+        if not str(ids.get("tmdb_show") or "").strip():
+            known = {key: ids.get(f"{key}_show") for key in ("imdb", "tvdb")}
+            episode = {key: ids.get(f"{key}_episode") for key in ("imdb", "tvdb")}
+            tmdb_show = show_tmdb_id(self._active_cfg(), known, episode)
+            if tmdb_show:
+                ids["tmdb_show"] = str(tmdb_show)
 
     def _dispatch_event(self, ev: ScrobbleEvent, duration_ms: int | None = None) -> bool:
+        key = (ev.server_uuid, ev.session_key)
+        signature = (ev.account, ev.media_type, ev.title, ev.year, ev.season, ev.number, tuple(sorted(ev.ids.items())))
+        if self._event_logs.should_log(key, signature):
+            _log(f"incoming '{ev.action}' user='{mask_account(ev.account)}' server='{ev.server_uuid}' media='{_media_name(ev)}' sess={ev.session_key}", "DEBUG")
+            _log(f"ids resolved: {_media_name(ev)} -> {_ids_desc(ev.ids)} sess={ev.session_key}", "DEBUG")
         accepted = bool(self._dispatch.dispatch(ev))
+        if not accepted and self._route_filter_logs.should_log(key, ev.account):
+            _log(
+                f"event not dispatched: user={mask_account(ev.account)} server={ev.server_uuid} sess={ev.session_key}",
+                "DEBUG",
+            )
         if accepted:
+            self._route_filter_logs.discard(key)
             try:
                 _cw_update("kodi", ev, duration_ms=duration_ms, provider_instance=self._instance_id)
             except Exception:
                 pass
-            _log(f"event {ev.action} {ev.media_type} user={mask_account(ev.account)} p={ev.progress:.1f} sess={ev.session_key}", "DEBUG")
+            _log(f"event {ev.action} {ev.media_type} user={mask_account(ev.account)} p={ev.progress:.1f} sess={ev.session_key}", "INFO")
         elif ev.action == "stop":
             try:
                 _cw_update_payload(
                     "kodi",
-                    ev.media_type,
+                    str(ev.media_type),
                     ev.title or "",
                     ev.year,
                     ev.season,
@@ -442,7 +504,6 @@ class KodiWatchService:
             return None
         player_id = int(player.get("playerid") or 0)
         start_ts = time.time()
-        server = str(self._kodi_cfg(self._active_cfg()).get("server") or "")
         session_key = f"kodi:{self._instance_id}:{player_id}:{meta['media_type']}:{meta['item_identity']}:{int(start_ts * 1000)}"
         pct, duration_ms = _progress_from_props(props)
         if duration_ms is None:
@@ -455,7 +516,7 @@ class KodiWatchService:
             "meta": meta,
             "item": dict(item),
             "account": self._current_profile(),
-            "server_uuid": _stable_server_uuid(server),
+            "server_uuid": self._server_uuid(self._active_cfg()),
             "last_action": "",
             "state": "",
             "last_progress": pct,
@@ -482,7 +543,10 @@ class KodiWatchService:
         item = _dict(result).get("item")
         if not isinstance(item, Mapping):
             raise KodiAuthError("Kodi returned an invalid player item response", reason="invalid_response")
-        return dict(item)
+        out = dict(item)
+        if out.get("file"):
+            out["file"] = strip_path_userinfo(out.get("file"))
+        return out
 
     def _player_props(self, player_id: int) -> dict[str, Any]:
         result = self._rpc(
@@ -534,16 +598,30 @@ class KodiWatchService:
                 session["last_emitted_progress"] = emit_progress
             session["seek_pending"] = False
 
+    def _stop_session(self, sk: str, session: dict[str, Any]) -> None:
+        pct = float(session.get("last_progress") or 0.0)
+        ev = self._event(session, "stop", pct, _dict(session.get("last_properties")))
+        self._dispatch_event(ev, session.get("duration_ms"))
+        self._sessions.pop(sk, None)
+
     def _stop_missing_sessions(self) -> None:
         for sk, session in list(self._sessions.items()):
-            pct = float(session.get("last_progress") or 0.0)
-            ev = self._event(session, "stop", pct, _dict(session.get("last_properties")))
-            self._dispatch_event(ev, session.get("duration_ms"))
-            self._sessions.pop(sk, None)
+            self._stop_session(sk, session)
         self._player_session.clear()
+
+    def _item_changed(self, session: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
+        if item.get("id") in (None, "", -1) and not item.get("file"):
+            return False
+        media_type = str(item.get("type") or "").strip().lower()
+        return _item_identity(item, media_type) != session.get("item_identity")
 
     def _tick(self) -> bool:
         cfg = self._active_cfg()
+        self._base_poll = watch_poll_seconds(cfg, self._default_poll)
+        self._max_idle_poll = watch_poll_seconds(cfg, MAX_IDLE_POLL_SECONDS, "idle_poll_seconds")
+        if self._addon_active(cfg):
+            self._drop_sessions()
+            return False
         if not self._configured(cfg):
             return False
 
@@ -582,6 +660,16 @@ class KodiWatchService:
                     session["last_properties"] = props
                 else:
                     props = self._player_props(player_id)
+                    try:
+                        item = self._player_item(player_id)
+                    except Exception:
+                        item = {}
+                    if self._item_changed(session, item):
+                        self._stop_session(str(sk), session)
+                        self._player_session.pop(player_id, None)
+                        session = self._create_session(player, item, props)
+                        if session is None:
+                            continue
                     if bool(props.get("live")):
                         continue
                     active_supported = True
@@ -602,7 +690,7 @@ class KodiWatchService:
             if not self._quiet_startup:
                 _log("Watcher source is disabled; Kodi watcher not started.", "INFO")
             return
-        if not self._configured(cfg):
+        if not self._configured(cfg) and not self._addon_enabled(cfg):
             if not self._quiet_startup:
                 _log("Kodi is not connected; watcher not started.", "WARNING")
             return
@@ -615,7 +703,7 @@ class KodiWatchService:
             if active:
                 self._idle_poll = self._base_poll
             else:
-                self._idle_poll = min(MAX_IDLE_POLL_SECONDS, max(self._base_poll, self._idle_poll + 0.75))
+                self._idle_poll = min(max(self._max_idle_poll, self._base_poll), max(self._base_poll, self._idle_poll * 1.5))
             self._stop.wait(self._idle_poll)
 
     def start_async(self) -> None:

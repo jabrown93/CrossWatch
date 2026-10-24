@@ -40,7 +40,7 @@ def test_get_config_reports_env_locked_paths(
     from cw_platform.config_base import load_config, save_config
 
     monkeypatch.setenv("CW_OIDC_ISSUER", "https://from-env.example.com/")
-    monkeypatch.setenv("CW_API_KEY", "machine-key")
+    monkeypatch.setenv("CW_CFG__security__api_key", "machine-key")
     _stub_env(monkeypatch, cfg_api, load_config, save_config)
 
     body = json.loads(cfg_api.api_config().body)

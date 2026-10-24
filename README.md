@@ -1,45 +1,37 @@
-<img width="1672" height="941" alt="CW-new" src="https://github.com/user-attachments/assets/19e8bad7-79d3-450c-b9a7-de086cc68ffd" />
+# CrossWatch
 
-</center>
+> **Unofficial fork of [cenodude/CrossWatch](https://github.com/cenodude/CrossWatch).** Image:
+> `ghcr.io/jabrown93/crosswatch`. The runtime image is shell-less, so `CW_CLI_ONLY` and `run-once`
+> below are unsupported; run the CLI with `docker exec crosswatch python /app/cli/cw.py ...`.
+> Fork differences, environment configuration, and the upstream sync process are in [FORK.md](FORK.md).
 
-> ## 🍴 This is a fork
->
-> This repository is a fork of [**cenodude/CrossWatch**](https://github.com/cenodude/CrossWatch),
-> kept in sync with upstream. It tracks upstream releases and layers the changes below on top.
-> For general usage, the upstream documentation and [wiki](https://wiki.crosswatch.app/) still apply.
->
-> **Differences from upstream:**
->
-> - **Authentication** — OIDC/SSO login, static API-key auth via an `x-api-key` header for
->   programmatic access, and a first-run setup-token gate. None of these exist upstream.
-> - **Security hardening** — secrets are redacted from config output/logs, outbound provider
->   requests are guarded against SSRF (including on every redirect hop, which also covers
->   Jellyfin Quick Connect), and an unrecognized webhook profile token is rejected with a
->   logged 401 rather than a silent 200.
-> - **Bug fixes** — ID-mapping fixes (prefer IMDb over TMDb in match priority; map Jellyfin
->   `ProviderIds`).
-> - **CI & automation** — a GitHub Actions test suite (pytest), automated Docker image and
->   GitHub Release publishing, semantic-release versioning, and Renovate for dependency
->   updates with SHA-pinned actions.
-> - **Hardened container** — the image is built on the shell-less, nonroot Docker Hardened
->   Image Python runtime rather than `python:slim`.
-> - **No Android companion app** — dropped upstream in v0.10.3; this fork follows suit and
->   purges any leftover paired-device tokens on the next credential rotation.
+**CrossWatch (CW)** tracks what you watch through Watcher and syncs your watchlists, ratings, history, playback progress and collections across supported media servers and trackers. **Watcher doesn't need Plex Pass or Emby Premiere.**
+
+Set up multiple Watcher routes for your servers and users, and sync pairs between media servers, between trackers, or from a server to a tracker. CW runs locally, with a web UI and a CLI to manage it all.
 
 <p align="center" style="font-size:14px;">
 <b>⭐ Star this repository to get updates</b><br>
 </p>
 
-
 <p align="center">
   <a href="https://github.com/cenodude/CrossWatch/releases/latest">
     <img src="https://img.shields.io/github/v/release/cenodude/CrossWatch?display_name=release&amp;sort=semver&amp;logo=github&amp;label=Latest%20Release&amp;style=for-the-badge" alt="Latest Release">
   </a>
-  <a href="https://github.com/jabrown93/CrossWatch/pkgs/container/crosswatch">
-    <img src="https://img.shields.io/badge/dynamic/json?url=https://ghcr-badge.elias.eu.org/api/jabrown93/CrossWatch/crosswatch&amp;query=%24.downloadCount&amp;style=for-the-badge&amp;logo=github&amp;label=GHCR%20Pulls" alt="GHCR Pulls">
+  <a href="https://github.com/cenodude/CrossWatch/pkgs/container/crosswatch">
+    <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cenodude/CrossWatch/badges/ghcr-pulls.json&amp;style=for-the-badge" alt="GHCR Pulls">
   </a>
   <a href="https://wiki.crosswatch.app/getting-started/first-time-setup">
     <img src="https://img.shields.io/badge/Quick%20Start-Must%20read!-d93c4a?style=for-the-badge&amp;logo=gitbook" alt="Must-read: Quick Start">
+  </a>
+  <br>
+  <a href="https://hub.docker.com/r/cenodude/crosswatch">
+    <img src="https://img.shields.io/docker/pulls/cenodude/crosswatch?style=for-the-badge&amp;logo=docker&amp;label=Docker%20Pulls" alt="Docker Pulls">
+  </a>
+  <a href="https://hub.docker.com/r/cenodude/crosswatch">
+    <img src="https://img.shields.io/docker/image-size/cenodude/crosswatch/latest?style=for-the-badge&amp;logo=docker&amp;label=Image%20Size" alt="Image Size">
+  </a>
+  <a href="https://hub.docker.com/r/cenodude/crosswatch/tags">
+    <img src="https://img.shields.io/docker/v/cenodude/crosswatch?sort=semver&amp;style=for-the-badge&amp;logo=docker&amp;label=Docker%20Version" alt="Docker Version">
   </a>
 </p>
 <p align="center">
@@ -55,47 +47,72 @@
   </a>
 </p>
 
+<img width="1672" height="941" alt="CrossWatch web UI overview" src="https://github.com/user-attachments/assets/06355278-8cdc-4a13-95ae-89f924fd0975" />
 
-**CrossWatch (CW)** is a synchronization engine that act as a bridge and keeps your **Plex, Jellyfin, Emby, SIMKL, Floppy, Trakt, AniList, TMDb, MDBList, PublicMetaDB, PunchPlay, Scrob, Tautulli, Kodi, Nuvio, Stremio and CW local tracker** in sync. It runs locally with a web UI where you link accounts, define sync pairs, run them manually or on a schedule, and review stats and history. CW also includes its own tracker to keep your data safe with snapshots. With Profiles, you can manage separate sync setups for yourself and for friends or family too, with their own servers and/or tracker API's.
+## Why CW?
 
-### CW in a nutshell:
-* **One brain for all your media syncs** A single place to configure everything.
-* **Be your own Sync Hub** Create profiles for seperate media servers/users/trackers.
-  * Managed user support (multi-users)
-* **Multi media-server** and **multi tracker** support with profiles.
-* **Synchronization**
-  * Watchlists, Ratings, History and Progress
-  * Rewatches: keep separate plays in sync for supported trackers.
-  * Anime ID mapping (powered by AniBridge and animeApi) for AniList and SIMKL pairs, with custom mappings.
-* **Scrobble (tracks your activity)**
-  * **Watcher** (Plex/Emby/Jellyfin/Kodi/Scrob to supported trackers)
-    * Does not require Plex Pass or Emby Premiere. Yay!
-  * **Webhooks** (Plex/Emby/Jellyfin to supported trackers)
-* **Tools**
-  * Analyzer: Finds items that are **stuck** or inconsistent between providers.
-  * Playback Progress Manager: View and edit unfinished playback sessions across providers.
-  * Editor: Inspect and adjust your items and add or block items.
-  * Events Viewer: Search and inspect sync runs.
-  * Captures: Rollback tool for provider watchlist, ratings, and history.
+**Watcher doesn't need Plex Pass or Emby Premiere.** Set up multiple routes for your servers and users, and send playback activity to their chosen supported destinations.
 
-And much, much more...such as:
-* Simple and advanced scheduling: From standard to more detailed pair schedules
-* CW Tracker Keeps snapshots/backups from your media servers and trackers.
-* Unified Watchlist: View all watchlist items in one place.
-* Player card: Shows what you are currently watching in real time.
-* Fallback GUID: Revives old items from  your Plex library.
+You can also keep media servers in sync with each other, connect them to trackers, or sync between trackers. Choose what each pair syncs: watch history, playback progress, watchlists, ratings or collections, depending on provider support. Run pairs manually or on a schedule.
 
-### Download
-[![Guide: Installation](https://img.shields.io/badge/Guide-INSTALLATION-0d6efd?style=for-the-badge)](https://wiki.crosswatch.app/getting-started/installation)
+Manage it all from one place: accounts, Watcher routes, syncs, current playback and a combined watchlist. Profiles keep your setup separate from those of friends and family.
 
+Keep your data with you, without being tied to one tracker. Sync it across the services you use and keep local snapshots in the CW Tracker.
 
-*   **Docker:**
+When you need more control, Interactive Sync lets you review changes before applying them. The Analyzer helps you check missing items, and saved mappings let you fix wrong matches, anime episode numbering, and split or combined episodes for future syncs.
 
-    ```bash
-    docker pull ghcr.io/jabrown93/crosswatch:latest
-    ```
+## Features
 
-### Run as Container
+- Watcher with multiple routes for different servers and users. **No Plex Pass or Emby Premiere needed.**
+- Server-to-server, server-to-tracker and tracker-to-tracker sync, where supported.
+- Watchlists, ratings, history, playback progress and collections. Rewatches too, for supported trackers.
+- Multiple accounts, separate profiles and managed user support.
+- Interactive Sync to review additions, updates and removals before applying them.
+- Webhook scrobbling for supported providers.
+- Custom mappings for wrong matches, anime IDs, and split or combined episodes.
+- A local CW Tracker with snapshots of your server and tracker data.
+- Optional AI help: ask CrossWatch advice with your own AI model. It can suggest. You can also give AI apps like Claude, Codex or Cursor read-only access. Off until you set it up.
+
+## Supported integrations
+
+CW works with Plex, Jellyfin, Emby, SIMKL, Floppy, FlickList, Trakt, WeTrakr, AniList, MyAnimeList (MAL), Kitsu, TMDb, MDBList, PublicMetaDB, PunchPlay, BingeBase, Scrob, Tautulli, Tracearr, Kodi, Nuvio, Stremio and its own local CW Tracker.
+
+Not every integration supports every feature. Some sync lists and history; others report playback activity. Setup details are in the [wiki](https://wiki.crosswatch.app/).
+
+## Installation
+
+The examples below use Docker. See the [installation guide](https://wiki.crosswatch.app/getting-started/installation) for more details.
+
+### Docker Compose
+
+Save this as `compose.yaml`:
+
+```yaml
+services:
+  crosswatch:
+    image: ghcr.io/jabrown93/crosswatch:latest
+    container_name: crosswatch
+    ports:
+      - "8787:8787"
+    environment:
+      TZ: Europe/Amsterdam
+    volumes:
+      - crosswatch_config:/config
+    restart: unless-stopped
+
+volumes:
+  crosswatch_config:
+```
+
+Change `TZ` to your timezone, then run this from the same folder:
+
+```bash
+docker compose up -d
+```
+
+### Docker run
+
+Or run it directly from Bash:
 
 ```bash
 docker run -d \
@@ -107,95 +124,103 @@ docker run -d \
   ghcr.io/jabrown93/crosswatch:latest
 ```
 
-or
+Both examples store persistent data in a Docker volume mounted at `/config`. Keep that volume when replacing or updating the container.
+
+### Your first sync
+
+Open [http://localhost:8787](http://localhost:8787). If Docker is running on another machine, use that machine's address with port `8787`.
+
+1. Connect the accounts you want to use.
+2. Create a sync pair: choose which services to connect and what to sync.
+3. Run the pair and check the results. Use Interactive Sync if you'd like to review changes before applying them.
+4. Add a schedule if you want it to run automatically.
+
+See the [first-time setup guide](https://wiki.crosswatch.app/getting-started/first-time-setup) for the full setup.
+
+## Scrobbling
+
+**Watcher** reports playback from Plex, Emby, Jellyfin, Kodi and Scrob to supported trackers. No Plex Pass or Emby Premiere needed for Watcher.
+
+You can also use **webhooks** from Plex, Emby and Jellyfin. Anime ID mapping is available for Watcher and webhooks with supported providers.
+
+### Kodi
+
+The [CrossWatch for Kodi add-on](https://github.com/crosswatch-app/kodi-addon) reports playback and household viewers. It also supports ratings directly in the add-on. Set up a Watcher route per viewer and they each get their own history, even when sharing a Kodi profile.
+
+## Mappings
+
+Sometimes the same episode has a different number on another service, or a title gets matched to the wrong movie. You can correct titles, IDs, seasons and episodes, then save the mapping for future syncs. Split and combined episodes are supported, and you can import or export your mappings.
+
+Anime ID mapping, powered by AniBridge and animeApi, supports AniList, MyAnimeList, Kitsu, SIMKL and CW Tracker pairs.
+
+## Tools
+
+Use the **Analyzer** when something hasn't synced as expected. You can compare snapshots, find missing items and watch time differences, fix wrong matches, check pending retries and release blocked items.
+
+| Tool | What you can do |
+| --- | --- |
+| Editor | Inspect, add or block items, manage saved mappings, and handle split or combined episodes. |
+| Sync topology advisor | See your sync routes and spot overlapping paths. |
+| Playback Progress Manager | View and edit unfinished playback sessions across providers. |
+| Import and Export | Import tracker files or export your data. |
+| Events and Logs | Look through sync history, investigate problems, and filter logs by pair or run. |
+| Captures | Roll back provider watchlists, ratings and history. |
+
+There's also a unified watchlist, a player card showing what's playing, and notifications for sync progress and pending reviews. Schedules can be simple or configured per pair.
+
+For Plex, you can import history for removed items into your CW Tracker.
+
+## Running without the web UI
+
+Add `-e CW_CLI_ONLY=1` to the Docker command, or `CW_CLI_ONLY: "1"` under `environment` in Compose. The API, CLI, webhooks and auth callbacks keep working.
+
+## Run once and exit
+
+For cron, Kubernetes CronJobs or another external scheduler, use `run-once`. Set up your accounts and sync pairs first:
 
 ```bash
-services:
-  crosswatch:
-    image: ghcr.io/jabrown93/crosswatch:latest
-    container_name: crosswatch
-    ports:
-      - "8787:8787"
-    environment:
-      TZ: Europe/Amsterdam
-    volumes:
-      - type: volume
-        source: crosswatch_config
-        target: /config
-    restart: unless-stopped
-
-volumes:
-  crosswatch_config:
+docker run --rm \
+  -v crosswatch_config:/config \
+  -e TZ=Europe/Amsterdam \
+  ghcr.io/jabrown93/crosswatch:latest \
+  run-once
 ```
 
-> The container exposes the web UI at:\
-> http://localhost:8787
+Use the volume that contains your existing configuration. If you set up CW with Compose, its volume name normally includes the Compose project name; replace `crosswatch_config` above with that volume's actual name.
 
-### Configuration from the environment
+To run specific pairs, use their IDs, numbers or unique prefixes. Replace the example IDs below with your own:
 
-Any setting can be supplied as an environment variable instead of being typed into the UI.
-Environment values win over `config.json` and are **never written to it**, so a secret from a
-Docker secret or Kubernetes Secret stays out of the config volume. Unset the variable and the
-field reverts to whatever the file held.
-
-Fields owned by the environment are shown disabled in the UI, labelled with the variable that
-owns them; a save that tried to change one reports which fields it discarded.
-
-Single sign-on and machine access have short names:
-
-| Variable | Setting |
-| --- | --- |
-| `CW_OIDC_ENABLED` | Offer OIDC login (`true` / `false`) |
-| `CW_OIDC_ISSUER` | Issuer URL — trailing slash is significant |
-| `CW_OIDC_CLIENT_ID` | Client ID |
-| `CW_OIDC_CLIENT_SECRET` | Client secret |
-| `CW_OIDC_PUBLIC_BASE_URL` | External base URL of this instance |
-| `CW_OIDC_GROUPS_CLAIM` | ID token claim holding group membership (default `groups`) |
-| `CW_OIDC_ALLOWED_GROUPS` | Groups allowed to sign in — **empty means no group restriction**: every account the IdP authenticates may sign in |
-| `CW_OIDC_SESSION_HOURS` | Lifetime of an OIDC session, 1–168 |
-| `CW_API_KEY` | Static key accepted in the `X-API-Key` header |
-
-Every other setting uses `CW_CFG__` followed by the config path, with `__` between each part:
-
-```yaml
-environment:
-  CW_OIDC_ENABLED: "true"
-  CW_OIDC_ISSUER: "https://auth.example.com/application/o/crosswatch/"
-  CW_OIDC_CLIENT_ID: "crosswatch"
-  CW_OIDC_CLIENT_SECRET: "${CROSSWATCH_OIDC_SECRET}"
-  CW_OIDC_PUBLIC_BASE_URL: "https://crosswatch.example.com"
-  CW_OIDC_ALLOWED_GROUPS: "crosswatch-admins,crosswatch-users"
-  # Any other path:
-  CW_CFG__plex__server_url: "http://plex:32400"
-  CW_CFG__runtime__debug: "true"
+```bash
+docker run --rm \
+  -v crosswatch_config:/config \
+  ghcr.io/jabrown93/crosswatch:latest \
+  run-once --pair pair_07c3 --pair pair_91ab
 ```
 
-Values are read as JSON when they parse as JSON and as plain text otherwise, so `true` is a
-boolean, `12` a number, and `["a","b"]` a list, while a URL is just a string. `CW_OIDC_ALLOWED_GROUPS`
-also accepts a comma-separated list. Setting a variable to an empty string sets the field to
-empty — to hand a field back to `config.json`, remove the variable.
+The command exits with `0` on success and `1` if the sync reports errors or cancellation. Add `--fail-on-unresolved` if you also want unmatched items to fail the job.
 
-Two limits follow from the `__` path form: list entries cannot be addressed, so sync pairs and
-scrobbler routes are not configurable this way, and keys beginning with an underscore are out of
-reach. Values are read at startup, so changes need a restart.
+## Help and feedback
 
-## Sponsors
+Setup docs are in the [wiki](https://wiki.crosswatch.app/). For questions and discussion, there's [r/CrossWatchApp](https://www.reddit.com/r/CrossWatchApp/).
 
-<div align="center">
+Please report bugs in [Issues](https://github.com/cenodude/CrossWatch/issues), with steps to reproduce them and what went wrong.
 
-<a href="https://www.buymeacoffee.com/cenodude">
-  <img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=000000">
-</a><center><br>
-Every cent goes to the <b>ALS Foundation</b> in the Netherlands</center>
-<br/>
-<br/>
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a PR. For security reports, see [SECURITY.md](SECURITY.md). The license is in [LICENSE](LICENSE).
 
-<a href="https://www.gitbook.com/">
-  <img alt="GitBook" src="https://img.shields.io/badge/GitBook-sponsored-3884ff?style=for-the-badge&logo=gitbook&logoColor=white">
-</a>
-
-</div>
+## Support and sponsors
 
 <p align="center">
-  Huge thanks to our sponsors for keeping this project moving.
+  <a href="https://www.buymeacoffee.com/cenodude">
+    <img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-ffdd00?style=for-the-badge&amp;logo=buy-me-a-coffee&amp;logoColor=000000">
+  </a>
 </p>
+
+Every cent donated through Buy Me a Coffee goes directly to the **ALS Foundation in the Netherlands**.
+
+<p align="center">
+  <a href="https://www.gitbook.com/">
+    <img alt="GitBook" src="https://img.shields.io/badge/GitBook-sponsored-3884ff?style=for-the-badge&amp;logo=gitbook&amp;logoColor=white">
+  </a>
+</p>
+
+Thanks to our sponsors for supporting CW.

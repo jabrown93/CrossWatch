@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -285,6 +286,152 @@ def test_recent_history_widget_includes_latest_state_history(monkeypatch) -> Non
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"PLEX", "SIMKL"}
 
 
+def test_recent_history_widget_merges_movie_rows_with_cross_provider_ids(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {"ok": True, "total": 0, "items": []},
+    )
+    state = {
+        "providers": {
+            "TRAKT": {
+                "history": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:1662317": {
+                                "type": "movie",
+                                "title": "The Crash",
+                                "year": 2026,
+                                "ids": {"tmdb": "1662317", "imdb": "tt40792117", "trakt": "1362157"},
+                                "watched_at": "2026-08-18T23:07:00Z",
+                            }
+                        }
+                    }
+                }
+            },
+            "STREMIO": {
+                "history": {
+                    "baseline": {
+                        "items": {
+                            "imdb:tt40792117": {
+                                "type": "movie",
+                                "title": "The Crash",
+                                "ids": {"imdb": "tt40792117"},
+                                "watched_at": "2026-08-18T23:07:00Z",
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    payload = dashboard_widgets.recent_history_widget(state, limit=5)
+
+    assert payload["total"] == 1
+    row = payload["items"][0]
+    assert row["title"] == "The Crash"
+    assert row["year"] == 2026
+    assert row["tmdb"] == "1662317"
+    assert row["ids"]["tmdb"] == "1662317"
+    assert row["ids"]["imdb"] == "tt40792117"
+    assert {source["provider"] for source in row["sources"]} == {"TRAKT", "STREMIO"}
+
+
+def test_recent_history_widget_merges_untimed_episode_state_by_show_ids(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {"ok": True, "total": 0, "items": []},
+    )
+    state = {
+        "providers": {
+            "TRAKT": {
+                "history": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:328735#s01e03": {
+                                "type": "episode",
+                                "title": "This Is Forever",
+                                "series_title": "The Idaho Murders: College Nightmare",
+                                "season": 1,
+                                "episode": 3,
+                                "watched_at": "2026-08-02T01:07:00Z",
+                                "ids": {"tmdb": "7535444", "imdb": "tt43681035"},
+                                "show_ids": {"tmdb": "328735", "imdb": "tt43680755"},
+                            }
+                        }
+                    }
+                }
+            },
+            "STREMIO": {
+                "history": {
+                    "baseline": {
+                        "items": {
+                            "imdb:tt43680755#s01e03": {
+                                "type": "episode",
+                                "title": "This Is Forever",
+                                "series_title": "The Idaho Murders: College Nightmare",
+                                "season": 1,
+                                "episode": 3,
+                                "watched_at": "1970-01-01T00:00:01Z",
+                                "_stremio_watched_at_fallback": "unknown_episode_watch_time",
+                                "ids": {"imdb": "tt43680755"},
+                                "show_ids": {"imdb": "tt43680755"},
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    payload = dashboard_widgets.recent_history_widget(state, limit=5)
+
+    assert payload["total"] == 1
+    row = payload["items"][0]
+    assert row["title"] == "The Idaho Murders: College Nightmare"
+    assert row["episode_label"] == "S01E03"
+    assert row["tmdb"] == "328735"
+    assert row["watched_at"] == 1785632820
+    assert {source["provider"] for source in row["sources"]} == {"TRAKT", "STREMIO"}
+
+
+def test_recent_history_widget_hides_stremio_unknown_episode_watch_time(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard_widgets,
+        "list_events",
+        lambda **_kwargs: {"ok": True, "total": 0, "items": []},
+    )
+    state = {
+        "providers": {
+            "STREMIO": {
+                "history": {
+                    "baseline": {
+                        "items": {
+                            "imdb:tt43680755#s01e03": {
+                                "type": "episode",
+                                "series_title": "The Idaho Murders: College Nightmare",
+                                "season": 1,
+                                "episode": 3,
+                                "watched": True,
+                                "watched_at": "1970-01-01T00:00:01Z",
+                                "_stremio_watched_at_fallback": "unknown_episode_watch_time",
+                                "ids": {"imdb": "tt43680755"},
+                                "show_ids": {"imdb": "tt43680755"},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    payload = dashboard_widgets.recent_history_widget(state, limit=5)
+
+    assert payload["items"] == []
+
+
 def test_recent_history_widget_merges_provider_local_episode_ids_and_inherits_art(monkeypatch) -> None:
     monkeypatch.setattr(
         dashboard_widgets,
@@ -563,6 +710,52 @@ def test_latest_ratings_widget_merges_provider_local_movie_ids_and_inherits_art(
     assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?kind=backdrop&size=w300"
     assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?size=w342"
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"SIMKL", "TRAKT"}
+
+
+def test_latest_ratings_widget_merges_movie_rows_with_cross_provider_ids() -> None:
+    state = {
+        "providers": {
+            "TRAKT": {
+                "ratings": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:1662317": {
+                                "type": "movie",
+                                "title": "The Crash",
+                                "year": 2026,
+                                "ids": {"tmdb": "1662317", "imdb": "tt40792117"},
+                                "rating": 8,
+                                "rated_at": "2026-08-18T23:07:00Z",
+                            }
+                        }
+                    }
+                }
+            },
+            "STREMIO": {
+                "ratings": {
+                    "baseline": {
+                        "items": {
+                            "imdb:tt40792117": {
+                                "type": "movie",
+                                "title": "The Crash",
+                                "ids": {"imdb": "tt40792117"},
+                                "rating": 8,
+                                "rated_at": "2026-08-18T23:07:00Z",
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    payload = dashboard_widgets.latest_ratings_widget(state, limit=5)
+
+    assert payload["total"] == 1
+    row = payload["items"][0]
+    assert row["ids"]["tmdb"] == "1662317"
+    assert row["ids"]["imdb"] == "tt40792117"
+    assert {source["provider"] for source in row["sources"]} == {"TRAKT", "STREMIO"}
 
 
 def test_latest_ratings_widget_keeps_original_provider_time_over_same_rating_sync_echo() -> None:
@@ -972,6 +1165,209 @@ def test_recent_scrobble_widget_reports_scrobble_total_separately(monkeypatch) -
     assert payload["scrobble_hours"] == 0.0
 
 
+def _history_tracker_items(count: int) -> dict:
+    return {
+        f"movie:tmdb:{idx}": {
+            "type": "movie",
+            "title": f"Movie {idx}",
+            "year": 2000 + (idx % 20),
+            "ids": {"tmdb": 900000 + idx},
+            "watched_at": f"2026-01-01T00:00:{idx % 60:02d}Z",
+            "watched": True,
+            "_epoch": 1767225600 + idx,
+        }
+        for idx in range(count)
+    }
+
+
+def test_recent_history_widget_windowing_keeps_newest_items(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", lambda: {})
+
+    count = dashboard_widgets._ROW_WINDOW * 3
+    items = _history_tracker_items(count)
+    for idx, key in enumerate(items):
+        items[key]["watched_at"] = 1767225600 + idx
+
+    payload = dashboard_widgets.recent_history_widget({}, limit=6, tracker_items=items)
+    titles = [row["title"] for row in payload["items"]]
+
+    assert titles == [f"Movie {idx}" for idx in range(count - 1, count - 7, -1)]
+
+
+def test_recent_history_widget_window_matches_unwindowed_top_rows(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", lambda: {})
+
+    items = _history_tracker_items(dashboard_widgets._ROW_WINDOW * 2)
+    for idx, key in enumerate(items):
+        items[key]["watched_at"] = 1767225600 + idx
+
+    windowed = dashboard_widgets._latest_history_tracker_rows(items, window=dashboard_widgets._ROW_WINDOW)
+    full = dashboard_widgets._latest_history_tracker_rows(items, window=None)
+
+    assert [row["key"] for row in windowed[:24]] == [row["key"] for row in full[:24]]
+    assert len(windowed) <= dashboard_widgets._ROW_WINDOW
+    assert len(full) == len(items)
+
+
+def _rating_tracker_items(count: int, *, same_epoch: bool) -> dict:
+    return {
+        f"movie:tmdb:{idx}": {
+            "type": "movie",
+            "title": f"Rating {idx:05d}",
+            "year": 2000 + (idx % 20),
+            "ids": {"tmdb": 800000 + idx},
+            "rating": (idx % 10) + 1,
+            "rated_at": "2026-01-01T00:00:00Z" if same_epoch else f"2026-01-01T00:00:{idx % 60:02d}Z",
+        }
+        for idx in range(count)
+    }
+
+
+def test_latest_ratings_widget_window_respects_full_sort_tiebreak(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+
+    items = _rating_tracker_items(dashboard_widgets._ROW_WINDOW * 2, same_epoch=True)
+
+    windowed = dashboard_widgets.latest_ratings_widget(
+        {}, limit=24, tracker_items=items, window=dashboard_widgets._ROW_WINDOW
+    )
+    full = dashboard_widgets.latest_ratings_widget({}, limit=24, tracker_items=items, window=0)
+
+    assert [row["title"] for row in windowed["items"]] == [row["title"] for row in full["items"]]
+
+
+def test_latest_ratings_widget_widens_window_when_merge_underfills(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+
+    items = _rating_tracker_items(100, same_epoch=False)
+    payload = dashboard_widgets.latest_ratings_widget({}, limit=24, tracker_items=items, window=5)
+
+    assert len(payload["items"]) == 24
+
+
+def test_recent_history_widget_widens_window_when_merge_underfills(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", lambda: {})
+    monkeypatch.setattr(dashboard_widgets, "_ROW_WINDOW", 2)
+
+    items = _history_tracker_items(100)
+    for idx, key in enumerate(items):
+        items[key]["watched_at"] = 1767225600 + idx
+
+    payload = dashboard_widgets.recent_history_widget({}, limit=24, tracker_items=items)
+
+    assert len(payload["items"]) == 24
+
+
+def test_dashboard_widgets_api_version_tracks_history_alias_files(monkeypatch, tmp_path) -> None:
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+    from services import analyzer
+
+    alias_dir = tmp_path / ".cw_state"
+    alias_dir.mkdir()
+    alias_file = alias_dir / "PLEX-TRAKT.history.pair_alias.json"
+    alias_file.write_text('{"a": 1}', encoding="utf-8")
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(analyzer, "CWS_DIR", alias_dir)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+    dashboardAPI.clear_dashboard_payload_cache()
+
+    first = dashboardAPI.dashboard_widgets(include="history", history_limit=8)
+    alias_file.write_text('{"a": 2, "b": 3}', encoding="utf-8")
+    second = dashboardAPI.dashboard_widgets(include="history", history_limit=8)
+
+    assert _loads_body(first.body)["version"] != _loads_body(second.body)["version"]
+    dashboardAPI.clear_dashboard_payload_cache()
+
+
+def test_bounded_state_load_matches_full_load(monkeypatch, tmp_path) -> None:
+    import time as _time
+
+    from cw_platform.local_db import state as sqlite_state
+    from cw_platform.orchestrator._state_store import StateStore
+
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", lambda: {})
+
+    count = 1200
+    items = {
+        f"ep:{idx}": {
+            "type": "episode",
+            "title": f"Show {idx}",
+            "season": 1,
+            "episode": (idx % 24) + 1,
+            "watched_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(1700000000 + idx * 600)),
+            "ids": {"tmdb": 900000 + idx},
+            "show_ids": {"tmdb": 5000 + idx},
+        }
+        for idx in range(count)
+    }
+    StateStore(tmp_path).save_state({"providers": {"EMBY": {"history": {"baseline": {"items": items}}}}})
+
+    full = sqlite_state.load_state_features(tmp_path, {"history"})
+    bounded = sqlite_state.load_state_features(tmp_path, {"history"}, recent_limit=400)
+
+    full_payload = dashboard_widgets.recent_history_widget(full, limit=24, tracker_items={})
+    bounded_payload = dashboard_widgets.recent_history_widget(bounded, limit=24, tracker_items={})
+
+    assert [r["key"] for r in bounded_payload["items"]] == [r["key"] for r in full_payload["items"]]
+
+    # the unbounded load must keep its original shape for the orchestrator
+    full_node = full["providers"]["EMBY"]["history"]["baseline"]
+    bounded_node = bounded["providers"]["EMBY"]["history"]["baseline"]
+    assert "item_keys" not in full_node
+    assert len(full_node["items"]) == count
+    assert len(bounded_node["items"]) == 400
+
+
+def test_recent_scrobble_widget_total_is_not_page_limited(monkeypatch) -> None:
+    rows = [
+        {
+            "id": f"scrobble-{idx}",
+            "kind": "scrobble",
+            "status": "ok",
+            "source": "plex",
+            "target": "trakt",
+            "media_type": "movie",
+            "title": f"Movie {idx}",
+            "watched_at": 1767225600 + idx,
+            "captured_at": 1767225600 + idx,
+        }
+        for idx in range(20)
+    ]
+    noise = [
+        {
+            "id": f"activity-{idx}",
+            "kind": "activity",
+            "status": "ok",
+            "source": "sync",
+            "media_type": "movie",
+            "title": f"Noise {idx}",
+            "captured_at": 1767225500 + idx,
+        }
+        for idx in range(5)
+    ]
+
+    def fake_list_events(**kwargs: Any) -> dict[str, Any]:
+        kind = kwargs.get("kind")
+        items = rows if kind == "scrobble" else [*rows, *noise]
+        limit = int(kwargs.get("limit") or len(items))
+        return {"ok": True, "total": len(items), "items": items[:limit]}
+
+    monkeypatch.setattr(dashboard_widgets, "list_events", fake_list_events)
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+
+    payload = dashboard_widgets.recent_scrobble_widget(limit=4)
+
+    assert len(payload["items"]) == 4
+    assert payload["total"] == 20
+    assert payload["scrobble_total"] == 20
+
+
 def test_recent_scrobble_widget_reports_scrobble_hours(monkeypatch) -> None:
     monkeypatch.setattr(
         dashboard_widgets,
@@ -1050,6 +1446,52 @@ def test_recent_progress_widget_uses_sync_state_not_live_provider_endpoints() ->
     assert payload["items"][0]["sources"] == [{"provider": "PLEX", "instance": "default"}]
 
 
+def test_recent_progress_widget_merges_movie_rows_with_cross_provider_ids() -> None:
+    state = {
+        "providers": {
+            "TRAKT": {
+                "progress": {
+                    "baseline": {
+                        "items": {
+                            "tmdb:1662317": {
+                                "type": "movie",
+                                "title": "The Crash",
+                                "year": 2026,
+                                "ids": {"tmdb": "1662317", "imdb": "tt40792117"},
+                                "progress_percent": 42.0,
+                                "progress_at": "2026-08-18T23:07:00Z",
+                            }
+                        }
+                    }
+                }
+            },
+            "STREMIO": {
+                "progress": {
+                    "baseline": {
+                        "items": {
+                            "imdb:tt40792117": {
+                                "type": "movie",
+                                "title": "The Crash",
+                                "ids": {"imdb": "tt40792117"},
+                                "progress_percent": 42.0,
+                                "progress_at": "2026-08-18T23:07:00Z",
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    payload = dashboard_widgets.recent_progress_widget(state, limit=5, tracker_items={})
+
+    assert payload["total"] == 1
+    row = payload["items"][0]
+    assert row["ids"]["tmdb"] == "1662317"
+    assert row["ids"]["imdb"] == "tt40792117"
+    assert {source["provider"] for source in row["sources"]} == {"TRAKT", "STREMIO"}
+
+
 def test_recent_playlists_widget_uses_playlist_activity(monkeypatch) -> None:
     from services import playlists
 
@@ -1069,6 +1511,22 @@ def test_recent_playlists_widget_uses_playlist_activity(monkeypatch) -> None:
         "items": [{"ts": 1767225600, "type": "Run", "status": "completed", "label": "MAP-01", "details": "+2/-0"}],
         "total": 1,
     }
+
+
+def test_recent_playlists_widget_total_is_not_page_limited(monkeypatch) -> None:
+    from services import playlists
+
+    rows = [
+        {"ts": 1767225600 + idx, "type": "Run", "status": "completed", "label": f"MAP-{idx:02d}", "details": "+1/-0"}
+        for idx in range(10)
+    ]
+    monkeypatch.setattr(playlists, "activity", lambda _cfg, limit=25: rows if limit is None else rows[:limit])
+    monkeypatch.setattr("cw_platform.config_base.load_config", lambda: {})
+
+    payload = dashboard_widgets.recent_playlists_widget(limit=4)
+
+    assert len(payload["items"]) == 4
+    assert payload["total"] == 10
 
 
 def _many_movie_items(feature: str, count: int) -> dict:
@@ -1205,6 +1663,295 @@ def test_dashboard_widgets_api_reads_state_widgets_from_db(monkeypatch, tmp_path
     assert payload["recent_progress"]["items"][0]["tmdb"] == "40"
 
 
+def test_dashboard_widgets_api_returns_not_modified_for_known_version(monkeypatch, tmp_path) -> None:
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+
+    first = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history",
+    )
+    version = _loads_body(first.body)["version"]
+    monkeypatch.setattr(
+        dashboardAPI,
+        "dashboard_widgets_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("payload should not rebuild")),
+    )
+
+    second = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history",
+        known_version=version,
+    )
+    payload = _loads_body(second.body)
+
+    assert payload == {"ok": True, "not_modified": True, "version": version}
+
+
+def test_dashboard_widgets_api_reuses_payload_for_same_version(monkeypatch, tmp_path) -> None:
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+    dashboardAPI.clear_dashboard_payload_cache()
+
+    first = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history",
+    )
+    first_payload = _loads_body(first.body)
+
+    monkeypatch.setattr(
+        dashboardAPI,
+        "dashboard_widgets_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("payload should not rebuild")),
+    )
+
+    second = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history",
+    )
+
+    assert _loads_body(second.body) == first_payload
+    dashboardAPI.clear_dashboard_payload_cache()
+
+
+def test_dashboard_widgets_api_rebuilds_when_version_changes(monkeypatch, tmp_path) -> None:
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+    dashboardAPI.clear_dashboard_payload_cache()
+
+    first = dashboardAPI.dashboard_widgets(include="history", history_limit=8)
+    second = dashboardAPI.dashboard_widgets(include="history", history_limit=12)
+
+    assert _loads_body(first.body)["version"] != _loads_body(second.body)["version"]
+    dashboardAPI.clear_dashboard_payload_cache()
+
+
+def test_dashboard_widgets_api_collapses_concurrent_builds(monkeypatch, tmp_path) -> None:
+    import threading
+    import time
+
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+    dashboardAPI.clear_dashboard_payload_cache()
+
+    builds = []
+    builds_lock = threading.Lock()
+    real_payload = dashboardAPI.dashboard_widgets_payload
+
+    def slow_payload(*args, **kwargs):
+        with builds_lock:
+            builds.append(1)
+        time.sleep(0.4)
+        return real_payload(*args, **kwargs)
+
+    monkeypatch.setattr(dashboardAPI, "dashboard_widgets_payload", slow_payload)
+
+    results = []
+    results_lock = threading.Lock()
+
+    def hit():
+        r = dashboardAPI.dashboard_widgets(include="history", history_limit=8)
+        with results_lock:
+            results.append(_loads_body(r.body))
+
+    threads = [threading.Thread(target=hit) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(builds) == 1, f"expected a single build, got {len(builds)}"
+    assert len(results) == 4
+    assert len({r["version"] for r in results}) == 1
+    dashboardAPI.clear_dashboard_payload_cache()
+
+
+def test_dashboard_widgets_api_library_total_uses_highest_provider_count(monkeypatch, tmp_path) -> None:
+    import time as _time
+
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+    from cw_platform.orchestrator._state_store import StateStore
+
+    def items(prefix: str, count: int, stamp: str) -> dict:
+        return {
+            f"{prefix}:{idx}": {
+                "type": "movie",
+                "title": f"Item {idx}",
+                "year": 2000,
+                "rating": (idx % 10) + 1,
+                stamp: _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(1700000000 + idx * 600)),
+                "ids": {"tmdb": 900000 + idx},
+            }
+            for idx in range(count)
+        }
+
+    StateStore(tmp_path).save_state(
+        {
+            "providers": {
+                "EMBY": {"history": {"baseline": {"items": items("ep", 432, "watched_at")}}},
+                "SIMKL": {"history": {"baseline": {"items": items("ep", 400, "watched_at")}}},
+            }
+        }
+    )
+
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+    monkeypatch.setattr(dashboard_widgets, "_resolve_missing_art_rows", lambda rows, **_kwargs: rows)
+    monkeypatch.setattr(dashboard_widgets, "_history_alias_representatives", lambda: {})
+    dashboardAPI.clear_dashboard_payload_cache()
+
+    payload = _loads_body(dashboardAPI.dashboard_widgets(include="history", history_limit=6).body)
+
+    # highest provider count wins, never the sum
+    assert payload["recent_history"]["library_total"] == 432
+    dashboardAPI.clear_dashboard_payload_cache()
+
+
+def test_dashboard_widgets_api_version_tracks_crosswatch_tracker_files(monkeypatch, tmp_path) -> None:
+    import cw_platform.config_base as config_base
+    from api import dashboardAPI
+
+    root = tmp_path / ".cw_provider"
+    root.mkdir()
+    (tmp_path / "config.json").write_text(
+        json.dumps({"crosswatch": {"root_dir": str(root)}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_base, "CONFIG", tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_tracker_feature_items", lambda _kind: {})
+
+    first = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history",
+    )
+    version = _loads_body(first.body)["version"]
+    (root / "history.json").write_text(
+        json.dumps({"items": {"movie:tmdb:949": {"type": "movie", "title": "Heat", "ids": {"tmdb": 949}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dashboardAPI,
+        "dashboard_widgets_payload",
+        lambda *_args, **_kwargs: {"ok": True, "recent_history": {"ok": True, "items": [], "total": 0}},
+    )
+
+    second = dashboardAPI.dashboard_widgets(
+        history_limit=8,
+        ratings_limit=12,
+        scrobble_limit=8,
+        progress_limit=8,
+        playlists_limit=8,
+        include="history",
+        known_version=version,
+    )
+    payload = _loads_body(second.body)
+
+    assert payload["ok"] is True
+    assert payload.get("not_modified") is not True
+    assert payload["version"] != version
+
+
+def test_dashboard_widget_frontend_uses_cached_payload_version() -> None:
+    js = Path("assets/js/dashboard-widgets.js").read_text("utf-8")
+    profile_js = Path("assets/js/profile-page.js").read_text("utf-8")
+
+    assert "const DATA_CACHE_KEY" in js
+    assert "function readCachedWidgetData()" in js
+    assert "function writeCachedWidgetData(payload)" in js
+    assert "function clearDashboardWidgetState()" in js
+    assert 'window.addEventListener("cw:sync-state-cleared", clearDashboardWidgetState);' in js
+    assert "clear: clearDashboardWidgetState" in js
+    assert "const WIDGET_FETCH_TIMEOUT_MS = 60 * 1000;" in js
+    assert "window.CW.API.j(url, {}, WIDGET_FETCH_TIMEOUT_MS)" in js
+    assert 'controller.abort("timeout")' in js
+    assert "function isTimeoutError(e)" in js
+    assert 'return e === "timeout" || e?.name === "AbortError";' in js
+    assert "if (isTimeoutError(e)) break;" in js
+    assert "const WIDGET_LOADING_DELAY_MS = 700;" in js
+    assert 'const REFRESHABLE_WIDGETS = ["history", "ratings", "scrobble", "progress", "playlists"];' in js
+    assert "const latestTotals = { history: 0, ratings: 0, scrobble: 0, progress: 0, playlists: 0 };" in js
+    assert "block.scrobble_total" in js
+    assert "block.library_total" in js
+    assert "async function refreshDashboardWidgets({ forceConfig = false, force = false, preserve = true, kinds = null } = {})" in js
+    assert 'params.set("known_version", cachedPayload.version)' in js
+    assert "const anyWidgetBlank = requestedKinds.some((kind) => !(latestItems[kind]?.length));" in js
+    assert "if (!forceConfig && !anyWidgetBlank && !partialRefresh && cachedPayload?.version)" in js
+    assert "if (data?.not_modified && cachedPayload)" in js
+    assert "if (requestedKinds.some((kind) => !hasPreservableContent(hosts[kind]))) {" in js
+    assert "applyWidgetPayload(cached, active)" in js
+    assert "if (!hasLoaded && cachedPayload)" in js
+    assert "applyWidgetPayload(cachedPayload, active)" in js
+    assert "const preserve = opts.preserve === false ? hasLoaded : true;" in js
+    assert "try { await window.CW?.OverviewProfile?.ready; } catch {}\n    if (seq !== loadSeq) return null;\n    if (!isOnMain()) return false;\n    if (!hasLoaded) revealFromCache();" in js
+    assert "function scheduleSlowWidgetLoading(hosts, requestedKinds)" in js
+    assert "if (!loadedWidgetKinds.has(kind)) setLoading(hosts[kind], kind);" in js
+    assert "function hasPreservableContent(host)" in js
+    assert "function setWidgetLoadError(host, message, preserve)" in js
+    assert "function showWidgetToast(message, ok = false)" in js
+    assert "function setExpandBusy(btn, busy)" in js
+    assert 'btn.classList.toggle("spinning"' not in js
+    assert "function widgetFetchLimit(key)" in js
+    assert 'history_limit: String(widgetFetchLimit("history"))' in js
+    assert 'history_limit: String(MAX_WIDGET_ITEMS)' not in js
+    assert "function expandWidget(kind, opts = {})" in js
+    assert "if (!REFRESHABLE_WIDGETS.includes(kind)) return false;" in js
+    assert 'refreshDashboardWidgets({ force: true, preserve: true, kinds: [kind] })' in js
+    assert "if (ok === null) return;" in js
+    assert "visibleCounts[kind] = current;" in js
+    assert 'showWidgetToast("Could not load more items.");' in js
+    assert "if (!wanted) lastLoadedAt = Date.now();" in js
+    assert "window.console.warn(\"[CrossWatch] dashboard widgets refresh failed\"" in js
+    assert 'const shouldShowWidgetError = (kind) => active[kind] && (!partialRefresh || requestedKinds.includes(kind));' in js
+    assert "if (!partialRefresh) {\n        writeCachedWidgetData(data);\n        widgetsDirty = dirtyVersion !== refreshVersion;\n      }" in js
+    assert "const requestedKinds = REFRESHABLE_WIDGETS.filter((key) => active[key] && (!wantedKinds || wantedKinds.has(key)));" in js
+    assert "mergeWidgetPayload" not in js
+    assert "loadedKinds" not in js
+    assert "refreshDashboardWidgets({ preserve: true });" in js
+    assert "refreshDashboardWidgets({ forceConfig: true, preserve: true })" in js
+    assert 'window.addEventListener("sync-complete", refreshForSyncComplete);' in js
+    assert "if (kinds && kinds.length) markWidgetsDirty(250, { kinds });" in js
+    assert "else markWidgetsDirty(250);" in js
+    assert 'window.addEventListener("cw:scrobble-stopped", refreshForScrobbleStopped);' in js
+    assert 'markWidgetsDirty(0, { kinds: ["scrobble", "history", "progress"] });' in js
+    assert 'window.addEventListener("watchlist:refresh", () => markWidgetsDirty(250));' not in js
+    assert "const readAnyCache = (key) =>" in profile_js
+    assert 'widgetParams.set("known_version", cached.widgets.version)' in profile_js
+    assert "if (widgetsNotModified)" in profile_js
+
+
 def test_dashboard_widgets_api_reads_scrobble_from_activity_db(monkeypatch, tmp_path) -> None:
     from api import dashboardAPI
 
@@ -1308,3 +2055,33 @@ def test_recent_scrobble_widget_filters_by_user_profile_instances(monkeypatch) -
 
     assert payload["total"] == 1
     assert payload["items"][0]["title"] == "Bob Movie"
+
+
+def _monster_episode(tmdb: str, series: str, episode: int) -> dict:
+    return {
+        "type": "episode", "season": 1, "episode": episode,
+        "series_title": series,
+        "ids": {"tmdb": f"76390{episode}", "show_ids": {"tmdb": tmdb, "plex": "6065854300205892022"}},
+    }
+
+
+def test_one_media_server_show_id_does_not_join_separate_shows() -> None:
+    dahmer = dashboard_widgets._media_id_aliases("history", _monster_episode("113988", "DAHMER", 2))
+    lizzie = dashboard_widgets._media_id_aliases("history", _monster_episode("299939", "Lizzie Borden", 2))
+    assert not set(dahmer) & set(lizzie)
+    assert any("tmdb:113988" in alias for alias in dahmer)
+    assert not any("plex:" in alias for alias in dahmer)
+
+
+def test_a_media_server_show_id_is_still_used_when_it_is_all_there_is() -> None:
+    row = {"type": "episode", "season": 1, "episode": 2,
+           "ids": {"show_ids": {"plex": "6065854300205892022"}}}
+    aliases = dashboard_widgets._media_id_aliases("history", row)
+    assert aliases == ["history|id|episode|plex:6065854300205892022|s1|e2"]
+
+
+def test_movie_aliases_still_carry_media_server_ids() -> None:
+    row = {"type": "movie", "ids": {"tmdb": "603", "plex": "12345"}}
+    aliases = dashboard_widgets._media_id_aliases("history", row)
+    assert any("plex:12345" in alias for alias in aliases)
+    assert any("tmdb:603" in alias for alias in aliases)

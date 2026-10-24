@@ -1,0 +1,72 @@
+/* assets/css/saved-mappings.css */
+/* CrossWatch - saved mapping comparisons */
+/* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
+.sm-dialog { width:min(1180px,calc(100vw - 32px)); max-height:calc(100dvh - 40px); padding:0; color:var(--fg,#e6e9ee); background:var(--cw-theme-surface,#101217); border:1px solid var(--border,#292d35); border-radius:12px; }
+.sm-dialog[open] { display:flex; flex-direction:column; }
+.sm-dialog::backdrop { background:#0009; }
+.sm-head { display:flex; justify-content:space-between; align-items:flex-start; gap:20px; padding:24px; border-bottom:1px solid var(--border,#292d35); }
+.sm-head h2 { margin:0 0 8px; font-size:24px; }
+.sm-head p,.sm-note,.sm-muted { color:var(--muted,#929ba8); }
+.sm-head p { margin:0; font-size:14px; }
+.sm-dialog button,.sm-dialog input,.sm-dialog select { font:inherit; font-size:14px; color:inherit; background:var(--cw-theme-input,#101217); border:1px solid var(--border,#292d35); border-radius:6px; padding:10px 12px; }
+.sm-dialog button { display:inline-flex; align-items:center; justify-content:center; gap:8px; cursor:pointer; box-shadow:none; }
+.sm-dialog button:hover { background:var(--cw-theme-surface-raised,#191c23); }
+.sm-dialog button:disabled { opacity:.4; cursor:default; }
+.sm-dialog :is(button,input,select):focus-visible { outline:2px solid var(--accent,#7957ff); outline-offset:2px; }
+.sm-dialog .material-symbols-rounded { font-size:20px; }
+.sm-filters { display:flex; align-items:flex-end; flex-wrap:wrap; gap:12px; padding:20px 24px 0; }
+.sm-filters label { display:grid; gap:8px; font-size:13px; color:var(--muted,#929ba8); min-width:150px; }
+.sm-filters label:first-child { flex:1; }
+.sm-filters input { width:100%; box-sizing:border-box; }
+.sm-note { padding:0 24px; font-size:13px; line-height:1.5; }
+.sm-results { overflow:auto; min-height:160px; margin:0 24px; border:1px solid var(--border,#292d35); border-radius:8px; }
+.sm-dialog table { width:100%; border-collapse:collapse; table-layout:fixed; }
+.sm-dialog th { text-align:left; color:var(--muted,#929ba8); font-size:13px; font-weight:500; background:var(--cw-theme-surface,#101217); position:sticky; top:0; }
+.sm-dialog td,.sm-dialog th { padding:8px 12px; border-bottom:1px solid var(--border,#292d35); vertical-align:top; overflow-wrap:anywhere; }
+.sm-dialog th:last-child { width:28%; }
+.sm-dialog .sm-mappings-table .sm-original-column { width:22%; }
+.sm-dialog td { font-size:14px; line-height:1.4; }
+.sm-dialog td > :is(strong,span,small) { display:block; margin-bottom:3px; }
+.sm-dialog td small { font-size:12px; color:var(--muted,#929ba8); }
+.sm-item-heading { display:flex; align-items:baseline; flex-wrap:wrap; gap:2px 8px; }
+.sm-item-heading .sm-muted { font-size:12px; }
+.sm-ids { display:flex; flex-wrap:wrap; gap:4px; margin:5px 0; }
+.sm-ids:empty { display:none; }
+.sm-ids span { padding:2px 5px; border:1px solid var(--border,#292d35); border-radius:4px; font-size:12px; }
+.sm-key { overflow-wrap:anywhere; }
+.sm-edit-error { margin:0 24px 12px; color:var(--danger,#e06470); font-size:14px; }
+.sm-edit-error:empty { display:none; }
+.sm-dialog .sm-edit { width:32px; height:32px; padding:5px; color:var(--accent,#7957ff); }
+.sm-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;padding:16px 24px 0}
+.sm-tabs,.sm-transfer{display:flex;gap:8px;flex-wrap:wrap}
+.sm-transfer input[hidden]{display:none}
+.sm-scope{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px 8px}
+.sm-scope>strong{grid-column:1;grid-row:1}
+.sm-scope-meta,.sm-saved-meta,.sm-scope>.sm-block-label{grid-column:1/-1}
+.sm-scope-meta{font-size:12px;color:var(--muted,#929ba8)}
+.sm-saved-meta{display:flex;flex-wrap:wrap;gap:2px 8px;align-items:center}
+.sm-row-actions{display:flex;grid-column:2;grid-row:1;gap:6px;align-items:center}
+.sm-dialog .sm-delete{width:32px;height:32px;padding:5px;color:var(--danger,#e06470)}
+.sm-tabs button[aria-pressed="true"]{color:var(--accent,#7957ff);background:color-mix(in srgb,var(--accent,#7957ff) 14%,transparent);border-color:var(--accent,#7957ff)}
+.sm-add-block{display:flex;align-items:flex-end;flex-wrap:wrap;gap:10px;margin:0 24px 16px}
+.sm-add-block[hidden]{display:none}
+.sm-add-block label{display:grid;gap:6px;flex:1;min-width:220px;font-size:13px;color:var(--muted,#929ba8)}
+.sm-add-block small{flex-basis:100%;color:var(--muted,#929ba8)}
+.sm-dialog .sm-block-label{display:inline-flex;align-items:center;gap:6px;color:var(--danger,#e06470);font-size:12px}
+.sm-block-icon{display:inline-flex;align-self:center;color:var(--danger,#e06470)}
+.sm-dialog .sm-block-icon .material-symbols-rounded{font-size:16px}
+.sm-dialog .sm-blocks-table th:first-child{width:55%}
+.sm-dialog .sm-blocks-table th:last-child{width:140px}
+.sm-dialog .sm-blocks-table td{padding-top:8px;padding-bottom:8px}
+.sm-dialog .sm-blocks-table [data-unblock]{padding:6px 9px;font-size:13px;gap:5px;white-space:nowrap;overflow-wrap:normal;flex-shrink:0}
+.sm-action-status{margin:0 24px 12px;font-size:13px;color:var(--success,#51b995)}
+.sm-action-status:empty{display:none}
+.sm-empty { padding:28px; text-align:center; color:var(--muted,#929ba8); }
+.sm-dialog footer { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:18px 24px; font-size:13px; color:var(--muted,#929ba8); }
+.sm-dialog footer > div { display:flex; gap:8px; }
+@media(max-width:650px) { .sm-results table { min-width:700px; } .sm-head,.sm-filters { padding:16px; } .sm-note { padding:0 16px; } .sm-results { margin:0 16px; } .sm-filters label { flex:1; min-width:100%; } }
+
+.sm-column-resizer { position:absolute; top:0; right:0; bottom:0; width:10px; cursor:col-resize; touch-action:none; user-select:none; border-right:2px solid var(--border,#292d35); }
+.sm-column-resizer:hover,.sm-column-resizer:focus-visible { border-color:var(--accent,#7957ff); outline:2px solid var(--accent,#7957ff); outline-offset:-2px; }
+.sm-dialog .sm-saved-meta .sm-block-label { font-size:12px; gap:4px; }
+.sm-saved-meta small { margin:0; }

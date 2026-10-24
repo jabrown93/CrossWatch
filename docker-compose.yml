@@ -7,7 +7,7 @@ services:
     environment:
       TZ: "${TZ:-Europe/Amsterdam}"
       # Any setting can come from the environment instead of config.json; these
-      # values win and are never written to the config volume. See the README
+      # values win and are never written to the config volume. See FORK.md
       # for the CW_CFG__<path> form that reaches every other setting.
       # CW_OIDC_ENABLED: "true"
       # CW_OIDC_ISSUER: "https://auth.example.com/application/o/crosswatch/"
@@ -15,7 +15,6 @@ services:
       # CW_OIDC_CLIENT_SECRET: "${CROSSWATCH_OIDC_SECRET}"
       # CW_OIDC_PUBLIC_BASE_URL: "https://crosswatch.example.com"
       # CW_OIDC_ALLOWED_GROUPS: "crosswatch-admins"
-      # CW_API_KEY: "${CROSSWATCH_API_KEY}"
     volumes:
       - crosswatch_config:/config
     restart: unless-stopped

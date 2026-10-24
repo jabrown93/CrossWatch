@@ -2,6 +2,9 @@
 # JELLYFIN Module for common functions
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+
+from cw_platform.path_matching import media_paths
+from .._path_matching import path_fallback
 from typing import Any, Mapping, Iterable, Sequence
 
 import json
@@ -9,13 +12,15 @@ import os
 import re
 import time
 import shutil
+from hashlib import sha256
 from pathlib import Path
+from threading import local
 
 from .._log import log as cw_log
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import minimal as id_minimal, canonical_key
+from cw_platform.log_context import log_run_id
 
 from ._routes import favorite as favorite_route, user_data as user_data_route, user_params, views as views_route
 
@@ -25,6 +30,29 @@ _NUM_PAT = re.compile(r"(\d{1,10})$")
 
 
 STATE_DIR = Path("/config/.cw_state")
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -41,7 +69,7 @@ def state_file(name: str) -> Path:
     else:
         scoped = STATE_DIR / f"{name}.{safe}"
         legacy = STATE_DIR / name
-    if (not _is_capture_mode()) and scoped != legacy and not scoped.exists() and legacy.exists():
+    if not str(_pair_scope() or "").startswith("cw2_") and (not _is_capture_mode()) and scoped != legacy and not scoped.exists() and legacy.exists():
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)
@@ -499,6 +527,9 @@ def _ids_from_provider_ids(pids: Mapping[str, Any] | None) -> dict[str, str]:
 def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(obj, Mapping) and "ids" in obj and "type" in obj:
         out = id_minimal(obj)
+        out_ids = out.get("ids")
+        if isinstance(out_ids, dict):
+            out_ids.pop("jellyfin", None)
         raw = obj.get("jellyfin_item_id") or obj.get("_jellyfin_item_id") or obj.get("Id")
         if raw:
             out["jellyfin_item_id"] = str(raw)
@@ -509,9 +540,8 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
     pids = obj.get("ProviderIds") if isinstance(obj.get("ProviderIds"), Mapping) else (obj.get("ids") or {})
     ids = {k: v for k, v in _ids_from_provider_ids(pids).items() if v}
     jf_id = obj.get("Id") or (pids.get("jellyfin") if isinstance(pids, Mapping) else None)
-    if jf_id:
-        ids["jellyfin"] = str(jf_id)
-    row: dict[str, Any] = {"type": t, "title": title, "year": year, "ids": ids}
+    ids.pop("jellyfin", None)
+    row: dict[str, Any] = {"type": t, "title": title, "year": year, "ids": ids, "media_paths": media_paths(obj)}
     
     if jf_id:
         row["jellyfin_item_id"] = str(jf_id)
@@ -526,12 +556,13 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
         series_title = series_title.strip() or None
         if series_title:
             row["series_title"] = series_title
-        s = (
-            obj.get("ParentIndexNumber")
-            or obj.get("SeasonIndexNumber")
-            or obj.get("season")
-            or obj.get("season_number")
-        )
+        s = obj.get("ParentIndexNumber")
+        if s is None:
+            s = obj.get("SeasonIndexNumber")
+        if s is None:
+            s = obj.get("season")
+        if s is None:
+            s = obj.get("season_number")
         e = (
             obj.get("IndexNumber")
             or obj.get("EpisodeIndexNumber")
@@ -686,10 +717,35 @@ def _index_row_provider_ids(out: dict[str, list[dict[str, Any]]], row: Mapping[s
 
 
 # provider index
+_RUN_PROVIDER_INDEX = local()
+
+
 def build_provider_index(adapter: Any, *, feature: str | None = None) -> dict[str, list[dict[str, Any]]]:
     cache = getattr(adapter, "_provider_index_cache", None)
     scope_key = tuple(sorted(jf_selected_library_ids(adapter.cfg, feature or "history")))
-    if isinstance(cache, dict) and cache and getattr(adapter, "_provider_index_scope", None) == scope_key:
+    # The sync API sets/resets this task-local ID. Do not use CW_RUN_ID: that
+    # environment variable can remain set after a run has finished.
+    run_id = log_run_id.get()
+    server = str(getattr(adapter.cfg, "server", "") or "")
+    user = str(getattr(adapter.cfg, "user_id", "") or "")
+    credential = sha256(str(getattr(adapter.cfg, "access_token", "") or "").encode()).digest()
+    pair_scope = _pair_scope()
+    run_key = (run_id, server, user, credential, pair_scope, feature or "history", scope_key)
+    # Cross-adapter reuse must have an explicit pair scope, even within a run.
+    share = bool(run_id and server and user and pair_scope and pair_scope.lower() not in {"unscoped", "default", "none"})
+    if not share:
+        _RUN_PROVIDER_INDEX.entry = None
+    if isinstance(cache, dict) and getattr(adapter, "_provider_index_run_key", None) == run_key:
+        return cache
+    shared = getattr(_RUN_PROVIDER_INDEX, "entry", None) if share else None
+    if shared is not None and shared[0] == run_key:
+        _, cache, paths = shared
+        setattr(adapter, "_provider_index_cache", cache)
+        setattr(adapter, "_provider_index_scope", scope_key)
+        setattr(adapter, "_provider_index_run_key", run_key)
+        setattr(adapter, "_path_index_cache", paths)
+        setattr(adapter, "_path_index_scope", scope_key)
+        _dbg("index_cache_hit", source="run", count=len(cache), path_count=len(paths))
         return cache
 
     http = adapter.client
@@ -710,6 +766,7 @@ def build_provider_index(adapter: Any, *, feature: str | None = None) -> dict[st
         params: dict[str, Any] = {
             "IncludeItemTypes": "Movie,Series,Episode",
             "Recursive": True,
+            "CollapseBoxSetItems": False,
             "Fields": (
                 "ProviderIds,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesId,"
                 "SeriesName,ParentId,Path,CollectionFolderId,AncestorIds,LibraryId,Name"
@@ -722,6 +779,8 @@ def build_provider_index(adapter: Any, *, feature: str | None = None) -> dict[st
         if parent_id:
             params["ParentId"] = parent_id
         r = http.get("/Items", params={**params, "userId": uid})
+        if getattr(r, "status_code", 0) != 200:
+            raise RuntimeError(f"jellyfin_provider_index_http_{getattr(r, 'status_code', 0)}")
         body = r.json() or {}
         items = body.get("Items") or []
         signature = tuple(str(row.get("Id") or "") for row in items if isinstance(row, Mapping))
@@ -753,8 +812,13 @@ def build_provider_index(adapter: Any, *, feature: str | None = None) -> dict[st
     _dbg('index_done', source='provider_index', count=len(out), path_count=len(path_index))
     setattr(adapter, "_provider_index_cache", out)
     setattr(adapter, "_provider_index_scope", scope_key)
+    setattr(adapter, "_provider_index_run_key", run_key)
     setattr(adapter, "_path_index_cache", path_index)
     setattr(adapter, "_path_index_scope", scope_key)
+    if share:
+        # One entry per thread keeps memory bounded; the sync thread releases
+        # it on exit. A different run or scope never reuses this entry.
+        _RUN_PROVIDER_INDEX.entry = (run_key, out, path_index)
     return out
 
 
@@ -783,7 +847,10 @@ def get_series_episodes(
         "Fields": "IndexNumber,ParentIndexNumber,SeasonId,SeriesId,ProviderIds,ProductionYear,Type",
         "EnableUserData": False,
     }
+    started = time.monotonic()
     r = http.get(f"/Shows/{series_id}/Episodes", params=q)
+    _dbg("series_episodes_response", series_id=series_id, status=getattr(r, "status_code", 0),
+         latency_ms=int((time.monotonic() - started) * 1000))
     if getattr(r, "status_code", 0) != 200:
         return None
     try:
@@ -879,6 +946,34 @@ def playlist_remove_entries(http: Any, playlist_id: str, entry_ids: Iterable[str
     if not eids:
         return True
     r = http.delete(f"/Playlists/{playlist_id}/Items", params={"entryIds": eids})
+    return getattr(r, "status_code", 0) in (200, 204)
+
+
+def update_item_name(http: Any, item_id: str, name: str) -> bool:
+    iid = str(item_id or "").strip()
+    nm = str(name or "").strip()
+    if not iid or not nm:
+        return False
+    r = http.get(f"/Items/{iid}")
+    body: dict[str, Any] = {}
+    if getattr(r, "status_code", 0) == 200:
+        try:
+            data = r.json() or {}
+        except Exception:
+            data = {}
+        if isinstance(data, Mapping):
+            body.update(data)
+    body["Id"] = iid
+    body["Name"] = nm
+    r2 = http.post(f"/Items/{iid}", json=body)
+    return getattr(r2, "status_code", 0) in (200, 204)
+
+
+def delete_item(http: Any, item_id: str) -> bool:
+    iid = str(item_id or "").strip()
+    if not iid:
+        return False
+    r = http.delete(f"/Items/{iid}")
     return getattr(r, "status_code", 0) in (200, 204)
 
 
@@ -1079,6 +1174,111 @@ def _pick_from_candidates(
     return str(iid) if iid and not looks_like_bad_id(iid) else None
 
 
+def _public_ids(ids: Mapping[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in ("tmdb", "imdb", "tvdb"):
+        pair = format_provider_pair(key, ids.get(key))
+        if pair:
+            out[key] = pair.partition(".")[2]
+    return out
+
+
+def _row_matches_type(row: Mapping[str, Any], want_type: str | None) -> bool:
+    if not want_type:
+        return True
+    row_type = str(row.get("Type") or "").strip().lower()
+    if want_type == "movie":
+        return row_type in ("movie", "video")
+    if want_type in ("show", "series"):
+        return row_type == "series"
+    if want_type == "episode":
+        return row_type == "episode"
+    return True
+
+
+def _row_matches_title_year(row: Mapping[str, Any], title: str, year: Any) -> bool:
+    if not title:
+        return False
+    row_title = str(row.get("Name") or "").strip().lower()
+    if row_title != title.lower():
+        return False
+    if year is None:
+        return True
+    try:
+        return isinstance(row.get("ProductionYear"), int) and abs(int(row["ProductionYear"]) - int(year)) <= 1
+    except Exception:
+        return False
+
+
+def _native_row_matches_request(
+    row: Mapping[str, Any],
+    ids: Mapping[str, Any],
+    *,
+    want_type: str | None,
+    title: str,
+    year: Any,
+    strict: bool = False,
+) -> bool:
+    if not row or not _row_matches_type(row, want_type):
+        return False
+
+    requested_public = _public_ids(ids)
+    if requested_public:
+        row_public = _ids_from_provider_ids(row.get("ProviderIds"))
+        if any(row_public.get(key) == value for key, value in requested_public.items()):
+            return True
+        if row_public or strict:
+            return False
+        return _row_matches_title_year(row, title, year)
+
+    if strict:
+        # The caller already verified the native item ID, type and library scope.
+        return True
+    if title:
+        return _row_matches_title_year(row, title, year)
+    return True
+
+
+def _validate_native_item_id(
+    adapter: Any,
+    iid: Any,
+    ids: Mapping[str, Any],
+    *,
+    selected_libs: set[str],
+    want_type: str | None,
+    title: str,
+    year: Any,
+) -> str | None:
+    s = str(iid or "").strip()
+    if not s or looks_like_bad_id(s):
+        return None
+    strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
+    needs_validation = bool(strict or selected_libs or _public_ids(ids) or title)
+    if not needs_validation:
+        _dbg("resolve_hit", kind="direct", method="provider_id", item_id=s)
+        return s
+    http = adapter.client
+    uid = adapter.cfg.user_id
+    try:
+        response = http.get(
+            f"/Items/{s}",
+            params={"userId": uid, "Fields": "ProviderIds,ProductionYear,LibraryId,CollectionFolderId,AncestorIds,ParentId,Type,Name"},
+        )
+        row = response.json() or {} if getattr(response, "status_code", 0) == 200 else {}
+    except Exception:
+        row = {}
+    if selected_libs and not jf_filter_library_candidates([row] if row else [], selected_libs):
+        setattr(adapter, "_jellyfin_last_resolve_hint", "outside_library_scope")
+        _dbg("target_candidate_outside_library_scope", item_id=s, allowed_library_ids=sorted(selected_libs), resolution_method="provider_id")
+        return None
+    if row and (not strict or str(row.get("Id") or "") == s) and _native_row_matches_request(
+        row, ids, want_type=want_type, title=title, year=year, strict=strict,
+    ):
+        return s
+    _dbg("native_id_rejected", item_id=s, kind=want_type, title=title, year=year)
+    return None
+
+
 def _direct_query_by_pairs(
     adapter: Any,
     http: Any,
@@ -1102,6 +1302,7 @@ def _direct_query_by_pairs(
         "AnyProviderIdEquals": ",".join(pairs),
         "IncludeItemTypes": include_types,
         "Recursive": True,
+        "CollapseBoxSetItems": False,
         "Fields": "ProviderIds,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesId,ParentId,CollectionFolderId,AncestorIds,LibraryId,Name",
         "Limit": 50,
     }
@@ -1156,6 +1357,339 @@ def _episode_number_matches(row: Mapping[str, Any], season: Any, episode: Any) -
         )
     except (TypeError, ValueError):
         return False
+
+
+def _valid_item_id(value: Any) -> str | None:
+    s = str(value or "").strip()
+    return s if s and not looks_like_bad_id(s) else None
+
+
+_TARGETED_CACHE = local()
+
+
+def _targeted_enabled(adapter: Any) -> bool:
+    value = getattr(getattr(adapter, "cfg", None), "targeted_lookup", True)
+    return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _targeted_cache(adapter: Any, feature: str) -> dict[Any, Any]:
+    cfg = adapter.cfg
+    config = getattr(adapter, "config", None)
+    scope = config.get("_cw_pair_scope") if isinstance(config, Mapping) else None
+    scope = str(scope or _pair_scope() or "")
+    run = log_run_id.get()
+    server = str(getattr(cfg, "server", "") or "")
+    user = str(getattr(cfg, "user_id", "") or "")
+    credential = str(getattr(cfg, "access_token", "") or "")
+    key = (run, server, user, sha256(credential.encode()).digest(), scope, feature,
+           tuple(sorted(jf_selected_library_ids(cfg, feature))))
+    shared = bool(run and server and user and credential and scope
+                  and scope.lower() not in {"unscoped", "default", "none"})
+    if shared:
+        entry = getattr(_TARGETED_CACHE, "entry", None)
+        if entry is None or entry[0] != key:
+            entry = (key, {})
+            _TARGETED_CACHE.entry = entry
+        return entry[1]
+    now = time.monotonic()
+    entry = getattr(adapter, "_jellyfin_targeted_cache", None)
+    if (entry is None or entry[0] != key
+            or (not run and (len(entry) < 3 or now - entry[2] >= 300))):
+        entry = (key, {}, now)
+        setattr(adapter, "_jellyfin_targeted_cache", entry)
+    return entry[1]
+
+
+def _targeted_search(
+    adapter: Any,
+    feature: str,
+    selected_libs: set[str],
+    include_types: str,
+    term: str,
+    *,
+    verify_ancestors: bool = False,
+) -> list[Mapping[str, Any]]:
+    if not str(term or "").strip():
+        return []
+    cache = _targeted_cache(adapter, feature)
+    key = ("search", include_types, term, verify_ancestors)
+    if key in cache:
+        _dbg("targeted_search_cache_hit", lookup_feature=feature, term=term, kind=include_types,
+             candidates=len(cache[key]), verify_ancestors=verify_ancestors)
+        return cache[key]
+    try:
+        rows: list[Mapping[str, Any]] = []
+        params = {
+                "recursive": True,
+                "includeItemTypes": include_types,
+                "SearchTerm": term,
+                "Fields": (
+                    "ProviderIds,ProductionYear,Type,IndexNumber,ParentIndexNumber,"
+                    "SeriesId,ParentId,CollectionFolderId,AncestorIds,LibraryId,Name"
+                ),
+                "Limit": 50,
+                "EnableUserData": False,
+                "EnableImages": False,
+            }
+        queries = [params] if verify_ancestors else jf_scoped_params(params, adapter.cfg, feature)
+        for query in queries:
+            started = time.monotonic()
+            response = adapter.client.get("/Items", params={**query, "userId": adapter.cfg.user_id})
+            status = getattr(response, "status_code", 0)
+            if status != 200:
+                _dbg("targeted_search_response", lookup_feature=feature, term=term, kind=include_types,
+                     status=status, source_library_id=query.get("ParentId"), reason="http_error",
+                     latency_ms=int((time.monotonic() - started) * 1000))
+                return []  # Do not remember a failed or partially successful search.
+            page = (response.json() or {}).get("Items") or []
+            _dbg("targeted_search_response", lookup_feature=feature, term=term, kind=include_types,
+                 status=status, source_library_id=query.get("ParentId"), candidates=len(page),
+                 limit=params["Limit"], limit_reached=len(page) >= params["Limit"],
+                 latency_ms=int((time.monotonic() - started) * 1000))
+            rows.extend(row for row in page if isinstance(row, Mapping))
+        before_scope = len(rows)
+        if verify_ancestors:
+            verified = []
+            for row in rows:
+                iid = _valid_item_id(row.get("Id"))
+                if not iid:
+                    continue
+                ancestor_key = ("ancestors", iid)
+                ancestors = cache.get(ancestor_key)
+                if ancestors is None:
+                    response = adapter.client.get(f"/Items/{iid}/Ancestors", params=user_params(adapter.cfg.user_id))
+                    if getattr(response, "status_code", 0) != 200:
+                        _dbg("targeted_search_ancestors_failed", lookup_feature=feature, term=term,
+                             item_id=iid, status=getattr(response, "status_code", 0), reason="http_error")
+                        return []
+                    body = response.json()
+                    if not isinstance(body, list):
+                        _dbg("targeted_search_ancestors_failed", lookup_feature=feature, term=term,
+                             item_id=iid, reason="invalid_response")
+                        return []
+                    ancestors = {str(a["Id"]) for a in body if isinstance(a, Mapping) and a.get("Id")}
+                    cache[ancestor_key] = ancestors
+                if ancestors & selected_libs:
+                    verified.append(row)
+            rows = verified
+        else:
+            rows = jf_filter_library_candidates(rows, selected_libs, trust_query_scope=True)
+        if selected_libs:
+            _dbg("targeted_search_scope", lookup_feature=feature, term=term, kind=include_types,
+                 candidates=before_scope, accepted=len(rows), rejected=before_scope - len(rows),
+                 allowed_library_ids=sorted(selected_libs), verify_ancestors=verify_ancestors)
+        rows = list({str(row.get("Id")): row for row in rows if _valid_item_id(row.get("Id"))}.values())
+        if len(cache) >= 2048:
+            cache.clear()
+        cache[key] = rows
+        return rows
+    except Exception as exc:
+        # Exception messages and request URLs may contain credentials.
+        _dbg("targeted_search_failed", lookup_feature=feature, term=term, kind=include_types,
+             error_type=type(exc).__name__)
+        return []
+
+
+def _row_matches_pair(row: Mapping[str, Any], pairs: Iterable[str]) -> bool:
+    row_ids = _ids_from_provider_ids(row.get("ProviderIds"))
+    if not row_ids:
+        return False
+    for pair in pairs or []:
+        namespace, _, value = str(pair or "").partition(".")
+        namespace = namespace.strip().lower()
+        value = value.strip().lower()
+        have = str(row_ids.get(namespace) or "").strip().lower()
+        if not namespace or not value or not have:
+            continue
+        if have == value:
+            return True
+        if have.isdigit() and value.isdigit() and int(have) == int(value):
+            return True
+    return False
+
+
+def _targeted_year_ok(row: Mapping[str, Any], year: Any, *, missing_ok: bool) -> bool:
+    if year is None:
+        return True
+    row_year = row.get("ProductionYear")
+    if row_year is None:
+        return missing_ok
+    try:
+        return abs(int(row_year) - int(year)) <= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _targeted_matches(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    jf_type: str,
+    title: str,
+    year: Any,
+    pairs: Iterable[str],
+    strict: bool,
+    feature: str = "history",
+) -> list[Mapping[str, Any]]:
+    pair_list = list(pairs or [])
+    candidates = list(rows)
+    matched = []
+    rejected: dict[str, int] = {}
+    for row in candidates:
+        reason = ""
+        if row.get("Type") != jf_type:
+            reason = "type_mismatch"
+        elif not _valid_item_id(row.get("Id")):
+            reason = "invalid_item_id"
+        elif pair_list and not _row_matches_pair(row, pair_list):
+            reason = "id_mismatch"
+        elif not pair_list and strict:
+            reason = "missing_source_ids"
+        elif not pair_list and (row.get("Name") or "").strip().casefold() != title.strip().casefold():
+            reason = "title_mismatch"
+        elif not (strict and pair_list) and not _targeted_year_ok(row, year, missing_ok=bool(pair_list)):
+            reason = "year_mismatch"
+        if reason:
+            rejected[reason] = rejected.get(reason, 0) + 1
+        else:
+            matched.append(row)
+    if not pair_list and len(matched) > 1:
+        rejected["ambiguous_title"] = len(matched)
+        matched = []
+    _dbg("targeted_search_match", lookup_feature=feature, term=title, kind=jf_type,
+         candidates=len(candidates), matched=len(matched), rejected=rejected)
+    return matched
+
+
+def _targeted_search_terms(title: str, *, has_ids: bool) -> list[str]:
+    terms = [title]
+    if has_ids:
+        # Only query text changes. A shortened query must still match external IDs.
+        cleaned = re.sub(r"(?:\s*\((?:NL|(?:19|20)\d{2})\))+$", "", title, flags=re.I).strip()
+        if cleaned and cleaned != title:
+            terms.append(cleaned)
+    return terms
+
+
+def _targeted_lookup_item_ids(
+    adapter: Any,
+    it: Mapping[str, Any],
+    *,
+    feature: str,
+    pairs: list[str],
+    episode_pairs: list[str],
+    series_pairs: list[str],
+    selected_libs: set[str],
+) -> list[str]:
+    if not _targeted_enabled(adapter):
+        return []
+
+    item_type = _lookup_type(it)
+    title = (it.get("title") or "").strip()
+    year = it.get("year")
+    season = it.get("season")
+    episode = it.get("episode")
+    series_title = (it.get("series_title") or "").strip()
+    strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
+
+    def search_matches(jf_type: str, term: str, ids: list[str], want_year: Any) -> list[Mapping[str, Any]]:
+        if ids and jf_type in {"Movie", "Series"}:
+            from ._id_lookup import find
+            matches = find(adapter, feature, jf_type, ids)
+            if matches:
+                return matches
+        if strict or not term:
+            return []
+        for search_term in _targeted_search_terms(term, has_ids=bool(ids)):
+            if search_term != term:
+                _dbg("targeted_search_variant", lookup_feature=feature, kind=jf_type,
+                     original_term=term, term=search_term)
+            for retry in ([False, True] if selected_libs else [False]):
+                matches = _targeted_matches(
+                    _targeted_search(adapter, feature, selected_libs, jf_type, search_term, verify_ancestors=retry),
+                    jf_type=jf_type, title=term, year=want_year, pairs=ids, strict=strict, feature=feature,
+                )
+                if matches:
+                    return matches
+        return []
+
+    if item_type in ("movie", "show", "series") and (title or pairs):
+        jf_type = "Movie" if item_type == "movie" else "Series"
+        rows = search_matches(jf_type, title, pairs, year)
+        found = sorted({str(row["Id"]) for row in rows})
+        if found:
+            kind = "movie" if jf_type == "Movie" else "series"
+            _dbg("resolve_hit", kind=kind, method="targeted_lookup", title=title, year=year, item_id=found[0], copies=len(found))
+        return found
+
+    if item_type == "episode" and (series_title or series_pairs) and season is not None and episode is not None:
+        series_rows = search_matches("Series", series_title, series_pairs, None)
+        rows = []
+        cache = _targeted_cache(adapter, feature)
+        for series_row in series_rows:
+            sid = str(series_row["Id"])
+            cache_key = ("episodes", sid)
+            episode_rows = cache.get(cache_key)
+            if episode_rows is None:
+                episode_rows = []
+                page_start = 0
+                seen_pages = set()
+                complete = True
+                while True:
+                    body = get_series_episodes(adapter.client, adapter.cfg.user_id, sid, start=page_start, limit=500)
+                    page = body.get("Items") if isinstance(body, Mapping) else None
+                    if not isinstance(page, list) or any(not isinstance(row, Mapping) for row in page):
+                        episode_rows = []
+                        complete = False
+                        break
+                    signature = tuple(str(row.get("Id") or "") for row in page)
+                    if page and signature in seen_pages:
+                        episode_rows = []
+                        complete = False
+                        break
+                    seen_pages.add(signature)
+                    episode_rows.extend(page)
+                    if len(page) < 500:
+                        break
+                    page_start += len(page)
+                if len(cache) >= 2048:
+                    cache.clear()
+                if complete:
+                    cache[cache_key] = episode_rows
+            rows.extend(row for row in episode_rows
+                        if row.get("Type") == "Episode"
+                        and str(row.get("SeriesId") or sid) == sid
+                        and _valid_item_id(row.get("Id")))
+        pair_rows = [row for row in rows if _row_matches_pair(row, episode_pairs)]
+        numbered_rows = [row for row in rows if _episode_number_matches(row, season, episode)]
+        _dbg("targeted_episode_candidates", lookup_feature=feature, series_title=series_title,
+             season=season, episode=episode, series_matches=len(series_rows),
+             numbered_candidates=len(numbered_rows), episode_id_matches=len(pair_rows))
+        chosen: Mapping[str, Any] | None = None
+        # Multiple copies with verified series identity and the same coordinates
+        # represent the same episode. Keep a deterministic destination item.
+        # An exact episode ID leads even when servers use different numbering.
+        numbered_pair_rows = [row for row in pair_rows if _episode_number_matches(row, season, episode)]
+        candidates = numbered_pair_rows or pair_rows or numbered_rows
+        if candidates:
+            chosen = min(candidates, key=lambda row: str(row["Id"]))
+        iid = _valid_item_id(chosen.get("Id")) if chosen else None
+        if iid:
+            _dbg("resolve_hit", kind="episode", method="targeted_series_lookup", series_title=series_title, season=season, episode=episode, item_id=iid)
+            return [iid]
+    # A source can supply episode IDs and a title without usable series metadata.
+    # Search only that title and require an episode ID match in this route.
+    if not strict and item_type == "episode" and title and episode_pairs:
+        rows = search_matches("Episode", title, episode_pairs, None)
+        found = sorted({str(row["Id"]) for row in rows})
+        if found:
+            _dbg("resolve_hit", kind="episode", method="targeted_episode_search", item_id=found[0])
+            return found[:1]
+    return []
+
+
+def _targeted_lookup_item_id(adapter: Any, it: Mapping[str, Any], **kwargs: Any) -> str | None:
+    found = _targeted_lookup_item_ids(adapter, it, **kwargs)
+    return found[0] if found else None
 
 
 def _path_match_item_id(
@@ -1215,45 +1749,15 @@ def _path_match_item_id(
     return iid
 
 
+@path_fallback("JELLYFIN")
 def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "history") -> str | None:
     http = adapter.client
     uid = adapter.cfg.user_id
     selected_libs = jf_selected_library_ids(adapter.cfg, feature)
     setattr(adapter, "_jellyfin_last_resolve_hint", None)
     outside_scope_seen = False
-
-    # Prefer native Jellyfin item id when present.
-    raw_iid = it.get("jellyfin_item_id") or it.get("_jellyfin_item_id")
-    if raw_iid:
-        s = str(raw_iid).strip()
-        if s and not looks_like_bad_id(s):
-            _dbg('resolve_hit', kind='direct', method='item_field', item_id=s)
-            return s
-
     ids = dict(it.get("ids") or {})
     show_ids = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else None
-
-    jf = ids.get("jellyfin")
-    if jf and not looks_like_bad_id(jf):
-        if selected_libs:
-            try:
-                response = http.get(
-                    f"/Items/{jf}",
-                    params={"userId": uid, "Fields": "LibraryId,CollectionFolderId,AncestorIds,ParentId,Type"},
-                )
-                row = response.json() or {} if getattr(response, "status_code", 0) == 200 else {}
-            except Exception:
-                row = {}
-            if not jf_filter_library_candidates([row] if row else [], selected_libs):
-                outside_scope_seen = True
-                setattr(adapter, "_jellyfin_last_resolve_hint", "outside_library_scope")
-                _dbg('target_candidate_outside_library_scope', item_id=str(jf), allowed_library_ids=sorted(selected_libs), resolution_method='provider_id')
-            else:
-                return str(jf)
-        else:
-            _dbg('resolve_hit', kind='direct', method='provider_id', item_id=str(jf))
-            return str(jf)
-
     t = _lookup_type(it)
     title = (it.get("title") or "").strip()
     year = it.get("year")
@@ -1261,9 +1765,39 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
     episode = it.get("episode")
     series_title = (it.get("series_title") or "").strip()
 
+    raw_iid = it.get("jellyfin_item_id") or it.get("_jellyfin_item_id")
+    native_iid = _validate_native_item_id(
+        adapter,
+        raw_iid,
+        ids,
+        selected_libs=selected_libs,
+        want_type=t,
+        title=title,
+        year=year,
+    )
+    if native_iid:
+        _dbg("resolve_hit", kind="direct", method="item_field", item_id=native_iid)
+        return native_iid
+
+    jf = ids.get("jellyfin")
+    native_iid = _validate_native_item_id(
+        adapter,
+        jf,
+        ids,
+        selected_libs=selected_libs,
+        want_type=t,
+        title=title,
+        year=year,
+    )
+    if native_iid:
+        _dbg("resolve_hit", kind="direct", method="provider_id", item_id=native_iid)
+        return native_iid
+    if jf and selected_libs and getattr(adapter, "_jellyfin_last_resolve_hint", None) == "outside_library_scope":
+        outside_scope_seen = True
+
     strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
 
-    path_iid = _path_match_item_id(
+    path_iid = None if strict or _targeted_enabled(adapter) else _path_match_item_id(
         adapter,
         it,
         feature=feature,
@@ -1286,6 +1820,24 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
             if p not in pairs:
                 pairs.append(p)
 
+    targeted_iid = _targeted_lookup_item_id(
+        adapter,
+        it,
+        feature=feature,
+        pairs=pairs,
+        episode_pairs=episode_pairs,
+        series_pairs=series_pairs,
+        selected_libs=selected_libs,
+    )
+    if targeted_iid:
+        return targeted_iid
+    if _targeted_enabled(adapter):
+        _dbg("resolve_miss", kind=t, title=title, series_title=series_title,
+             season=season, episode=episode, method="targeted_only")
+        setattr(adapter, "_jellyfin_last_resolve_hint",
+                "outside_library_scope" if outside_scope_seen else "unmatched_in_jellyfin")
+        return None
+
     # Movies
     if t == "movie":
         idx = build_provider_index(adapter) if feature == "history" else build_provider_index(adapter, feature=feature)
@@ -1298,6 +1850,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
             )
             if raw_cands and not cands and selected_libs:
                 outside_scope_seen = True
+            cands = [row for row in cands if _row_matches_type(row, "movie")]
             iid = _pick_from_candidates(cands, want_type="movie", want_year=year)
             if iid:
                 _dbg('resolve_hit', kind='movie', method='provider_index', pref=pref, item_id=iid)
@@ -1518,14 +2071,13 @@ def resolve_item_ids(adapter: Any, it: Mapping[str, Any], *, feature: str = "his
     if not http or not uid:
         return []
 
-    # Prefer native Jellyfin item id when present
-    raw_iid = it.get("jellyfin_item_id") or it.get("_jellyfin_item_id")
-    if raw_iid:
-        s = str(raw_iid).strip()
-        if s and not looks_like_bad_id(s):
-            return [s]
-
     one = resolve_item_id(adapter, it, feature=feature)
+    if getattr(adapter, "path_matching", False) and getattr(adapter, "_jellyfin_last_resolve_hint", None) in {"path_match", "path_ambiguous", "path_id_conflict"}:
+        return [str(one)] if one else []
+    # Only movies expand to multiple copies below. Episode/show resolution is
+    # already complete, including any necessary index fallback.
+    if _lookup_type(it) != "movie":
+        return [str(one)] if one else []
     selected_libs = jf_selected_library_ids(adapter.cfg, feature)
 
     ids = dict(it.get("ids") or {})
@@ -1547,6 +2099,16 @@ def resolve_item_ids(adapter: Any, it: Mapping[str, Any], *, feature: str = "his
         for p in spairs:
             if p not in pairs:
                 pairs.append(p)
+
+    if _targeted_enabled(adapter):
+        found = _targeted_lookup_item_ids(
+            adapter, it, feature=feature, pairs=pairs,
+            episode_pairs=all_ext_pairs(ids, prio),
+            series_pairs=all_ext_pairs(show_ids, prio) if show_ids else [],
+            selected_libs=selected_libs,
+        )
+        # Retain a validated native item even if a title search cannot find it.
+        return list(dict.fromkeys(([str(one)] if one else []) + found))
 
     idx = build_provider_index(adapter) if feature == "history" else build_provider_index(adapter, feature=feature)
 

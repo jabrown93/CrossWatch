@@ -298,13 +298,28 @@
           vip: !!(data?.plexpass || data?.subscription?.plan),
           detail: data?.subscription?.plan ? `Plan: ${titleCase(data.subscription.plan)}` : (data?.plexpass ? "Plan: Plex Pass" : ""),
         };
-      case "TRAKT":
-        return { vip: !!data?.vip, detail: data?.vip ? "Plan: VIP" : "Plan: Free" };
+      case "TRAKT": {
+        const username = txt(data?.username);
+        return { vip: !!data?.vip, detail: [username ? `Account: ${username}` : "", data?.vip ? "Plan: VIP" : "Plan: Free"].filter(Boolean).join("\n") };
+      }
+      case "WETRAKR": {
+        const plan = txt(data?.plan).toLowerCase();
+        const vip = plan === "vip" || !!data?.vip;
+        const username = txt(data?.username);
+        return { vip, detail: [username ? `Account: ${username}` : "", vip ? "Plan: VIP" : plan === "free" ? "Plan: Free" : "", ...(meta.dailyQuotaDetails?.(data) || [])].filter(Boolean).join("\n") };
+      }
       case "SIMKL": {
         const plan = txt(data?.account_type || data?.plan_type || data?.account?.type).toLowerCase();
         const premium = plan === "pro" || plan === "vip";
         const label = plan ? (plan === "vip" ? "VIP" : titleCase(plan)) : "";
-        return { vip: premium, detail: label ? `Plan: ${label}` : "" };
+        const lines = label ? [`Plan: ${label}`] : [];
+        const left = Number(data?.daily_remaining);
+        if (data?.daily_remaining != null && Number.isFinite(left)) {
+          const limit = Number(data?.daily_limit);
+          lines.push(`API calls left today: ${left}${Number.isFinite(limit) && limit > 0 ? ` / ${limit}` : ""}`);
+          if (data?.daily_resets_label) lines.push(`Resets: ${txt(data.daily_resets_label)}`);
+        }
+        return { vip: premium, detail: lines.join("\n") };
       }
       case "EMBY":
         return { vip: !!data?.premiere, detail: data?.premiere ? "Plan: Premiere" : "" };

@@ -9,8 +9,9 @@ from typing import Any
 import requests
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
-from cw_platform.provider_instances import get_provider_block, ensure_instance_block, normalize_instance_id
+from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
 
 try:
     from _logging import log as _real_log
@@ -19,7 +20,7 @@ except ImportError:
 
 
 API_BASE = "https://publicmetadb.com"
-UA = "CrossWatch/1.0"
+UA = http_user_agent(override_env="CW_PUBLICMETADB_UA")
 HTTP_TIMEOUT = 10
 __VERSION__ = "1.0"
 
@@ -42,7 +43,7 @@ def _load_config() -> dict[str, Any]:
 
 
 def _block(cfg: Mapping[str, Any], instance_id: Any = None) -> dict[str, Any]:
-    return get_provider_block(cfg or {}, "publicmetadb", instance_id)
+    return resolve_provider_block(cfg or {}, "publicmetadb", instance_id)
 
 
 def validate_api_key(api_key: str, *, base_url: str = API_BASE, timeout: float = HTTP_TIMEOUT) -> tuple[bool, str]:

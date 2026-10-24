@@ -2,6 +2,10 @@
 # Two-way synchronization logic for data pairs.
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+
+from ..path_matching import PathAliases, rekey_by_path
+
+from ._pairs_utils import pair_endpoint_config, pair_feature_libraries
 from collections.abc import Mapping
 from typing import Any
 
@@ -9,7 +13,9 @@ import os
 import re
 import datetime as _dt
 
-from ._pairs_oneway import _emit_item_failures, _emit_item_resolutions, compute_effective_add, compute_effective_remove, is_remove_retry_reason, load_feature_state, resolve_baseline_writes, select_baseline_keys
+from ._pairs_oneway import _emit_item_failures, _emit_item_resolutions, compute_effective_add, compute_effective_remove, current_attempt_unresolved_keys, is_remove_retry_reason, load_feature_state, resolve_baseline_writes, select_baseline_keys
+from ._dropped import apply_dropped_tags, preview_dropped_tags, provider_dropped_mode, reads_dropped, tags_dropped, with_written
+from ..run_control import cancel_requested
 
 try:
     from ._pairs_oneway import (
@@ -67,18 +73,28 @@ except Exception:  # pragma: no cover
         return False
 
 from ..provider_instances import normalize_instance_id
-from ._planner import diff_ratings, diff_progress, _pick_rating
+from ._planner import diff_ratings, diff_progress, _pick_rating, _pick_rating_quantized, _quantize_rating
+from ._interactive import choose_conflict
+from ._episode_groups import HistoryGroups, note_identity_conflicts
 from ._progress_completion import fcfg_for_progress_target
+from ._specials import filter_specials_index, specials_excluded
+from ._scope import provider_call
+from .. import library_presence as _library_presence
 try:
+    from ._pairs_oneway import _media_type_filter_index as _media_filter
     from ._pairs_oneway import _ratings_filter_index as _rate_filter
 except Exception:
-    def _rate_filter(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
+    def _media_filter(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
         return idx
 
-from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
-from ..history_events import history_sync_key, minimal_history_item
+    def _rate_filter(idx: dict[str, Any], fcfg: Mapping[str, Any], allowed_types: set[str] | None = None) -> dict[str, Any]:
+        return idx
+
+from ..id_map import migrate_media_index, minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids, _norm_type, part_fragment as _part_fragment
+from ..history_events import has_history_watch, history_sync_key, minimal_history_item
 from ..anime_mapping.service import (
     anime_mapping_pair_feature_options as _anime_pair_feature_options,
+    anime_only_adds as _anime_only_adds,
     config_with_pair_feature_options as _anime_config_with_pair_feature_options,
     enrich_index_for_pair as _anime_enrich_index_for_pair,
 )
@@ -96,8 +112,8 @@ from ._snapshots import (
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
-from ._tombstones import clear_items_for_feature, keys_for_feature
-from ._unresolved import load_unresolved_keys, load_unresolved_pending, record_unresolved, clear_unresolved
+from ._tombstones import clear_items_for_feature, keys_for_feature, media_tombstone_tokens
+from ._unresolved import load_unresolved_keys, load_unresolved_pending, record_unresolved, clear_unresolved, clear_matched_history_retries
 from ._phantoms import PhantomGuard  # type: ignore[attr-defined]
 
 from ._pairs_blocklist import apply_blocklist
@@ -106,12 +122,16 @@ from ._history_rewatches import (
     collapse_history_latest,
     config_with_history_rewatches,
     filter_history_events,
-    history_event_diff,
-    history_event_present,
+    compare_history_events,
+    history_event_matches,
+    history_timestamp_tolerance_seconds,
     history_rewatch_pair_enabled,
     history_rewatches_requested,
 )
 from ._pairs_utils import (
+    declared_types_for,
+    ratings_step_for,
+    ratings_zero_for,
     config_with_pair_libraries as _config_with_pair_libraries,
     supports_feature as _supports_feature,
     resolve_flags as _resolve_flags,
@@ -121,6 +141,7 @@ from ._pairs_utils import (
     apply_verify_after_write_supported as _apply_verify_after_write_supported,
     manual_policy as _manual_policy,
     merge_manual_adds as _merge_manual_adds,
+    manual_corrections as _manual_corrections,
     filter_manual_block as _filter_manual_block,
 )
 
@@ -235,15 +256,13 @@ def _effective_library_whitelist(
     feature: str,
     fcfg: Mapping[str, Any],
 ) -> list[str]:
-    if feature not in ("history", "ratings", "progress"):
+    if feature not in ("history", "ratings", "progress", "collection"):
         return []
 
     libs: list[str] = []
     lib_cfg = fcfg.get("libraries")
     if isinstance(lib_cfg, dict):
-        per = lib_cfg.get(provider_name.upper()) or lib_cfg.get(provider_name.lower())
-        if isinstance(per, (list, tuple)):
-            libs = [str(x).strip() for x in per if str(x).strip()]
+        libs = pair_feature_libraries(fcfg, provider_name, cfg.get("_cw_provider_instance"))
     elif isinstance(lib_cfg, (list, tuple)):
         libs = [str(x).strip() for x in lib_cfg if str(x).strip()]
 
@@ -291,11 +310,15 @@ def _filter_index_by_libraries(idx: dict[str, Any], libs: list[str], *, allow_un
 
     return out
 
-def _minimal_keep_rating(it: Mapping[str, Any]) -> dict[str, Any]:
+def _minimal_keep_rating(it: Mapping[str, Any], step: float = 1.0, *, allow_zero: bool = False) -> dict[str, Any]:
     out = _minimal(it)
     try:
         if "rating" in it:
-            out["rating"] = it.get("rating")
+            q = _quantize_rating(it.get("rating"), step, allow_zero=allow_zero)
+            if q is None:
+                out["rating"] = it.get("rating")
+            else:
+                out["rating"] = int(q) if float(q).is_integer() else q
         ra = (it.get("rated_at") or it.get("ratedAt") or it.get("user_rated_at") or "")
         ra = ra.strip() if isinstance(ra, str) else ""
         if ra:
@@ -348,12 +371,15 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     import time as _t
 
     cfg, emit, info, dbg = ctx.config, ctx.emit, ctx.emit_info, ctx.dbg
+    history_tolerance = history_timestamp_tolerance_seconds(cfg)
     src_inst = normalize_instance_id(os.getenv("CW_PAIR_SRC_INSTANCE"))
     dst_inst = normalize_instance_id(os.getenv("CW_PAIR_DST_INSTANCE"))
     sync_cfg = (cfg.get("sync") or {})
     provs = ctx.providers
     a = str(a).upper()
     b = str(b).upper()
+    a_choice = f"{a}#{src_inst}" if a == b else a
+    b_choice = f"{b}#{dst_inst}" if a == b else b
 
     aops = provs.get(a)
     bops = provs.get(b)
@@ -434,9 +460,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         provider_cfg = config_with_history_rewatches(provider_cfg, False)
         emit("debug", msg="history.rewatches.disabled", a=a, b=b, reason="provider_capability")
 
-    def _pause_for(pname: str) -> int:
+    def _pause_for(pname: str, inst: str) -> int:
         base = int(getattr(ctx, "apply_chunk_pause_ms", 0) or 0)
-        inst = src_inst if pname == a else (dst_inst if pname == b else "default")
         rem = _rate_remaining(health_map.get(f"{pname}#{inst}") or health_map.get(pname))
         if rem is not None and rem < 10:
             emit("rate:slow", provider=pname, remaining=rem, base_ms=base, extra_ms=1000)
@@ -451,6 +476,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
     emit("two:start", a=a, b=b, feature=feature, removals=allow_removals)
 
+    a_cfg = pair_endpoint_config(provider_cfg, a, src_inst)
+    b_cfg = pair_endpoint_config(provider_cfg, b, dst_inst)
     pair_providers = {a: aops, b: bops}
 
     if str(a).strip().upper() == "SIMKL" and str(b).strip().upper() != "SIMKL":
@@ -463,16 +490,29 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     def _on_snapshot(name: str, idx: Mapping[str, Any]) -> None:
         if name != prep_after:
             return
-        prepare_source_snapshot(prep_ops, config=provider_cfg, feature=feature, items=idx, dbg=dbg)
+        prepare_source_snapshot(prep_ops, config=b_cfg if prep_ops is bops else a_cfg, feature=feature, items=idx, dbg=dbg)
 
-    snaps = build_snapshots_for_feature(
-        feature=feature, config=provider_cfg, providers=pair_providers,
-        snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
-        dbg=dbg, emit_info=info,
-        build_order=build_order, on_snapshot=_on_snapshot,
-    )
-    A_cur = snaps.get(a) or {}
-    B_cur = snaps.get(b) or {}
+    if a == b:
+        A_cur = build_snapshots_for_feature(
+            feature=feature, config=a_cfg, providers={a: aops},
+            snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
+            dbg=dbg, emit_info=info, on_snapshot=_on_snapshot,
+        ).get(a) or {}
+        B_cur = build_snapshots_for_feature(
+            feature=feature, config=b_cfg, providers={b: bops},
+            snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
+            dbg=dbg, emit_info=info,
+        ).get(b) or {}
+    else:
+        snaps = build_snapshots_for_feature(
+            feature=feature, config=provider_cfg, providers=pair_providers,
+            snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
+            dbg=dbg, emit_info=info,
+            build_order=build_order, on_snapshot=_on_snapshot,
+        )
+        A_cur = snaps.get(a) or {}
+        B_cur = snaps.get(b) or {}
+    cancelled = bool(cancel_requested())
 
 
     prev_state_cache = getattr(ctx, "_stable_prev_state_by_feature", None)
@@ -482,29 +522,47 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             setattr(ctx, "_stable_prev_state_by_feature", prev_state_cache)
         except Exception:
             pass
-    prev_state = prev_state_cache.get(feature)
+    state_key = (getattr(ctx.state_store, "pair_scope", None), feature)
+    prev_state = prev_state_cache.get(state_key)
     if not prev_state:
         prev_state = load_feature_state(ctx.state_store, feature)
         try:
-            prev_state_cache[feature] = prev_state
+            prev_state_cache[state_key] = prev_state
         except Exception:
             pass
 
-    manual_adds_A, manual_blocks_A = _manual_policy(prev_state, a, feature)
-    manual_adds_B, manual_blocks_B = _manual_policy(prev_state, b, feature)
+    manual_adds_A, manual_blocks_A = _manual_policy(prev_state, a, feature, src_inst)
+    manual_adds_B, manual_blocks_B = _manual_policy(prev_state, b, feature, dst_inst)
 
     prev_provs = (prev_state.get("providers") or {})
 
     def _prev_items(pmap: Mapping[str, Any], prov: str, inst: str, feat: str) -> dict[str, Any]:
         try:
-            pblk = pmap.get(prov) or {}
+            pkey = str(prov or "").upper()
+            pblk = pmap.get(pkey) or pmap.get(str(prov or "")) or {}
+            if not isinstance(pblk, Mapping):
+                for pk, pv in (pmap or {}).items():
+                    if str(pk or "").upper() == pkey and isinstance(pv, Mapping):
+                        pblk = pv
+                        break
             if not isinstance(pblk, Mapping):
                 return {}
             if inst != "default":
                 insts = pblk.get("instances") or {}
-                if not isinstance(insts, Mapping):
+                if isinstance(insts, Mapping):
+                    pblk2 = insts.get(inst) or {}
+                    if not isinstance(pblk2, Mapping):
+                        want_inst = normalize_instance_id(inst)
+                        for ik, iv in insts.items():
+                            if normalize_instance_id(ik) == want_inst and isinstance(iv, Mapping):
+                                pblk2 = iv
+                                break
+                    if isinstance(pblk2, Mapping) and pblk2:
+                        pblk = pblk2
+                    else:
+                        return {}
+                else:
                     return {}
-                pblk = insts.get(inst) or {}
                 if not isinstance(pblk, Mapping):
                     return {}
             fblk = pblk.get(feat) or {}
@@ -514,7 +572,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             if not isinstance(base, Mapping):
                 return {}
             items = base.get("items") or {}
-            return dict(items) if isinstance(items, Mapping) else {}
+            return migrate_media_index(items)
         except Exception:
             return {}
 
@@ -523,12 +581,12 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
     prev_cp_A = prev_checkpoint(prev_state, a, feature, src_inst)
     prev_cp_B = prev_checkpoint(prev_state, b, feature, dst_inst)
-    now_cp_A = module_checkpoint(aops, provider_cfg, feature)
-    now_cp_B = module_checkpoint(bops, provider_cfg, feature)
+    now_cp_A = module_checkpoint(aops, a_cfg, feature)
+    now_cp_B = module_checkpoint(bops, b_cfg, feature)
 
     if drop_guard:
         A_eff_guard, A_suspect, A_reason = coerce_suspect_snapshot(
-            config=provider_cfg,
+            config=a_cfg,
             provider=a, ops=aops, prev_idx=prevA, cur_idx=A_cur, feature=feature,
             suspect_min_prev=int((cfg.get("runtime") or {}).get("suspect_min_prev", 20)),
             suspect_shrink_ratio=float((cfg.get("runtime") or {}).get("suspect_shrink_ratio", 0.10)),
@@ -538,7 +596,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         if A_suspect:
             dbg("snapshot.guard", provider=a, feature=feature, reason=A_reason)
         B_eff_guard, B_suspect, B_reason = coerce_suspect_snapshot(
-            config=provider_cfg,
+            config=b_cfg,
             provider=b, ops=bops, prev_idx=prevB, cur_idx=B_cur, feature=feature,
             suspect_min_prev=int((cfg.get("runtime") or {}).get("suspect_min_prev", 20)),
             suspect_shrink_ratio=float((cfg.get("runtime") or {}).get("suspect_shrink_ratio", 0.10)),
@@ -552,40 +610,68 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         A_eff_guard, A_suspect = dict(A_cur), False
         B_eff_guard, B_suspect = dict(B_cur), False
 
-    a_sem = _index_semantics(aops, feature, cfg=ctx.config, provider=a)
-    b_sem = _index_semantics(bops, feature, cfg=ctx.config, provider=b)
+    a_sem = _index_semantics(aops, feature, cfg=a_cfg, provider=a)
+    b_sem = _index_semantics(bops, feature, cfg=b_cfg, provider=b)
 
     A_eff = (dict(prevA) | dict(A_cur)) if a_sem == "delta" else dict(A_eff_guard)
     B_eff = (dict(prevB) | dict(B_cur)) if b_sem == "delta" else dict(B_eff_guard)
 
-    libs_A = _effective_library_whitelist(cfg, a, feature, fcfg)
-    libs_B = _effective_library_whitelist(cfg, b, feature, fcfg)
+    libs_A = _effective_library_whitelist(a_cfg, a, feature, fcfg)
+    libs_B = _effective_library_whitelist(b_cfg, b, feature, fcfg)
 
     allow_unknown_A = (str(a).upper() == "PLEX" and feature == "history") or str(a).upper() == "KODI"
     allow_unknown_B = (str(b).upper() == "PLEX" and feature == "history") or str(b).upper() == "KODI"
+    allow_unknown_prev_A = allow_unknown_A or feature == "collection"
+    allow_unknown_prev_B = allow_unknown_B or feature == "collection"
+    allow_unknown_eff_A = allow_unknown_A or feature == "collection"
+    allow_unknown_eff_B = allow_unknown_B or feature == "collection"
 
     if libs_A:
-        prevA = _filter_index_by_libraries(prevA, libs_A, allow_unknown=allow_unknown_A)
+        prevA = _filter_index_by_libraries(prevA, libs_A, allow_unknown=allow_unknown_prev_A)
         A_cur = _filter_index_by_libraries(A_cur, libs_A, allow_unknown=allow_unknown_A)
-        A_eff = _filter_index_by_libraries(A_eff, libs_A, allow_unknown=allow_unknown_A)
+        A_eff = _filter_index_by_libraries(A_eff, libs_A, allow_unknown=allow_unknown_eff_A)
 
     if libs_B:
-        prevB = _filter_index_by_libraries(prevB, libs_B, allow_unknown=allow_unknown_B)
+        prevB = _filter_index_by_libraries(prevB, libs_B, allow_unknown=allow_unknown_prev_B)
         B_cur = _filter_index_by_libraries(B_cur, libs_B, allow_unknown=allow_unknown_B)
-        B_eff = _filter_index_by_libraries(B_eff, libs_B, allow_unknown=allow_unknown_B)
+        B_eff = _filter_index_by_libraries(B_eff, libs_B, allow_unknown=allow_unknown_eff_B)
+
+    if feature == "collection":
+        prevA = _media_filter(prevA, fcfg)
+        A_cur = _media_filter(A_cur, fcfg)
+        A_eff = _media_filter(A_eff, fcfg)
+        prevB = _media_filter(prevB, fcfg)
+        B_cur = _media_filter(B_cur, fcfg)
+        B_eff = _media_filter(B_eff, fcfg)
+
+    specials_keep_A: dict[str, Any] = {}
+    specials_keep_B: dict[str, Any] = {}
+    if specials_excluded(feature, fcfg):
+        prevA, _ = filter_specials_index(prevA)
+        A_cur, specials_cur_A = filter_specials_index(A_cur)
+        A_eff, specials_keep_A = filter_specials_index(A_eff)
+        prevB, _ = filter_specials_index(prevB)
+        B_cur, specials_cur_B = filter_specials_index(B_cur)
+        B_eff, specials_keep_B = filter_specials_index(B_eff)
+        if specials_cur_A or specials_cur_B:
+            emit("debug", msg="specials.filtered", feature=feature, a=a, b=b, side_a=len(specials_cur_A), side_b=len(specials_cur_B))
 
     dropped_A: set[str] = set()
     dropped_B: set[str] = set()
-    if a in ("TRAKT", "MDBLIST", "SIMKL") and _provider_ignore_dropped_enabled(cfg, a, feature):
-        dropped_A = _load_provider_dropped_tokens(aops, cfg)
+    a_tags_dropped = reads_dropped(aops) and tags_dropped(bops) and provider_dropped_mode(a_cfg, a, feature) == "tag"
+    b_tags_dropped = reads_dropped(bops) and tags_dropped(aops) and provider_dropped_mode(b_cfg, b, feature) == "tag"
+    tag_tokens_A: set[str] = _load_provider_dropped_tokens(aops, a_cfg) if a_tags_dropped else set()
+    tag_tokens_B: set[str] = _load_provider_dropped_tokens(bops, b_cfg) if b_tags_dropped else set()
+    if not a_tags_dropped and reads_dropped(aops) and _provider_ignore_dropped_enabled(a_cfg, a, feature):
+        dropped_A = _load_provider_dropped_tokens(aops, a_cfg)
         if dropped_A:
             prevA, prev_filtered_A = _filter_index_for_dropped_shows(prevA, dropped_A)
             A_cur, cur_filtered_A = _filter_index_for_dropped_shows(A_cur, dropped_A)
             A_eff, eff_filtered_A = _filter_index_for_dropped_shows(A_eff, dropped_A)
             if prev_filtered_A or cur_filtered_A or eff_filtered_A:
                 emit("debug", msg="provider.dropped.filtered", provider=a, feature=feature, scope="side_a", prev=prev_filtered_A, current=cur_filtered_A, effective=eff_filtered_A)
-    if b in ("TRAKT", "MDBLIST", "SIMKL") and _provider_ignore_dropped_enabled(cfg, b, feature):
-        dropped_B = _load_provider_dropped_tokens(bops, cfg)
+    if not b_tags_dropped and reads_dropped(bops) and _provider_ignore_dropped_enabled(b_cfg, b, feature):
+        dropped_B = _load_provider_dropped_tokens(bops, b_cfg)
         if dropped_B:
             prevB, prev_filtered_B = _filter_index_for_dropped_shows(prevB, dropped_B)
             B_cur, cur_filtered_B = _filter_index_for_dropped_shows(B_cur, dropped_B)
@@ -611,8 +697,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         if len(A_eff) != a_before or len(B_eff) != b_before:
             dbg("anime_mapping.rekeyed", feature=feature, a=a, b=b, a_items=len(A_eff), b_items=len(B_eff))
         if feature in ("history", "ratings", "progress"):
-            A_eff = _comparison_view(aops, provider_cfg, feature, A_eff, side=a, dbg=dbg)
-            B_eff = _comparison_view(bops, provider_cfg, feature, B_eff, side=b, dbg=dbg)
+            A_eff = _comparison_view(aops, a_cfg, feature, A_eff, side=a, dbg=dbg)
+            B_eff = _comparison_view(bops, b_cfg, feature, B_eff, side=b, dbg=dbg)
 
     if feature == "history":
         A_cur = filter_history_events(A_cur, event_mode=history_event_mode)
@@ -629,20 +715,28 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             A_eff = collapse_history_latest(A_eff)
             B_eff = collapse_history_latest(B_eff)
 
-    now = int(_t.time())
+    groups = HistoryGroups(ctx, feature, [(a, src_inst), (b, dst_inst)], [A_eff, B_eff], reverse=True,
+                           fcfg=fcfg, blocks=[manual_blocks_A, manual_blocks_B],
+                           blocked="Grouped rewatches are not supported. Disable History rewatches for this pair." if history_event_mode else
+                           "A provider is unavailable or its snapshot is incomplete." if a_down or b_down or A_suspect or B_suspect else "")
+    A_eff, B_eff = groups.strip(0, A_eff), groups.strip(1, B_eff)
+    A_cur, B_cur = groups.strip(0, A_cur), groups.strip(1, B_cur)
+    prevA, prevB = groups.strip(0, prevA), groups.strip(1, prevB)
+    note_identity_conflicts(ctx, feature, [A_eff, B_eff], [manual_adds_A, manual_adds_B], [manual_blocks_A, manual_blocks_B],
+                            announce=not dry_run_flag)
+
+    review = getattr(ctx, "interactive", None)
+    now = review.planned_at if review is not None else int(_t.time())
     tomb_ttl_days = int((cfg.get("sync") or {}).get("tombstone_ttl_days", 30))
     tomb_ttl_secs = max(1, tomb_ttl_days) * 24 * 3600
-    pair_key = "-".join(sorted([a, b]))
-    tomb_map = dict(
-        keys_for_feature(
-            ctx.state_store, feature, pair=pair_key
-        ) or {}
-    )
-    tomb = {k for k, ts in tomb_map.items() if not isinstance(ts, int) or (now - int(ts)) <= tomb_ttl_secs}
+    pair_key = str(getattr(ctx.state_store, "pair_scope", None) or "-".join(sorted([a, b]))).upper()
+    tomb_map = keys_for_feature(ctx.state_store, feature, pair=pair_key, ttl_seconds=tomb_ttl_secs, now=now) or {}
+    tomb = set(tomb_map)
 
     bootstrap = (not prevA) and (not prevB) and not tomb
     obsA: set[str] = set()
     obsB: set[str] = set()
+    observed_tombstones: dict[str, int] = {}
     if not bootstrap:
         if include_obs_A and not A_suspect:
             obsA = {k for k in prevA.keys() if k not in (A_cur or {})}
@@ -651,32 +745,24 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         newly = (obsA | obsB) - tomb
 
         if newly:
-            t = ctx.state_store.load_tomb() or {}
-            ks = t.setdefault("keys", {})
-
             def _tokens_for_ck(ck: str) -> set[str]:
                 toks = {ck}
                 if feature == "history" and history_event_mode:
                     return toks
                 it = (prevA.get(ck) or prevB.get(ck) or {})
-                ids = (it.get("ids") or {})
-                try:
-                    for k, v in (ids or {}).items():
-                        if v is None or str(v) == "":
-                            continue
-                        toks.add(f"{str(k).lower()}:{str(v).lower()}")
-                except Exception:
-                    pass
-                return toks
+                return media_tombstone_tokens(it, ck)
 
             write_tokens: set[str] = set()
             for ck in set(newly):
                 write_tokens |= _tokens_for_ck(ck)
 
-            for tok in write_tokens:
-                ks.setdefault(f"{feature}:{pair_key}|{tok}", now)
-
-            ctx.state_store.save_tomb(t)
+            observed_tombstones = dict.fromkeys(write_tokens, now)
+            if review is None:
+                t = ctx.state_store.load_tomb() or {}
+                ks = t.setdefault("keys", {})
+                for tok in write_tokens:
+                    ks.setdefault(f"{feature}:{pair_key}|{tok}", now)
+                ctx.state_store.save_tomb(t)
 
         emit("debug", msg="observed.deletions", a=len(obsA), b=len(obsB), tomb=len(tomb),
              suppressed_on_A=bool(A_suspect), suppressed_on_B=bool(B_suspect))
@@ -696,18 +782,24 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     if manual_adds_B:
         B_eff = _merge_manual_adds(B_eff, manual_adds_B)
 
+    path_aliases = PathAliases((dict(prevA) | A_eff, dict(prevB) | B_eff), bool(cfg.get("_cw_path_matching")) and not history_event_mode)
+    path_native_keys_B: dict[str, str] = {}
+    if cfg.get("_cw_path_matching") and not history_event_mode:
+        native_keys = {id(item): key for key, item in B_eff.items()}
+        B_eff = rekey_by_path(B_eff, A_eff)
+        path_native_keys_B = {key: native_keys[id(item)] for key, item in B_eff.items() if key != native_keys[id(item)]}
     coord_aliases = _build_history_coordinate_aliases(cfg, feature, (A_eff, B_eff))
     if coord_aliases.enabled:
         dbg("anime_mapping.history_coords", feature=feature, a=a, b=b, **coord_aliases.stats())
 
     def _typed_tokens(it: Mapping[str, Any]) -> set[str]:
-        typ = str(it.get("type") or "").strip().lower()
+        typ = _norm_type(it.get("type"))
         show_ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else {}
         ids_raw = it.get("ids") if isinstance(it.get("ids"), Mapping) else {}
         show_ids = dict(show_ids_raw or {})
         ids = dict(ids_raw or {})
         coord_ids: Mapping[str, Any] = (show_ids or ids) if typ in ("episode", "season") else ids
-        toks: set[str] = set(coord_aliases.tokens(it))
+        toks: set[str] = set(coord_aliases.tokens(it)) | path_aliases.tokens(it)
 
         if typ == "episode":
             if show_ids:
@@ -718,7 +810,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     show_v = show_ids.get(k)
                     if show_v is not None and str(show_v).lower() == str(v).lower():
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}#episode")
             try:
                 season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
                 episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
@@ -750,7 +842,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             for k, v in ids.items():
                 if v is None or str(v) == "":
                     continue
-                toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                suffix = "#show" if str(k).lower() == "tmdb" and typ in ("show", "anime") else _part_fragment(it)
+                toks.add(f"{str(k).lower()}:{str(v).lower()}{suffix}")
 
         return toks
 
@@ -762,7 +855,12 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     def _sync_minimal(it: Mapping[str, Any], fallback_key: str | None = None) -> dict[str, Any]:
         if feature == "history":
             return minimal_history_item(it, fallback_key, event_mode=history_event_mode)
-        return _minimal(it)
+        out = _minimal(it)
+        if feature == "collection":
+            collected_at = it.get("collected_at")
+            if collected_at not in (None, ""):
+                out["collected_at"] = str(collected_at)
+        return out
 
     def _find_history_event_in_idx(idx: Mapping[str, Any], it: Mapping[str, Any], fallback_key: str | None = None) -> Mapping[str, Any] | None:
         if feature != "history" or not history_event_mode:
@@ -771,11 +869,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         direct = idx.get(sk) if sk else None
         if isinstance(direct, Mapping):
             return direct
-        bucket_sec = _hist_bucket_sec(a, b, feature)
-        for dk, dv in (idx or {}).items():
-            if isinstance(dv, Mapping) and history_event_present(it, sk, {str(dk): dv}, _typed_tokens, bucket_sec=bucket_sec):
-                return dv
-        return None
+        matches = history_event_matches({sk: it}, idx, _typed_tokens, tolerance_seconds=history_tolerance)
+        return idx.get(matches[sk]) if sk in matches else None
 
     def _show_level_tokens(it: Mapping[str, Any]) -> set[str]:
         ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else it.get("ids")
@@ -834,12 +929,17 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         if ck and ck in idx:
             v = idx.get(ck)
             return v if isinstance(v, Mapping) else None
+        is_episode = _norm_type(it.get("type")) == "episode"
         for tok in _typed_tokens(it):
             dk = alias.get(tok)
             if not dk:
                 continue
             v = idx.get(dk)
-            return v if isinstance(v, Mapping) else None
+            if not isinstance(v, Mapping):
+                return None
+            if (_norm_type(v.get("type")) == "episode") != is_episode:
+                continue
+            return v
         if feature == "history" and str(it.get("type") or "").strip().lower() == "show":
             target = _show_level_tokens(it)
             if target:
@@ -874,6 +974,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             if ck:
                 toks.add(ck)
             toks |= _typed_tokens(it)
+            toks |= media_tombstone_tokens(it)
         except Exception:
             pass
         return toks
@@ -881,7 +982,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     def _item_tomb_ts(it: Mapping[str, Any]) -> int | None:
         hit_ts: int | None = None
         try:
-            for tok in _tokens(it):
+            tokens = _tokens(it)
+            ck = _ck(it)
+            if ck.endswith("#show"):
+                tokens.add(ck.removesuffix("#show"))
+            for tok in tokens:
                 ts = tomb_map.get(tok)
                 if ts is None:
                     continue
@@ -1003,17 +1108,27 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
     add_to_A: list[dict[str, Any]] = []
     add_to_B: list[dict[str, Any]] = []
+    matched_history_to_A: set[str] = set()
+    matched_history_to_B: set[str] = set()
     upd_to_A: list[dict[str, Any]] = []
     upd_to_B: list[dict[str, Any]] = []
     rem_from_A: list[dict[str, Any]] = []
     rem_from_B: list[dict[str, Any]] = []
+    unresolved_A: set[str] = set()
+    unresolved_B: set[str] = set()
+    retry_scope: tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, str]] | None = None
 
     if feature == "ratings":
-        A_f = _rate_filter(A_eff, fcfg)
-        B_f = _rate_filter(B_eff, fcfg)
+        ratings_step = max(ratings_step_for(aops), ratings_step_for(bops))
+        ratings_zero = ratings_zero_for(aops) and ratings_zero_for(bops)
+        a_types, b_types = declared_types_for(aops, "ratings"), declared_types_for(bops, "ratings")
+        both_types = a_types & b_types if a_types is not None and b_types is not None else (a_types if a_types is not None else b_types)
+        A_f = _rate_filter(A_eff, fcfg, both_types)
+        B_f = _rate_filter(B_eff, fcfg, both_types)
 
         B_alias_tmp = _alias_index(B_f)
         A_alias_tmp = _alias_index(A_f)
+        retry_scope = (A_f, A_alias_tmp, B_f, B_alias_tmp)
 
         def _rated_epoch(it: Mapping[str, Any]) -> int | None:
             from datetime import datetime
@@ -1028,7 +1143,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
         bi = sync_cfg.get("bidirectional") or {}
         sot = (bi.get("source_of_truth") or bi.get("sourceOfTruth") or "").strip().upper()
-        prefer = sot if sot in (a, b) else a
+        prefer = next((choice for choice in (a_choice, b_choice) if choice.upper() == sot), a_choice)
 
         addA: list[dict[str, Any]] = []
         addB: list[dict[str, Any]] = []
@@ -1046,8 +1161,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 matched_A.add(str(ak))
                 matched_B.add(str(bk))
 
-                ra = _pick_rating(av)
-                rb = _pick_rating(bv)
+                ra = _pick_rating_quantized(av, ratings_step, allow_zero=ratings_zero)
+                rb = _pick_rating_quantized(bv, ratings_step, allow_zero=ratings_zero)
                 if ra is None and rb is None:
                     continue
                 if ra is None:
@@ -1058,7 +1173,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     if allow_removals and _deleted_on_B(av):
                         remA.append(_minimal(av))
                     else:
-                        addB.append(_minimal_keep_rating(av))
+                        addB.append(_minimal_keep_rating(av, ratings_step, allow_zero=ratings_zero))
                     continue
                 if ra == rb:
                     continue
@@ -1066,19 +1181,20 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 ta = _rated_epoch(av)
                 tb = _rated_epoch(bv)
                 if ta is not None and tb is not None and ta != tb:
-                    win = a if ta > tb else b
+                    win = a_choice if ta > tb else b_choice
                 else:
                     win = prefer
-                if win == a:
-                    addB.append(_minimal_keep_rating(av))
+                win = choose_conflict(ctx, feature, ak, a_choice, b_choice, av, bv, win)
+                if win == a_choice:
+                    addB.append(_minimal_keep_rating(av, ratings_step, allow_zero=ratings_zero))
                 else:
-                    addA.append(_minimal_keep_rating(bv))
+                    addA.append(_minimal_keep_rating(bv, ratings_step, allow_zero=ratings_zero))
                 continue
 
             if allow_removals and _deleted_on_B(av):
                 remA.append(_minimal(av))
             else:
-                addB.append(_minimal_keep_rating(av))
+                addB.append(_minimal_keep_rating(av, ratings_step, allow_zero=ratings_zero))
 
         for bk, bv in (B_f or {}).items():
             if not isinstance(bv, Mapping) or str(bk) in matched_B:
@@ -1089,7 +1205,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             if allow_removals and _deleted_on_A(bv):
                 remB.append(_minimal(bv))
             else:
-                addA.append(_minimal_keep_rating(bv))
+                addA.append(_minimal_keep_rating(bv, ratings_step, allow_zero=ratings_zero))
 
         add_to_A = addA if allow_adds else []
         add_to_B = addB if allow_adds else []
@@ -1381,7 +1497,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
         bi = sync_cfg.get("bidirectional") or {}
         sot = (bi.get("source_of_truth") or bi.get("sourceOfTruth") or "").strip().upper()
-        prefer = sot if sot in (a, b) else a
+        prefer = next((choice for choice in (a_choice, b_choice) if choice.upper() == sot), a_choice)
 
         upB = {k: it for it in up_B if (k := _ck(it))}
         upA = {k: it for it in up_A if (k := _ck(it))}
@@ -1412,23 +1528,24 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 ta = _real_prog_epoch(a, a_it)
                 tb = _real_prog_epoch(b, b_it)
                 if ta is not None and tb is not None and ta != tb:
-                    win = a if ta > tb else b
+                    win = a_choice if ta > tb else b_choice
                 else:
                     msa = _prog_ms(a_it)
                     msb = _prog_ms(b_it)
                     if msa > 0 and msb > 0 and msa != msb:
-                        win = a if msa > msb else b
+                        win = a_choice if msa > msb else b_choice
                     else:
                         pca = _prog_percent(a_it)
                         pcb = _prog_percent(b_it)
                         if pca is not None and pcb is not None and abs(float(pca) - float(pcb)) > 0.1:
-                            win = a if float(pca) > float(pcb) else b
+                            win = a_choice if float(pca) > float(pcb) else b_choice
                         elif msa != msb:
-                            win = a if msa > msb else b
+                            win = a_choice if msa > msb else b_choice
                         else:
                             win = prefer
 
-                if win == a:
+                win = choose_conflict(ctx, feature, k, a_choice, b_choice, a_it, b_it, win)
+                if win == a_choice:
                     addB.append(_minimal_keep_progress(upB[k]))
                 else:
                     addA.append(_minimal_keep_progress(upA[k]))
@@ -1440,10 +1557,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 ta = _real_prog_epoch(a, clB[k])
                 tb = _real_prog_epoch(b, b_it)
                 if ta is not None and tb is not None and ta != tb:
-                    win = a if ta > tb else b
+                    win = a_choice if ta > tb else b_choice
                 else:
                     win = prefer
-                if win == a:
+                win = choose_conflict(ctx, feature, k, a_choice, b_choice, clB[k], b_it, win)
+                if win == a_choice:
                     if allow_removals:
                         remB.append(_minimal(clB[k]))
                 else:
@@ -1454,10 +1572,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 tb = _real_prog_epoch(b, clA[k])
                 ta = _real_prog_epoch(a, a_it)
                 if ta is not None and tb is not None and ta != tb:
-                    win = a if ta > tb else b
+                    win = a_choice if ta > tb else b_choice
                 else:
                     win = prefer
-                if win == b:
+                win = choose_conflict(ctx, feature, k, a_choice, b_choice, a_it, clA[k], win)
+                if win == b_choice:
                     if allow_removals:
                         remA.append(_minimal(clA[k]))
                 else:
@@ -1487,9 +1606,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             B_eff = filter_history_events(B_eff, event_mode=True)
             A_alias = _alias_index(A_eff)
             B_alias = _alias_index(B_eff)
-            bucket_sec = _hist_bucket_sec(a, b, feature)
-            missing_for_B, _ = history_event_diff(A_eff, B_eff, typed_tokens=_typed_tokens, bucket_sec=bucket_sec)
-            missing_for_A, _ = history_event_diff(B_eff, A_eff, typed_tokens=_typed_tokens, bucket_sec=bucket_sec)
+            missing_for_B, missing_for_A, history_matches = compare_history_events(
+                A_eff, B_eff, typed_tokens=_typed_tokens, tolerance_seconds=history_tolerance,
+            )
+            matched_history_to_B = set(history_matches)
+            matched_history_to_A = set(history_matches.values())
 
             for v in missing_for_B:
                 tomb_blocks = _tomb_blocks_remove(v, prev_self=prevA, prev_self_alias=prevA_alias)
@@ -1510,11 +1631,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         elif feature == "history":
             A_eff = {
                 k: v for k, v in A_eff.items()
-                if isinstance(v, Mapping) and (v.get("watched_at") or v.get("last_watched_at"))
+                if has_history_watch(v)
             }
             B_eff = {
                 k: v for k, v in B_eff.items()
-                if isinstance(v, Mapping) and (v.get("watched_at") or v.get("last_watched_at"))
+                if has_history_watch(v)
             }
             A_alias = _alias_index(A_eff)
             B_alias = _alias_index(B_eff)
@@ -1524,11 +1645,12 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 dst_eff: dict[str, Any],
                 dst_alias: dict[str, str],
                 target: list[dict[str, Any]],
+                corrected_keys: set[str],
             ) -> None:
                 seen: set[str] = {(_ck(it) or "") for it in target if isinstance(it, Mapping)}
                 source = manual_adds if isinstance(manual_adds, Mapping) else {}
                 for mk, mv in source.items():
-                    if not isinstance(mv, Mapping):
+                    if not isinstance(mv, Mapping) or mk in corrected_keys:
                         continue
                     dv = _find_in_idx(dst_eff, dst_alias, mv)
                     if not isinstance(dv, Mapping):
@@ -1544,9 +1666,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     target.append(upd)
 
             if _history_upsert_supported(bops, feature):
-                _append_manual_history_updates(manual_adds_A, B_eff, B_alias, upd_to_B)
+                _append_manual_history_updates(manual_adds_A, B_eff, B_alias, upd_to_B,
+                                               _manual_corrections(prev_state, a, feature, src_inst))
             if _history_upsert_supported(aops, feature):
-                _append_manual_history_updates(manual_adds_B, A_eff, A_alias, upd_to_A)
+                _append_manual_history_updates(manual_adds_B, A_eff, A_alias, upd_to_A,
+                                               _manual_corrections(prev_state, b, feature, dst_inst))
 
         bucket_sec = 0 if (feature == "history" and history_event_mode) else _hist_bucket_sec(a, b, feature)
         if bucket_sec and int(bucket_sec) > 1:
@@ -1588,7 +1712,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                         continue
                 else:
                     # Skip synthetic entries (no watched_at) key-matching helpers only.
-                    if not (v.get("watched_at") or v.get("last_watched_at")):
+                    if not has_history_watch(v):
                         continue
                     if _present(B_eff, B_alias, v):
                         continue
@@ -1609,7 +1733,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                         continue
                 else:
                     # Skip synthetic entries (no watched_at) key-matching helpers only.
-                    if not (v.get("watched_at") or v.get("last_watched_at")):
+                    if not has_history_watch(v):
                         continue
                     if _present(A_eff, A_alias, v):
                         continue
@@ -1620,30 +1744,46 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 else:
                     add_to_A.append(_minimal(v))
         elif not (feature == "history" and history_event_mode):
+            try:
+                unresolved_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
+                unresolved_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
+            except Exception:
+                unresolved_A = set()
+                unresolved_B = set()
             coord_pruned_to_B = 0
             coord_pruned_to_A = 0
             for _k, v in A_eff.items():
                 if _present(B_eff, B_alias, v):
                     if _coord_only_present(B_eff, B_alias, v):
+                        if _sync_key(v, str(_k)) in unresolved_B:
+                            add_to_B.append(_minimal(v))
+                            continue
                         coord_pruned_to_B += 1
                     continue
                 tomb_blocks = _tomb_blocks_remove(v, prev_self=prevA, prev_self_alias=prevA_alias)
-                if allow_removals and (tomb_blocks or (_ck(v) in obsB) or (_ck(v) in shrinkB)) and (_prev_had(prevB, prevB_alias, v) or tomb_blocks):
+                if allow_removals and (tomb_blocks or (b_sem == "present" and capB is not False and _deleted_on_B(v)) or (_ck(v) in shrinkB)) and (_prev_had(prevB, prevB_alias, v) or tomb_blocks):
                     rem_from_A.append(_minimal(v))
                 else:
                     add_to_B.append(_minimal(v))
             for _k, v in B_eff.items():
                 if _present(A_eff, A_alias, v):
                     if _coord_only_present(A_eff, A_alias, v):
+                        if _sync_key(v, str(_k)) in unresolved_A:
+                            add_to_A.append(_minimal(v))
+                            continue
                         coord_pruned_to_A += 1
                     continue
                 tomb_blocks = _tomb_blocks_remove(v, prev_self=prevB, prev_self_alias=prevB_alias)
-                if allow_removals and (tomb_blocks or (_ck(v) in obsA) or (_ck(v) in shrinkA)) and (_prev_had(prevA, prevA_alias, v) or tomb_blocks):
+                if allow_removals and (tomb_blocks or (a_sem == "present" and capA is not False and _deleted_on_A(v)) or (_ck(v) in shrinkA)) and (_prev_had(prevA, prevA_alias, v) or tomb_blocks):
                     rem_from_B.append(_minimal(v))
                 else:
                     add_to_A.append(_minimal(v))
             if coord_pruned_to_A or coord_pruned_to_B:
                 dbg("anime_mapping.coord_pruned", feature=feature, a=a, b=b, to_a=coord_pruned_to_A, to_b=coord_pruned_to_B)
+    add_to_A = groups.ordinary(0, add_to_A) + groups.adds[0]
+    add_to_B = groups.ordinary(1, add_to_B) + groups.adds[1]
+    upd_to_A, upd_to_B = groups.ordinary(0, upd_to_A), groups.ordinary(1, upd_to_B)
+    rem_from_A, rem_from_B = groups.ordinary(0, rem_from_A), groups.ordinary(1, rem_from_B)
     if not allow_adds:
         add_to_A.clear()
         add_to_B.clear()
@@ -1669,9 +1809,15 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         rem_from_B.clear()
         dbg("bootstrap.no-delete", a=a, b=b)
 
+    if not unresolved_A and not unresolved_B:
+        try:
+            unresolved_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
+            unresolved_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
+        except Exception:
+            unresolved_A = set()
+            unresolved_B = set()
+
     try:
-        unresolved_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-        unresolved_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
         retryA = sum(1 for it in add_to_A if _sync_key(it) in unresolved_A)
         retryB = sum(1 for it in add_to_B if _sync_key(it) in unresolved_B)
         if retryA:
@@ -1681,43 +1827,58 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     except Exception:
         pass
 
+    blocked_total = 0
     if feature != "watchlist":
-            add_to_A = apply_blocklist(
-                ctx.state_store,
-                add_to_A,
-                dst=a,
-                feature=feature,
-                pair_key=pair_key,
-                cross_feature_unresolved=_cross_feature_unresolved(feature),
-                ignore_pair_tomb=(str(feature or "").lower() in ("history", "ratings")),
-                emit=emit,
-            )
-            add_to_B = apply_blocklist(
-                ctx.state_store,
-                add_to_B,
-                dst=b,
-                feature=feature,
-                pair_key=pair_key,
-                cross_feature_unresolved=_cross_feature_unresolved(feature),
-                ignore_pair_tomb=(str(feature or "").lower() in ("history", "ratings")),
-                emit=emit,
-            )
+        before_blocklist_A = len(add_to_A)
+        add_to_A = apply_blocklist(
+            ctx.state_store,
+            add_to_A,
+            dst=a,
+            instance=a_cfg.get("_cw_provider_instance"),
+            feature=feature,
+            pair_key=pair_key,
+            cross_feature_unresolved=_cross_feature_unresolved(feature),
+            ignore_pair_tomb=(str(feature or "").lower() in ("history", "ratings")),
+            tomb_ttl_seconds=tomb_ttl_secs,
+            now=now,
+            observed_tombstones=observed_tombstones,
+            emit=emit,
+        )
+        blocked_total += max(0, before_blocklist_A - len(add_to_A))
+
+        before_blocklist_B = len(add_to_B)
+        add_to_B = apply_blocklist(
+            ctx.state_store,
+            add_to_B,
+            dst=b,
+            instance=b_cfg.get("_cw_provider_instance"),
+            feature=feature,
+            pair_key=pair_key,
+            cross_feature_unresolved=_cross_feature_unresolved(feature),
+            ignore_pair_tomb=(str(feature or "").lower() in ("history", "ratings")),
+            tomb_ttl_seconds=tomb_ttl_secs,
+            now=now,
+            observed_tombstones=observed_tombstones,
+            emit=emit,
+        )
+        blocked_total += max(0, before_blocklist_B - len(add_to_B))
 
     manual_blocked = 0
-    if manual_blocks_A:
+    manual_blocks = manual_blocks_A | manual_blocks_B
+    if manual_blocks:
         pre_add, pre_rem = len(add_to_A), len(rem_from_A)
-        add_to_A = _filter_manual_block(add_to_A, manual_blocks_A)
-        rem_from_A = _filter_manual_block(rem_from_A, manual_blocks_A)
+        add_to_A = groups.unblocked(add_to_A, manual_blocks)
+        rem_from_A = _filter_manual_block(rem_from_A, manual_blocks)
         blk = (pre_add - len(add_to_A)) + (pre_rem - len(rem_from_A))
         if blk:
             emit("debug", msg="blocked.counts", feature=feature, dst=a, pair=f"{a}-{b}",
                  blocked_manual=int(blk), blocked_total=int(blk))
         manual_blocked += blk
 
-    if manual_blocks_B:
+    if manual_blocks:
         pre_add, pre_rem = len(add_to_B), len(rem_from_B)
-        add_to_B = _filter_manual_block(add_to_B, manual_blocks_B)
-        rem_from_B = _filter_manual_block(rem_from_B, manual_blocks_B)
+        add_to_B = groups.unblocked(add_to_B, manual_blocks)
+        rem_from_B = _filter_manual_block(rem_from_B, manual_blocks)
         blk = (pre_add - len(add_to_B)) + (pre_rem - len(rem_from_B))
         if blk:
             emit("debug", msg="blocked.counts", feature=feature, dst=b, pair=f"{a}-{b}",
@@ -1729,6 +1890,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             ctx.stats_manual_blocked = int(getattr(ctx, "stats_manual_blocked", 0) or 0) + int(manual_blocked)
         except Exception:
             pass
+        blocked_total += int(manual_blocked)
 
     bb = ((cfg or {}).get("blackbox") if isinstance(cfg, dict) else getattr(cfg, "blackbox", {})) or {}
     use_phantoms = bool(bb.get("enabled") and bb.get("block_adds", True))
@@ -1738,9 +1900,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     guardB = PhantomGuard(src=a, dst=b, feature=feature, ttl_days=bb_ttl_days, enabled=use_phantoms)
 
     if use_phantoms and add_to_A:
-        add_to_A, _ = guardA.filter_adds(add_to_A, _sync_key, _sync_minimal, emit, ctx.state_store, pair_key)
+        add_to_A, blocked_A = guardA.filter_adds(add_to_A, _sync_key, _sync_minimal, emit, ctx.state_store, pair_key)
+        blocked_total += int(blocked_A or 0)
     if use_phantoms and add_to_B:
-        add_to_B, _ = guardB.filter_adds(add_to_B, _sync_key, _sync_minimal, emit, ctx.state_store, pair_key)
+        add_to_B, blocked_B = guardB.filter_adds(add_to_B, _sync_key, _sync_minimal, emit, ctx.state_store, pair_key)
+        blocked_total += int(blocked_B or 0)
 
     if feature == "ratings":
         upd_to_A = [it for it in add_to_A if _present(A_eff, A_alias, it)]
@@ -1755,6 +1919,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         src_eff: dict[str, Any],
         src_alias: dict[str, str],
         planned_items: list[dict[str, Any]],
+        instance: str | None = None,
     ) -> list[dict[str, Any]]:
         if not allow_removals:
             return planned_items
@@ -1762,7 +1927,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         retry: list[dict[str, Any]] = []
         stale: list[str] = []
         try:
-            pending = load_unresolved_pending(dst_name, feature)
+            pending = load_unresolved_pending(dst_name, feature, instance=instance)
         except Exception:
             pending = []
         for rec in pending or []:
@@ -1790,15 +1955,16 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             retry.append(_sync_minimal(dv))
         if stale and not dry_run_flag:
             try:
-                clear_unresolved(dst_name, feature, stale)
+                clear_unresolved(dst_name, feature, stale, instance=instance)
             except Exception:
                 pass
         if retry:
             emit("debug", msg="unresolved.remove_retry", feature=feature, dst=dst_name, count=len(retry))
         return list(planned_items) + retry
 
-    rem_from_A = _retry_pending_removes(a, A_eff, A_alias, B_eff, B_alias, rem_from_A)
-    rem_from_B = _retry_pending_removes(b, B_eff, B_alias, A_eff, A_alias, rem_from_B)
+    A_retry, A_retry_alias, B_retry, B_retry_alias = retry_scope or (A_eff, A_alias, B_eff, B_alias)
+    rem_from_A = _retry_pending_removes(a, A_retry, A_retry_alias, B_retry, B_retry_alias, rem_from_A, a_cfg.get("_cw_provider_instance"))
+    rem_from_B = _retry_pending_removes(b, B_retry, B_retry_alias, A_retry, A_retry_alias, rem_from_B, b_cfg.get("_cw_provider_instance"))
     retry_remove_keys = {k for k in (_sync_key(it) for it in (rem_from_A or []) + (rem_from_B or [])) if k}
     add_to_A = [it for it in add_to_A if _sync_key(it) not in retry_remove_keys]
     add_to_B = [it for it in add_to_B if _sync_key(it) not in retry_remove_keys]
@@ -1816,10 +1982,90 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         emit=emit, dbg=dbg, dst_name=b, feature=feature,
     )
 
+    if a in {"ANILIST", "KITSU", "MYANIMELIST"} or b in {"ANILIST", "KITSU", "MYANIMELIST"}:
+        anime_only_skipped = 0
+        if a in {"ANILIST", "KITSU", "MYANIMELIST"}:
+            add_to_A, anime_only_skipped = _anime_only_adds(add_to_A, provider_cfg, anime_pair_opts, feature, target=a)
+        if b in {"ANILIST", "KITSU", "MYANIMELIST"}:
+            add_to_B, skipped_b = _anime_only_adds(add_to_B, provider_cfg, anime_pair_opts, feature, target=b)
+            anime_only_skipped += skipped_b
+        if anime_only_skipped:
+            emit("debug", msg="anime_mapping.anime_only_filtered", feature=feature, a=a, b=b, skipped=anime_only_skipped)
+
+    library_skipped_A: list[tuple[Any, str]] = []
+    library_skipped_B: list[tuple[Any, str]] = []
+    if _library_presence.requested(feature, fcfg):
+        if add_to_A and not a_down and _library_presence.supported(aops, feature):
+            add_to_A, library_skipped_A, presence_error = _library_presence.split_absent(
+                aops, a_cfg, feature, add_to_A, call=provider_call,
+                known=(lambda it: _present(A_eff, A_alias, it)) if feature == "progress" else None,
+            )
+            emit("debug", msg="library_only.filtered", feature=feature, dst=a, pair=f"{a}-{b}",
+                 kept=len(add_to_A), skipped=len(library_skipped_A), error=presence_error or None)
+        if add_to_B and not b_down and _library_presence.supported(bops, feature):
+            add_to_B, library_skipped_B, presence_error = _library_presence.split_absent(
+                bops, b_cfg, feature, add_to_B, call=provider_call,
+                known=(lambda it: _present(B_eff, B_alias, it)) if feature == "progress" else None,
+            )
+            emit("debug", msg="library_only.filtered", feature=feature, dst=b, pair=f"{a}-{b}",
+                 kept=len(add_to_B), skipped=len(library_skipped_B), error=presence_error or None)
+
     emit("two:plan", a=a, b=b, feature=feature,
          add_to_A=len(add_to_A), add_to_B=len(add_to_B),
          upd_to_A=len(upd_to_A), upd_to_B=len(upd_to_B),
          rem_from_A=len(rem_from_A), rem_from_B=len(rem_from_B))
+    cancelled = cancelled or bool(cancel_requested())
+
+    if not (cancelled or dry_run_flag or a_down or b_down or A_suspect or B_suspect):
+        for provider, matched, items, instance in ((a, matched_history_to_A, B_eff, a_cfg.get("_cw_provider_instance")), (b, matched_history_to_B, A_eff, b_cfg.get("_cw_provider_instance"))):
+            if matched:
+                resolved = clear_matched_history_retries(provider, matched, instance=instance)
+                if resolved:
+                    resolved_items = {key: items[event_key] for key, event_key in resolved.items()}
+                    _emit_item_resolutions(emit, provider, feature, pair_key, resolved, resolved_items, instance=instance)
+
+    review = getattr(ctx, "interactive", None)
+    if review is not None:
+        planned_A, planned_B = list(add_to_A), list(add_to_B)
+        args_A = dict(source=b, source_instance=dst_inst, before=A_eff, down=a_down)
+        args_B = dict(source=a, source_instance=src_inst, before=B_eff, down=b_down)
+        review.excluded(feature, a, src_inst, "add", library_skipped_A, **args_A)
+        review.excluded(feature, b, dst_inst, "add", library_skipped_B, **args_B)
+        add_to_A = review.filter(feature, a, src_inst, "add", add_to_A, **args_A)
+        add_to_B = review.filter(feature, b, dst_inst, "add", add_to_B, **args_B)
+        upd_to_A = review.filter(feature, a, src_inst, "update", upd_to_A, **args_A)
+        upd_to_B = review.filter(feature, b, dst_inst, "update", upd_to_B, **args_B)
+        rem_from_A = review.filter(feature, a, src_inst, "remove", rem_from_A, **args_A)
+        rem_from_B = review.filter(feature, b, dst_inst, "remove", rem_from_B, **args_B)
+        if review.preview:
+            if (a_tags_dropped or b_tags_dropped) and not (a_down or b_down):
+                view_A = groups.restore(0, A_eff)
+                view_B = groups.restore(1, {path_native_keys_B.get(key, key): item for key, item in B_eff.items()})
+
+                def _with_planned(view: Mapping[str, Any], planned: list[dict[str, Any]]) -> dict[str, Any]:
+                    out = dict(view)
+                    for n, it in enumerate(planned):
+                        out.setdefault(_sync_key(_sync_minimal(it)) or f"planned:{n}", it)
+                    return out
+
+                if a_tags_dropped:
+                    preview_dropped_tags(
+                        review=review, src=a, src_inst=src_inst, dst=b, dst_inst=dst_inst, src_cfg=a_cfg, dst_ops=bops,
+                        feature=feature, source=view_A, source_tokens=tag_tokens_A, target=_with_planned(view_B, planned_B),
+                        target_tokens=lambda: tag_tokens_B or dropped_B or _load_provider_dropped_tokens(bops, b_cfg), down=b_down,
+                    )
+                if b_tags_dropped:
+                    preview_dropped_tags(
+                        review=review, src=b, src_inst=dst_inst, dst=a, dst_inst=src_inst, src_cfg=b_cfg, dst_ops=aops,
+                        feature=feature, source=view_B, source_tokens=tag_tokens_B, target=_with_planned(view_A, planned_A),
+                        target_tokens=lambda: tag_tokens_A or dropped_A or _load_provider_dropped_tokens(aops, a_cfg), down=a_down,
+                    )
+            return {"cancelled": cancelled, "library_skipped": len(library_skipped_A) + len(library_skipped_B)}
+
+    B_eff = {path_native_keys_B.get(key, key): item for key, item in B_eff.items()}
+    A_eff, B_eff = groups.restore(0, A_eff), groups.restore(1, B_eff)
+    tag_source_A = dict(A_eff) if a_tags_dropped else {}
+    tag_source_B = dict(B_eff) if b_tags_dropped else {}
 
     resA_rem: dict[str, Any] = {"ok": True, "count": 0}
     resB_rem: dict[str, Any] = {"ok": True, "count": 0}
@@ -1840,14 +2086,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             for it in (items or []):
                 try:
                     ck = _sync_key(_sync_minimal(it))
-                    if ck:
-                        tokens.add(ck)
                     if feature == "history" and history_event_mode:
-                        continue
-                    for idk, idv in ((it.get("ids") or {}) or {}).items():
-                        if idv is None or str(idv) == "":
-                            continue
-                        tokens.add(f"{str(idk).lower()}:{str(idv).lower()}")
+                        if ck:
+                            tokens.add(ck)
+                    else:
+                        tokens.update(media_tombstone_tokens(it, ck))
                 except Exception:
                     continue
 
@@ -1860,17 +2103,17 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         except Exception:
             pass
 
-    if rem_from_A:
+    if rem_from_A and not cancelled:
         if a_down:
-            record_unresolved(a, feature, rem_from_A, hint="provider_down:remove")
+            record_unresolved(a, feature, rem_from_A, hint="provider_down:remove", instance=a_cfg.get("_cw_provider_instance"))
             remove_unresolved_A = len(set(remA_keys))
             emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="remove", count=len(rem_from_A))
         else:
             emit("two:apply:remove:A:start", dst=a, feature=feature, count=len(rem_from_A))
             resA_rem = apply_remove(
-                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=rem_from_A,
+                dst_ops=aops, cfg=a_cfg, dst_name=a, feature=feature, items=rem_from_A,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a, src_inst),
             )
             decA_rem = compute_effective_remove(
                 attempted_keys=remA_keys,
@@ -1888,13 +2131,13 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     A_eff.pop(k, None)
                 _mark_tombs([it for it in rem_from_A if _sync_key(_sync_minimal(it)) in okA_set])
                 _bust_snapshot(a)
-                clear_unresolved(a, feature, okA_keys)
+                clear_unresolved(a, feature, okA_keys, instance=a_cfg.get("_cw_provider_instance"))
             if decA_rem["failed_keys"] and not dry_run_flag:
                 failA = set(decA_rem["failed_keys"])
                 record_unresolved(
                     a, feature,
                     [it for it in rem_from_A if _sync_key(_sync_minimal(it)) in failA],
-                    hint="two:apply:remove:unconfirmed",
+                    hint="two:apply:remove:unconfirmed", instance=a_cfg.get("_cw_provider_instance"),
                 )
 
             emit("two:apply:remove:A:done", dst=a, feature=feature,
@@ -1905,18 +2148,19 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                  unresolved=remove_unresolved_A,
                  errors=int(resA_rem.get("errors", 0)),
                  result=resA_rem)
+            cancelled = bool((resA_rem or {}).get("cancelled")) or bool(cancel_requested())
 
-    if rem_from_B:
+    if rem_from_B and not cancelled:
         if b_down:
-            record_unresolved(b, feature, rem_from_B, hint="provider_down:remove")
+            record_unresolved(b, feature, rem_from_B, hint="provider_down:remove", instance=b_cfg.get("_cw_provider_instance"))
             remove_unresolved_B = len(set(remB_keys))
             emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="remove", count=len(rem_from_B))
         else:
             emit("two:apply:remove:B:start", dst=b, feature=feature, count=len(rem_from_B))
             resB_rem = apply_remove(
-                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=rem_from_B,
+                dst_ops=bops, cfg=b_cfg, dst_name=b, feature=feature, items=rem_from_B,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b, dst_inst),
             )
             decB_rem = compute_effective_remove(
                 attempted_keys=remB_keys,
@@ -1934,13 +2178,13 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     B_eff.pop(k, None)
                 _mark_tombs([it for it in rem_from_B if _sync_key(_sync_minimal(it)) in okB_set])
                 _bust_snapshot(b)
-                clear_unresolved(b, feature, okB_keys)
+                clear_unresolved(b, feature, okB_keys, instance=b_cfg.get("_cw_provider_instance"))
             if decB_rem["failed_keys"] and not dry_run_flag:
                 failB = set(decB_rem["failed_keys"])
                 record_unresolved(
                     b, feature,
                     [it for it in rem_from_B if _sync_key(_sync_minimal(it)) in failB],
-                    hint="two:apply:remove:unconfirmed",
+                    hint="two:apply:remove:unconfirmed", instance=b_cfg.get("_cw_provider_instance"),
                 )
 
             emit("two:apply:remove:B:done", dst=b, feature=feature,
@@ -1951,6 +2195,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                  unresolved=remove_unresolved_B,
                  errors=int(resB_rem.get("errors", 0)),
                  result=resB_rem)
+            cancelled = bool((resB_rem or {}).get("cancelled")) or bool(cancel_requested())
 
     resA_add: dict[str, Any] = {"ok": True, "count": 0}
     resB_add: dict[str, Any] = {"ok": True, "count": 0}
@@ -1965,20 +2210,20 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     unresolved_new_A_total = 0
     unresolved_new_B_total = 0
 
-    if upd_to_A:
+    if upd_to_A and not cancelled:
         if a_down:
-            record_unresolved(a, feature, upd_to_A, hint="provider_down:update")
+            record_unresolved(a, feature, upd_to_A, hint="provider_down:update", instance=a_cfg.get("_cw_provider_instance"))
             emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="update", count=len(upd_to_A))
             unresolved_new_A_total += len(upd_to_A)
         else:
             emit("two:apply:update:A:start", dst=a, feature=feature, count=len(upd_to_A))
-            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
             resA_upd = apply_update(
-                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=upd_to_A,
+                dst_ops=aops, cfg=a_cfg, dst_name=a, feature=feature, items=upd_to_A,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a, src_inst),
             )
-            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
             prov_unresolved_keys_A_raw = (resA_upd or {}).get("unresolved_keys")
             prov_unresolved_keys_A: list[str] = (
                 [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
@@ -2004,21 +2249,22 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                  unresolved=int(resA_upd.get("unresolved", 0)),
                  errors=int(resA_upd.get("errors", 0)),
                  result=resA_upd)
+            cancelled = bool((resA_upd or {}).get("cancelled")) or bool(cancel_requested())
 
-    if upd_to_B:
+    if upd_to_B and not cancelled:
         if b_down:
-            record_unresolved(b, feature, upd_to_B, hint="provider_down:update")
+            record_unresolved(b, feature, upd_to_B, hint="provider_down:update", instance=b_cfg.get("_cw_provider_instance"))
             emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="update", count=len(upd_to_B))
             unresolved_new_B_total += len(upd_to_B)
         else:
             emit("two:apply:update:B:start", dst=b, feature=feature, count=len(upd_to_B))
-            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
             resB_upd = apply_update(
-                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=upd_to_B,
+                dst_ops=bops, cfg=b_cfg, dst_name=b, feature=feature, items=upd_to_B,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b, dst_inst),
             )
-            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
             prov_unresolved_keys_B_raw = (resB_upd or {}).get("unresolved_keys")
             prov_unresolved_keys_B: list[str] = (
                 [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
@@ -2044,16 +2290,17 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                  unresolved=int(resB_upd.get("unresolved", 0)),
                  errors=int(resB_upd.get("errors", 0)),
                  result=resB_upd)
+            cancelled = bool((resB_upd or {}).get("cancelled")) or bool(cancel_requested())
 
-    if add_to_A:
+    if add_to_A and not cancelled:
         if a_down:
-            record_unresolved(a, feature, add_to_A, hint="provider_down:add")
+            record_unresolved(a, feature, add_to_A, hint="provider_down:add", instance=a_cfg.get("_cw_provider_instance"))
             emit("writes:skipped", dst=a, feature=feature, reason="provider_down", op="add", count=len(add_to_A))
             unresolved_new_A_total += len(add_to_A)
         else:
             emit("two:apply:add:A:start", dst=a, feature=feature, count=len(add_to_A))
-            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            _ = set(load_blackbox_keys(a, feature, pair=pair_key) or [])
+            unresolved_before_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
+            _ = set(load_blackbox_keys(a, feature, pair=pair_key, instance=a_cfg.get("_cw_provider_instance")) or [])
             attempted_A: list[str] = []
             seen_A: set[str] = set()
             k2i_A: dict[str, Any] = {}
@@ -2066,11 +2313,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 k2i_A[k] = _sync_minimal(it)
             
             resA_add = apply_add(
-                dst_ops=aops, cfg=provider_cfg, dst_name=a, feature=feature, items=add_to_A,
+                dst_ops=aops, cfg=a_cfg, dst_name=a, feature=feature, items=add_to_A,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a),
+                chunk_size=effective_chunk_size(ctx, a), chunk_pause_ms=_pause_for(a, src_inst),
             )
-            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_after_A = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
             prov_unresolved_keys_A_raw = (resA_add or {}).get("unresolved_keys")
             prov_unresolved_keys_A: list[str] = (
                 [str(x) for x in prov_unresolved_keys_A_raw if x] if isinstance(prov_unresolved_keys_A_raw, list) else []
@@ -2078,7 +2325,12 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             prov_unresolved_set_A: set[str] = set(prov_unresolved_keys_A)
 
             new_unresolved_A = (unresolved_after_A - unresolved_before_A) | (prov_unresolved_set_A - unresolved_before_A)
-            still_unresolved_A = set(attempted_A) & (unresolved_after_A | prov_unresolved_set_A)
+            still_unresolved_A = current_attempt_unresolved_keys(
+                attempted_A,
+                unresolved_before_A,
+                unresolved_after_A,
+                prov_unresolved_set_A,
+            )
             unresolved_new_A_total += len(still_unresolved_A)
    
             prov_confirmed_keys_A_raw = (resA_add or {}).get("confirmed_keys")
@@ -2103,7 +2355,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         
             if verify_after_write and _apply_verify_after_write_supported(aops):
                 try:
-                    unresolved_again = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+                    unresolved_again = set(load_unresolved_keys(a, feature, cross_features=_cross_feature_unresolved(feature), instance=a_cfg.get("_cw_provider_instance")) or [])
                     confirmed_A = [k for k in confirmed_A if k not in unresolved_again]
                 except Exception:
                     pass
@@ -2132,24 +2384,23 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 if failed_A and not ambiguous_partial_A and not dry_run_flag:
                     _bb_A = record_attempts(a, feature, failed_A,
                         reason="two:apply:add:failed", op="add",
-                        pair=pair_key, cfg=cfg)
+                        pair=pair_key, cfg=cfg, instance=a_cfg.get("_cw_provider_instance"))
                     promoted_A = {str(x) for x in ((_bb_A or {}).get("promoted_keys") or []) if x}
                     failed_items_A = [k2i_A[k] for k in failed_A if k in k2i_A and k not in promoted_A]
                     if failed_items_A:
-                        record_unresolved(a, feature, failed_items_A, hint="apply:add:failed")
+                        record_unresolved(a, feature, failed_items_A, hint="apply:add:failed", instance=a_cfg.get("_cw_provider_instance"))
                     if promoted_A:
-                        clear_unresolved(a, feature, promoted_A)
-                        unresolved_new_A_total = max(0, unresolved_new_A_total - len(promoted_A & set(still_unresolved_A)))
+                        clear_unresolved(a, feature, promoted_A, instance=a_cfg.get("_cw_provider_instance"))
                         
-                    _emit_item_failures(emit, a, feature, pair_key, failed_A, k2i_A, _bb_A)
+                    _emit_item_failures(emit, a, feature, pair_key, failed_A, k2i_A, _bb_A, instance=a_cfg.get("_cw_provider_instance"))
                
                 if success_A and not dry_run_flag:
-                    record_success(a, feature, success_A, pair=pair_key, cfg=cfg)
-                    clear_unresolved(a, feature, success_A)
+                    record_success(a, feature, success_A, pair=pair_key, cfg=cfg, instance=a_cfg.get("_cw_provider_instance"))
+                    clear_unresolved(a, feature, success_A, instance=a_cfg.get("_cw_provider_instance"))
                     unresolved_new_A_total = max(0, unresolved_new_A_total - len(set(success_A) & set(still_unresolved_A)))
                     resolved_A = [k for k in success_A if k in unresolved_before_A]
                     if resolved_A:
-                        _emit_item_resolutions(emit, a, feature, pair_key, resolved_A, k2i_A)
+                        _emit_item_resolutions(emit, a, feature, pair_key, resolved_A, k2i_A, instance=a_cfg.get("_cw_provider_instance"))
                     clear_items_for_feature(
                         ctx.state_store,
                         dbg,
@@ -2177,16 +2428,17 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                  unresolved=int(resA_add.get("unresolved", 0)),
                  errors=int(resA_add.get("errors", 0)),
                  result=resA_add)
+            cancelled = bool((resA_add or {}).get("cancelled")) or bool(cancel_requested())
 
-    if add_to_B:
+    if add_to_B and not cancelled:
         if b_down:
-            record_unresolved(b, feature, add_to_B, hint="provider_down:add")
+            record_unresolved(b, feature, add_to_B, hint="provider_down:add", instance=b_cfg.get("_cw_provider_instance"))
             emit("writes:skipped", dst=b, feature=feature, reason="provider_down", op="add", count=len(add_to_B))
             unresolved_new_B_total += len(add_to_B)
         else:
             emit("two:apply:add:B:start", dst=b, feature=feature, count=len(add_to_B))
-            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            _ = set(load_blackbox_keys(b, feature, pair=pair_key) or [])
+            unresolved_before_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
+            _ = set(load_blackbox_keys(b, feature, pair=pair_key, instance=b_cfg.get("_cw_provider_instance")) or [])
             attempted_B: list[str] = []
             seen_B: set[str] = set()
             k2i_B: dict[str, Any] = {}
@@ -2199,11 +2451,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 k2i_B[k] = _sync_minimal(it)
             
             resB_add = apply_add(
-                dst_ops=bops, cfg=provider_cfg, dst_name=b, feature=feature, items=add_to_B,
+                dst_ops=bops, cfg=b_cfg, dst_name=b, feature=feature, items=add_to_B,
                 dry_run=dry_run_flag, emit=emit, dbg=dbg,
-                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b),
+                chunk_size=effective_chunk_size(ctx, b), chunk_pause_ms=_pause_for(b, dst_inst),
             )
-            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_after_B = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
             prov_unresolved_keys_B_raw = (resB_add or {}).get("unresolved_keys")
             prov_unresolved_keys_B: list[str] = (
                 [str(x) for x in prov_unresolved_keys_B_raw if x] if isinstance(prov_unresolved_keys_B_raw, list) else []
@@ -2211,7 +2463,12 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             prov_unresolved_set_B: set[str] = set(prov_unresolved_keys_B)
 
             new_unresolved_B = (unresolved_after_B - unresolved_before_B) | (prov_unresolved_set_B - unresolved_before_B)
-            still_unresolved_B = set(attempted_B) & (unresolved_after_B | prov_unresolved_set_B)
+            still_unresolved_B = current_attempt_unresolved_keys(
+                attempted_B,
+                unresolved_before_B,
+                unresolved_after_B,
+                prov_unresolved_set_B,
+            )
             unresolved_new_B_total += len(still_unresolved_B)
            
             prov_confirmed_keys_B_raw = (resB_add or {}).get("confirmed_keys")
@@ -2236,7 +2493,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         
             if verify_after_write and _apply_verify_after_write_supported(bops):
                 try:
-                    unresolved_again = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+                    unresolved_again = set(load_unresolved_keys(b, feature, cross_features=_cross_feature_unresolved(feature), instance=b_cfg.get("_cw_provider_instance")) or [])
                     confirmed_B = [k for k in confirmed_B if k not in unresolved_again]
                 except Exception:
                     pass
@@ -2265,24 +2522,23 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 if failed_B and not ambiguous_partial_B and not dry_run_flag:
                     _bb_B = record_attempts(b, feature, failed_B,
                         reason="two:apply:add:failed", op="add",
-                        pair=pair_key, cfg=cfg)
+                        pair=pair_key, cfg=cfg, instance=b_cfg.get("_cw_provider_instance"))
                     promoted_B = {str(x) for x in ((_bb_B or {}).get("promoted_keys") or []) if x}
                     failed_items_B = [k2i_B[k] for k in failed_B if k in k2i_B and k not in promoted_B]
                     if failed_items_B:
-                        record_unresolved(b, feature, failed_items_B, hint="apply:add:failed")
+                        record_unresolved(b, feature, failed_items_B, hint="apply:add:failed", instance=b_cfg.get("_cw_provider_instance"))
                     if promoted_B:
-                        clear_unresolved(b, feature, promoted_B)
-                        unresolved_new_B_total = max(0, unresolved_new_B_total - len(promoted_B & set(still_unresolved_B)))
+                        clear_unresolved(b, feature, promoted_B, instance=b_cfg.get("_cw_provider_instance"))
                         
-                    _emit_item_failures(emit, b, feature, pair_key, failed_B, k2i_B, _bb_B)
+                    _emit_item_failures(emit, b, feature, pair_key, failed_B, k2i_B, _bb_B, instance=b_cfg.get("_cw_provider_instance"))
                 
                 if success_B and not dry_run_flag:
-                    record_success(b, feature, success_B, pair=pair_key, cfg=cfg)
-                    clear_unresolved(b, feature, success_B)
+                    record_success(b, feature, success_B, pair=pair_key, cfg=cfg, instance=b_cfg.get("_cw_provider_instance"))
+                    clear_unresolved(b, feature, success_B, instance=b_cfg.get("_cw_provider_instance"))
                     unresolved_new_B_total = max(0, unresolved_new_B_total - len(set(success_B) & set(still_unresolved_B)))
                     resolved_B = [k for k in success_B if k in unresolved_before_B]
                     if resolved_B:
-                        _emit_item_resolutions(emit, b, feature, pair_key, resolved_B, k2i_B)
+                        _emit_item_resolutions(emit, b, feature, pair_key, resolved_B, k2i_B, instance=b_cfg.get("_cw_provider_instance"))
                     clear_items_for_feature(
                         ctx.state_store,
                         dbg,
@@ -2310,6 +2566,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                  unresolved=int(resB_add.get("unresolved", 0)),
                  errors=int(resB_add.get("errors", 0)),
                  result=resB_add)
+            cancelled = bool((resB_add or {}).get("cancelled")) or bool(cancel_requested())
 
     def _post_apply_refresh(prov: str, inst: str, res: dict[str, Any] | None, ops: Any, eff: dict[str, Any], down: bool) -> None:
         if dry_run_flag or down or not needs_post_apply_refresh(res):
@@ -2322,7 +2579,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
              presence_confirmed_keys=len(r.get("presence_confirmed_keys") or []))
         try:
             refreshed = refresh_destination_after_apply(
-                ops=ops, config=provider_cfg, feature=feature, provider=prov, snap_cache=ctx.snap_cache,
+                ops=ops, config=pair_endpoint_config(provider_cfg, prov, inst), feature=feature, provider=prov, snap_cache=ctx.snap_cache,
             )
         except Exception:
             refreshed = None
@@ -2331,17 +2588,50 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             for rk, rv in refreshed.items():
                 if rk not in eff:
                     base_update += 1
-                eff[rk] = rv
+                if feature == "collection" and isinstance(eff.get(rk), Mapping) and isinstance(rv, Mapping):
+                    merged = dict(eff[rk])
+                    for kk, vv in rv.items():
+                        if kk in ("ids", "show_ids") and isinstance(merged.get(kk), Mapping) and isinstance(vv, Mapping):
+                            ids = dict(merged.get(kk) or {})
+                            for idk, idv in vv.items():
+                                if ids.get(idk) in (None, "") and idv not in (None, ""):
+                                    ids[idk] = idv
+                            merged[kk] = ids
+                        elif merged.get(kk) in (None, "") and vv not in (None, ""):
+                            merged[kk] = vv
+                    eff[rk] = merged
+                else:
+                    eff[rk] = rv
         tk = str(os.environ.get("CW_PLEX_TRACE_KEY", "") or "").strip().lower()
         contains_trace = bool(tk) and any(str(k).split("@", 1)[0].lower() == tk for k in (refreshed or {}))
         emit("post_apply_refresh:done", provider=prov, instance=inst, feature=feature,
              refreshed_count=len(refreshed or {}), first_keys=list(refreshed or {})[:10],
              contains_trace_key=contains_trace, baseline_update_count=base_update)
 
-    _post_apply_refresh(a, src_inst, post_apply_A_res, aops, A_eff, a_down)
-    _post_apply_refresh(b, dst_inst, post_apply_B_res, bops, B_eff, b_down)
+    if not cancelled:
+        _post_apply_refresh(a, src_inst, post_apply_A_res, aops, A_eff, a_down)
+        _post_apply_refresh(b, dst_inst, post_apply_B_res, bops, B_eff, b_down)
+
+    if a_tags_dropped and not (cancelled or a_down or b_down):
+        apply_dropped_tags(
+            src=a, dst=b, src_cfg=a_cfg, dst_ops=bops, dst_cfg=b_cfg, feature=feature,
+            source=tag_source_A, source_tokens=tag_tokens_A,
+            target=with_written(B_eff, add_to_B, post_apply_B_res, lambda it: _sync_key(_sync_minimal(it))),
+            target_tokens=lambda: tag_tokens_B or dropped_B or _load_provider_dropped_tokens(bops, b_cfg),
+            dry_run=dry_run_flag, emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst,
+        )
+    if b_tags_dropped and not (cancelled or a_down or b_down):
+        apply_dropped_tags(
+            src=b, dst=a, src_cfg=b_cfg, dst_ops=aops, dst_cfg=a_cfg, feature=feature,
+            source=tag_source_B, source_tokens=tag_tokens_B,
+            target=with_written(A_eff, add_to_A, post_apply_A_res, lambda it: _sync_key(_sync_minimal(it))),
+            target_tokens=lambda: tag_tokens_A or dropped_A or _load_provider_dropped_tokens(aops, a_cfg),
+            dry_run=dry_run_flag, emit=emit, review=review, src_inst=dst_inst, dst_inst=src_inst,
+        )
 
     try:
+        if cancelled:
+            raise RuntimeError("sync cancelled before checkpoint persistence")
         if not getattr(ctx, "write_state_json", True):
             raise RuntimeError("legacy state persistence disabled")
 
@@ -2467,8 +2757,13 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 return out
 
             B_eff = _rekey_to_other(B_eff, A_eff)
-        _commit_baseline(provs_block, a, src_inst, feature, A_eff)
-        _commit_baseline(provs_block, b, dst_inst, feature, B_eff)
+        if review is not None:
+            if review.retain_deferred(feature, a, src_inst, A_eff, prevA, _sync_key):
+                now_cp_A = prev_cp_A
+            if review.retain_deferred(feature, b, dst_inst, B_eff, prevB, _sync_key):
+                now_cp_B = prev_cp_B
+        _commit_baseline(provs_block, a, src_inst, feature, specials_keep_A | A_eff)
+        _commit_baseline(provs_block, b, dst_inst, feature, specials_keep_B | B_eff)
         _commit_checkpoint(provs_block, a, src_inst, feature, now_cp_A)
         _commit_checkpoint(provs_block, b, dst_inst, feature, now_cp_B)
 
@@ -2478,8 +2773,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             (str(b).upper(), str(dst_inst or "default"), str(feature).lower()): _ensure_pf(provs_block, b, dst_inst, feature),
         }
         ctx.state_store.save_feature_blocks(blocks, last_sync_epoch=last_sync_epoch)
+        if not dry_run_flag:
+            groups.commit([A_eff, B_eff])
     except Exception:
-        pass
+        if getattr(ctx.state_store, "pair_scope", None):
+            raise
 
     emit("two:done", a=a, b=b, feature=feature,
          upd_to_A=eff_upd_A, upd_to_B=eff_upd_B,
@@ -2510,7 +2808,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         "unresolved_to_B": unresolved_B_total,
         "unresolved": unresolved_total,
         "skipped": skipped_total,
+        "blocked": int(blocked_total),
+        "manual_excluded": int(manual_blocked),
+        "library_skipped": len(library_skipped_A) + len(library_skipped_B),
         "errors": errors_total,
+        "cancelled": bool(cancelled or cancel_requested()),
     }
 
 def run_two_way_feature(

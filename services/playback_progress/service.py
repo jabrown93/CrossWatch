@@ -7,18 +7,20 @@ import math
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, cast
 
 from _logging import log as BASE_LOG
 from cw_platform.config_base import load_config, save_config
+from cw_platform.profile_preferences import display_timezone
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 from cw_platform.orchestrator._progress_completion import progress_caps_from_ops, progress_write_completion_policy
 from cw_platform.provider_instances import build_provider_config_view, get_instance_block, get_provider_block, list_instance_ids, normalize_instance_id
 
 from .adapters.base import PlaybackProgressAdapter, configured_label
 from .adapters.crosswatch import CrossWatchPlaybackAdapter
+from .adapters.flicklist import FlickListPlaybackAdapter
 from .adapters.floppy import FloppyPlaybackAdapter
 from .adapters.media_servers import EmbyPlaybackAdapter, JellyfinPlaybackAdapter, KodiPlaybackAdapter, PlexPlaybackAdapter
 from .adapters.mdblist import MDBListPlaybackAdapter
@@ -29,6 +31,7 @@ from .adapters.scrob import ScrobPlaybackAdapter
 from .adapters.simkl import SimklPlaybackAdapter
 from .adapters.stremio import StremioPlaybackAdapter
 from .adapters.trakt import TraktPlaybackAdapter
+from .adapters.wetrakr import WeTrakrPlaybackAdapter
 from .models import PlaybackActionResult, PlaybackCapabilities, PlaybackListResult, clean_mapping, utc_now_iso
 
 
@@ -36,8 +39,9 @@ LOG = BASE_LOG.child("PLAYBACK")
 CACHE_TTL_SECONDS = 60.0
 MAX_WORKERS = 6
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 20.0
+FIRST_RESPONSE_SECONDS = 2.5
 GROUP_PROGRESS_TOLERANCE = 2.0
-PHASE1_PROVIDERS = ("crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "punchplay", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy", "scrob")
+PHASE1_PROVIDERS = ("crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "wetrakr", "punchplay", "flicklist", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy", "scrob")
 SORT_VALUES = {"last_updated", "progress_high", "progress_low", "remaining_time", "rating_high", "title", "provider"}
 LIVE_MEDIA_PROVIDERS = {"plex", "emby", "jellyfin", "kodi"}
 LIVE_ACTIVE_STATES = {"playing", "paused", "buffering"}
@@ -45,6 +49,7 @@ LIVE_MAX_AGE_SECONDS = 10 * 60
 CANONICAL_TMDB_RE = re.compile(r"^tmdb:(\d+)(?:#|$)", re.I)
 EDITABLE_PROGRESS_MIN_PERCENT = 2.0
 EDITABLE_PROGRESS_DEFAULT_MAX_EXCLUSIVE = 100.0
+GROUP_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "wetrakr")
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -77,6 +82,58 @@ def _group_number(value: Any) -> str:
         return str(int(value))
     except Exception:
         return str(value).strip().lower()
+
+
+def _group_id_value(provider: str, value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if provider == "imdb" and text.isdigit():
+        text = f"tt{text}"
+    return text.lower()
+
+
+def _canonical_id_pair(value: Any) -> tuple[str, str] | None:
+    text = str(value or "").strip()
+    if not text or text.lower().startswith("unknown:"):
+        return None
+    base = text.split("#", 1)[0].strip()
+    if ":" not in base:
+        return None
+    provider, ident = base.split(":", 1)
+    provider = provider.strip().lower()
+    ident = _group_id_value(provider, ident)
+    if provider not in GROUP_ID_KEYS or not ident:
+        return None
+    return provider, ident
+
+
+def _record_movie_id_aliases(item: Mapping[str, Any]) -> list[str]:
+    ids = _as_mapping(item.get("ids"))
+    aliases: list[str] = []
+    canonical = _canonical_id_pair(item.get("canonical_key"))
+    if canonical:
+        aliases.append(f"{canonical[0]}:{canonical[1]}")
+    for provider in GROUP_ID_KEYS:
+        value = ids.get(provider) or item.get(provider)
+        ident = _group_id_value(provider, value)
+        if ident:
+            aliases.append(f"{provider}:{ident}")
+    return list(dict.fromkeys(aliases))
+
+
+def _record_show_id_aliases(item: Mapping[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    canonical = _canonical_id_pair(item.get("canonical_key"))
+    if canonical:
+        aliases.append(f"{canonical[0]}:{canonical[1]}")
+    show_ids = _show_ids_for_artwork(item)
+    for provider in GROUP_ID_KEYS:
+        value = show_ids.get(provider)
+        ident = _group_id_value(provider, value)
+        if ident:
+            aliases.append(f"{provider}:{ident}")
+    return list(dict.fromkeys(aliases))
 
 
 def _live_source_provider(value: Any) -> str:
@@ -278,6 +335,14 @@ def _record_group_keys(item: Mapping[str, Any]) -> list[str]:
     if key and not key.startswith("unknown:"):
         keys.append(f"key:{key}:profile:{profile}")
     media_type = _group_text(item.get("media_type"))
+    if media_type == "movie":
+        for alias in _record_movie_id_aliases(item):
+            keys.append(f"id:movie:{alias}:profile:{profile}")
+    elif media_type in {"episode", "anime_episode"}:
+        season = _group_number(item.get("season"))
+        episode = _group_number(item.get("episode"))
+        for alias in _record_show_id_aliases(item):
+            keys.append(f"id:episode:{alias}:{season}:{episode}:profile:{profile}")
     title = _group_text(item.get("title"))
     series = _group_text(item.get("series_title"))
     season = _group_number(item.get("season"))
@@ -603,6 +668,33 @@ def _group_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _paused_month(item: Mapping[str, Any], display_tz: str = "UTC") -> str:
+    dt = _parse_iso(item.get("updated_at") or item.get("progress_at"))
+    return dt.astimezone(display_timezone(display_tz)).strftime("%Y-%m") if dt else ""
+
+
+def _playback_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
+    stale_before = datetime.now(timezone.utc) - timedelta(days=30)
+    summary = {"total": len(rows), "movies": 0, "episodes": 0, "anime": 0, "almost_done": 0, "stale": 0}
+    for row in rows:
+        media = str(row.get("media_type") or "").lower()
+        if media == "movie":
+            summary["movies"] += 1
+        elif media == "anime_episode":
+            summary["anime"] += 1
+        elif media:
+            summary["episodes"] += 1
+        try:
+            if row.get("progress_percent") is not None and float(row["progress_percent"]) >= 90:
+                summary["almost_done"] += 1
+        except (TypeError, ValueError):
+            pass
+        paused = _parse_iso(row.get("updated_at") or row.get("progress_at"))
+        if paused and paused < stale_before:
+            summary["stale"] += 1
+    return summary
+
+
 def _duration_seconds_from_record(record: Mapping[str, Any]) -> int | None:
     try:
         duration = record.get("duration_seconds")
@@ -686,6 +778,7 @@ def _instance_label(cfg: Mapping[str, Any], provider: str, instance_id: str) -> 
         "simkl": "SIMKL",
         "mdblist": "MDBList",
         "publicmetadb": "PublicMetaDB",
+        "wetrakr": "WeTrakr",
         "plex": "Plex",
         "emby": "Emby",
         "jellyfin": "Jellyfin",
@@ -728,10 +821,10 @@ def _path_value(block: Mapping[str, Any], path: str) -> Any:
 
 def _profile_has_explicit_identity(cfg: Mapping[str, Any], provider: str, instance_id: Any) -> bool:
     inst = normalize_instance_id(instance_id)
-    if inst == "default":
-        return True
     provider_key = str(provider or "").strip().lower()
     if provider_key in {"cw", "crosswatch"}:
+        if inst == "default":
+            return True
         base = cfg.get("crosswatch") if isinstance(cfg, Mapping) else None
         insts = (base or {}).get("instances") if isinstance(base, Mapping) else None
         return bool(isinstance(insts, Mapping) and inst in insts and isinstance(insts.get(inst), Mapping))
@@ -741,6 +834,7 @@ def _profile_has_explicit_identity(cfg: Mapping[str, Any], provider: str, instan
     identity_paths = {
         "trakt": ("access_token", "token", "oauth.access_token"),
         "simkl": ("access_token", "token", "oauth.access_token"),
+        "wetrakr": ("access_token", "refresh_token"),
         "mdblist": ("access_token", "api_key", "key"),
         "publicmetadb": ("api_key",),
         "plex": (
@@ -764,6 +858,7 @@ def _profile_has_explicit_identity(cfg: Mapping[str, Any], provider: str, instan
         "stremio": ("auth_key", "authKey"),
         "floppy": ("server_url", "api_token"),
         "punchplay": ("access_token", "refresh_token", "user_id", "username"),
+        "flicklist": ("api_key", "access_token", "token", "username", "user_id"),
         "scrob": ("server_url", "api_key", "username"),
     }.get(str(provider or "").strip().lower(), ())
     return any(str(_path_value(raw, path) or "").strip() for path in identity_paths)
@@ -826,6 +921,7 @@ class PlaybackProgressService:
     def __init__(self) -> None:
         self.adapters: dict[str, PlaybackProgressAdapter] = {
             "trakt": TraktPlaybackAdapter(),
+            "wetrakr": WeTrakrPlaybackAdapter(),
             "simkl": SimklPlaybackAdapter(),
             "mdblist": MDBListPlaybackAdapter(),
             "publicmetadb": PublicMetaDBPlaybackAdapter(),
@@ -837,11 +933,14 @@ class PlaybackProgressService:
             "stremio": StremioPlaybackAdapter(),
             "floppy": FloppyPlaybackAdapter(),
             "punchplay": PunchPlayPlaybackAdapter(),
+            "flicklist": FlickListPlaybackAdapter(),
             "scrob": ScrobPlaybackAdapter(),
             "crosswatch": CrossWatchPlaybackAdapter(),
         }
         self._cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self._inflight: dict[tuple[str, str, str], tuple[Future[PlaybackListResult], float]] = {}
+        self._pool = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2, thread_name_prefix="playback-list")
 
     def _adapter(self, provider: str) -> PlaybackProgressAdapter | None:
         provider_key = str(provider or "").strip().lower()
@@ -912,7 +1011,26 @@ class PlaybackProgressService:
             prefix = (str(provider).lower(), normalize_instance_id(instance_id))
             for key in [key for key in self._cache if key[:2] == prefix]:
                 self._cache.pop(key, None)
+            for key in [key for key in self._inflight if key[:2] == prefix]:
+                self._inflight.pop(key, None)
         LOG.debug(f"cache invalidated provider={provider} instance={normalize_instance_id(instance_id)}")
+
+    def _submit_list(self, cfg: Mapping[str, Any], spec: Mapping[str, str], force_refresh: bool) -> tuple[Future[PlaybackListResult], float]:
+        key = self._cache_key(spec["provider"], spec["instance_id"], self._adapter(spec["provider"]))
+        with self._lock:
+            running = self._inflight.get(key)
+            if running and not running[0].done():
+                return running
+            entry = (self._pool.submit(self._list_one, cfg, spec, force_refresh), time.monotonic())
+            self._inflight[key] = entry
+
+        def _release(future: Future[PlaybackListResult]) -> None:
+            with self._lock:
+                if self._inflight.get(key, (None, 0.0))[0] is future:
+                    self._inflight.pop(key, None)
+
+        entry[0].add_done_callback(_release)
+        return entry
 
     def _activity_marker(self, adapter: PlaybackProgressAdapter, config_view: Mapping[str, Any], *, instance_id: str) -> str:
         marker_fn = getattr(adapter, "activity_marker", None)
@@ -1010,6 +1128,10 @@ class PlaybackProgressService:
         page_size: int = 50,
         force_refresh: bool = False,
         user_filter: Mapping[str, Any] | None = None,
+        month: str | None = None,
+        display_tz: str = "UTC",
+        tmdb: str | None = None,
+        progressive: bool = False,
     ) -> dict[str, Any]:
         cfg = load_config()
         provider_filter = str(provider or "").strip().lower()
@@ -1036,35 +1158,41 @@ class PlaybackProgressService:
             f"provider_filter={provider_filter or 'all'} instance_filter={instance_filter or 'all'}"
         )
         results: list[PlaybackListResult] = []
+        loading: list[dict[str, Any]] = []
         if readable_specs:
-            pool = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(readable_specs)))
-            future_specs = {pool.submit(self._list_one, cfg, spec, force_refresh): spec for spec in readable_specs}
-            try:
-                done, pending = wait(future_specs, timeout=_provider_timeout_seconds(cfg))
-                for future in done:
+            timeout_s = _provider_timeout_seconds(cfg)
+            jobs = [(spec, *self._submit_list(cfg, spec, force_refresh)) for spec in readable_specs]
+            now = time.monotonic()
+            budget = max(0.0, max(timeout_s - (now - started) for _spec, _future, started in jobs))
+            wait([future for _spec, future, _started in jobs], timeout=min(budget, FIRST_RESPONSE_SECONDS) if progressive else budget)
+            now = time.monotonic()
+            for spec, future, started in jobs:
+                if future.done():
                     try:
                         results.append(future.result())
                     except Exception:
-                        results.append(PlaybackListResult(ok=False, provider="unknown", instance_id="", error_code="provider_error", message="Provider request failed.", retryable=True))
-                for future in pending:
-                    spec = future_specs[future]
-                    future.cancel()
-                    LOG.warn(
-                        f"provider timeout provider={spec['provider']} instance={spec['instance_id']} "
-                        f"timeout_s={_provider_timeout_seconds(cfg):g}"
+                        results.append(PlaybackListResult(ok=False, provider=spec["provider"], instance_id=spec["instance_id"], error_code="provider_error", message="Provider request failed.", retryable=True))
+                    continue
+                if progressive and now - started < timeout_s:
+                    cap = cap_by_key.get((spec["provider"], spec["instance_id"]))
+                    loading.append({
+                        "provider": spec["provider"],
+                        "provider_label": cap.provider_label if cap else spec["provider"],
+                        "instance_id": spec["instance_id"],
+                        "instance_label": spec["instance_label"],
+                    })
+                    continue
+                LOG.warn(f"provider timeout provider={spec['provider']} instance={spec['instance_id']} timeout_s={timeout_s:g}")
+                results.append(
+                    PlaybackListResult(
+                        ok=False,
+                        provider=spec["provider"],
+                        instance_id=spec["instance_id"],
+                        error_code="provider_timeout",
+                        message="Provider did not respond quickly enough. It was skipped for this refresh.",
+                        retryable=True,
                     )
-                    results.append(
-                        PlaybackListResult(
-                            ok=False,
-                            provider=spec["provider"],
-                            instance_id=spec["instance_id"],
-                            error_code="provider_timeout",
-                            message="Provider did not respond quickly enough. It was skipped for this refresh.",
-                            retryable=True,
-                        )
-                    )
-            finally:
-                pool.shutdown(wait=False, cancel_futures=True)
+                )
 
         errors = skipped_errors + [
             _enrich_list_error(r.to_error(), cap_by_key.get((r.provider, r.instance_id)))
@@ -1072,26 +1200,57 @@ class PlaybackProgressService:
             if not r.ok
         ]
         items = [_with_remaining_fallback(item.to_dict()) for result in results if result.ok for item in result.items]
+        from services.media_scope import MediaScope
+
+        media_scope = MediaScope(cfg)
+        items = [
+            item for item in items
+            if media_scope.keep({**item, "type": item.get("media_type")},
+                                item["provider"], item["instance_id"], "progress")
+        ]
         _share_artwork_metadata(items)
         _overlay_live_streams(items)
+        summary_rows = [dict(item) for item in items]
+        summary = _playback_summary(summary_rows if provider_filter else _group_records(summary_rows))
         filtered = self._apply_filters(items, media_type=media_type, progress_min=progress_min, progress_max=progress_max, age=age, rating_min=rating_min, search=search)
+        wanted_tmdb = str(tmdb or "").strip()
+        if wanted_tmdb:
+            filtered = [item for item in filtered if str((item.get("ids") or {}).get("tmdb") or "").strip() == wanted_tmdb]
         if not provider_filter:
             filtered = _group_records(filtered)
         sorted_items = self._sort(filtered, sort)
         page = max(1, int(page or 1))
         page_size = max(1, min(250, int(page_size or 50)))
+        months: list[dict[str, Any]] = []
+        if (sort if sort in SORT_VALUES else "last_updated") == "last_updated":
+            month_counts: dict[str, int] = {}
+            for item in sorted_items:
+                key = _paused_month(item, display_tz)
+                if key:
+                    month_counts[key] = month_counts.get(key, 0) + 1
+            months = [{"month": key, "count": month_counts[key]} for key in sorted(month_counts, reverse=True)]
+            wanted_month = str(month or "").strip()
+            if wanted_month:
+                for position, item in enumerate(sorted_items):
+                    key = _paused_month(item, display_tz)
+                    if key and key <= wanted_month:
+                        page = position // page_size + 1
+                        break
         total = len(sorted_items)
         start = (page - 1) * page_size
         end = start + page_size
-        LOG.debug(f"list completed total={total} errors={len(errors)} page={page} page_size={page_size}")
+        LOG.debug(f"list completed total={total} errors={len(errors)} loading={len(loading)} page={page} page_size={page_size}")
         return {
             "items": sorted_items[start:end],
             "page": page,
             "page_size": page_size,
             "total": total,
+            "months": months,
             "providers": [cap.to_dict() for cap in capabilities],
             "errors": errors,
-            "partial": bool(errors and items),
+            "loading": loading,
+            "summary": summary,
+            "partial": bool((errors or loading) and items),
             "refreshed_at": utc_now_iso(),
         }
 

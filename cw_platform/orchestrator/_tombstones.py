@@ -7,10 +7,24 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Callable, TypeVar, AbstractSet
 
-from ..id_map import canonical_key, ID_KEYS
+from ..id_map import canonical_key, ID_KEYS, _norm_type
 from ._state_store import StateStore
 
 TItem = TypeVar("TItem", bound=Mapping[str, Any])
+
+
+def media_tombstone_tokens(item: Mapping[str, Any], key: str | None = None) -> set[str]:
+    typ = _norm_type(item.get("type"))
+    typ = "show" if typ == "anime" else typ
+    tokens = {str(key or canonical_key(item))}
+    ids = item.get("ids")
+    if isinstance(ids, Mapping):
+        suffix = "#episode" if typ == "episode" else ""
+        tokens.update(f"{str(k).lower()}:{str(v).strip().lower()}{suffix}" for k, v in ids.items() if v not in (None, ""))
+    if typ in ("movie", "show"):
+        tokens = {f"{token}#{typ}" if token.startswith("tmdb:") and token[5:].isdigit() else token for token in tokens}
+    return tokens - {""}
+
 
 def pair_key(a: str, b: str) -> str:
     return "-".join(sorted([a.upper(), b.upper()]))
@@ -63,6 +77,8 @@ def keys_for_feature(
     *,
     pair: str | None = None,
     include_global: bool = True,
+    ttl_seconds: int | None = None,
+    now: int | None = None,
 ) -> dict[str, int]:
     tomb = store.load_tomb()
     raw = tomb.get("keys") or {}
@@ -72,6 +88,10 @@ def keys_for_feature(
         }
     else:
         ks_all = {}
+
+    if ttl_seconds is not None:
+        current = int(time.time()) if now is None else now
+        ks_all = {k: ts for k, ts in ks_all.items() if current - ts < ttl_seconds}
 
     out: dict[str, int] = {}
 
@@ -120,12 +140,13 @@ def clear_items_for_feature(
             pass
 
         ids = item.get("ids") or {}
-        if isinstance(ids, Mapping):
+        if isinstance(ids, Mapping) and _norm_type(item.get("type")) != "episode":
             for idk in ID_KEYS:
                 idv = ids.get(idk)
                 if idv is None or str(idv).strip() == "":
                     continue
                 tokens.add(f"{str(idk).lower()}:{str(idv).strip().lower()}")
+        tokens.update(media_tombstone_tokens(item))
 
         typ = str(item.get("type") or "").lower()
         ttl = str(item.get("title") or "").strip().lower()
@@ -189,12 +210,14 @@ def filter_with(
         return list(items or [])
 
     def _hit(keys: set[str], item: Mapping[str, Any]) -> bool:
+        if keys & media_tombstone_tokens(item):
+            return True
         ck = canonical_key(item)
         if ck in keys:
             return True
 
         ids = item.get("ids") or {}
-        if isinstance(ids, Mapping):
+        if isinstance(ids, Mapping) and _norm_type(item.get("type")) != "episode":
             for k in ID_KEYS:
                 v = ids.get(k)
                 if v is not None and f"{k}:{str(v).lower()}" in keys:

@@ -3,21 +3,51 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
+from collections import OrderedDict
 from typing import Any, cast
 from fastapi import FastAPI, Query, Request
 
-from cw_platform.config_base import CONFIG, _tmdb_api_key, config_path, load_config
+from cw_platform.config_base import CONFIG, config_path, load_config
 from cw_platform.local_db import manual_policy as sqlite_manual_policy
 from cw_platform.local_db import state as sqlite_state
 from cw_platform.local_db import watchlist_hide as sqlite_watchlist_hide
+from cw_platform.memory_release import register_cache
 from cw_platform.orchestrator._state_store import StateStore
 from cw_platform.provider_instances import instances_for_user_profile, normalize_instance_id, provider_display_key
 from services.watchlist import build_watchlist, detect_available_watchlist_providers
 
 
 _WALL_CACHE_LOCK = threading.Lock()
-_WALL_CACHE: dict[str, Any] = {"key": None, "data": None}
+_WALL_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_WALL_CACHE_MAX = 8
+
+
+def _wall_cache_get(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _WALL_CACHE_LOCK:
+        data = _WALL_CACHE.get(key)
+        if data is None:
+            return None
+        _WALL_CACHE.move_to_end(key)
+        return dict(data)
+
+
+def _wall_cache_put(key: tuple[Any, ...], data: dict[str, Any]) -> None:
+    with _WALL_CACHE_LOCK:
+        _WALL_CACHE[key] = dict(data)
+        _WALL_CACHE.move_to_end(key)
+        while len(_WALL_CACHE) > _WALL_CACHE_MAX:
+            _WALL_CACHE.popitem(last=False)
+
+
+def clear_wall_cache() -> None:
+    with _WALL_CACHE_LOCK:
+        _WALL_CACHE.clear()
+
+
+register_cache("wall", clear_wall_cache)
 
 
 def _path_key(path: Any) -> tuple[str, int, int]:
@@ -41,6 +71,33 @@ def _cache_key(*, both_only: bool, active_only: bool, limit: int, user_profile: 
         int(limit or 0),
         str(user_profile or "").strip(),
     )
+
+
+def _cache_version(key: tuple[Any, ...]) -> str:
+    blob = json.dumps(key, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _tmdb_api_key(cfg: dict[str, Any]) -> str:
+    def _pick_from_block(blk: Any) -> str:
+        if not isinstance(blk, dict):
+            return ""
+        k = str(blk.get("api_key") or "").strip()
+        if k:
+            return k
+        insts = blk.get("instances")
+        if isinstance(insts, dict):
+            for v in insts.values():
+                kk = str((v or {}).get("api_key") or "").strip() if isinstance(v, dict) else ""
+                if kk:
+                    return kk
+        return ""
+
+    for key in ("tmdb", "tmdb_sync"):
+        found = _pick_from_block(cfg.get(key))
+        if found:
+            return found
+    return ""
 
 
 def _load_state() -> dict[str, Any]:
@@ -144,18 +201,24 @@ def register_wall(app: FastAPI) -> None:
         active_only: bool = Query(False, description="Keep only items from configured providers"),
         limit: int = Query(0, ge=0, le=100, description="Optional item limit"),
         user_profile: str = Query("", description="Optional user profile id to scope provider instances"),
+        known_version: str = Query("", description="Client cache version to avoid rebuilding unchanged wall data"),
     ) -> dict[str, Any]:
-        from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
+        from api.appAuthAPI import effective_request_profile_id
+
+        from services.media_scope import MediaScope
 
         cfg = load_config() or {}
-        token = request.cookies.get(COOKIE_NAME) if request is not None else None
-        profile = effective_user_profile_id(cfg, token, user_profile)
-        key = _cache_key(both_only=both_only, active_only=active_only, limit=limit, user_profile=profile)
-        with _WALL_CACHE_LOCK:
-            if _WALL_CACHE.get("key") == key and isinstance(_WALL_CACHE.get("data"), dict):
-                return dict(_WALL_CACHE["data"])
+        media_scope = MediaScope(cfg)
+        profile = effective_request_profile_id(cfg, request, user_profile)
+        key = _cache_key(both_only=both_only, active_only=active_only, limit=limit, user_profile=profile) + (media_scope.fingerprint(),)
+        version = _cache_version(key)
+        if known_version and str(known_version).strip() == version:
+            return {"ok": True, "not_modified": True, "version": version}
+        cached = _wall_cache_get(key)
+        if cached is not None:
+            return cached
 
-        st = _load_state()
+        st = media_scope.state(_load_state())
         api_key = _tmdb_api_key(cfg)
         scoped = bool(str(profile or "").strip())
         user_filter = instances_for_user_profile(cfg, profile) if scoped else {}
@@ -194,8 +257,7 @@ def register_wall(app: FastAPI) -> None:
             "total": total,
             "missing_tmdb_key": not bool(api_key),
             "last_sync_epoch": st.get("last_sync_epoch") if isinstance(st, dict) else None,
+            "version": version,
         }
-        with _WALL_CACHE_LOCK:
-            _WALL_CACHE["key"] = key
-            _WALL_CACHE["data"] = data
+        _wall_cache_put(key, data)
         return data

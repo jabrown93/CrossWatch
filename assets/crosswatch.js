@@ -13,43 +13,20 @@
   // Tabs
   function showTab(id) {
     try {
-      D.querySelectorAll("#page-main, #page-watchlist, #page-playback_progress, #page-settings, .tab-page")
+      if (D.documentElement.classList.contains("cw-compact") && id !== "main") id = "main";
+      D.querySelectorAll("#page-main, #page-settings, .tab-page")
         .forEach(el => el.classList.add("hidden"));
 
       const tgt = D.getElementById("page-" + id) || D.getElementById(id);
       if (tgt) tgt.classList.remove("hidden");
 
-      ["main", "watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"].forEach(n => {
+      ["main", "snapshots", "playlists", "editor", "settings"].forEach(n => {
         const th = D.getElementById("tab-" + n);
         if (th) th.classList.toggle("active", n === id);
       });
 
       D.dispatchEvent(new CustomEvent("tab-changed", { detail: { id } }));
       Events.emit?.("tab:changed", { id });
-
-      if (id === "watchlist") {
-        try { window.Watchlist?.mount?.(D.getElementById("page-watchlist")); } catch {}
-      }
-      if (id === "playback_progress") {
-        (async () => {
-          try {
-            if (!window.PlaybackProgress?.mount && window.CW?.PageLoader?.ensure) {
-              await window.CW.PageLoader.ensure({
-                key: "playback_progress",
-                src: "/assets/js/playback_progress.js",
-                namespace: "PlaybackProgress",
-              });
-            }
-            window.PlaybackProgress?.mount?.(D.getElementById("page-playback_progress"));
-          } catch (e) {
-            console.warn("[crosswatch] Playback Progress failed to load", e);
-            const root = D.getElementById("playback-progress-root");
-            if (root && (!root.children.length || root.querySelector(".cw-page-loading"))) {
-              root.innerHTML = '<div class="cw-page-load-error">Playback Progress failed to load. Refresh the page and try again.</div>';
-            }
-          }
-        })();
-      }
     } catch (e) {
       console.warn("[crosswatch] showTab failed", e);
     }
@@ -112,9 +89,9 @@
       if (ui === "compact" || q.get("compact") === "1") return "compact";
       if (ui === "full" || q.get("full") === "1") return "full";
 
-      const saved = String(localStorage.getItem("cw_ui_mode") || "").toLowerCase();
+      let saved = "";
+      try { saved = String(localStorage.getItem("cw_ui_mode") || "").toLowerCase(); } catch {}
       if (saved === "compact" || saved === "full") return saved;
-
       if (_cwShouldAutoCompact()) return "compact";
     } catch {}
     return "full";
@@ -123,6 +100,9 @@
   const _cwApplyUiMode = (mode) => {
     const m = mode === "compact" ? "compact" : "full";
     document.documentElement.classList.toggle("cw-compact", m === "compact");
+    const syncSwitch = () => document.getElementById("cw-ui-mode-switch")?.setAttribute("aria-checked", String(m === "compact"));
+    syncSwitch();
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", syncSwitch, { once: true });
     return m;
   };
 
@@ -130,6 +110,7 @@
     window.cwSetUiMode = (mode) => {
       try {
         const m = mode === "compact" ? "compact" : "full";
+        if (m === "full" && Date.now() < Number(window.__cwSuppressUiModeUntil || 0)) return;
         try { localStorage.setItem("cw_ui_mode", m); } catch {}
 
         const url = new URL(window.location.href);
@@ -137,6 +118,7 @@
         q.delete("compact");
         q.delete("full");
         q.set("ui", m);
+        if (m === "compact") url.hash = "main";
         url.search = q.toString() ? "?" + q.toString() : "";
 
         window.location.assign(url.toString());
@@ -391,6 +373,9 @@ function _cwHasConfiguredValue(v) {
       "tautulli.server_url",
       "tautulli.api_key",
       "tautulli.history.user_id",
+      "tracearr.server_url",
+      "tracearr.api_key",
+      "tracearr.history.user_id",
       "trakt.client_id",
       "trakt.client_secret",
       "trakt.access_token",

@@ -56,9 +56,9 @@
     if (String(item?.media_type || "").toLowerCase() !== "episode") {
       return item?.year ? `${title} (${item.year})` : title;
     }
-    const s = Number(item?.season || 0);
+    const s = item?.season === null || item?.season === undefined || item?.season === "" ? -1 : Number(item.season);
     const e = Number(item?.episode || 0);
-    const code = s && e ? `S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}` : "";
+    const code = s >= 0 && e ? `S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}` : "";
     return code ? `${title} - ${code}` : title;
   }
 
@@ -291,9 +291,6 @@
     state.modal = modal;
 
     $(".activity-close", modal)?.addEventListener("click", closeModal);
-    modal.addEventListener("click", (e) => {
-      if (e.target === modal) closeModal();
-    });
     ["#activity-q", "#activity-media", "#activity-status"].forEach((sel) => {
       $(sel, modal)?.addEventListener("input", () => loadActivityPage(true));
       $(sel, modal)?.addEventListener("change", () => loadActivityPage(true));

@@ -13,21 +13,82 @@ from typing import Any, Callable, Mapping, TypeGuard
 import requests
 
 from .._log import log as cw_log
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 from ._auth import is_configured as auth_configured
 from ._auth import request_with_auth as mdblist_request_with_auth
 
 STATE_DIR = Path("/config/.cw_state")
 WATERMARK_PATH = STATE_DIR / "mdblist.watermarks.json"
 START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
-
-# STATE_DIR is created lazily on first write (see write_json / _migrate_legacy_json).
-# Don't mkdir at import time — it crashes when /config is absent or unwritable (e.g. CI),
-# and the other sync providers already defer directory creation the same way.
+SHOW_BATCH_LIMIT = 200
 
 
 class MDBListFetchError(RuntimeError):
     pass
+
+
+class CursorPager:
+    def __init__(self, limit: int, max_pages: int = 2000):
+        self.limit = max(1, min(int(limit), 1000))
+        self.max_pages = max(1, int(max_pages))
+        self.pages = 0
+        self.cursor: str | None = None
+        self.seen: set[str] = set()
+
+    def params(self) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": self.limit}
+        if self.cursor is not None:
+            params["cursor"] = self.cursor
+        return params
+
+    def advance(self, data: Any, response: Any) -> bool:
+        if not isinstance(data, (Mapping, list)):
+            raise MDBListFetchError("Invalid MDBList page response")
+        pagination = data.get("pagination") if isinstance(data, Mapping) else None
+        pagination = pagination if isinstance(pagination, Mapping) else {}
+        headers = {str(k).lower(): v for k, v in (getattr(response, "headers", None) or {}).items()}
+        cursor = pagination.get("next_cursor") or (data.get("next_cursor") if isinstance(data, Mapping) else None) or headers.get("x-next-cursor")
+        has_more = pagination.get("has_more", headers.get("x-has-more"))
+        self.pages += 1
+        if has_more is not None and str(has_more).lower() in ("false", "0", "no"):
+            return False
+        if not cursor:
+            if str(has_more).lower() in ("true", "1", "yes"):
+                raise MDBListFetchError("MDBList page has more items but no next cursor")
+            return False
+        if not isinstance(cursor, str) or cursor in self.seen:
+            raise MDBListFetchError("MDBList returned an invalid or repeated cursor")
+        if self.pages >= self.max_pages:
+            raise MDBListFetchError("MDBList cursor read exceeded the page limit")
+        self.seen.add(cursor)
+        self.cursor = cursor
+        return True
+
+
+# Fork: STATE_DIR is created lazily on first write; mkdir at import crashes when
+# /config is absent or unwritable (e.g. CI).
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def _scoped_watermark_path(path: Path) -> Path:
@@ -129,6 +190,8 @@ def _legacy_path(path: Path) -> Path | None:
 
 
 def _migrate_legacy_json(path: Path) -> None:
+    if str(_pair_scope() or "").startswith("cw2_"):
+        return
     if path.exists():
         return
     if _is_capture_mode() or _pair_scope() is None:

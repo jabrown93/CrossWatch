@@ -6,33 +6,47 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
+from cw_platform.run_control import cancel_requested
 
-from .._mod_common import (
-    request_with_retries,
-    _pair_scope,
-    _is_capture_mode,
-    _safe_scope,
-    _iso_ok,
-    _max_iso,
-)
+from .._mod_common import request_with_retries
 from .._log import log as cw_log
+from ._pagination import TraktPager
 
 # headers
 def _user_agent() -> str:
-    return (
-        os.environ.get("CW_TRAKT_UA")
-        or os.environ.get("CW_UA")
-        or "CrossWatch TRAKT"
-    )
+    return http_user_agent("TRAKT", override_env="CW_TRAKT_UA")
 
 STATE_DIR = Path("/config/.cw_state")
 _ACT_MEMO: tuple[float, dict[str, Any] | None] = (0.0, None)
 _SETTINGS_MEMO: tuple[float, dict[str, Any] | None] = (0.0, None)
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -67,6 +81,12 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _chunk(seq: list[Any], n: int) -> Iterable[list[Any]]:
+    n = max(1, int(n or 1))
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
 
 
 def _last_limit_path() -> Path:
@@ -137,6 +157,37 @@ def update_watermark_if_new(feature: str, iso_ts: str | None) -> str | None:
     if new and new != current:
         save_watermark(feature, new)
     return new
+
+
+def _iso_ok(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except Exception:
+        return False
+
+
+def _iso_z(value: str | None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid ISO timestamp")
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _max_iso(a: str | None, b: str | None) -> str | None:
+    if not _iso_ok(a):
+        return _iso_z(b) if _iso_ok(b) else None
+    if not _iso_ok(b):
+        return _iso_z(a)
+    a_z = _iso_z(a)
+    b_z = _iso_z(b)
+    dt_a = datetime.fromisoformat(a_z.replace("Z", "+00:00"))
+    dt_b = datetime.fromisoformat(b_z.replace("Z", "+00:00"))
+    return _iso_z(a if dt_a >= dt_b else b)
 
 
 def fetch_last_activities(
@@ -305,7 +356,7 @@ def load_dropped_show_tokens(adapter: Any) -> set[str]:
     raw_cached_tokens = cached.get("tokens") if isinstance(cached, Mapping) else None
     cached_tokens = raw_cached_tokens if isinstance(raw_cached_tokens, list) else []
     cache_version = int(cached.get("version") or 0) if isinstance(cached, Mapping) else 0
-    cache_ok = cache_version >= 1
+    cache_ok = cache_version >= 2
     if cache_ok and remote_ts and str(cached.get("updated_at") or "").strip() == str(remote_ts).strip():
         return {str(x) for x in cached_tokens if str(x).strip()}
     if cache_ok and not remote_ts and cached_tokens:
@@ -313,8 +364,9 @@ def load_dropped_show_tokens(adapter: Any) -> set[str]:
 
     tokens: set[str] = set()
     page = 1
-    limit = 100
-    while page <= 100:
+    limit = 250
+    pager = TraktPager("dropped", 100)
+    while True:
         try:
             r = adapter.client.get(
                 "https://api.trakt.tv/users/hidden/dropped",
@@ -325,15 +377,13 @@ def load_dropped_show_tokens(adapter: Any) -> set[str]:
                 cw_log("TRAKT", "common", "warn", "dropped_fetch_failed", page=page, path=str(dropped_path))
             except Exception:
                 pass
-            break
+            raise
         if not (200 <= r.status_code < 300):
             try:
                 cw_log("TRAKT", "common", "warn", "dropped_fetch_http", page=page, status=r.status_code, path=str(dropped_path))
             except Exception:
                 pass
-            break
-        data = r.json() if (r.text or "").strip() else []
-        rows = data if isinstance(data, list) else []
+        rows = pager.read(r, page)
         if not rows:
             break
         for row in rows:
@@ -355,18 +405,55 @@ def load_dropped_show_tokens(adapter: Any) -> set[str]:
                 }
             )
             tokens.update(_identity_tokens(item))
-        if len(rows) < limit:
-            break
         page += 1
 
     doc = {
-        "version": 1,
+        "version": 2,
         "updated_at": str(remote_ts or ""),
         "fetched_at": _now_iso(),
         "tokens": sorted(tokens),
     }
     _write_json(dropped_path, doc)
     return tokens
+
+
+def tag_dropped_shows(adapter: Any, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    shows: list[dict[str, Any]] = []
+    skipped = 0
+    for item in items:
+        ids = ids_for_trakt({"type": "show", "ids": dict(item.get("ids") or {})})
+        if ids:
+            shows.append({"ids": ids})
+        else:
+            skipped += 1
+    confirmed = 0
+    not_found = 0
+    errors = 0
+    for start in range(0, len(shows), 100):
+        if cancel_requested():
+            break
+        part = shows[start:start + 100]
+        try:
+            r = adapter.client.post("https://api.trakt.tv/users/hidden/dropped", json={"shows": part})
+        except Exception as e:
+            cw_log("TRAKT", "history", "warn", "dropped_tag_failed", count=len(part), error=str(e))
+            errors += len(part)
+            continue
+        if not (200 <= r.status_code < 300):
+            cw_log("TRAKT", "history", "warn", "dropped_tag_http", count=len(part), status=r.status_code)
+            errors += len(part)
+            continue
+        try:
+            body = r.json() if (r.text or "").strip() else {}
+        except Exception:
+            body = {}
+        added = body.get("added") if isinstance(body, Mapping) else None
+        missing = body.get("not_found") if isinstance(body, Mapping) else None
+        confirmed += int((added or {}).get("shows") or 0) if isinstance(added, Mapping) else 0
+        not_found += len((missing or {}).get("shows") or []) if isinstance(missing, Mapping) else 0
+    cw_log("TRAKT", "history", "info", "dropped_tagged", attempted=len(shows), confirmed=confirmed,
+           skipped=skipped, not_found=not_found, errors=errors)
+    return {"attempted": len(shows), "confirmed": confirmed, "skipped": skipped, "not_found": not_found, "errors": errors}
 
 
 def build_headers(arg1: Any, access_token: str | None = None) -> dict[str, str]:
@@ -553,7 +640,7 @@ def pick_trakt_kind(item: Mapping[str, Any]) -> str:
     return "movies"
 
 
-def build_watchlist_body(items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str | None = None, item_fields: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {}
     nested_shows: dict[str, dict[str, Any]] = {}
 
@@ -573,18 +660,39 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             sort_keys=True,
         )
 
+    def with_date(obj: dict[str, Any], it: Mapping[str, Any]) -> dict[str, Any]:
+        if date_field:
+            value = it.get(date_field)
+            if value:
+                obj[date_field] = str(value)
+        return obj
+
+    def with_fields(obj: dict[str, Any], it: Mapping[str, Any]) -> dict[str, Any]:
+        if item_fields:
+            obj.update(item_fields(it))
+        return with_date(obj, it)
+
+    def nested_show_obj(entry: Mapping[str, Any]) -> dict[str, Any]:
+        obj: dict[str, Any] = {"ids": entry["ids"]}
+        if entry.get("seasons"):
+            obj["seasons"] = list(entry["seasons"].values())
+        if date_field and entry.get(date_field):
+            obj[date_field] = entry[date_field]
+        return obj
+
     for it in items or []:
         kind = pick_trakt_kind(it)
         ids = ids_for_trakt(it)
         if kind == "movies":
             if ids:
-                push("movies", {"ids": ids})
+                push("movies", with_fields({"ids": ids}, it))
             continue
 
         if kind == "shows":
             if ids:
                 skey = show_key(ids)
-                nested_shows.setdefault(skey, {"ids": ids, "seasons": {}})
+                entry = nested_shows.setdefault(skey, {"ids": ids, "seasons": {}})
+                with_date(entry, it)
             continue
 
         if kind == "seasons":
@@ -592,7 +700,7 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             if season_no is None:
                 season_no = it.get("number")
             if ids:
-                push("seasons", {"ids": ids})
+                push("seasons", with_date({"ids": ids}, it))
                 continue
             show_ids = show_scope_ids(it)
             if show_ids and season_no is not None:
@@ -602,7 +710,8 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                     season_i = int(str(season_no))
                 except Exception:
                     continue
-                entry["seasons"].setdefault(season_i, {"number": season_i})
+                season_entry = entry["seasons"].setdefault(season_i, {"number": season_i})
+                with_date(season_entry, it)
             continue
 
         if kind == "episodes":
@@ -620,7 +729,7 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
 
             # Prefer show-scoped season/episode when weak episode IDs.
             if use_ids:
-                push("episodes", {"ids": ids})
+                push("episodes", with_fields({"ids": ids}, it))
                 continue
 
             if show_scope_ok:
@@ -632,10 +741,10 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 except Exception:
                     continue
                 season_entry = entry["seasons"].setdefault(season_i, {"number": season_i, "episodes": []})
-                season_entry.setdefault("episodes", []).append({"number": episode_i})
+                season_entry.setdefault("episodes", []).append(with_fields({"number": episode_i}, it))
     if nested_shows:
         body.setdefault("shows", []).extend(
-            ({"ids": v["ids"], "seasons": list(v["seasons"].values())} if v.get("seasons") else {"ids": v["ids"]})
+            nested_show_obj(v)
             for v in nested_shows.values()
             if v.get("ids")
         )

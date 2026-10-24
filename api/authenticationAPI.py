@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+import base64
 import copy
 
 import importlib
+import json
 import logging
 import re
 import secrets
@@ -20,6 +22,7 @@ from fastapi import Body, Request, HTTPException, Response, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from api.provider_guard import usage_conflict_response
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import DEFAULT_CFG, load_config, save_config
 from cw_platform.provider_instances import apply_instance_defaults, ensure_instance_block, ensure_provider_block, normalize_instance_id
 from cw_platform.tracker_storage import remove_crosswatch_storage
@@ -39,14 +42,17 @@ from providers.sync.jellyfin._auth_http import JellyfinAuthError
 from providers.auth._auth_KODI import KodiAuthError
 from providers.auth._auth_STREMIO import StremioAuthError, StremioClient
 from providers.sync.kodi._common import (
+    KodiClient,
     ensure_whitelist_defaults as kodi_ensure_whitelist_defaults,
     fetch_libraries_from_cfg as kodi_fetch_libraries_from_cfg,
+    make_config as kodi_make_config,
 )
 from providers.sync.plex._utils import (
     ensure_whitelist_defaults,
     fetch_libraries_from_cfg,
     inspect_and_persist,
 )
+from providers.sync.plex._common import stable_client_id as plex_stable_client_id
 import providers.sync.plex._utils as plex_utils
 
 __all__ = ["register_auth"]
@@ -164,7 +170,7 @@ def _validate_mdblist_api_key(api_key: str, *, timeout: float = 12.0) -> tuple[b
         r = requests.get(
             "https://api.mdblist.com/user",
             params={"apikey": key},
-            headers={"Accept": "application/json", "User-Agent": "CrossWatch/MDBListAuth"},
+            headers={"Accept": "application/json", "User-Agent": http_user_agent("MDBListAuth", override_env="CW_MDBLIST_UA")},
             timeout=timeout,
         )
     except requests.Timeout:
@@ -196,7 +202,7 @@ def _validate_publicmetadb_api_key(api_key: str, *, base_url: str = "https://pub
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {key}",
-                "User-Agent": "CrossWatch/PublicMetaDBAuth",
+                "User-Agent": http_user_agent("PublicMetaDBAuth", override_env="CW_PUBLICMETADB_UA"),
             },
             timeout=timeout,
         )
@@ -232,7 +238,7 @@ def _validate_tautulli_credentials(server_url: str, api_key: str, *, timeout: fl
             f"{server}/api/v2",
             field_name="tautulli.server_url",
             params={"apikey": key, "cmd": "get_server_info"},
-            headers={"Accept": "application/json", "User-Agent": "CrossWatch/TautulliAuth"},
+            headers={"Accept": "application/json", "User-Agent": http_user_agent("TautulliAuth", override_env="CW_TAUTULLI_UA")},
             timeout=timeout,
             verify=coerce_bool(verify_ssl, True),
         )
@@ -373,6 +379,10 @@ def _req_error_user_msg(provider: str, e: Exception) -> str:
 
 def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, probe_cache: Optional[dict[str, Any]] = None) -> None:
     def _probe_bust(name: str) -> None:
+        if name == "simkl":
+            from api.probesAPI import invalidate_provider_caches
+
+            invalidate_provider_caches(name)
         try:
             if isinstance(probe_cache, dict): probe_cache[name] = (0.0, False)
         except Exception:
@@ -456,8 +466,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
         cid = str((base.get("client_id") or plex.get("client_id") or "")).strip()
         if not cid:
-            cid = secrets.token_hex(12)
-            base["client_id"] = cid
+            cid = plex_stable_client_id()
+        base["client_id"] = cid
         plex["client_id"] = cid
         save_config(cfg)
 
@@ -497,9 +507,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             pass
         while time.time() < deadline:
             cfg = load_config()
-            token = str((ensure_instance_block(cfg, "plex", inst).get("account_token") or "")).strip()
-            if token:
+            block = ensure_instance_block(cfg, "plex", inst)
+            token = str(block.get("account_token") or "").strip()
+            pending = block.get("_pending_pin") or {}
+            if token and not pending:
                 return token
+            if pending.get("id") != pin_id:
+                return None
             try:
                 if _PLEX_PROVIDER:
                     _PLEX_PROVIDER.finish(cfg, instance_id=inst)
@@ -528,6 +542,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                     plex_cfg = ensure_instance_block(cfg, "plex", _inst)
 
                     plex_cfg["account_token"] = token
+                    plex_cfg.pop("_pending_pin", None)
                     existing_url = (plex_cfg.get("server_url") or "").strip()
                     existing_user = (plex_cfg.get("username") or "").strip()
                     existing_aid = str(plex_cfg.get("account_id") or "").strip()
@@ -1073,11 +1088,11 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         verify = coerce_bool(jf.get("verify_ssl", False))
         devid = str(jf.get("device_id") or "crosswatch").strip() or "crosswatch"
 
-        base = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{devid}", Version="1.0"'
+        base = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{devid}", Version="{app_version()}"'
         auth = f'{base}, Token="{token}"'
         headers = {
             "Accept": "application/json",
-            "User-Agent": "CrossWatch/1.0",
+            "User-Agent": http_user_agent(override_env="CW_JELLYFIN_UA"),
             "Authorization": auth,
             "X-Emby-Authorization": auth,
             "X-MediaBrowser-Token": token,
@@ -1087,7 +1102,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         def _get(url: str, *, params: dict[str, Any] | None = None, use_headers: bool = True) -> requests.Response:
             return requests.get(
                 url,
-                headers=headers if use_headers else {"Accept": "application/json", "User-Agent": "CrossWatch/1.0"},
+                headers=headers if use_headers else {"Accept": "application/json", "User-Agent": http_user_agent(override_env="CW_JELLYFIN_UA")},
                 params=params,
                 timeout=timeout,
                 verify=verify,
@@ -1325,6 +1340,126 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             "instance": inst,
         }
 
+    def _kodi_addon_status(request: Request, cfg: dict[str, Any], inst: str) -> dict[str, Any]:
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        base = str(request.base_url).rstrip("/")
+        proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+        if proto == "https" and base.startswith("http://"):
+            base = "https://" + base[7:]
+        return kodi_addon.status(cfg, inst, base)
+
+    def _kodi_addon_apply(request: Request, cfg: dict[str, Any], inst: str, enabled: bool, regenerate: bool = False) -> None:
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        was_enabled = kodi_addon.instance_enabled(cfg, inst)
+        ensure_provider_block(cfg, "kodi")
+        ensure_instance_block(cfg, "kodi", inst)
+        kodi_addon.set_instance_enabled(cfg, inst, enabled, regenerate=regenerate)
+        save_config(cfg)
+        if not enabled or regenerate:
+            kodi_addon.forget_instance(inst)
+        _probe_bust("kodi")
+        if enabled == was_enabled:
+            return
+        try:
+            from providers.scrobble import watch_manager as wm
+            from providers.scrobble.sources import source_enabled
+
+            running = any(bool(g.get("running")) for g in (wm.status(request.app) or {}).get("groups") or [])
+            autostart = bool(((cfg.get("scrobble") or {}).get("watch") or {}).get("autostart"))
+            if source_enabled(cfg, "watcher") and (running or autostart):
+                wm.start_from_config(request.app)
+        except Exception as exc:
+            _safe_log(log_fn, "KODI", f"[KODI:{inst}] watcher refresh failed error_type={type(exc).__name__}")
+
+    @app.get("/api/kodi/addon", tags=["media providers"], response_model=None)
+    def api_kodi_addon(request: Request, instance: str | None = Query(None)) -> Any:
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        return _kodi_addon_status(request, cfg, inst)
+
+    @app.post("/api/kodi/addon", tags=["media providers"], response_model=None)
+    def api_kodi_addon_update(request: Request, payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> Any:
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "Malformed request"}, 400)
+        was_enabled = kodi_addon.instance_enabled(cfg, inst)
+        enabled = coerce_bool(payload.get("enabled")) if "enabled" in payload else was_enabled
+        regenerate = coerce_bool(payload.get("regenerate")) if "regenerate" in payload else False
+        if not enabled:
+            conflict = usage_conflict_response(cfg, "kodi", inst) if was_enabled and not kodi_addon.jsonrpc_connected(cfg, inst) else None
+            if conflict is not None:
+                return conflict
+        _kodi_addon_apply(request, cfg, inst, bool(enabled), bool(regenerate))
+        return _kodi_addon_status(request, load_config(), inst)
+
+    @app.post("/api/kodi/addon/pair", tags=["media providers"], response_model=None)
+    def api_kodi_addon_pair(request: Request, instance: str | None = Query(None)) -> Any:
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        if not kodi_addon.instance_enabled(cfg, inst):
+            _kodi_addon_apply(request, cfg, inst, True)
+            cfg = load_config()
+        if not kodi_addon.instance_enabled(cfg, inst):
+            return JSONResponse({"ok": False, "error": "Could not turn on the Kodi add-on", "instance": inst}, 500)
+        kodi_addon.create_pair_code(inst)
+        return _kodi_addon_status(request, cfg, inst)
+
+    @app.post("/api/kodi/addon/link", tags=["media providers"], response_model=None)
+    def api_kodi_addon_link(request: Request, payload: dict[str, Any] = Body(default={}), instance: str | None = Query(None)) -> Any:
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        kcfg = kodi_make_config(cfg, inst)
+        if not (kcfg.server and kcfg.connection_verified):
+            return JSONResponse({"ok": False, "error": "Kodi is not connected over JSON-RPC", "instance": inst}, 400)
+        given = str((payload.get("address") if isinstance(payload, dict) else "") or "").strip()
+        base = kodi_addon.clean_base_url(given) if given else str(_kodi_addon_status(request, cfg, inst).get("address") or "")
+        if not base:
+            return JSONResponse({"ok": False, "error": "Enter the CrossWatch address as http(s)://host:port", "instance": inst}, 400)
+
+        def failed(exc: KodiAuthError, missing: str) -> JSONResponse:
+            reason = str(getattr(exc, "reason", "") or "link_failed")
+            _safe_log(log_fn, "KODI", f"[KODI:{inst}] add-on link failed reason={reason}")
+            if reason == "jsonrpc_error":
+                return JSONResponse({"ok": False, "error": missing, "reason": "addon_missing", "instance": inst}, 400)
+            return JSONResponse({"ok": False, "error": "Kodi server is unreachable", "reason": reason, "instance": inst}, 502)
+
+        client = KodiClient(kcfg)
+        try:
+            details = client.rpc("Addons.GetAddonDetails", {"addonid": kodi_addon.ADDON_ID, "properties": ["enabled"]})
+        except KodiAuthError as exc:
+            return failed(exc, "The CrossWatch add-on is not installed on this Kodi. Install it first, then link again.")
+        found = details.get("addon") if isinstance(details, dict) else None
+        if isinstance(found, dict) and found.get("enabled") is False:
+            return JSONResponse(
+                {"ok": False, "error": "The CrossWatch add-on is disabled on this Kodi. Enable it first, then link again.", "reason": "addon_disabled", "instance": inst},
+                400,
+            )
+
+        if not kodi_addon.instance_enabled(cfg, inst):
+            _kodi_addon_apply(request, cfg, inst, True)
+            cfg = load_config()
+        if not kodi_addon.instance_enabled(cfg, inst):
+            return JSONResponse({"ok": False, "error": "Could not turn on the Kodi add-on", "instance": inst}, 500)
+        try:
+            client.rpc(
+                "Addons.ExecuteAddon",
+                {"addonid": kodi_addon.ADDON_ID, "params": kodi_addon.link_params(base, kodi_addon.create_pair_code(inst, link=True)[0]), "wait": False},
+            )
+        except KodiAuthError as exc:
+            return failed(exc, "Kodi could not start the CrossWatch add-on.")
+        return {"ok": True, "instance": inst, "address": base}
+
     @app.get("/api/kodi/libraries", tags=["media providers"])
     def api_kodi_libraries(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
@@ -1332,6 +1467,43 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         _apply_media_overrides(cfg, "kodi", inst, server, verify_ssl)
         kodi_ensure_whitelist_defaults(cfg, instance_id=inst)
         return {"libraries": kodi_fetch_libraries_from_cfg(cfg, instance_id=inst), "instance": inst}
+
+    @app.get("/api/kodi/users", tags=["media providers"], response_model=None)
+    def api_kodi_users(instance: str | None = Query(None), server: str | None = Query(None), verify_ssl: bool | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        _apply_media_overrides(cfg, "kodi", inst, server, verify_ssl)
+        kcfg = kodi_make_config(cfg, inst)
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        addon_on = kodi_addon.instance_enabled(cfg, inst)
+        viewers = [{"id": name, "name": name, "current": False, "source": "addon"} for name in kodi_addon.known_viewers(inst)] if addon_on else []
+        if not (kcfg.server and kcfg.connection_verified):
+            if addon_on:
+                return {"users": viewers, "instance": inst}
+            raise HTTPException(status_code=401, detail="Not connected to Kodi.")
+        client = KodiClient(kcfg)
+        try:
+            body = client.rpc("Profiles.GetProfiles")
+            current = client.rpc("Profiles.GetCurrentProfile")
+        except KodiAuthError as exc:
+            _safe_log(log_fn, "KODI", f"[KODI:{inst}] profiles fetch failed reason={getattr(exc, 'reason', '')}")
+            raise HTTPException(status_code=502, detail="Kodi server is unreachable") from exc
+        current_label = str((current or {}).get("label") or "").strip() if isinstance(current, dict) else ""
+        profiles = (body or {}).get("profiles") if isinstance(body, dict) else None
+        users: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in profiles if isinstance(profiles, list) else []:
+            name = str((row or {}).get("label") or "").strip() if isinstance(row, dict) else ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            users.append({"id": name, "name": name, "current": name == current_label})
+        for row in viewers:
+            if row["name"] not in seen:
+                seen.add(row["name"])
+                users.append(row)
+        return {"users": users, "instance": inst}
 
     @app.post("/api/kodi/disconnect", tags=["auth"])
     def api_kodi_disconnect(instance: str | None = Query(None)) -> Any:
@@ -1345,7 +1517,14 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         if not prov:
             return JSONResponse({"ok": False, "error": "Provider missing", "instance": inst}, 500)
         prov.disconnect(cfg, instance_id=inst)
+        from providers.scrobble.kodi import addon as kodi_addon
+
+        addon_was_on = kodi_addon.instance_enabled(cfg, inst)
+        if addon_was_on:
+            kodi_addon.set_instance_enabled(cfg, inst, False)
         save_config(cfg)
+        if addon_was_on:
+            kodi_addon.forget_instance(inst)
         _probe_bust("kodi")
         _safe_log(log_fn, "KODI", f"[KODI:{inst}] disconnected")
         return {"ok": True, "instance": inst}
@@ -1430,11 +1609,56 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         prov = _import_provider("providers.auth._auth_STREMIO")
         if not prov:
             return JSONResponse({"ok": False, "error": "Provider missing", "instance": inst}, 500)
+        from providers.scrobble.stremio import addon as stremio_addon
+
         prov.disconnect(cfg, instance_id=inst)
+        stremio_addon.set_instance_enabled(cfg, inst, False)
         save_config(cfg)
+        stremio_addon.forget_instance(inst)
         _probe_bust("stremio")
         _safe_log(log_fn, "STREMIO", f"[STREMIO:{inst}] disconnected")
         return {"ok": True, "instance": inst}
+
+    def _stremio_addon_status(request: Request, cfg: dict[str, Any], inst: str) -> dict[str, Any]:
+        from providers.scrobble.stremio import addon as stremio_addon
+
+        base = str(request.base_url).rstrip("/")
+        proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+        if proto == "https" and base.startswith("http://"):
+            base = "https://" + base[7:]
+        return stremio_addon.status(cfg, inst, base)
+
+    @app.get("/api/stremio/addon", tags=["auth"], response_model=None)
+    def api_stremio_addon(request: Request, instance: str | None = Query(None)) -> Any:
+        return _stremio_addon_status(request, load_config(), normalize_instance_id(instance))
+
+    @app.post("/api/stremio/addon", tags=["auth"], response_model=None)
+    def api_stremio_addon_update(request: Request, payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> Any:
+        from providers.scrobble.stremio import addon as stremio_addon
+
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "Malformed request"}, 400)
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        was_enabled = stremio_addon.instance_enabled(cfg, inst)
+        enabled = coerce_bool(payload.get("enabled")) if "enabled" in payload else was_enabled
+        regenerate = coerce_bool(payload.get("regenerate")) if "regenerate" in payload else False
+        from cw_platform.provider_usage import find_provider_usage
+
+        routed = any(u.get("feature") == "watcher" and u.get("role") == "provider" for u in find_provider_usage(cfg, "stremio", inst))
+        if was_enabled and not enabled and routed:
+            return JSONResponse(
+                {"ok": False, "error": "provider_in_use", "message": "This add-on feeds a Watcher route. Remove that route first.", "instance": inst},
+                409,
+            )
+        ensure_provider_block(cfg, "stremio")
+        ensure_instance_block(cfg, "stremio", inst)
+        stremio_addon.set_instance_enabled(cfg, inst, bool(enabled), regenerate=bool(regenerate))
+        save_config(cfg)
+        if not enabled or regenerate:
+            stremio_addon.forget_instance(inst)
+        _safe_log(log_fn, "STREMIO", f"[STREMIO:{inst}] scrobble add-on {'on' if enabled else 'off'}{' (new URL)' if enabled and regenerate else ''}")
+        return _stremio_addon_status(request, load_config(), inst)
 
     @app.get("/api/emby/inspect", tags=["media providers"])
     def emby_inspect(instance: str | None = Query(None)) -> dict[str, Any]:
@@ -1457,7 +1681,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                 if server and token:
                     r = requests.get(
                         f"{server}/Users/Me",
-                        headers={"X-Emby-Token": token, "Accept": "application/json"},
+                        headers={"X-Emby-Token": token, "Accept": "application/json", "User-Agent": http_user_agent("EmbyAuth", override_env="CW_EMBY_UA")},
                         timeout=float(em.get("timeout", 15) or 15),
                         verify=coerce_bool(em.get("verify_ssl", False)),
                     )
@@ -1504,10 +1728,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         verify = coerce_bool(em.get("verify_ssl", False))
         device_id = str(em.get("device_id") or "crosswatch").strip() or "crosswatch"
         stored_user_id = str(em.get("user_id") or "").strip()
-        auth = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{device_id}", Version="1.0", Token="{token}"'
+        auth = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{device_id}", Version="{app_version()}", Token="{token}"'
         headers = {
             "Accept": "application/json",
-            "User-Agent": "CrossWatch/1.0",
+            "User-Agent": http_user_agent(override_env="CW_EMBY_UA"),
             "Authorization": auth,
             "X-Emby-Authorization": auth,
             "X-Emby-Token": token,
@@ -1517,7 +1741,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         def _get(url: str, *, params: dict[str, Any] | None = None, use_headers: bool = True) -> requests.Response:
             return requests.get(
                 url,
-                headers=headers if use_headers else {"Accept": "application/json", "User-Agent": "CrossWatch/1.0"},
+                headers=headers if use_headers else {"Accept": "application/json", "User-Agent": http_user_agent(override_env="CW_EMBY_UA")},
                 params=params,
                 timeout=timeout,
                 verify=verify,
@@ -1592,6 +1816,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
     # TMDB
     TMDB_API_BASE = "https://api.themoviedb.org/3"
+    TMDB_API_BASE_V4 = "https://api.themoviedb.org/4"
 
     def _tmdb_v3_api_key_error(api_key: str) -> str:
         key = str(api_key or "").strip()
@@ -1638,7 +1863,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         if key_error:
             return False, key_error
         try:
-            r = requests.get(f"{TMDB_API_BASE}/configuration", params={"api_key": key}, timeout=12)
+            r = requests.get(f"{TMDB_API_BASE}/configuration", params={"api_key": key}, headers={"User-Agent": http_user_agent("TMDbAuth", override_env="CW_TMDB_UA")}, timeout=12)
             r.raise_for_status()
             data = r.json() or {}
             if not isinstance(data, dict) or not isinstance(data.get("images"), dict):
@@ -1694,7 +1919,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return {"ok": False, "error": "internal"}
 
     def _tmdb_v3_request_token(api_key: str) -> dict[str, Any]:
-        r = requests.get(f"{TMDB_API_BASE}/authentication/token/new", params={"api_key": api_key}, timeout=15)
+        r = requests.get(f"{TMDB_API_BASE}/authentication/token/new", params={"api_key": api_key}, headers={"User-Agent": http_user_agent("TMDbAuth", override_env="CW_TMDB_UA")}, timeout=15)
         r.raise_for_status()
         return r.json() or {}
 
@@ -1703,15 +1928,121 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             f"{TMDB_API_BASE}/authentication/session/new",
             params={"api_key": api_key},
             json={"request_token": request_token},
+            headers={"User-Agent": http_user_agent("TMDbAuth", override_env="CW_TMDB_UA")},
             timeout=15,
         )
         r.raise_for_status()
         return r.json() or {}
 
     def _tmdb_v3_account(api_key: str, session_id: str) -> dict[str, Any]:
-        r = requests.get(f"{TMDB_API_BASE}/account", params={"api_key": api_key, "session_id": session_id}, timeout=15)
+        r = requests.get(f"{TMDB_API_BASE}/account", params={"api_key": api_key, "session_id": session_id}, headers={"User-Agent": http_user_agent("TMDbAuth", override_env="CW_TMDB_UA")}, timeout=15)
         r.raise_for_status()
         return r.json() or {}
+
+    def _tmdb_v4_headers(token: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json;charset=utf-8",
+            "User-Agent": http_user_agent("TMDbAuth", override_env="CW_TMDB_UA"),
+        }
+
+    def _tmdb_v4_request_token(read_token: str) -> dict[str, Any]:
+        r = requests.post(f"{TMDB_API_BASE_V4}/auth/request_token", json={}, headers=_tmdb_v4_headers(read_token), timeout=15)
+        r.raise_for_status()
+        return r.json() or {}
+
+    def _tmdb_v4_access_token(read_token: str, request_token: str) -> dict[str, Any]:
+        r = requests.post(f"{TMDB_API_BASE_V4}/auth/access_token", json={"request_token": request_token}, headers=_tmdb_v4_headers(read_token), timeout=15)
+        r.raise_for_status()
+        return r.json() or {}
+
+    def _tmdb_v3_session_from_v4(api_key: str, access_token: str) -> dict[str, Any]:
+        r = requests.post(
+            f"{TMDB_API_BASE}/authentication/session/convert/4",
+            params={"api_key": api_key},
+            json={"access_token": access_token},
+            headers={"User-Agent": http_user_agent("TMDbAuth", override_env="CW_TMDB_UA")},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json() or {}
+
+    def _tmdb_read_token_error(read_token: str, api_key: str = "") -> str:
+        token = str(read_token or "").strip()
+        if not token:
+            return ""
+        if token.lower().startswith("bearer "):
+            return "Paste the TMDb API Read Access Token only, without a Bearer prefix."
+        invalid = "Invalid TMDb API Read Access Token. Use the long token from TMDb API settings, not the API Key."
+        if not token.startswith("eyJ") or token.count(".") != 2:
+            return invalid
+        try:
+            part = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode("utf-8"))
+        except Exception:
+            return invalid
+        if not isinstance(claims, dict):
+            return invalid
+        aud = str(claims.get("aud") or "").strip().lower()
+        key = str(api_key or "").strip().lower()
+        if aud and key and aud != key:
+            return "The API Read Access Token and the API Key belong to different TMDb apps. Copy both from the same TMDb API settings page."
+        return ""
+
+    def _tmdb_sync_lists_ready(tm: dict[str, Any]) -> bool:
+        from providers.sync._mod_TMDB import lists_ready
+
+        return lists_ready(tm)
+
+    def _tmdb_sync_clear_pending(tm: dict[str, Any]) -> None:
+        tm.pop("_pending_request_token", None)
+        tm.pop("_pending_request_token_ts", None)
+        tm.pop("_pending_created_at", None)
+        tm.pop("_pending_v4", None)
+        tm.pop("_pending_access_token", None)
+        tm.pop("_pending_account_object_id", None)
+
+    def _tmdb_sync_complete(cfg: dict[str, Any], tm: dict[str, Any], api_key: str, request_token: str) -> str:
+        if tm.get("_pending_v4"):
+            access = str(tm.get("_pending_access_token") or "").strip()
+            object_id = str(tm.get("_pending_account_object_id") or "").strip()
+            if not access or not object_id:
+                read_token = str(tm.get("read_token") or "").strip()
+                if not read_token:
+                    return ""
+                j = _tmdb_v4_access_token(read_token, request_token)
+                access = str((j or {}).get("access_token") or "").strip()
+                object_id = str((j or {}).get("account_id") or "").strip()
+                if not access or not object_id:
+                    return ""
+                tm["_pending_access_token"] = access
+                tm["_pending_account_object_id"] = object_id
+                save_config(cfg)
+            sess = str((_tmdb_v3_session_from_v4(api_key, access) or {}).get("session_id") or "").strip()
+            if not sess:
+                return ""
+            from providers.sync._mod_TMDB import session_ref
+
+            tm["access_token"] = access
+            tm["account_object_id"] = object_id
+            tm["v4_session_ref"] = session_ref(sess)
+        else:
+            sess = str((_tmdb_v3_create_session(api_key, request_token) or {}).get("session_id") or "").strip()
+            if not sess:
+                return ""
+            tm["access_token"] = ""
+            tm.pop("account_object_id", None)
+            tm.pop("v4_session_ref", None)
+        tm["api_key"] = api_key
+        tm["session_id"] = sess
+        _tmdb_sync_clear_pending(tm)
+        try:
+            me = _tmdb_v3_account(api_key, sess)
+            tm["account_id"] = str((me or {}).get("id") or "").strip()
+            tm["username"] = str((me or {}).get("username") or "").strip()
+        except Exception:
+            pass
+        return sess
 
     def _tmdb_sync_error(e: Exception) -> str:
         return _tmdb_request_error(e).replace("TMDb check failed", "TMDb connect failed")
@@ -1731,25 +2062,41 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             key_error = _tmdb_sync_key_error(key)
             if key_error:
                 return {"ok": False, "error": key_error}
+            read_token = str((payload or {}).get("read_token") or "").strip()
+            if _looks_masked_secret(read_token):
+                read_token = str((tm or {}).get("read_token") or "").strip()
+            read_error = _tmdb_read_token_error(read_token, key)
+            if read_error:
+                return {"ok": False, "error": read_error}
             tm["api_key"] = key
+            tm["read_token"] = read_token
 
-            j = _tmdb_v3_request_token(key)
+            if read_token:
+                j = _tmdb_v4_request_token(read_token)
+            else:
+                j = _tmdb_v3_request_token(key)
             token = str((j or {}).get("request_token") or "").strip()
             if not token:
                 return {"ok": False, "error": "TMDb did not return a request token"}
+            _tmdb_sync_clear_pending(tm)
             tm["_pending_request_token"] = token
-            tm.pop("_pending_request_token_ts", None)
-            tm.pop("_pending_created_at", None)
+            tm["_pending_v4"] = bool(read_token)
             tm["_pending_created_at"] = int(time.time())
             save_config(cfg)
 
             _probe_bust("tmdb_sync")
-            _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] request_token issued instance={inst}")
+            _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] request_token issued instance={inst} v4={bool(read_token)}")
+            auth_url = (
+                f"https://www.themoviedb.org/auth/access?request_token={token}"
+                if read_token
+                else f"https://www.themoviedb.org/authenticate/{token}"
+            )
             return {
                 "ok": True,
                 "request_token": token,
-                "auth_url": f"https://www.themoviedb.org/authenticate/{token}",
+                "auth_url": auth_url,
                 "expires_at": (j or {}).get("expires_at"),
+                "lists": bool(read_token),
                 "instance": inst,
             }
         except Exception as e:
@@ -1772,28 +2119,14 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             if not token:
                 return {"ok": False, "error": "Missing request_token. Click Connect first."}
 
-            j = _tmdb_v3_create_session(key, token)
-            sess = str((j or {}).get("session_id") or "").strip()
+            sess = _tmdb_sync_complete(cfg, tm, key, token)
             if not sess:
                 return {"ok": False, "error": "TMDb did not return a session id. Did you approve the request?"}
 
-            tm["api_key"] = key
-            tm["session_id"] = sess
-            tm.pop("_pending_request_token", None)
-            tm.pop("_pending_request_token_ts", None)
-            tm.pop("_pending_created_at", None)
-
-            try:
-                me = _tmdb_v3_account(key, sess)
-                tm["account_id"] = str((me or {}).get("id") or "").strip()
-                tm["username"] = str((me or {}).get("username") or "").strip()
-            except Exception:
-                pass
-
             save_config(cfg)
             _probe_bust("tmdb_sync")
-            _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] session created instance={inst}")
-            return {"ok": True, "session_id": sess, "account_id": tm.get("account_id") or "", "instance": inst}
+            _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] session created instance={inst} lists={_tmdb_sync_lists_ready(tm)}")
+            return {"ok": True, "session_id": sess, "account_id": tm.get("account_id") or "", "lists_ready": _tmdb_sync_lists_ready(tm), "instance": inst}
         except Exception as e:
             _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] ERROR connect/finish: {e}")
             return {"ok": False, "error": "internal"}
@@ -1812,9 +2145,14 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                 sess = str((tm or {}).get("session_id") or "").strip()
             tm["api_key"] = key
             tm["session_id"] = sess
-            tm.pop("_pending_request_token", None)
-            tm.pop("_pending_request_token_ts", None)
-            tm.pop("_pending_created_at", None)
+            if "read_token" in (payload or {}):
+                read_token = str((payload or {}).get("read_token") or "").strip()
+                if not _looks_masked_secret(read_token):
+                    read_error = _tmdb_read_token_error(read_token, key)
+                    if read_error:
+                        return {"ok": False, "error": read_error, "instance": inst}
+                    tm["read_token"] = read_token
+            _tmdb_sync_clear_pending(tm)
             save_config(cfg)
             _probe_bust("tmdb_sync")
             _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] credentials saved instance={inst}")
@@ -1836,25 +2174,16 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             if not key:
                 return {"ok": True, "connected": False, "pending": bool(token), "error": "Missing api_key", "instance": inst}
 
-            if not sess and token:
+            if token:
                 try:
-                    j = _tmdb_v3_create_session(key, token)
-                    new_sess = str((j or {}).get("session_id") or "").strip()
+                    new_sess = _tmdb_sync_complete(cfg, tm, key, token)
                     if new_sess:
-                        tm["session_id"] = new_sess
-                        tm.pop("_pending_request_token", None)
-                        tm.pop("_pending_request_token_ts", None)
-                        tm.pop("_pending_created_at", None)
-                        try:
-                            me = _tmdb_v3_account(key, new_sess)
-                            tm["account_id"] = str((me or {}).get("id") or "").strip()
-                            tm["username"] = str((me or {}).get("username") or "").strip()
-                        except Exception:
-                            pass
                         save_config(cfg)
                         _probe_bust("tmdb_sync")
                         _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] auto-finish: session created instance={inst}")
                         sess = new_sess
+                    else:
+                        return {"ok": True, "connected": False, "pending": True, "error": "", "instance": inst}
                 except Exception:
                     return {"ok": True, "connected": False, "pending": True, "error": "", "instance": inst}
 
@@ -1870,23 +2199,28 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                     save_config(cfg)
                 except Exception:
                     pass
-            return {"ok": True, "connected": True, "pending": False, "account": {"id": (me or {}).get("id"), "username": (me or {}).get("username")}, "instance": inst}
+            return {"ok": True, "connected": True, "pending": False, "account": {"id": (me or {}).get("id"), "username": (me or {}).get("username")}, "lists_ready": _tmdb_sync_lists_ready(tm), "instance": inst}
         except Exception:
             return {"ok": False, "connected": False, "pending": False, "error": "verify_failed", "instance": inst}
 
     @app.post("/api/tmdb_sync/disconnect", tags=["auth"])
-    def api_tmdb_sync_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_tmdb_sync_disconnect(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "tmdb", inst)
+            if conflict is not None:
+                return conflict
             tm = ensure_instance_block(cfg, "tmdb_sync", inst)
             tm["api_key"] = ""
             tm["session_id"] = ""
+            tm["read_token"] = ""
+            tm["access_token"] = ""
             tm.pop("account_id", None)
+            tm.pop("account_object_id", None)
+            tm.pop("v4_session_ref", None)
             tm.pop("username", None)
-            tm.pop("_pending_request_token", None)
-            tm.pop("_pending_request_token_ts", None)
-            tm.pop("_pending_created_at", None)
+            _tmdb_sync_clear_pending(tm)
             save_config(cfg)
             _probe_bust("tmdb_sync")
             _safe_log(log_fn, "TMDB_SYNC", f"[TMDB_SYNC] disconnected instance={inst}")
@@ -1992,6 +2326,138 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "MDBLIST", f"[MDBLIST] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
+    @app.post("/api/myanimelist/oauth/start", tags=["auth"])
+    def api_myanimelist_oauth_start(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_MYANIMELIST as myanimelist_auth
+
+        return myanimelist_auth.start_oauth(instance_id=normalize_instance_id(instance))
+
+    @app.post("/api/myanimelist/oauth/poll", tags=["auth"])
+    def api_myanimelist_oauth_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_MYANIMELIST as myanimelist_auth
+
+            res = myanimelist_auth.poll_oauth(flow_id=str(payload.get("flow_id") or ""), instance_id=inst)
+            if res.get("status") == "authorized" and isinstance(probe_cache, dict):
+                probe_cache["myanimelist"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MYANIMELIST", f"[MYANIMELIST] ERROR OAuth poll: {type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/myanimelist/oauth/cancel", tags=["auth"])
+    def api_myanimelist_oauth_cancel(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_MYANIMELIST as myanimelist_auth
+
+        return myanimelist_auth.cancel_oauth(flow_id=str(payload.get("flow_id") or ""), instance_id=normalize_instance_id(instance))
+
+    @app.post("/api/myanimelist/refresh", tags=["auth"])
+    def api_myanimelist_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("myanimelist", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["myanimelist"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MYANIMELIST", f"[MYANIMELIST] ERROR refresh: {type(e).__name__}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.get("/api/myanimelist/status", tags=["auth"])
+    def api_myanimelist_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        from providers.auth import _auth_MYANIMELIST as myanimelist_auth
+
+        return myanimelist_auth.account_status(cfg, instance_id=inst)
+
+    @app.post("/api/myanimelist/disconnect", tags=["auth"])
+    def api_myanimelist_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "myanimelist", inst)
+            if conflict is not None:
+                return conflict
+            from providers.auth import _auth_MYANIMELIST as myanimelist_auth
+
+            myanimelist_auth.PROVIDER.disconnect(cfg, instance_id=inst)
+            _safe_log(log_fn, "MYANIMELIST", f"[MYANIMELIST] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["myanimelist"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "MYANIMELIST", f"[MYANIMELIST] ERROR disconnect: {type(e).__name__}")
+            return {"ok": False, "error": "internal"}
+
+    @app.post("/api/wetrakr/oauth/start", tags=["auth"])
+    def api_wetrakr_oauth_start(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_WETRAKR as wetrakr_auth
+
+        return wetrakr_auth.start_oauth(instance_id=normalize_instance_id(instance))
+
+    @app.post("/api/wetrakr/oauth/finish", tags=["auth"])
+    def api_wetrakr_oauth_finish(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_WETRAKR as wetrakr_auth
+
+            res = wetrakr_auth.finish_oauth(code=str(payload.get("code") or ""), flow_id=str(payload.get("flow_id") or ""), instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["wetrakr"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "WETRAKR", f"[WETRAKR] ERROR OAuth finish: {type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/wetrakr/oauth/cancel", tags=["auth"])
+    def api_wetrakr_oauth_cancel(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_WETRAKR as wetrakr_auth
+
+        return wetrakr_auth.cancel_oauth(flow_id=str(payload.get("flow_id") or ""), instance_id=normalize_instance_id(instance))
+
+    @app.post("/api/wetrakr/refresh", tags=["auth"])
+    def api_wetrakr_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("wetrakr", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["wetrakr"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "WETRAKR", f"[WETRAKR] ERROR refresh: {type(e).__name__}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.get("/api/wetrakr/status", tags=["auth"])
+    def api_wetrakr_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        from providers.auth import _auth_WETRAKR as wetrakr_auth
+
+        return wetrakr_auth.account_status(cfg, instance_id=inst)
+
+    @app.post("/api/wetrakr/disconnect", tags=["auth"])
+    def api_wetrakr_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "wetrakr", inst)
+            if conflict is not None:
+                return conflict
+            from providers.auth import _auth_WETRAKR as wetrakr_auth
+
+            wetrakr_auth.PROVIDER.disconnect(cfg, instance_id=inst)
+            _safe_log(log_fn, "WETRAKR", f"[WETRAKR] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["wetrakr"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "WETRAKR", f"[WETRAKR] ERROR disconnect: {type(e).__name__}")
+            return {"ok": False, "error": "internal"}
+
     @app.post("/api/punchplay/device/start", tags=["auth"])
     def api_punchplay_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
@@ -2076,6 +2542,203 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
+    @app.post("/api/bingebase/device/start", tags=["auth"])
+    def api_bingebase_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().start_device_code("bingebase", cfg, instance_id=inst)
+            if isinstance(probe_cache, dict):
+                probe_cache["bingebase"] = (0.0, False)
+            _safe_log(log_fn, "BINGEBASE", f"[BINGEBASE] device start instance={inst} ok={bool(res.get('ok'))}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "BINGEBASE", f"[BINGEBASE] ERROR device start type={type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/bingebase/device/poll", tags=["auth"])
+    def api_bingebase_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code(
+                "bingebase",
+                cfg,
+                instance_id=inst,
+                device_code=str((payload or {}).get("device_code") or "").strip() or None,
+            )
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["bingebase"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "BINGEBASE", f"[BINGEBASE] ERROR device poll type={type(e).__name__}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.post("/api/bingebase/device/cancel", tags=["auth"])
+    def api_bingebase_device_cancel(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_BINGEBASE as bingebase_auth
+
+            return bingebase_auth.cancel_device_code(load_config(), instance_id=inst)
+        except Exception as e:
+            _safe_log(log_fn, "BINGEBASE", f"[BINGEBASE] ERROR device cancel type={type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.get("/api/bingebase/status", tags=["auth"])
+    def api_bingebase_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        p = ensure_instance_block(cfg, "bingebase", inst)
+        try:
+            from providers.auth import _auth_BINGEBASE as bingebase_auth
+
+            if bingebase_auth.ensure_default_webhook(p):
+                save_config(cfg)
+                if isinstance(probe_cache, dict):
+                    probe_cache["bingebase"] = (0.0, False)
+        except Exception:
+            pass
+        out = _provider_auth().status_for_block("bingebase", p)
+        out["instance"] = inst
+        return out
+
+    @app.post("/api/bingebase/disconnect", tags=["auth"])
+    def api_bingebase_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "bingebase", inst)
+            if conflict is not None:
+                return conflict
+            from providers.auth import _auth_BINGEBASE as bingebase_auth
+
+            bingebase_auth.PROVIDER.disconnect(cfg, instance_id=inst)
+            _safe_log(log_fn, "BINGEBASE", f"[BINGEBASE] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["bingebase"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "BINGEBASE", f"[BINGEBASE] ERROR disconnect type={type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/flicklist/save", tags=["auth"])
+    def api_flicklist_save(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_FLICKLIST as flicklist_auth
+
+            raw = payload or {}
+            cfg = load_config()
+            block = ensure_instance_block(cfg, "flicklist", inst)
+            client_id = str(raw.get("client_id") or "").strip()
+            if client_id:
+                block["client_id"] = client_id
+            api_key = str(raw.get("api_key") or raw.get("key") or "").strip()
+            if not api_key:
+                save_config(cfg)
+                return {"ok": True, "instance": inst, "client_id_configured": bool(client_id or block.get("client_id"))}
+            res = flicklist_auth.save_api_key(cfg, instance_id=inst, api_key=api_key)
+            if isinstance(probe_cache, dict):
+                probe_cache["flicklist"] = (0.0, False)
+            return dict(res)
+        except Exception as e:
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] ERROR save: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/flicklist/device/start", tags=["auth"])
+    def api_flicklist_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            raw = payload or {}
+            cfg = load_config()
+            block = ensure_instance_block(cfg, "flicklist", inst)
+            client_id = str(raw.get("client_id") or "").strip()
+            if client_id:
+                block["client_id"] = client_id
+                save_config(cfg)
+            credential = str(raw.get("credential") or "session").strip().lower()
+            if credential not in {"key", "session"}:
+                credential = "session"
+            res = _provider_auth().start_device_code("flicklist", cfg, instance_id=inst, credential=credential)
+            if isinstance(probe_cache, dict):
+                probe_cache["flicklist"] = (0.0, False)
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] device start instance={inst} ok={bool(res.get('ok'))}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] ERROR device start: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/flicklist/device/poll", tags=["auth"])
+    def api_flicklist_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code(
+                "flicklist",
+                cfg,
+                instance_id=inst,
+                device_code=str((payload or {}).get("device_code") or "").strip() or None,
+            )
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["flicklist"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] ERROR device poll: {e}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.post("/api/flicklist/device/cancel", tags=["auth"])
+    def api_flicklist_device_cancel(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_FLICKLIST as flicklist_auth
+
+            return flicklist_auth.cancel_device_code(load_config(), instance_id=inst)
+        except Exception as e:
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] ERROR device cancel: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/flicklist/refresh", tags=["auth"])
+    def api_flicklist_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("flicklist", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["flicklist"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] ERROR refresh: {e}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.get("/api/flicklist/status", tags=["auth"])
+    def api_flicklist_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        p = ensure_instance_block(cfg, "flicklist", inst)
+        out = _provider_auth().status_for_block("flicklist", p)
+        out["instance"] = inst
+        return out
+
+    @app.post("/api/flicklist/disconnect", tags=["auth"])
+    def api_flicklist_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "flicklist", inst)
+            if conflict is not None:
+                return conflict
+            from providers.auth import _auth_FLICKLIST as flicklist_auth
+
+            flicklist_auth.PROVIDER.disconnect(cfg, instance_id=inst)
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["flicklist"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "FLICKLIST", f"[FLICKLIST] ERROR disconnect: {e}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
     @app.post("/api/publicmetadb/save", tags=["auth"])
     def api_publicmetadb_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
         try:
@@ -2116,9 +2779,12 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {"connected": bool(ok), "instance": normalize_instance_id(instance), **({} if ok else {"reason": reason})}
 
     @app.post("/api/publicmetadb/disconnect", tags=["auth"])
-    def api_publicmetadb_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_publicmetadb_disconnect(instance: str | None = Query(None)) -> Any:
         try:
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "publicmetadb", normalize_instance_id(instance))
+            if conflict is not None:
+                return conflict
             p = ensure_instance_block(cfg, "publicmetadb", instance)
             p["api_key"] = ""
             save_config(cfg)
@@ -2165,17 +2831,59 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return code if code in allowed else "invalid_response"
         if name == "NuvioServiceUnavailable":
             return "service_unavailable"
+        if name == "NuvioDiscoveryError":
+            return _nuvio_discovery_error(e)
         return "internal"
+
+    _NUVIO_DISCOVERY_ERRORS: dict[str, str] = {
+        "connection_failed": "connection_failed",
+        "disconnect_first": "disconnect_first",
+        "http_error": "http_error",
+        "invalid_document": "invalid_document",
+        "invalid_url": "invalid_url",
+        "missing_configuration": "missing_configuration",
+        "not_self_hosted": "not_self_hosted",
+        "official_server": "official_server",
+        "response_too_large": "response_too_large",
+        "tv_login_unsupported": "tv_login_unsupported",
+        "unsupported_version": "unsupported_version",
+        "wrong_service": "wrong_service",
+    }
+
+    def _nuvio_discovery_error(e: Exception) -> str:
+        return _NUVIO_DISCOVERY_ERRORS.get(str(e or "").strip(), "discovery_failed")
 
     def _nuvio_public_error() -> str:
         return "nuvio_request_failed"
+
+    @app.post("/api/nuvio/server", tags=["auth"])
+    def api_nuvio_server(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth._auth_NUVIO import NuvioDiscoveryError, configure_server
+
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = configure_server(
+                cfg,
+                instance_id=inst,
+                server_mode=(payload or {}).get("server_mode"),
+                base_url=(payload or {}).get("base_url"),
+            )
+            _probe_bust("nuvio")
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] server set instance={inst} mode={res.get('server_mode')}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "NUVIO", f"[NUVIO] server set failed reason={_nuvio_error(e)} instance={inst}")
+            if isinstance(e, NuvioDiscoveryError):
+                return {"ok": False, "error": _nuvio_discovery_error(e), "instance": inst}
+            return {"ok": False, "error": _nuvio_public_error(), "instance": inst}
 
     @app.post("/api/nuvio/device/start", tags=["auth"])
     def api_nuvio_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
-            redirect = str((payload or {}).get("redirect_base_url") or "https://nuvio.tv/tv-login").strip() or "https://nuvio.tv/tv-login"
+            redirect = str((payload or {}).get("redirect_base_url") or "").strip() or None
             res = _provider_auth().start_device_code("nuvio", cfg, instance_id=inst, redirect_base_url=redirect)
             _safe_log(log_fn, "NUVIO", f"[NUVIO] device login started instance={inst}")
             return res
@@ -2355,10 +3063,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {"connected": bool(ok), "instance": inst, **({} if ok else {"reason": reason})}
 
     @app.post("/api/tautulli/disconnect", tags=["auth"])
-    def api_tautulli_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_tautulli_disconnect(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "tautulli", inst)
+            if conflict is not None:
+                return conflict
             t = ensure_instance_block(cfg, "tautulli", inst)
             t["server_url"] = ""
             t["api_key"] = ""
@@ -2369,6 +3080,113 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return {"ok": True, "instance": inst}
         except Exception as e:
             _safe_log(log_fn, "TAUTULLI", f"[TAUTULLI] ERROR disconnect: {e}")
+            return {"ok": False, "error": "disconnect_failed", "instance": inst}
+
+
+    # TRACEARR
+    @app.post("/api/tracearr/save", tags=["auth"])
+    def api_tracearr_save(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_TRACEARR as tracearr_auth
+
+        inst = normalize_instance_id(instance)
+        raw = payload or {}
+        server = tracearr_auth.normalize_server_url(raw.get("server_url") or raw.get("server") or "")
+        key_in = str(raw.get("api_key") or raw.get("key") or "").strip()
+        history_raw = raw.get("history")
+        history_in: dict[str, Any] = history_raw if isinstance(history_raw, dict) else {}
+        user_touched = "user_id" in raw or "user_id" in history_in
+        user_id = str(raw.get("user_id") or history_in.get("user_id") or "").strip()
+
+        cfg = load_config()
+        t = ensure_instance_block(cfg, "tracearr", inst)
+
+        if server:
+            t["server_url"] = server
+        if key_in and not set(key_in) <= {"*", "•"}:
+            t["api_key"] = key_in
+        if user_touched:
+            t.setdefault("history", {})
+            t["history"]["user_id"] = user_id
+
+        final_server = str(t.get("server_url") or "").strip()
+        final_key = str(t.get("api_key") or "").strip()
+
+        if not final_server:
+            return {"ok": False, "error": "server_url_required", "instance": inst}
+        if not final_key:
+            return {"ok": False, "error": "api_key_required", "instance": inst}
+        ok, reason = tracearr_auth.validate_credentials(
+            final_server,
+            final_key,
+            timeout=float(t.get("timeout", 12.0) or 12.0),
+            verify_ssl=coerce_bool(t.get("verify_ssl", True), True),
+        )
+        if not ok:
+            _safe_log(log_fn, "TRACEARR", f"[TRACEARR] validation failed reason={reason} instance={inst}")
+            return {"ok": False, "error": reason, "instance": inst}
+
+        save_config(cfg)
+        _safe_log(log_fn, "TRACEARR", f"[TRACEARR] saved instance={inst}")
+        if isinstance(probe_cache, dict):
+            probe_cache["tracearr"] = (0.0, False)
+        return {"ok": True, "server_url": final_server, "has_key": True, "instance": inst}
+
+    @app.get("/api/tracearr/status", tags=["auth"])
+    def api_tracearr_status(instance: str | None = Query(None), verify: int | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_TRACEARR as tracearr_auth
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        t = ensure_instance_block(cfg, "tracearr", inst)
+        if not tracearr_auth.is_configured(t):
+            return {"connected": False, "instance": inst}
+        if not verify:
+            return {"connected": True, "instance": inst}
+
+        ok, reason = tracearr_auth.validate_credentials(
+            str(t.get("server_url") or ""),
+            str(t.get("api_key") or ""),
+            timeout=float(t.get("timeout", 10) or 10),
+            verify_ssl=coerce_bool(t.get("verify_ssl", True), True),
+        )
+        return {"connected": bool(ok), "instance": inst, **({} if ok else {"reason": reason})}
+
+    @app.get("/api/tracearr/users", tags=["auth"])
+    def api_tracearr_users(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth import _auth_TRACEARR as tracearr_auth
+
+        inst = normalize_instance_id(instance)
+        cfg = load_config()
+        t = ensure_instance_block(cfg, "tracearr", inst)
+        if not tracearr_auth.is_configured(t):
+            return {"ok": False, "error": "not_configured", "users": [], "instance": inst}
+        users, reason = tracearr_auth.list_users(
+            str(t.get("server_url") or ""),
+            str(t.get("api_key") or ""),
+            timeout=float(t.get("timeout", 10) or 10),
+            verify_ssl=coerce_bool(t.get("verify_ssl", True), True),
+        )
+        selected = str(((t.get("history") or {}) if isinstance(t.get("history"), dict) else {}).get("user_id") or "")
+        return {"ok": not reason, **({"error": reason} if reason else {}), "users": users, "selected": selected, "instance": inst}
+
+    @app.post("/api/tracearr/disconnect", tags=["auth"])
+    def api_tracearr_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "tracearr", inst)
+            if conflict is not None:
+                return conflict
+            t = ensure_instance_block(cfg, "tracearr", inst)
+            t["server_url"] = ""
+            t["api_key"] = ""
+            save_config(cfg)
+            _safe_log(log_fn, "TRACEARR", f"[TRACEARR] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["tracearr"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "TRACEARR", f"[TRACEARR] ERROR disconnect: {e}")
             return {"ok": False, "error": "disconnect_failed", "instance": inst}
 
 
@@ -2435,10 +3253,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {"connected": bool(ok), "server_url": server, "has_token": True, "verify_ssl": coerce_bool(f.get("verify_ssl", False), False), "instance": inst, **({} if ok else {"reason": reason})}
 
     @app.post("/api/floppy/disconnect", tags=["auth"])
-    def api_floppy_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_floppy_disconnect(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "floppy", inst)
+            if conflict is not None:
+                return conflict
             f = ensure_instance_block(cfg, "floppy", inst)
             f["server_url"] = ""
             f["api_token"] = ""
@@ -2583,10 +3404,13 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return {**base, "connected": bool(ok), **({} if ok else {"reason": reason})}
 
     @app.post("/api/scrob/disconnect", tags=["auth"])
-    def api_scrob_disconnect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_scrob_disconnect(instance: str | None = Query(None)) -> Any:
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
+            conflict = usage_conflict_response(cfg, "scrob", inst)
+            if conflict is not None:
+                return conflict
             s = ensure_instance_block(cfg, "scrob", inst)
             s["server_url"] = ""
             s["api_key"] = ""
@@ -2609,7 +3433,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
 
     # TRAKT
-    def trakt_request_pin(instance_id: Any) -> dict[str, Any]:
+    def trakt_request_pin(instance_id: Any, method: Optional[str] = None) -> dict[str, Any]:
         prov = _import_provider("providers.auth._auth_TRAKT")
         if not prov:
             raise RuntimeError("Trakt provider not available")
@@ -2617,7 +3441,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         cfg = load_config()
         inst = normalize_instance_id(instance_id)
         ensure_instance_block(cfg, "trakt", inst)
-        res = prov.start(cfg, redirect_uri="", instance_id=inst)  # type: ignore[attr-defined]
+        res = prov.start(cfg, redirect_uri="", instance_id=inst, method=method)  # type: ignore[attr-defined]
         save_config(cfg)
 
         pend = (ensure_instance_block(cfg, "trakt", inst).get("_pending_device") or {}) if isinstance(cfg, dict) else {}
@@ -2626,7 +3450,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         verification_url = (
             pend.get("verification_url")
             or (res or {}).get("verification_url")
-            or "https://trakt.tv/activate"
+            or "https://auth.trakt.tv/activate"
         )
         exp_epoch = int((pend.get("expires_at") or 0) or (time.time() + 600))
 
@@ -2720,6 +3544,9 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
     def api_trakt_pin_new(payload: Optional[dict[str, Any]] = Body(None), instance: str = Query("default")) -> dict[str, Any]:
         try:
             inst = normalize_instance_id(instance)
+            method = str((payload or {}).get("auth_method") or "").strip().lower()
+            if method not in ("pin", "app"):
+                method = ""
             if payload:
                 cid = str(payload.get("client_id") or "").strip()
                 secr = str(payload.get("client_secret") or "").strip()
@@ -2727,7 +3554,9 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                     cid = ""
                 if _looks_masked_secret(secr):
                     secr = ""
-                if cid or secr:
+                if not method and (cid or secr):
+                    method = "app"
+                if method != "pin" and (cid or secr):
                     cfg = load_config()
                     tr = ensure_instance_block(cfg, "trakt", inst)
                     if cid:
@@ -2742,16 +3571,16 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                             base["client_secret"] = secr
                     save_config(cfg)
 
-            info = trakt_request_pin(inst)
+            info = trakt_request_pin(inst, method or None)
             user_code = str(info["user_code"])
             verification_url = str(
-                info.get("verification_url") or "https://trakt.tv/activate"
+                info.get("verification_url") or "https://auth.trakt.tv/activate"
             )
             exp_epoch = int(info.get("expires_epoch") or 0)
             device_code = str(info["device_code"])
 
             def waiter(_device_code: str, _inst: str) -> None:
-                token = trakt_wait_for_token(_device_code, instance_id=_inst, timeout_sec=300)
+                token = trakt_wait_for_token(_device_code, instance_id=_inst, timeout_sec=max(300, exp_epoch - int(time.time())))
                 if token:
                     _safe_log(
                         log_fn,
@@ -2794,6 +3623,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             tr["expires_at"] = 0
             try:
                 tr.pop("_pending_device", None)
+                tr.pop("auth_error", None)
             except Exception:
                 pass
             save_config(cfg)
@@ -2803,6 +3633,48 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         except Exception as e:
             _safe_log(log_fn, "TRAKT", f"[TRAKT] ERROR token delete: {e}")
             return {"ok": False, "error": "internal"}
+
+    @app.post("/api/kitsu/connect", tags=["auth"])
+    def api_kitsu_connect(payload: dict[str, Any] = Body(...), instance: str = Query("default")) -> Any:
+        from providers.auth import _auth_KITSU as kitsu
+
+        try:
+            username = str(payload.pop("username", ""))
+            password = str(payload.pop("password", ""))
+            connection = kitsu.login(username, password)
+            return JSONResponse({"ok": True, "connection": connection}, headers={"Cache-Control": "no-store"})
+        except kitsu.KitsuAuthError as exc:
+            message = "Kitsu rejected the login" if str(exc) == "invalid_grant" else "Kitsu connection failed"
+            return JSONResponse({"ok": False, "error": message}, status_code=400, headers={"Cache-Control": "no-store"})
+        except Exception:
+            return JSONResponse({"ok": False, "error": "Kitsu connection failed"}, status_code=502)
+        finally:
+            password = ""
+            payload.clear()
+
+    @app.get("/api/kitsu/status", tags=["auth"])
+    def api_kitsu_status(instance: str = Query("default")) -> dict[str, Any]:
+        from providers.auth import _auth_KITSU as kitsu
+        from cw_platform.provider_instances import resolve_provider_block
+
+        return kitsu.status_for_block(resolve_provider_block(load_config(), "kitsu", instance))
+
+    @app.post("/api/kitsu/disconnect", tags=["auth"])
+    def api_kitsu_disconnect(instance: str = Query("default")) -> Any:
+        from providers.auth import _auth_KITSU as kitsu
+
+        inst = normalize_instance_id(instance)
+        with kitsu.instance_lock(inst):
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "kitsu", inst)
+            if conflict is not None:
+                return conflict
+            block = ensure_instance_block(cfg, "kitsu", inst)
+            kitsu.clear_oauth(block)
+            block["reauth_required"] = False
+            save_config(cfg)
+        _probe_bust("kitsu")
+        return {"ok": True}
 
     # ANILIST
     @app.post("/api/anilist/save", tags=["auth"])
@@ -2897,6 +3769,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                 return PlainTextResponse("AniList token exchange failed.", 400)
 
             a["access_token"] = tok["access_token"]
+            a["auth_completed_at"] = str(time.time_ns())
             if tok.get("user"):
                 a["user"] = tok["user"]
             save_config(cfg)
@@ -2914,9 +3787,12 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return PlainTextResponse("Error", 500)
 
     @app.post("/api/anilist/token/delete", tags=["auth"])
-    def api_anilist_token_delete(instance: str = Query("default")) -> dict[str, Any]:
+    def api_anilist_token_delete(instance: str = Query("default")) -> Any:
         cfg = load_config()
         inst = normalize_instance_id(instance)
+        conflict = usage_conflict_response(cfg, "anilist", inst)
+        if conflict is not None:
+            return conflict
         a = ensure_instance_block(cfg, "anilist", inst)
         a["access_token"] = ""
         a.pop("user", None)
@@ -2947,9 +3823,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             state = secrets.token_urlsafe(24)
             redirect_uri = f"{origin}/callback"
             _simkl_prune_state()
-            SIMKL_STATE[state] = {"instance": inst, "redirect_uri": redirect_uri, "created_at": int(time.time())}
-
-            url = simkl_build_authorize_url(cfg, inst, client_id, redirect_uri, state)
+            url, verifier = simkl_build_authorize_url(cfg, inst, client_id, redirect_uri, state)
+            SIMKL_STATE[state] = {"instance": inst, "redirect_uri": redirect_uri, "code_verifier": verifier, "created_at": int(time.time())}
             save_config(cfg)
             return {"ok": True, "authorize_url": url, "instance": inst}
         except Exception as e:
@@ -2981,13 +3856,17 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             if not client_id or not client_secret:
                 return PlainTextResponse("SIMKL client_id/client_secret missing.", 400)
 
-            tokens = simkl_exchange_code(cfg, inst, client_id, client_secret, str(code), redirect_uri)
+            iss = str(request.query_params.get("iss") or "").strip()
+            if iss and iss.rstrip("/") != "https://simkl.com":
+                SIMKL_STATE.pop(state, None)
+                return PlainTextResponse("SIMKL issuer mismatch.", 400)
+
+            tokens = simkl_exchange_code(cfg, inst, client_id, client_secret, str(code), redirect_uri, str(st.get("code_verifier") or ""))
             if not isinstance(tokens, dict) or not str(tokens.get("access_token") or "").strip():
+                SIMKL_STATE.pop(state, None)
                 return PlainTextResponse("SIMKL token exchange failed.", 400)
 
-            simkl_cfg["access_token"] = str(tokens.get("access_token") or "").strip()
-            simkl_cfg.pop("refresh_token", None)
-            simkl_cfg.pop("token_expires_at", None)
+            simkl_cfg["auth_completed_at"] = str(time.time_ns())
             save_config(cfg)
 
             SIMKL_STATE.pop(state, None)
@@ -3006,14 +3885,17 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         if conflict is not None:
             return conflict
         s = ensure_instance_block(cfg, "simkl", inst)
+        token_keys: tuple[str, ...] = ("access_token", "refresh_token", "token_expires_at", "scopes", "account", "_pending_pin", "auth_method")
         try:
-            from providers.auth._auth_SIMKL import app_pin_client_id as _simkl_pin_cid
-            if str(s.get("client_id") or "").strip() == _simkl_pin_cid():
+            from providers.auth import _auth_SIMKL as _simkl_auth
+            _simkl_auth.revoke_block(s)
+            if str(s.get("client_id") or "").strip() in _simkl_auth.baked_client_ids():
                 s.pop("client_id", None)
                 s.pop("api_key", None)
+            token_keys = _simkl_auth.TOKEN_KEYS
         except Exception:
             pass
-        for k in ("access_token", "refresh_token", "token_expires_at", "scopes", "account", "_pending_pin", "auth_method"):
+        for k in token_keys:
             s.pop(k, None)
         save_config(cfg)
         _probe_bust("simkl")
@@ -3108,13 +3990,13 @@ def anilist_exchange_code_for_token(*, code: str, redirect_uri: str, instance_id
             prov.finish(cfg, redirect_uri=redirect_uri, code=code, instance_id=inst)
             save_config(cfg)
     except Exception:
-        pass
+        return None
 
     cfg2 = load_config()
     a = ensure_instance_block(cfg2, "anilist", inst)
     access = str(a.get("access_token") or "").strip()
     user = a.get("user")
-    if access:
+    if prov and access:
         out: dict[str, Any] = {"access_token": access}
         if isinstance(user, dict) and user:
             out["user"] = user
@@ -3133,7 +4015,7 @@ def anilist_exchange_code_for_token(*, code: str, redirect_uri: str, instance_id
         "redirect_uri": redirect_uri,
         "code": code,
     }
-    headers = {"Accept": "application/json", "User-Agent": "CrossWatch/1.0"}
+    headers = {"Accept": "application/json", "User-Agent": http_user_agent(override_env="CW_ANILIST_UA")}
 
     r = requests.post("https://anilist.co/api/v2/oauth/token", json=payload, headers=headers, timeout=15)
     if r.status_code >= 400:
@@ -3151,7 +4033,7 @@ def anilist_exchange_code_for_token(*, code: str, redirect_uri: str, instance_id
         vr = requests.post(
             "https://graphql.anilist.co",
             json={"query": "query { Viewer { id name } }"},
-            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json", "Accept": "application/json"},
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json", "Accept": "application/json", "User-Agent": http_user_agent("AniListAuth", override_env="CW_ANILIST_UA")},
             timeout=15,
         )
         if vr.ok:
@@ -3182,38 +4064,41 @@ def _simkl_prune_state(max_age_s: int = 900) -> None:
     except Exception:
         pass
 
-def simkl_build_authorize_url(cfg: dict[str, Any], instance_id: Any, client_id: str, redirect_uri: str, state: str) -> str:
+def simkl_build_authorize_url(cfg: dict[str, Any], instance_id: Any, client_id: str, redirect_uri: str, state: str) -> tuple[str, str]:
     prov = _import_provider("providers.auth._auth_SIMKL")
     inst = normalize_instance_id(instance_id)
     s = ensure_instance_block(cfg, "simkl", inst)
     s["client_id"] = (client_id or s.get("client_id") or "").strip()
-    url = f"https://simkl.com/oauth/authorize?response_type=code&client_id={s['client_id']}&redirect_uri={redirect_uri}"
-    try:
-        if prov:
-            cfg_view = dict(cfg); cfg_view["simkl"] = s
-            res = prov.start(cfg_view, redirect_uri=redirect_uri) or {}
-            url = (res or {}).get("url") or url
-    except Exception:
-        pass
-    if "state=" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}state={state}"
-    return url
+    if not prov:
+        raise RuntimeError("SIMKL auth provider missing")
+    res = prov.start(cfg, redirect_uri=redirect_uri, instance_id=inst, state=state) or {}
+    url = str(res.get("url") or "")
+    verifier = str(res.get("code_verifier") or "")
+    if not url or not verifier:
+        raise RuntimeError("SIMKL authorize URL could not be built")
+    return url, verifier
 
-def simkl_exchange_code(cfg: dict[str, Any], instance_id: Any, client_id: str, client_secret: str, code: str, redirect_uri: str) -> dict[str, Any] | None:
+def simkl_exchange_code(
+    cfg: dict[str, Any],
+    instance_id: Any,
+    client_id: str,
+    client_secret: str,
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
+) -> dict[str, Any] | None:
     prov = _import_provider("providers.auth._auth_SIMKL")
     inst = normalize_instance_id(instance_id)
     s = ensure_instance_block(cfg, "simkl", inst)
     s["client_id"] = (client_id or "").strip()
     s["client_secret"] = (client_secret or "").strip()
+    if not prov:
+        return None
     try:
-        if prov:
-            cfg_view = dict(cfg); cfg_view["simkl"] = s
-            prov.finish(cfg_view, redirect_uri=redirect_uri, code=code)
+        prov.finish(cfg, instance_id=inst, redirect_uri=redirect_uri, code=code, code_verifier=code_verifier)
     except Exception:
-        pass
+        return None
     access = str(s.get("access_token") or "").strip()
     if not access:
         return None
-    out: dict[str, Any] = {"access_token": access}
-    return out
+    return {"access_token": access}

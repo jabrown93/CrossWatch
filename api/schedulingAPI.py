@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Request
+
+from cw_platform.access_policy import request_is_monitor
+from services.scheduler_webhooks import payload_format_label, scheduler_webhooks_configured, send_test_webhook
 
 router = APIRouter(prefix="/api/scheduling", tags=["scheduling"])
 
@@ -221,19 +224,10 @@ def _scheduling_warning_summary(cfg: dict[str, Any]) -> dict[str, Any]:
 def _scheduler_webhook_status(scfg: dict[str, Any]) -> dict[str, Any]:
     hooks = _as_dict(_as_dict(scfg).get("webhooks"))
     enabled = hooks.get("enabled") is True
-    fmt_raw = _clean_text(hooks.get("payload_format") or hooks.get("payloadFormat") or hooks.get("format")).lower().replace("-", "_")
-    notifiarr = fmt_raw in {"notifiarr", "notifiarr_passthrough"}
-    label = "Notifiarr Passthrough" if notifiarr else "CrossWatch JSON"
+    fmt_raw = _clean_text(hooks.get("payload_format") or hooks.get("payloadFormat") or hooks.get("format"))
     common_url = _clean_text(hooks.get("url") or hooks.get("default_url") or hooks.get("defaultUrl"))
-    urls = [
-        common_url,
-        _clean_text(hooks.get("base_url") or hooks.get("healthchecks_base_url")),
-        _clean_text(hooks.get("start_url")),
-        _clean_text(hooks.get("success_url")),
-        _clean_text(hooks.get("failure_url")),
-    ]
-    configured = bool(common_url) if notifiarr else any(urls)
-    return {"enabled": enabled, "configured": configured, "label": label}
+    configured = scheduler_webhooks_configured({**hooks, "payload_format": fmt_raw, "url": common_url})
+    return {"enabled": enabled, "configured": configured, "label": payload_format_label(fmt_raw)}
 
 
 def _log_scheduler_webhook_status(prev_scfg: dict[str, Any], next_scfg: dict[str, Any], log: Callable[..., Any]) -> None:
@@ -358,6 +352,19 @@ def sched_stop() -> dict[str, Any]:
     return {"ok": True, "stopped": True, **st}
 
 
+@router.post("/webhooks/test")
+def sched_webhooks_test() -> dict[str, Any]:
+    load_config, _, _, _, _, log = _env()
+    scheduling = _as_dict((load_config() or {}).get("scheduling"))
+    ok, error = send_test_webhook(_as_dict(scheduling.get("webhooks")))
+    try:
+        message = "Scheduler webhook test: delivered" if ok else f"Scheduler webhook test: failed, {error}"
+        log("SYNC", "SCHED")(message, level="INFO" if ok else "WARN")
+    except Exception:
+        pass
+    return {"ok": ok, "error": error}
+
+
 @router.get("")
 def sched_get() -> dict[str, Any]:
     load_config, *_ = _env()
@@ -400,7 +407,7 @@ def sched_post(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         return {"ok": True, "next_run_at": int(nxt) if nxt else 0}
 
 @router.get("/status")
-def sched_status() -> dict[str, Any]:
+def sched_status(request: Request = cast(Request, None)) -> dict[str, Any]:
     load_config, _, scheduler, hint, *_ = _env()
     try:
         st = scheduler.status()  # type: ignore[union-attr]
@@ -410,6 +417,8 @@ def sched_status() -> dict[str, Any]:
     try:
         cfg = load_config() or {}
         st["config"] = (cfg.get("scheduling") or {}) or {}
+        if request_is_monitor(request):
+            st["config"] = {key: value for key, value in _as_dict(st["config"]).items() if key != "webhooks"}
         live = int(st.get("next_run_at") or 0)
         hint_val = int((hint.get("next_run_at") or 0)) if isinstance(hint, dict) else 0
         if not live and hint_val:

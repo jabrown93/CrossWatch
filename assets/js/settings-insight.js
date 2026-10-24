@@ -12,7 +12,6 @@
   const Meta = () => w.CW?.ProviderMeta || null;
   const $ = (s, r = d) => r.querySelector(s);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const PROVIDERS = ['plex', 'emby', 'jellyfin', 'trakt', 'simkl', 'mdblist', 'publicmetadb', 'anilist', 'tmdb', 'tautulli'];
 
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
   const has = (v) => typeof v === 'string' ? v.trim().length > 0 : !!v;
@@ -73,9 +72,10 @@
     const p = String(provider || '').toLowerCase(), b = blk && typeof blk === 'object' ? blk : {};
     if (p === 'plex') return has(b.account_token) || has(b.token) || has(b.access_token);
     if (p === 'emby' || p === 'jellyfin') return has(b.access_token) || has(b.api_key) || has(b.token);
-    if (p === 'trakt' || p === 'simkl') return has(b.access_token) || has(b.refresh_token);
+    if (p === 'trakt' || p === 'simkl' || p === 'wetrakr') return has(b.access_token) || has(b.refresh_token);
     if (p === 'anilist') return has(b.access_token) || has(b.token);
     if (p === 'mdblist') return has(b.api_key) || has(b.access_token);
+    if (p === 'tracearr') return has(b.server_url || b.server) && has(b.api_key);
     if (p === 'tautulli') return has((b || cfg?.tautulli || cfg?.auth?.tautulli || {}).server_url || (b || cfg?.tautulli || cfg?.auth?.tautulli || {}).server);
     if (p === 'tmdb') return has(b.api_key) && has(b.session_id || b.session);
     return has(b.access_token) || has(b.api_key) || has(b.token);
@@ -90,7 +90,8 @@
   }
 
   function authSummary(cfg) {
-    const profiles = PROVIDERS.map((provider) => ({ provider, count: countProfiles(cfg, provider) })).filter((x) => x.count);
+    const providers = (Meta()?.authProviders?.() || []).map(({ key }) => key.toLowerCase());
+    const profiles = providers.map((provider) => ({ provider, count: countProfiles(cfg, provider) })).filter((x) => x.count);
     return { configured: profiles.length, profiles };
   }
 

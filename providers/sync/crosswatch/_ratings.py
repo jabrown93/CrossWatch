@@ -9,7 +9,8 @@ from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.id_map import migrate_media_key, canonical_key, ids_from, unified_keys_from_ids
+from providers.sync._mod_common import observation_time
 
 from ._common import (
     _atomic_write,
@@ -20,14 +21,16 @@ from ._common import (
     _root,
     _snapshot_state,
     current_state_only,
-    latest_snapshot_file,
-    latest_state_file,
+    fallback_snapshot_file,
+    fallback_state_file,
     make_logger,
     may_persist,
+    merge_tracker_identity,
     pair_scoped,
     readonly,
     scoped_file,
     state_file_for_read,
+    tracker_minimal,
 )
 
 _dbg, _info, _warn, _error = make_logger("ratings")
@@ -37,8 +40,8 @@ def _now_iso_z() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
-    base = id_minimal(obj)
+def _accepted(obj: Mapping[str, Any], *, observed_at: str | None = None) -> dict[str, Any]:
+    base = tracker_minimal(obj)
     out: dict[str, Any] = dict(base)
 
     typ = str(obj.get("type") or base.get("type") or "")
@@ -48,13 +51,14 @@ def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
             out["series_title"] = str(st)
         if obj.get("series_year") is not None:
             out["series_year"] = obj.get("series_year")
-        season = int(obj.get("season") or 0)
+        season_raw = obj.get("season")
+        season = None if season_raw is None or season_raw == "" else int(season_raw)
         episode = int(obj.get("episode") or 0)
-        if season:
+        if season is not None:
             out["season"] = season
         if episode:
             out["episode"] = episode
-        if season and episode:
+        if season is not None and episode:
             out["title"] = f"S{season:02d}E{episode:02d}"
         elif "title" in obj:
             out["title"] = obj.get("title")
@@ -76,8 +80,38 @@ def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
     if ra:
         out["rated_at"] = str(ra)
     elif obj.get("rating") is not None or obj.get("liked") is not None:
-        out["rated_at"] = _now_iso_z()
+        out["rated_at"] = observed_at or _now_iso_z()
     return out
+
+
+_ALIAS_EXCLUDED_TYPES = ("episode", "season")
+
+
+def _alias_tokens(obj: Mapping[str, Any]) -> set[str]:
+    typ = str(obj.get("type") or "").strip().lower()
+    if typ in _ALIAS_EXCLUDED_TYPES:
+        return set()
+    return {f"{typ}|{tok}" for tok in unified_keys_from_ids(ids_from(obj))}
+
+
+def _alias_index(cur: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in (cur or {}).items():
+        if not isinstance(value, Mapping):
+            continue
+        for tok in _alias_tokens(value):
+            out.setdefault(tok, str(key))
+    return out
+
+
+def _resolve_stored_key(cur: Mapping[str, Any], alias: Mapping[str, str], accepted: Mapping[str, Any], key: str) -> str | None:
+    if key in cur:
+        return key
+    for tok in _alias_tokens(accepted):
+        alt = alias.get(tok)
+        if alt and alt != key and alt in cur:
+            return alt
+    return None
 
 
 def _ratings_path(adapter: Any) -> Path:
@@ -88,6 +122,7 @@ def _load_state(adapter: Any) -> dict[str, Any]:
     if _pair_scope() is None:
         return {"ts": 0, "items": {}}
     root = _root(adapter)
+    observed_at = observation_time(adapter)
     path = _ratings_path(adapter)
     raw: Any | None
 
@@ -100,15 +135,17 @@ def _load_state(adapter: Any) -> dict[str, Any]:
     read_path = state_file_for_read(root, "ratings", path)
     raw = _read_json(read_path)
     if raw is None:
-        alt = latest_state_file(root, "ratings")
+        alt = fallback_state_file(root, "ratings")
         if alt and alt != path:
             raw = _read_json(alt)
     if raw is None and current_state_only(adapter):
         return {"ts": 0, "items": {}}
     if raw is None:
-        snap = latest_snapshot_file(root, "ratings")
+        snap = fallback_snapshot_file(root, "ratings")
         if snap:
             raw = _read_json(snap)
+            if raw is not None:
+                _warn("state_restored_from_snapshot", snapshot=snap.name)
     if raw is None:
         return {"ts": 0, "items": {}}
 
@@ -120,7 +157,7 @@ def _load_state(adapter: Any) -> dict[str, Any]:
             key = canonical_key(obj)
             if not key:
                 continue
-            items[key] = _accepted(obj)
+            items[key] = _accepted(obj, observed_at=observed_at)
         state = {"ts": 0, "items": items}
         if items and may_persist(adapter, path):
             _atomic_write(path, {"ts": int(time.time()), "items": items})
@@ -134,10 +171,10 @@ def _load_state(adapter: Any) -> dict[str, Any]:
             for key, value in items_raw.items():
                 if not isinstance(value, Mapping):
                     continue
-                ck = str(key) or canonical_key(value)
+                ck = migrate_media_key(str(key), value)
                 if not ck:
                     continue
-                items2[ck] = _accepted(value)
+                items2[ck] = _accepted(value, observed_at=observed_at)
             state = {"ts": ts, "items": items2}
             if items2 and may_persist(adapter, path):
                 _atomic_write(path, {"ts": ts or int(time.time()), "items": items2})
@@ -147,10 +184,10 @@ def _load_state(adapter: Any) -> dict[str, Any]:
         for key, value in raw.items():
             if not isinstance(value, Mapping):
                 continue
-            ck = str(key) or canonical_key(value)
+            ck = migrate_media_key(str(key), value)
             if not ck:
                 continue
-            items3[ck] = _accepted(value)
+            items3[ck] = _accepted(value, observed_at=observed_at)
         state = {"ts": 0, "items": items3}
         if items3 and may_persist(adapter, path):
             _atomic_write(path, {"ts": int(time.time()), "items": items3})
@@ -208,6 +245,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
 
     state = _load_state(adapter)
     cur: dict[str, dict[str, Any]] = dict(state.get("items") or {})
+    alias = _alias_index(cur)
     unresolved_src: list[Mapping[str, Any]] = []
     changed = 0
 
@@ -223,11 +261,18 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         if not key:
             unresolved_src.append(obj)
             continue
-        existing = cur.get(key)
+        stored_key = _resolve_stored_key(cur, alias, accepted, key)
+        existing = cur.get(stored_key) if stored_key else None
         new_ts = str(accepted.get("rated_at") or "")
         old_ts = str((existing or {}).get("rated_at") or "")
         if existing is None or old_ts <= new_ts:
+            if isinstance(existing, Mapping):
+                accepted = merge_tracker_identity(existing, accepted)
+            if stored_key and stored_key != key:
+                cur.pop(stored_key, None)
             cur[key] = accepted
+            for tok in _alias_tokens(accepted):
+                alias[tok] = key
             changed += 1
 
     if changed:
@@ -249,6 +294,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
 
     state = _load_state(adapter)
     cur: dict[str, dict[str, Any]] = dict(state.get("items") or {})
+    alias = _alias_index(cur)
     unresolved_src: list[Mapping[str, Any]] = []
     changed = 0
 
@@ -264,8 +310,9 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         if not key:
             unresolved_src.append(obj)
             continue
-        if key in cur:
-            del cur[key]
+        stored_key = _resolve_stored_key(cur, alias, accepted, key)
+        if stored_key:
+            del cur[stored_key]
             changed += 1
 
     if changed:

@@ -1,4 +1,10 @@
+# /providers/sync/jellyfin/_playlists.py
+# Jellyfin Module for playlist sync functions
+# Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
+
 from __future__ import annotations
+
+from cw_platform.interactive_reads import retained_read
 
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -12,6 +18,7 @@ from ._common import (
     collection_remove_items,
     create_collection,
     create_playlist,
+    delete_item,
     key_of as jelly_key_of,
     make_logger,
     normalize as jelly_normalize,
@@ -20,6 +27,7 @@ from ._common import (
     playlist_remove_entries,
     resolve_item_id,
     sleep_ms,
+    update_item_name,
 )
 
 _PROVIDER = "JELLYFIN"
@@ -33,6 +41,10 @@ class JellyfinPlaylistError(RuntimeError):
 
 
 class JellyfinPlaylistNotFound(JellyfinPlaylistError):
+    pass
+
+
+class JellyfinPlaylistUnsupported(JellyfinPlaylistError):
     pass
 
 
@@ -132,6 +144,7 @@ def _fetch_resources(adapter: Any, endpoint_type: str) -> list[PlaylistResource]
     return out
 
 
+@retained_read
 def list_resources(adapter: Any) -> list[PlaylistResource]:
     out = _fetch_resources(adapter, "playlist")
     out.extend(_fetch_resources(adapter, "collection"))
@@ -180,13 +193,19 @@ def _is_movie_or_show(row: Mapping[str, Any]) -> bool:
     return typ in ("movie", "show", "series")
 
 
-def get_snapshot(adapter: Any, playlist_id: Any) -> PlaylistSnapshot:
-    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+@retained_read
+def _member_rows(adapter: Any, endpoint_type: str, raw_id: str):
     page_size = max(200, int(getattr(adapter.cfg, "watchlist_query_limit", 1000) or 1000))
     if endpoint_type == "collection":
         rows, _total = collection_fetch_all(adapter.client, adapter.cfg.user_id, raw_id, page_size=page_size)
     else:
         rows, _total = playlist_fetch_all(adapter.client, raw_id, page_size=page_size)
+    return rows
+
+
+def get_snapshot(adapter: Any, playlist_id: Any) -> PlaylistSnapshot:
+    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+    rows = _member_rows(adapter, endpoint_type, raw_id)
     items: list[PlaylistItem] = []
     for pos, row in enumerate(rows):
         if not isinstance(row, Mapping) or not _is_movie_or_show(row):
@@ -241,6 +260,46 @@ def create(
     return res
 
 
+def rename(adapter: Any, playlist_id: Any, name: str, *, dry_run: bool = False) -> PlaylistResource:
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("playlist name required")
+    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+    if dry_run:
+        return PlaylistResource(
+            provider=_PROVIDER,
+            id=resource.id,
+            name=nm,
+            instance=resource.instance,
+            kind=resource.kind,
+            can_read=resource.can_read,
+            can_add=resource.can_add,
+            can_remove=resource.can_remove,
+            can_reorder=resource.can_reorder,
+            media_types=resource.media_types,
+            extra=dict(resource.extra or {}),
+        )
+    if not update_item_name(adapter.client, raw_id, nm):
+        raise JellyfinPlaylistError(f"jellyfin rename {endpoint_type} failed")
+    res = _resource_from_row(adapter, {"Id": raw_id, "Name": nm, "Type": "BoxSet" if endpoint_type == "collection" else "Playlist"}, endpoint_type)
+    if res is None:
+        raise JellyfinPlaylistError(f"jellyfin rename {endpoint_type} returned no id")
+    _info("rename_done", list_id=res.id, endpoint_type=endpoint_type, name=res.name)
+    return res
+
+
+def delete(adapter: Any, playlist_id: Any, *, dry_run: bool = False) -> dict[str, Any]:
+    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+    if endpoint_type != "playlist":
+        raise JellyfinPlaylistUnsupported("jellyfin collections must be deleted in jellyfin")
+    if dry_run:
+        return {"ok": True, "dry_run": True}
+    if not delete_item(adapter.client, raw_id):
+        raise JellyfinPlaylistError("jellyfin delete playlist failed")
+    _info("delete_done", list_id=resource.id)
+    return {"ok": True, "count": 1}
+
+
 def _accepted_items(adapter: Any, items: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[str, str]], list[dict[str, Any]]]:
     accepted: list[tuple[str, str]] = []
     unresolved: list[dict[str, Any]] = []
@@ -290,11 +349,7 @@ def add(adapter: Any, playlist_id: Any, items: Sequence[Mapping[str, Any]]) -> d
 
 
 def _current_members(adapter: Any, endpoint_type: str, raw_id: str) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
-    page_size = max(200, int(getattr(adapter.cfg, "watchlist_query_limit", 1000) or 1000))
-    if endpoint_type == "collection":
-        rows, _total = collection_fetch_all(adapter.client, adapter.cfg.user_id, raw_id, page_size=page_size)
-    else:
-        rows, _total = playlist_fetch_all(adapter.client, raw_id, page_size=page_size)
+    rows = _member_rows(adapter, endpoint_type, raw_id)
     by_key: dict[str, list[str]] = {}
     keys_by_id: dict[str, set[str]] = {}
     for row in rows:

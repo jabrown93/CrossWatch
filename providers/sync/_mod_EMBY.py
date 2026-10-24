@@ -3,6 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from ._path_matching import enrich_snapshot, path_presence
+
 import json
 import os
 import time
@@ -11,6 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import requests
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.provider_instances import normalize_instance_id
 from cw_platform.value_coercion import coerce_bool
 
@@ -22,6 +25,12 @@ from .emby import _watchlist as feat_watchlist
 from .emby import _history as feat_history
 from .emby import _ratings as feat_ratings
 from .emby import _progress as feat_progress
+try:
+    from .emby import _collection as feat_collection
+except Exception as e:
+    feat_collection = None
+    if os.environ.get("CW_DEBUG") or os.environ.get("CW_EMBY_DEBUG"):
+        cw_log("EMBY", "collection", "warn", "feature_import_failed", error=str(e))
 try:
     from .emby import _playlists as feat_playlists
 except Exception as e:
@@ -42,27 +51,42 @@ from ._mod_common import (
 _HISTORY_META_FIELDS = ("confirmed_keys", "unresolved_keys", "results", "reason_counts")
 
 
-def _finalize_result(adapter: Any, key_of, feature: str, items, cnt: int, unresolved: Any) -> dict[str, Any]:
+def _finalize_result(adapter: Any, key_of, feature: str, items, cnt: int, unresolved: Any, *, op: str = "add") -> dict[str, Any]:
     meta = getattr(adapter, "_history_write_meta", None) if feature == "history" else None
     if isinstance(meta, Mapping):
         rc = meta.get("reason_counts")
+        confirmed = list(meta.get("confirmed_keys") or [])
+        skipped = {
+            str(row.get("key")) for row in (meta.get("results") or [])
+            if isinstance(row, Mapping) and row.get("action") == "skip" and row.get("key")
+        } if op == "add" else set()
+        skipped_keys = [key for key in confirmed if key in skipped]
         return build_op_result(
             ok=True,
             count=int(cnt),
-            confirmed_keys=meta.get("confirmed_keys") or [],
+            confirmed_keys=[key for key in confirmed if key not in skipped],
             unresolved_keys=meta.get("unresolved_keys") or _unresolved_keys(unresolved, key_of),
             unresolved=unresolved,
             results=meta.get("results") or [],
             reason_counts=(dict(rc) if isinstance(rc, Mapping) else None),
+            **({"skipped_keys": skipped_keys, "skipped": len(skipped_keys)} if op == "add" else {}),
         )
     results = list(getattr(adapter, "_progress_write_results", [])) if feature == "progress" else []
+    confirmed = _confirmed_keys(key_of, items, unresolved)
+    applied = {str(row.get("key")) for row in results if row.get("status") == "applied"}
+    skipped = {
+        str(row.get("key")) for row in results
+        if row.get("status") == "skipped" and row.get("key")
+    } - applied if op == "add" else set()
+    skipped_keys = [key for key in confirmed if key in skipped]
     return build_op_result(
         ok=True,
         count=int(cnt),
-        confirmed_keys=_confirmed_keys(key_of, items, unresolved),
+        confirmed_keys=[key for key in confirmed if key not in skipped],
         unresolved_keys=_unresolved_keys(unresolved, key_of),
         unresolved=unresolved,
         results=results,
+        **({"skipped_keys": skipped_keys, "skipped": len(skipped_keys)} if feature == "progress" and op == "add" else {}),
     )
 
 
@@ -111,15 +135,17 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "2.2"
-os.environ.setdefault("CW_EMBY_VERSION", __VERSION__)
-os.environ.setdefault("CW_EMBY_UA", f"CrossWatch/{__VERSION__} (Emby)")
+__VERSION__ = "2.7"
+os.environ.setdefault("CW_EMBY_UA", http_user_agent("Emby", override_env="CW_EMBY_UA"))
 __all__ = ["get_manifest", "EMBYModule", "OPS"]
 
-_DEF_UA = os.environ.get("CW_EMBY_UA") or os.environ.get("CW_UA") or f"CrossWatch/{__VERSION__} (Emby)"
+_DEF_UA = os.environ.get("CW_EMBY_UA") or os.environ.get("CW_UA") or http_user_agent("Emby", override_env="CW_EMBY_UA")
 
 
-def _pick_instance_id(provider: str) -> str:
+def _pick_instance_id(provider: str, cfg: Mapping[str, Any] | None = None) -> str:
+    explicit_instance = (cfg or {}).get("_cw_provider_instance")
+    if explicit_instance is not None:
+        return normalize_instance_id(explicit_instance)
     prov = str(provider or "").upper().strip()
     for k in ("CW_SNAPSHOT_INSTANCE", "CW_INSTANCE_ID", "CW_PROFILE", "CW_PROVIDER_INSTANCE", "CW_INSTANCE"):
         v = (os.environ.get(k) or "").strip()
@@ -176,11 +202,23 @@ _FEATURES: dict[str, Any] = {
     "history": feat_history,
     "ratings": feat_ratings,
     "progress": feat_progress,
+    "collection": feat_collection,
+}
+
+_HISTORY_CAPABILITIES: dict[str, Any] = {
+    "index_semantics": "present",
+    "observed_deletes": True,
+    "aggregated": True,
+    "event_history": False,
+    "rewatches": {"read": False, "write": False, "account_gate": False},
 }
 
 _PLAYLIST_CAPABILITIES: dict[str, Any] = {
     "read": True,
     "create": True,
+    "create_endpoint_types": ["playlist", "collection"],
+    "rename": True,
+    "delete": True,
     "add": True,
     "remove": True,
     "reorder": True,
@@ -205,6 +243,16 @@ _PROGRESS_CAPABILITIES: dict[str, Any] = {
             "setting": "LibraryOptions.MaxResumePct",
         },
     },
+}
+
+_COLLECTION_CAPABILITIES: dict[str, Any] = {
+    "index_semantics": "present",
+    "observed_deletes": True,
+    "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+    "read": True,
+    "add": False,
+    "remove": False,
+    "source_only": True,
 }
 
 _HEALTH_SHADOW_NAME = "emby.health.shadow.json"
@@ -241,12 +289,14 @@ def get_manifest() -> Mapping[str, Any]:
             "ratings": False,
             "playlists": feat_playlists is not None,
             "progress": True,
+            "collection": feat_collection is not None,
         },
         "requires": ["requests"],
         "capabilities": {
             "bidirectional": True,
             "provides_ids": False,
             "index_semantics": "present",
+            "history": _HISTORY_CAPABILITIES,
             "ratings": {
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
@@ -254,7 +304,9 @@ def get_manifest() -> Mapping[str, Any]:
                 "from_date": False,
             },
             "progress": _PROGRESS_CAPABILITIES,
+            "collection": _COLLECTION_CAPABILITIES,
             "playlists": _PLAYLIST_CAPABILITIES,
+            "library_presence": {"features": ["history", "progress", "watchlist"]},
         },
     }
 
@@ -283,6 +335,8 @@ class EMBYConfig:
     history_libraries: list[str] | None = None
     progress_libraries: list[str] | None = None
     ratings_libraries: list[str] | None = None
+    collection_libraries: list[str] | None = None
+    collection_media_info: bool = False
     progress_replay_enabled: bool = False
     progress_timestamp_tolerance_seconds: int = 30
 
@@ -301,7 +355,7 @@ class EMBYClient:
         self.session.verify = bool(cfg.verify_ssl)
         auth_val = (
             f'MediaBrowser Client="CrossWatch", Device="CrossWatch", '
-            f'DeviceId="{cfg.device_id}", Version="{__VERSION__}", Token="{cfg.access_token}"'
+            f'DeviceId="{cfg.device_id}", Version="{app_version()}", Token="{cfg.access_token}"'
         )
         self.session.headers.update(
             {
@@ -332,6 +386,7 @@ class EMBYClient:
             json=json,
             timeout=self.cfg.timeout,
             max_retries=self.cfg.max_retries,
+            verify=self.cfg.verify_ssl,
         )
 
     def get(self, path: str, *, params: dict[str, Any] | None = None) -> requests.Response:
@@ -362,8 +417,9 @@ class EMBYClient:
 
 class EMBYModule:
     def __init__(self, cfg: Mapping[str, Any]):
-        self.instance_id = "default"
-        inst = _pick_instance_id("EMBY")
+        self.path_matching = coerce_bool(cfg.get("_cw_path_matching", False))
+        inst = _pick_instance_id("EMBY", cfg)
+        self.instance_id = inst
         em = _merge_instance_block((cfg or {}).get("emby") or {}, inst)
         auth = _merge_instance_block(dict((cfg or {}).get("auth") or {}).get("emby") or {}, inst)
         em.setdefault("server", auth.get("server"))
@@ -390,6 +446,7 @@ class EMBYModule:
         hi_gprio = hi.get("history_guid_priority") or wl_gprio
         pr = dict(em.get("progress") or {})
         ra = dict(em.get("ratings") or {})
+        co = dict(em.get("collection") or {})
 
         def _list_str(v: Any) -> list[str] | None:
             if not v:
@@ -439,6 +496,8 @@ class EMBYModule:
             history_libraries=_list_str(hi.get("libraries")),
             progress_libraries=_list_str(pr.get("libraries")),
             ratings_libraries=_list_str(ra.get("libraries")),
+            collection_libraries=_list_str(co.get("libraries")),
+            collection_media_info=coerce_bool(co.get("media_info", False)),
             progress_replay_enabled=coerce_bool(pr.get("replay_enabled", em.get("progress_replay_enabled", False))),
             progress_timestamp_tolerance_seconds=_i(pr.get("timestamp_tolerance_seconds", em.get("progress_clock_drift_seconds", 30)), 30),
             history_force_overwrite=force_overwrite,
@@ -475,7 +534,7 @@ class EMBYModule:
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
-        toggles = {"watchlist": True, "history": True, "ratings": False, "playlists": feat_playlists is not None, "progress": True}
+        toggles = {"watchlist": True, "history": True, "ratings": False, "playlists": feat_playlists is not None, "progress": True, "collection": feat_collection is not None}
         present = _present_flags()
         out = {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
         out["playlists"] = bool(feat_playlists is not None)
@@ -497,7 +556,7 @@ class EMBYModule:
                 "server": {"product": None, "version": None},
                 "disabled": [k for k, v in enabled.items() if not v],
             }
-            features = {k: False for k in ("watchlist", "history", "ratings", "playlists", "progress")}
+            features = {k: False for k in ("watchlist", "history", "ratings", "playlists", "progress", "collection")}
             api = {
                 "ping": {"status": None},
                 "info": {"status": None},
@@ -545,6 +604,7 @@ class EMBYModule:
             "ratings": base_ready if enabled.get("ratings") else False,
             "playlists": base_ready if enabled.get("playlists") else False,
             "progress": base_ready if enabled.get("progress") else False,
+            "collection": base_ready if enabled.get("collection") else False,
         }
 
         checks: list[bool] = [features[k] for k, on in enabled.items() if on]
@@ -628,7 +688,7 @@ class EMBYModule:
         mod = _FEATURES.get(f)
         if not mod:
             return {}
-        return mod.build_index(self, **kwargs)
+        return enrich_snapshot(self, mod.build_index(self, **kwargs), "EMBY", feature)
 
     def _dry_result(self, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         lst = list(items)
@@ -693,7 +753,16 @@ class EMBYModule:
         except Exception:
             pass
         cnt, unresolved = mod.remove(self, lst)
-        return _finalize_result(self, self.key_of, f, lst, cnt, unresolved)
+        return _finalize_result(self, self.key_of, f, lst, cnt, unresolved, op="remove")
+
+    def library_presence(self, feature: str, items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        from .emby import _presence
+
+        rows = list(items)
+        feature = (feature or "history").lower()
+        results = _presence.presence(self, rows, feature=feature)
+        return path_presence(self, rows, results, "EMBY", feature)
+
 class _EmbyOPS:
     def name(self) -> str:
         return "EMBY"
@@ -709,6 +778,7 @@ class _EmbyOPS:
             "bidirectional": True,
             "provides_ids": False,
             "index_semantics": "present",
+            "history": _HISTORY_CAPABILITIES,
             "ratings": {
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
@@ -716,7 +786,9 @@ class _EmbyOPS:
                 "from_date": False,
             },
             "progress": _PROGRESS_CAPABILITIES,
+            "collection": _COLLECTION_CAPABILITIES,
             "playlists": _PLAYLIST_CAPABILITIES,
+            "library_presence": {"features": ["history", "progress", "watchlist"]},
         }
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
@@ -759,6 +831,15 @@ class _EmbyOPS:
     ) -> Mapping[str, Any]:
         return self._adapter(cfg).remove(feature, items, dry_run=dry_run)
 
+    def library_presence(
+        self,
+        cfg: Mapping[str, Any],
+        items: Iterable[Mapping[str, Any]],
+        *,
+        feature: str,
+    ) -> list[dict[str, Any]]:
+        return self._adapter(cfg).library_presence(feature, items)
+
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
 
@@ -800,6 +881,27 @@ class _EmbyOPS:
             items=list(items or []),
             dry_run=dry_run,
         )
+
+    def rename_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        name: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().rename(self._playlist_adapter(cfg, instance), playlist_id, name, dry_run=dry_run)
+
+    def delete_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._pl().delete(self._playlist_adapter(cfg, instance), playlist_id, dry_run=dry_run)
 
     def add_playlist_items(
         self,

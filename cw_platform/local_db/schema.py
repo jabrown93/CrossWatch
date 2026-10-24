@@ -6,7 +6,7 @@ from __future__ import annotations
 import sqlite3
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 6
 
 ID_KEYS = (
     "tmdb",
@@ -24,6 +24,7 @@ ID_KEYS = (
     "emby",
     "guid",
     "slug",
+    "wetrakr",
 )
 
 
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS baseline_items (
 {_id_columns("show_ids")},
     watched                  INTEGER,
     watched_at               TEXT,
+    collected_at             TEXT,
     rating                   REAL,
     rated_at                 TEXT,
     progress_ms              INTEGER,
@@ -380,6 +382,7 @@ CREATE TABLE IF NOT EXISTS manual_policy_add_items (
     watched                  INTEGER,
     watched_at               TEXT,
     last_watched_at          TEXT,
+    collected_at             TEXT,
     rating                   REAL,
     user_rating              REAL,
     rated_at                 TEXT,
@@ -599,20 +602,12 @@ _INDEXES = (
 )
 
 
-def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
-    """Idempotent ALTER for columns added after a database was first created.
-
-    Every CREATE here is IF NOT EXISTS, so an existing database never picks up a
-    new column on its own. SQLite has no ADD COLUMN IF NOT EXISTS, so compare
-    against PRAGMA table_info and add what is missing. Safe to run on every
-    connect, which is when apply_schema() runs.
-    """
-    have = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
-    for name, decl in columns.items():
-        if name in have:
-            continue
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    existing = {str(row[1]) for row in rows}
+    if column not in existing:
         try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         except sqlite3.OperationalError as e:
             # Connections are per thread and apply_schema() runs on each one, so
             # two threads can both read the column as absent before either ALTER
@@ -627,8 +622,23 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute(_CREATE_SCHEMA_MIGRATIONS)
         conn.execute(_CREATE_STATE_META)
         conn.execute(_CREATE_LOCAL_META)
+        conn.execute("""CREATE TABLE IF NOT EXISTS media_path_catalogues (
+            cache_key TEXT PRIMARY KEY, revision TEXT, refreshed_at REAL NOT NULL,
+            items_json TEXT NOT NULL
+        )""")
         conn.execute(_CREATE_PROVIDER_FEATURE_STATE)
         conn.execute(_CREATE_BASELINE_ITEMS)
+        conn.execute(_CREATE_PROVIDER_FEATURE_STATE.replace("provider_feature_state", "pair_feature_state").replace(
+            "provider          TEXT", "pair_scope        TEXT NOT NULL,\n    provider          TEXT"
+        ).replace("UNIQUE(provider, instance, feature)", "UNIQUE(pair_scope, provider, instance, feature)"))
+        conn.execute(_CREATE_BASELINE_ITEMS.replace("baseline_items", "pair_baseline_items").replace(
+            "REFERENCES provider_feature_state", "REFERENCES pair_feature_state"
+        ))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pair_items_state_key ON pair_baseline_items(provider_state_id, item_key)")
+        _ensure_column(conn, "baseline_items", "collected_at", "TEXT")
+        for table in ("baseline_items", "pair_baseline_items"):
+            _ensure_column(conn, table, "path_metadata_json", "TEXT")
+            _ensure_column(conn, table, "media_json", "TEXT")
         conn.execute(_CREATE_LAST_SYNC_SUMMARY)
         conn.execute(_CREATE_LAST_SYNC_FIELDS)
         conn.execute(_CREATE_LAST_SYNC_RESULT_METRICS)
@@ -646,8 +656,21 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute(_CREATE_STATISTICS_FEATURE_TOTALS)
         conn.execute(_CREATE_STATISTICS_INGESTED_RUNS)
         conn.execute(_CREATE_MANUAL_POLICY_FEATURES)
+        conn.execute("""CREATE TABLE IF NOT EXISTS manual_policy_pairs (
+            pair_id TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS episode_group_state (
+            pair_scope TEXT NOT NULL, group_id TEXT NOT NULL, state_json TEXT NOT NULL,
+            PRIMARY KEY(pair_scope,group_id)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS episode_group_scrobbles (
+            pair_scope TEXT NOT NULL, delivery_scope TEXT NOT NULL, state_json TEXT NOT NULL,
+            PRIMARY KEY(pair_scope,delivery_scope)
+        )""")
         conn.execute(_CREATE_MANUAL_POLICY_BLOCKS)
         conn.execute(_CREATE_MANUAL_POLICY_ADD_ITEMS)
+        _ensure_column(conn, "manual_policy_add_items", "collected_at", "TEXT")
+        _ensure_column(conn, "manual_policy_features", "mappings_json", "TEXT")
         conn.execute(_CREATE_WATCHLIST_HIDDEN_ITEMS)
         conn.execute(_CREATE_CURRENTLY_WATCHING_STREAMS)
         conn.execute(_CREATE_CURRENTLY_WATCHING_IDS)
@@ -659,11 +682,16 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute(_CREATE_SYNC_RUN_PROVIDER_COUNTS)
         conn.execute(_CREATE_SYNC_RUN_FEATURE_LANES)
         conn.execute(_CREATE_SYNC_RUN_SPOTLIGHT_ITEMS)
-        _add_missing_columns(conn, "activity_events", {"account_id": "TEXT", "account_uuid": "TEXT"})
+        for column in ("account_id", "account_uuid"):
+            _ensure_column(conn, "activity_events", column, "TEXT")
+        for table in ("baseline_items", "pair_baseline_items", "manual_policy_add_items", "sync_run_spotlight_items"):
+            for prefix in ("ids", "show_ids"):
+                _ensure_column(conn, table, f"{prefix}_wetrakr", "TEXT")
         for stmt in _INDEXES:
             conn.execute(stmt)
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at, name) VALUES(?,?,?)",
-            (SCHEMA_VERSION, int(time.time()), "local_state"),
-        )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)).fetchone() is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at, name) VALUES(?,?,?)",
+                (SCHEMA_VERSION, int(time.time()), "local_state"),
+            )
     return SCHEMA_VERSION

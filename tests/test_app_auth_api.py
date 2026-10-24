@@ -287,6 +287,217 @@ def test_bootstrap_credentials_still_work_without_origin(monkeypatch) -> None:
     assert cfg["app_auth"]["sessions"]
 
 
+def test_bootstrap_credentials_recheck_latest_config_before_write(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    # Fork: get past the setup-token gate to the logic under test.
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
+
+    initial = _auth_cfg(enabled=False)
+    initial["app_auth"]["username"] = ""
+    initial["app_auth"]["password"] = {"scheme": "pbkdf2_sha256", "iterations": 260_000, "salt": "", "hash": ""}
+    latest = _auth_cfg()
+    latest["app_auth"]["username"] = "owner"
+    monkeypatch.setattr(auth, "load_config", lambda: initial)
+
+    def _stale_update(mutator):
+        return latest, mutator(latest)
+
+    monkeypatch.setattr(auth, "_update_config", _stale_update)
+
+    resp = auth.api_set_credentials(_request("/api/app-auth/credentials"), {"enabled": True, "username": "attacker", "password": "secrett2"})
+
+    assert resp.status_code == 401
+    assert _json_body(resp)["error"] == "Unauthorized"
+    assert latest["app_auth"]["username"] == "owner"
+
+
+def test_recovery_credentials_recheck_latest_config_before_write(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    # Fork: get past the setup-token gate to the logic under test.
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
+
+    initial = _auth_cfg()
+    initial["app_auth"]["reset_required"] = True
+    latest = _auth_cfg()
+    latest["app_auth"]["username"] = "owner"
+    latest["app_auth"]["reset_required"] = False
+    monkeypatch.setattr(auth, "load_config", lambda: initial)
+
+    def _stale_update(mutator):
+        return latest, mutator(latest)
+
+    monkeypatch.setattr(auth, "_update_config", _stale_update)
+
+    resp = auth.api_set_credentials(_request("/api/app-auth/credentials"), {"enabled": True, "username": "attacker", "password": "secrett2"})
+
+    assert resp.status_code == 401
+    assert _json_body(resp)["error"] == "Unauthorized"
+    assert latest["app_auth"]["username"] == "owner"
+
+
+def test_concurrent_bootstrap_credentials_only_first_write_wins(monkeypatch) -> None:
+    import threading
+
+    from api import appAuthAPI as auth
+    # Fork: get past the setup-token gate to the logic under test.
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
+
+    cfg = _auth_cfg(enabled=False)
+    cfg["app_auth"]["username"] = ""
+    cfg["app_auth"]["password"] = {"scheme": "pbkdf2_sha256", "iterations": 260_000, "salt": "", "hash": ""}
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+
+    gate = threading.Barrier(2)
+    lock = threading.Lock()
+
+    def _concurrent_update(mutator):
+        gate.wait(timeout=5)
+        with lock:
+            return cfg, mutator(cfg)
+
+    monkeypatch.setattr(auth, "_update_config", _concurrent_update)
+    results: dict[str, int] = {}
+
+    def _worker(username: str) -> None:
+        resp = auth.api_set_credentials(
+            _request("/api/app-auth/credentials"),
+            {"enabled": True, "username": username, "password": "secrett2"},
+        )
+        results[username] = resp.status_code
+
+    threads = [threading.Thread(target=_worker, args=(username,)) for username in ("owner", "attacker")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(results.values()) == [200, 401]
+    assert cfg["app_auth"]["username"] in {"owner", "attacker"}
+    assert results[cfg["app_auth"]["username"]] == 200
+
+
+def test_bootstrap_credentials_clear_untrusted_pre_auth_tokens(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    # Fork: get past the setup-token gate to the logic under test.
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
+
+    cfg = _auth_cfg(enabled=False)
+    cfg["app_auth"]["username"] = ""
+    cfg["app_auth"]["password"] = {"scheme": "pbkdf2_sha256", "iterations": 260_000, "salt": "", "hash": ""}
+    cfg["app_auth"]["api_tokens"] = [
+        {"id": "legacy1", "token_hash": {"scheme": "pbkdf2_sha256", "iterations": 1, "salt": "a", "hash": "b"}},
+        {"id": "abcdefabcdefabcd", "version": 2, "secret": "secret"},
+    ]
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    req = _request("/api/app-auth/credentials")
+    resp = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "secrett1"})
+
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["api_tokens"] == []
+
+
+def test_bootstrap_credentials_preserve_local_cli_pre_auth_tokens(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    # Fork: get past the setup-token gate to the logic under test.
+    monkeypatch.setattr(auth, "verify_setup_token", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth, "_consume_setup_token", lambda: None)
+
+    local_token = {
+        "id": "abcdefabcdefabcd",
+        "version": 2,
+        "secret": "secret",
+        "created_via": "local_cli",
+    }
+    cfg = _auth_cfg(enabled=False)
+    cfg["app_auth"]["username"] = ""
+    cfg["app_auth"]["password"] = {"scheme": "pbkdf2_sha256", "iterations": 260_000, "salt": "", "hash": ""}
+    cfg["app_auth"]["api_tokens"] = [local_token]
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    req = _request("/api/app-auth/credentials")
+    resp = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "secrett1"})
+
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["api_tokens"] == [local_token]
+
+
+def test_bootstrap_credentials_reject_unauthenticated_disable(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg(enabled=False)
+    cfg["app_auth"]["username"] = ""
+    cfg["app_auth"]["password"] = {"scheme": "pbkdf2_sha256", "iterations": 260_000, "salt": "", "hash": ""}
+    cfg["app_auth"]["api_tokens"] = [{"id": "abcdefabcdefabcd", "version": 2, "secret": "secret"}]
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    resp = auth.api_set_credentials(_request("/api/app-auth/credentials"), {"enabled": False, "username": "admin"})
+
+    assert resp.status_code == 401
+    assert cfg["app_auth"]["api_tokens"] == [{"id": "abcdefabcdefabcd", "version": 2, "secret": "secret"}]
+
+
+def test_recovery_credentials_reject_unauthenticated_disable(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["reset_required"] = True
+    cfg["app_auth"]["api_tokens"] = [{"id": "abcdefabcdefabcd", "version": 2, "secret": "secret"}]
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    resp = auth.api_set_credentials(_request("/api/app-auth/credentials"), {"enabled": False, "username": "admin"})
+
+    assert resp.status_code == 401
+    assert cfg["app_auth"]["reset_required"] is True
+    assert cfg["app_auth"]["api_tokens"] == [{"id": "abcdefabcdefabcd", "version": 2, "secret": "secret"}]
+
+
+def test_credentials_update_preserves_existing_tokens(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    existing_token = {
+        "id": "abcdefabcdefabcd",
+        "version": 2,
+        "secret": "secret",
+        "created_via": "api",
+    }
+    cfg = _auth_cfg()
+    cfg["app_auth"]["api_tokens"] = [existing_token]
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    session, _exp = auth._issue_session(cfg, _request("/api/app-auth/login"))
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session}"})
+    resp = auth.api_set_credentials(req, {"enabled": True, "username": "admin", "password": "newpass1"})
+
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["api_tokens"] == [existing_token]
+
+
+def test_disabling_credentials_clears_tokens(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+
+    cfg = _auth_cfg()
+    cfg["app_auth"]["api_tokens"] = [{"id": "abcdefabcdefabcd", "version": 2, "secret": "secret"}]
+    monkeypatch.setattr(auth, "load_config", lambda: cfg)
+    monkeypatch.setattr(auth, "save_config", lambda *_args, **_kwargs: None)
+
+    session, _exp = auth._issue_session(cfg, _request("/api/app-auth/login"))
+    req = _request("/api/app-auth/credentials", headers={"cookie": f"{auth.COOKIE_NAME}={session}"})
+    resp = auth.api_set_credentials(req, {"enabled": False, "username": "admin"})
+
+    assert resp.status_code == 200
+    assert cfg["app_auth"]["api_tokens"] == []
+
+
 def test_login_sets_session_cookie_when_remember_disabled(monkeypatch) -> None:
     from api import appAuthAPI as auth
 
@@ -420,10 +631,7 @@ def test_setup_lock_required_for_upgrade_without_auth(monkeypatch) -> None:
     assert auth.setup_lock_required(cfg) is True
 
 
-def test_setup_lock_required_for_fresh_install_without_credentials() -> None:
-    """Mandatory setup: a fresh install with no app_auth credentials
-    configured must always be setup-locked, regardless of the raw
-    (pre-normalization) `enabled` flag — auth is not opt-in."""
+def test_setup_lock_required_when_up_to_date_without_auth(monkeypatch) -> None:
     from api import appAuthAPI as auth
     from cw_platform.config_base import _normalize_app_auth
 
@@ -452,6 +660,26 @@ def test_setup_lock_not_required_once_credentials_configured() -> None:
     assert auth.credentials_configured(cfg) is True
     assert auth.reset_pending(cfg) is False
     assert auth.setup_lock_required(cfg) is False
+
+
+def test_setup_lock_blocks_regular_api_until_credentials_exist(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    import crosswatch
+
+    cfg = _auth_cfg(enabled=False)
+    cfg["app_auth"]["username"] = ""
+    cfg["app_auth"]["password"] = {"scheme": "pbkdf2_sha256", "iterations": 260_000, "salt": "", "hash": ""}
+    monkeypatch.setattr(crosswatch, "load_config", lambda: cfg)
+
+    client = TestClient(crosswatch.app)
+
+    blocked = client.get("/api/editor")
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == "Authentication setup required"
+
+    assert client.get("/api/app-auth/status").status_code == 200
+    assert client.get("/api/version").status_code == 200
 
 
 def test_credentials_reject_too_short_password(monkeypatch) -> None:
@@ -868,7 +1096,7 @@ def test_created_managed_user_defaults_to_full_access(monkeypatch) -> None:
     restricted_perms = _json_body(restricted)["user"]["permissions"]
 
     assert created.status_code == 200
-    assert created_perms == {"dashboard": True, "watchlist": True, "playback": True, "write": True}
+    assert created_perms == {"dashboard": True, "watchlist": True, "playback": True, "write": True, "monitor": False}
     assert restricted.status_code == 200
     assert restricted_perms["write"] is False
     assert restricted_perms["dashboard"] is True
@@ -965,6 +1193,12 @@ def test_non_admin_api_policy_blocks_sensitive_routes() -> None:
     assert auth.non_admin_api_allowed("/api/import/commit", "POST") is True
     assert auth.non_admin_api_allowed("/api/editor", "POST") is True
     assert auth.non_admin_api_allowed("/api/playlists/mappings", "POST") is True
+    assert auth.non_admin_api_allowed("/api/playlists/rulesets", "GET") is True
+    assert auth.non_admin_api_allowed("/api/playlists/rulesets/custom", "GET") is True
+    assert auth.non_admin_api_allowed("/api/playlists/rulesets/validate", "POST") is True
+    assert auth.non_admin_api_allowed("/api/playlists/rulesets", "POST") is False
+    assert auth.non_admin_api_allowed("/api/playlists/rulesets/custom/clone", "POST") is False
+    assert auth.non_admin_api_allowed("/api/playlists/rulesets/custom", "DELETE") is False
     assert auth.non_admin_api_allowed("/api/snapshots/create", "POST") is True
     assert auth.non_admin_api_allowed("/api/watch/start", "POST") is False
     assert auth.non_admin_api_allowed("/api/playback_progress/settings", "POST") is False
@@ -1024,6 +1258,34 @@ def test_fastapi_docs_are_disabled() -> None:
     assert crosswatch.app.openapi_url is None
 
 
+def test_cli_only_env_disables_webui_but_not_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    import crosswatch
+
+    monkeypatch.setenv("CW_CLI_ONLY", "1")
+
+    assert crosswatch._cli_only_mode() is True
+    assert crosswatch._webui_disabled_path("/") is True
+    assert crosswatch._webui_disabled_path("/login") is True
+    assert crosswatch._webui_disabled_path("/assets/crosswatch.js") is True
+    assert crosswatch._webui_disabled_path("/api/status") is False
+    assert crosswatch._webui_disabled_path("/webhook/plex") is False
+    assert crosswatch._webui_disabled_path("/callback/trakt") is False
+
+
+def test_cli_only_mode_blocks_ui_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+
+    import crosswatch
+
+    monkeypatch.setenv("CW_CLI_ONLY", "1")
+    monkeypatch.setattr(crosswatch, "load_config", lambda: {"app_auth": {"enabled": False}})
+
+    res = TestClient(crosswatch.app).get("/", follow_redirects=False)
+
+    assert res.status_code == 404
+    assert "web UI is disabled" in res.text
+
+
 def test_non_admin_permissions_gate_feature_reads() -> None:
     import crosswatch
 
@@ -1032,6 +1294,7 @@ def test_non_admin_permissions_gate_feature_reads() -> None:
     assert crosswatch._non_admin_permission_allowed(user, "/api/dashboard/widgets") is True
     assert crosswatch._non_admin_permission_allowed(user, "/api/state/wall") is True
     assert crosswatch._non_admin_permission_allowed(user, "/api/activity/recent") is True
+    assert crosswatch._non_admin_permission_allowed(user, "/api/events/feed") is True
     assert crosswatch._non_admin_permission_allowed(user, "/api/watch/currently_watching") is True
     assert crosswatch._non_admin_permission_allowed(user, "/api/status") is True
     assert crosswatch._non_admin_permission_allowed(user, "/api/pairs") is True

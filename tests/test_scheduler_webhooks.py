@@ -7,6 +7,15 @@ from typing import Any
 import pytest
 
 
+def _mock_scheduler_webhook_dns(monkeypatch: pytest.MonkeyPatch, webhooks: Any, *addresses: str) -> None:
+    resolved = addresses or ("93.184.216.34",)
+
+    def fake_getaddrinfo(_host: str, port: int, *_args: Any, **_kwargs: Any) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+        return [(0, 0, 0, "", (address, int(port or 443))) for address in resolved]
+
+    monkeypatch.setattr(webhooks.socket, "getaddrinfo", fake_getaddrinfo)
+
+
 def test_resolve_completion_event_keeps_unresolved_runs_successful() -> None:
     from services.scheduler_webhooks import resolve_completion_event
 
@@ -102,6 +111,68 @@ def test_scheduler_webhook_urls_must_be_http_or_https() -> None:
     assert callback_url(webhooks, "failure") == "https://monitor.example/failure"
 
 
+def test_scheduler_webhook_url_allows_public_destinations(monkeypatch) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks, "93.184.216.34")
+
+    assert webhooks.scheduler_webhook_url_allowed("https://hooks.example.com/crosswatch") is True
+
+
+@pytest.mark.parametrize(
+    ("address", "allowed"),
+    [
+        ("64:ff9b::808:808", True),
+        ("64:ff9b::5db8:d822", True),
+        ("2606:4700:4700::1111", True),
+        ("::ffff:0:808:808", True),
+        ("64:ff9b::a9fe:a9fe", False),
+        ("64:ff9b::a00:5", False),
+        ("::ffff:0:a9fe:a9fe", False),
+        ("64:ff9b:1::808:808", False),
+    ],
+)
+def test_scheduler_webhook_url_judges_nat64_by_embedded_ipv4(monkeypatch, address: str, allowed: bool) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks, address)
+
+    assert webhooks.scheduler_webhook_url_allowed("https://hooks.example.com/crosswatch") is allowed
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8080/hook",
+        "http://localhost.:8080/hook",
+        "http://127.0.0.1:8080/hook",
+        "http://[::1]:8080/hook",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/hook",
+        "http://192.168.1.20/hook",
+        "http://[64:ff9b::a9fe:a9fe]/latest/meta-data/",
+        "http://[64:ff9b::7f00:1]:8080/hook",
+        "http://[64:ff9b::c0a8:114]/hook",
+        "http://[::a9fe:a9fe]/latest/meta-data/",
+        "http://[::7f00:1]:8080/hook",
+        "http://[::ffff:0:a9fe:a9fe]/latest/meta-data/",
+        "http://[::ffff:0:7f00:1]:8080/hook",
+    ],
+)
+def test_scheduler_webhook_url_blocks_local_and_private_literals(url: str) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    assert webhooks.scheduler_webhook_url_allowed(url) is False
+
+
+def test_scheduler_webhook_url_blocks_private_dns_results(monkeypatch) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks, "10.0.0.5")
+
+    assert webhooks.scheduler_webhook_url_allowed("https://hooks.example.com/crosswatch") is False
+
+
 def test_scheduler_webhook_payload_includes_context_and_summary_counts() -> None:
     from services.scheduler_webhooks import build_payload
 
@@ -136,6 +207,14 @@ def test_scheduler_webhook_payload_includes_context_and_summary_counts() -> None
     assert payload["summary"] == {"added": 5, "removed": 1, "updated": 1}
 
 
+def test_scheduler_webhook_payload_carries_sync_notices_only_when_present() -> None:
+    from services.scheduler_webhooks import build_payload
+
+    assert "notices" not in build_payload("success", {}, {"exit_code": 0})
+    payload = build_payload("success", {}, {"exit_code": 0, "notices": ["2 episodes share a number", ""]})
+    assert payload["notices"] == ["2 episodes share a number"] and payload["status"] == "ok"
+
+
 def test_scheduler_webhook_notifiarr_payload_shape() -> None:
     from services.scheduler_webhooks import build_payload
 
@@ -165,6 +244,7 @@ def test_scheduler_webhook_notifiarr_notify_adds_channel(monkeypatch) -> None:
     import services.scheduler_webhooks as webhooks
 
     posted: dict[str, Any] = {}
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks)
 
     class FakeResponse:
         def raise_for_status(self) -> None:
@@ -173,6 +253,7 @@ def test_scheduler_webhook_notifiarr_notify_adds_channel(monkeypatch) -> None:
     def fake_post(url: str, **kwargs: Any) -> FakeResponse:
         posted["url"] = url
         posted["json"] = kwargs.get("json")
+        posted["allow_redirects"] = kwargs.get("allow_redirects")
         return FakeResponse()
 
     monkeypatch.setattr(webhooks.requests, "post", fake_post)
@@ -196,10 +277,43 @@ def test_scheduler_webhook_notifiarr_notify_adds_channel(monkeypatch) -> None:
     assert ok is True
     assert posted["url"] == "https://notifiarr.com/api/v1/notification/passthrough/key"
     assert posted["json"]["discord"]["ids"]["channel"] == 123456789012345678
+    assert posted["allow_redirects"] is False
+
+
+def test_scheduler_webhook_notify_blocks_unsafe_destination(monkeypatch) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks, "10.0.0.5")
+
+    def fail_post(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("unsafe scheduler webhook should not be delivered")
+
+    logs: list[str] = []
+    monkeypatch.setattr(webhooks.requests, "post", fail_post)
+
+    ok = webhooks.notify_scheduler_webhook(
+        {
+            "scheduling": {
+                "webhooks": {
+                    "enabled": True,
+                    "failure_url": "https://hooks.example.com/fail",
+                }
+            }
+        },
+        "failure",
+        {"source": "scheduler", "scheduler_mode": "standard", "run_id": "run-unsafe"},
+        {"exit_code": 1},
+        log_fn=logs.append,
+    )
+
+    assert ok is False
+    assert logs and "blocked unsafe URL" in logs[0]
 
 
 def test_scheduler_webhook_notify_is_best_effort(monkeypatch) -> None:
     import services.scheduler_webhooks as webhooks
+
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks)
 
     def fail_post(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("offline")
@@ -671,3 +785,210 @@ def test_scheduled_sync_thread_dispatches_failure_webhook_on_exception(monkeypat
     assert [event for event, _, _ in calls] == ["start", "failure"]
     assert calls[1][1]["run_id"] == "run-456"
     assert calls[1][2]["exit_code"] == 1
+
+
+PUSHOVER_TOKEN = "a" * 30
+PUSHOVER_USER = "u" * 30
+
+
+def test_scheduler_webhook_pushover_and_ntfy_destinations() -> None:
+    from services.scheduler_webhooks import (
+        PUSHOVER_URL,
+        callback_url,
+        normalize_scheduler_webhooks,
+        payload_format_label,
+        scheduler_webhooks_configured,
+    )
+
+    pushover = normalize_scheduler_webhooks({
+        "enabled": True,
+        "url": "https://hooks.example.com/ignored",
+        "payload_format": "Pushover",
+        "pushover_token": PUSHOVER_TOKEN,
+        "pushover_user": PUSHOVER_USER,
+    })
+    assert pushover["payload_format"] == "pushover"
+    assert {callback_url(pushover, event) for event in ("start", "success", "failure")} == {PUSHOVER_URL}
+    assert payload_format_label("pushover") == "Pushover"
+
+    incomplete = normalize_scheduler_webhooks({"payload_format": "pushover", "pushover_token": "short", "pushover_user": PUSHOVER_USER})
+    assert incomplete["pushover_token"] == ""
+    assert callback_url(incomplete, "failure") == ""
+    assert scheduler_webhooks_configured(incomplete) is False
+
+    ntfy = normalize_scheduler_webhooks({
+        "url": "https://ntfy.sh/crosswatch",
+        "failure_url": "https://hooks.example.com/fail",
+        "payload_format": "ntfy",
+    })
+    assert ntfy["payload_format"] == "ntfy"
+    assert callback_url(ntfy, "failure") == "https://ntfy.sh/crosswatch"
+    assert scheduler_webhooks_configured(ntfy) is True
+    assert payload_format_label("ntfy") == "ntfy"
+
+
+def test_scheduler_webhook_pushover_and_ntfy_payload_shape() -> None:
+    from services.scheduler_webhooks import build_payload
+
+    context = {"run_id": "run-9", "scheduler_mode": "standard", "pair_id": "plex-trakt"}
+
+    failure = build_payload("failure", context, {"exit_code": 1, "errors": 2}, "pushover")
+    assert failure["title"] == "CrossWatch scheduled sync failed"
+    assert failure["priority"] == 1
+    assert failure["message"].splitlines()[0] == "Scheduled sync failed. Check the CrossWatch sync logs for details."
+    assert "Pair: plex-trakt" in failure["message"].splitlines()
+    assert "Errors: 2" in failure["message"].splitlines()
+    assert build_payload("success", context, {"exit_code": 0}, "pushover")["priority"] == 0
+    assert build_payload("start", context, {}, "pushover")["priority"] == -1
+
+    long_context = {"run_id": "r" * 2000, "scheduler_mode": "standard"}
+    assert len(build_payload("failure", long_context, {"exit_code": 1}, "pushover")["message"]) == 1024
+
+    ntfy = build_payload("failure", context, {"exit_code": 1, "errors": 2}, "ntfy")
+    assert ntfy["title"] == "CrossWatch scheduled sync failed"
+    assert ntfy["priority"] == 4
+    assert ntfy["message"] == failure["message"]
+    assert build_payload("success", context, {"exit_code": 0}, "ntfy")["priority"] == 3
+    assert build_payload("start", context, {}, "ntfy")["priority"] == 2
+    assert len(build_payload("failure", {"run_id": "é" * 5000}, {"exit_code": 1}, "ntfy")["message"].encode("utf-8")) <= 4096
+
+
+def test_scheduler_webhook_pushover_notify_posts_form_fields(monkeypatch) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    posted: dict[str, Any] = {}
+    reply: dict[str, Any] = {"code": 200, "status": 1}
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks)
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = reply["code"]
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"status": reply["status"]}
+
+    def fake_post(url: str, **kwargs: Any) -> FakeResponse:
+        posted["url"] = url
+        posted.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(webhooks.requests, "post", fake_post)
+    cfg = {
+        "scheduling": {
+            "webhooks": {
+                "enabled": True,
+                "payload_format": "pushover",
+                "pushover_token": PUSHOVER_TOKEN,
+                "pushover_user": PUSHOVER_USER,
+            }
+        }
+    }
+    context = {"source": "scheduler", "scheduler_mode": "standard", "run_id": "run-11"}
+
+    assert webhooks.notify_scheduler_webhook(cfg, "failure", context, {"exit_code": 1}) is True
+    assert posted["url"] == "https://api.pushover.net/1/messages.json"
+    assert "json" not in posted
+    assert posted["data"]["token"] == PUSHOVER_TOKEN
+    assert posted["data"]["user"] == PUSHOVER_USER
+    assert posted["data"]["priority"] == 1
+    assert posted["data"]["title"] == "CrossWatch scheduled sync failed"
+    assert posted["data"]["message"].startswith("Scheduled sync failed.")
+    assert posted["allow_redirects"] is False
+
+    for code, status in ((200, 0), (302, 1), (200, 1.5), (200, True), (200, "1")):
+        logs: list[str] = []
+        reply.update({"code": code, "status": status})
+        assert webhooks.notify_scheduler_webhook(cfg, "failure", context, {"exit_code": 1}, log_fn=logs.append) is False
+        assert logs == ["[!] Scheduler webhook failure: rejected by Pushover"]
+
+
+def test_scheduler_webhook_ntfy_notify_posts_plain_text_with_headers(monkeypatch) -> None:
+    import services.scheduler_webhooks as webhooks
+
+    posted: dict[str, Any] = {}
+    _mock_scheduler_webhook_dns(monkeypatch, webhooks)
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_post(url: str, **kwargs: Any) -> FakeResponse:
+        posted["url"] = url
+        posted.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(webhooks.requests, "post", fake_post)
+
+    ok = webhooks.notify_scheduler_webhook(
+        {"scheduling": {"webhooks": {"enabled": True, "url": "https://ntfy.sh/crosswatch", "payload_format": "ntfy"}}},
+        "success",
+        {"source": "scheduler", "scheduler_mode": "standard", "run_id": "run-12", "pair_id": "plex-tränkt"},
+        {"exit_code": 0},
+    )
+
+    assert ok is True
+    assert posted["url"] == "https://ntfy.sh/crosswatch"
+    assert "json" not in posted
+    assert posted["headers"]["Title"] == "CrossWatch scheduled sync succeeded"
+    assert posted["headers"]["Priority"] == "3"
+    assert posted["headers"]["Content-Type"] == "text/plain; charset=utf-8"
+    body = posted["data"].decode("utf-8")
+    assert body.splitlines()[0] == "Scheduled sync completed successfully."
+    assert "Pair: plex-tränkt" in body.splitlines()
+
+
+def test_scheduling_pushover_config_is_normalized_sensitive_and_redacted() -> None:
+    from api.configAPI import _is_sensitive_config_path
+    from cw_platform.config_base import _is_sensitive_path, _normalize_scheduling, redact_config
+
+    cfg = {
+        "scheduling": {
+            "webhooks": {
+                "enabled": True,
+                "payload_format": "pushover",
+                "pushover_token": f" {PUSHOVER_TOKEN} ",
+                "pushover_user": "not-a-key",
+            }
+        }
+    }
+
+    _normalize_scheduling(cfg)
+
+    hooks = cfg["scheduling"]["webhooks"]
+    assert hooks["payload_format"] == "pushover"
+    assert hooks["pushover_token"] == PUSHOVER_TOKEN
+    assert hooks["pushover_user"] == ""
+    for key in ("pushover_token", "pushover_user"):
+        assert _is_sensitive_path(("scheduling", "webhooks", key)) is True
+        assert _is_sensitive_config_path(("scheduling", "webhooks", key)) is True
+
+    hooks["pushover_user"] = PUSHOVER_USER
+    redacted = redact_config(cfg)["scheduling"]["webhooks"]
+    assert redacted["pushover_token"] == "••••••••"
+    assert redacted["pushover_user"] == "••••••••"
+
+    cfg["scheduling"]["webhooks"] = {"payload_format": "ntfy", "url": "https://ntfy.sh/crosswatch"}
+    _normalize_scheduling(cfg)
+    assert cfg["scheduling"]["webhooks"]["payload_format"] == "ntfy"
+
+
+def test_scheduler_merge_defaults_keeps_new_webhook_fields() -> None:
+    from services.scheduling import merge_defaults
+
+    hooks = merge_defaults({
+        "webhooks": {
+            "enabled": True,
+            "payload_format": "pushover",
+            "pushover_token": PUSHOVER_TOKEN,
+            "pushover_user": PUSHOVER_USER,
+            "alert_on_unresolved": True,
+        }
+    })["webhooks"]
+
+    assert hooks["payload_format"] == "pushover"
+    assert hooks["pushover_token"] == PUSHOVER_TOKEN
+    assert hooks["pushover_user"] == PUSHOVER_USER
+    assert hooks["alert_on_unresolved"] is True

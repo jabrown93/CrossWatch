@@ -1,5 +1,5 @@
 # services/snapshots.py
-# CrossWatch - Provider captures (watchlist/ratings/history/progress)
+# CrossWatch - Provider captures (watchlist/ratings/history/progress/collection)
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ from cw_platform.config_base import CONFIG, load_config
 from cw_platform.modules_registry import load_sync_ops, state_read_features, sync_provider_names
 from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id
 
-Feature = Literal["watchlist", "ratings", "history", "progress"]
-CreateFeature = Literal["watchlist", "ratings", "history", "progress", "all"]
+Feature = Literal["watchlist", "ratings", "history", "progress", "collection"]
+CreateFeature = Literal["watchlist", "ratings", "history", "progress", "collection", "all"]
 RestoreMode = Literal["merge", "clear_restore"]
 
 SNAPSHOT_KIND = "snapshot"
 SNAPSHOT_BUNDLE_KIND = "snapshot_bundle"
-SNAPSHOT_FEATURES: tuple[Feature, ...] = ("watchlist", "ratings", "history", "progress")
+SNAPSHOT_FEATURES: tuple[Feature, ...] = ("watchlist", "ratings", "history", "progress", "collection")
 _CAPTURE_PROGRESS: dict[str, dict[str, Any]] = {}
 _CAPTURE_PROGRESS_LOCK = Lock()
 _CAPTURE_PROGRESS_TTL_SECONDS = 6 * 60 * 60
@@ -481,7 +481,7 @@ def _resolve_snapshot_file(path: str, *, must_exist: bool = True) -> tuple[str, 
 
 def _norm_feature(x: str) -> Feature:
     v = str(x or "").strip().lower()
-    if v not in ("watchlist", "ratings", "history", "progress"):
+    if v not in ("watchlist", "ratings", "history", "progress", "collection"):
         raise ValueError(f"Unsupported feature: {x}")
     return cast(Feature, v)
 
@@ -613,6 +613,68 @@ def _state_read_feature_enabled(ops: Any, feature: Feature) -> bool:
     return bool(state_read_features(ops).get(feature))
 
 
+def _provider_capabilities(ops: Any) -> Mapping[str, Any]:
+    fn = getattr(ops, "capabilities", None)
+    if not callable(fn):
+        return {}
+    try:
+        caps = fn() or {}
+    except Exception:
+        return {}
+    return caps if isinstance(caps, Mapping) else {}
+
+
+def _first_cap_bool(cap: Mapping[str, Any], names: Sequence[str]) -> bool | None:
+    for name in names:
+        if name not in cap:
+            continue
+        value = cap.get(name)
+        if isinstance(value, bool):
+            return value
+        if value is not None and name in {"writes"}:
+            return bool(value)
+    return None
+
+
+def _cleanup_feature_enabled(ops: Any, feature: Feature) -> bool:
+    if not _state_read_feature_enabled(ops, feature):
+        return False
+
+    caps = _provider_capabilities(ops)
+    cap_raw = caps.get(feature)
+    if not isinstance(cap_raw, Mapping):
+        return not bool(caps.get("read_only"))
+
+    cap: Mapping[str, Any] = cap_raw
+    if bool(cap.get("source_only")):
+        return False
+
+    cleanup_raw = cap.get("cleanup") if "cleanup" in cap else cap.get("clear")
+    if isinstance(cleanup_raw, bool):
+        return cleanup_raw
+    if isinstance(cleanup_raw, Mapping):
+        cleanup: Mapping[str, Any] = cleanup_raw
+        enabled = cleanup.get("enabled")
+        if isinstance(enabled, bool):
+            return enabled
+        remove = _first_cap_bool(cleanup, ("remove", "delete", "write", "writes", "unrate", "upsert"))
+        if remove is not None:
+            return remove
+
+    names: tuple[str, ...]
+    if feature == "ratings":
+        names = ("remove", "unrate", "write", "upsert")
+    else:
+        names = ("remove", "delete", "write", "writes", "upsert")
+
+    remove = _first_cap_bool(cap, names)
+    if remove is not None:
+        return remove
+    if bool(cap.get("read_only")) or bool(caps.get("read_only")):
+        return False
+    return True
+
+
 def _configured(ops: Any, cfg: Mapping[str, Any]) -> bool:
     fn = getattr(ops, "is_configured", None)
     if not callable(fn):
@@ -659,6 +721,7 @@ def snapshot_manifest(cfg: Mapping[str, Any] | None = None) -> list[dict[str, An
             continue
         raw = state_read_features(ops)
         feats = {k: bool(raw.get(k)) for k in SNAPSHOT_FEATURES}
+        cleanup_feats = {k: _cleanup_feature_enabled(ops, k) for k in SNAPSHOT_FEATURES}
 
         insts = list_instance_ids(cfg, pid)
         inst_meta: list[dict[str, Any]] = []
@@ -675,6 +738,7 @@ def snapshot_manifest(cfg: Mapping[str, Any] | None = None) -> list[dict[str, An
                 "label": getattr(ops, "label", lambda: pid)() if callable(getattr(ops, "label", None)) else pid,
                 "configured": configured_any,
                 "features": feats,
+                "cleanup_features": cleanup_feats,
                 "instances": inst_meta,
             }
         )
@@ -725,18 +789,22 @@ def _pick_id(
     ids: Mapping[str, Any] | None,
     show_ids: Mapping[str, Any] | None,
     order: Sequence[str],
+    *,
+    prefer_show: bool = False,
 ) -> tuple[str, str, str] | None:
     ids = ids if isinstance(ids, Mapping) else {}
     show_ids = show_ids if isinstance(show_ids, Mapping) else {}
 
-    for k in order:
-        v = ids.get(k)
-        if v not in (None, "", 0, False):
-            return (str(k), str(v), "ids")
-    for k in order:
-        v = show_ids.get(k)
-        if v not in (None, "", 0, False):
-            return (str(k), str(v), "show_ids")
+    sources = (
+        (("show_ids", show_ids), ("ids", ids))
+        if prefer_show
+        else (("ids", ids), ("show_ids", show_ids))
+    )
+    for src, obj in sources:
+        for k in order:
+            v = obj.get(k)
+            if v not in (None, "", 0, False):
+                return (str(k), str(v), src)
     return None
 
 
@@ -767,6 +835,7 @@ def _canonical_item_key(provider: str, feature: Feature, orig_key: str, item: Ma
         "SIMKL": ["simkl", "simkl_id"],
         "TMDB": ["tmdb"],
         "MDBLIST": ["mdblist"],
+        "WETRAKR": ["wetrakr"],
         "PLEX": ["plex", "guid"],
         "JELLYFIN": ["jellyfin"],
         "EMBY": ["emby"],
@@ -774,16 +843,24 @@ def _canonical_item_key(provider: str, feature: Feature, orig_key: str, item: Ma
         "PUBLICMETADB": ["tmdb"],
     }
 
+    prefer_show = kind in ("season", "episode")
     if pid in native:
-        picked = _pick_id(ids, show_ids, native[pid])
+        picked = _pick_id(ids, show_ids, native[pid], prefer_show=prefer_show)
     else:
-        picked = _pick_id(ids, show_ids, ["tmdb", "imdb", "tvdb", "trakt", "simkl", "anilist"])
+        picked = _pick_id(
+            ids,
+            show_ids,
+            ["tmdb", "imdb", "tvdb", "trakt", "simkl", "anilist"],
+            prefer_show=prefer_show,
+        )
 
     if not picked:
         return str(orig_key or "").strip()
 
     id_key, id_val, src = picked
     base = f"{id_key}:{id_val}"
+    if id_key == "tmdb" and kind == "show":
+        base = f"{base}#show"
 
     season = _as_int(item.get("season"))
     episode = _as_int(item.get("episode"))
@@ -1602,14 +1679,14 @@ def clear_provider_features(
         except Exception:
             adapter = None
 
-        def _load_current_items(feat: Feature) -> list[Mapping[str, Any]]:
+        def _load_current_items(feat: Feature) -> dict[str, Mapping[str, Any]]:
             with _capture_mode_env(pid=pid, instance=inst, feat=feat):
                 cur_raw = (adapter.build_index(feat) if adapter else ops.build_index(cfg_view, feature=feat)) or {}
-            cur_items: list[Mapping[str, Any]] = []
+            cur_items: dict[str, Mapping[str, Any]] = {}
             if isinstance(cur_raw, Mapping):
-                for v in cur_raw.values():
+                for key, v in cur_raw.items():
                     if isinstance(v, Mapping):
-                        cur_items.append(dict(v))
+                        cur_items[str(key)] = dict(v)
             return cur_items
 
         total_removed = 0
@@ -1624,10 +1701,13 @@ def clear_provider_features(
                 feature_items=0,
                 percent=_progress_percent(index, len(feature_list) or 1, 0.12),
             )
-            if not _state_read_feature_enabled(ops, feat):
-                done["results"][feat] = {"ok": True, "skipped": True, "reason": "feature_disabled"}
+            if not _cleanup_feature_enabled(ops, feat):
+                reason = "feature_disabled" if not _state_read_feature_enabled(ops, feat) else "cleanup_not_supported"
+                done["results"][feat] = {"ok": True, "skipped": True, "reason": reason}
                 continue
-            cur = _load_current_items(feat)
+            current = _load_current_items(feat)
+            seen_keys = set(current)
+            cur = list(current.values())
             initial_count = len(cur)
             _capture_progress_update(
                 progress_id,
@@ -1641,7 +1721,7 @@ def clear_provider_features(
             unresolved: list[Any] = []
             errors: list[str] = []
             passes = 0
-            max_passes = 6 if feat == "history" else 1
+            max_passes = 6 if feat in {"history", "collection"} else 1
             prev_count: int | None = None
 
             while cur and passes < max_passes:
@@ -1680,7 +1760,7 @@ def clear_provider_features(
                     else:
                         removed += len(cur)
                     if isinstance(res, Mapping) and isinstance(res.get("unresolved"), list):
-                        unresolved.extend(list(res.get("unresolved") or []))
+                        unresolved = list(res.get("unresolved") or [])
                 except Exception as e:
                     errors.append(str(e))
                     break
@@ -1694,12 +1774,16 @@ def clear_provider_features(
                     percent=_progress_percent(index, len(feature_list) or 1, 0.82),
                 )
 
-                remaining = _load_current_items(feat)
+                current = _load_current_items(feat)
+                seen_keys.update(current)
+                remaining = list(current.values())
                 remaining_count = len(remaining)
+                removed = len(seen_keys) - remaining_count
                 if remaining_count <= 0:
                     cur = []
+                    unresolved = []
                     break
-                if feat != "history":
+                if feat not in {"history", "collection"}:
                     cur = remaining
                     break
                 if prev_count is not None and remaining_count >= prev_count:
@@ -1709,12 +1793,12 @@ def clear_provider_features(
                 cur = remaining
 
             total_removed += removed
-            ok = len(errors) == 0
+            ok = len(errors) == 0 and len(cur) == 0
             done["ok"] = done["ok"] and ok
             done["results"][feat] = {
                 "ok": ok,
                 "removed": removed,
-                "count": initial_count,
+                "count": len(seen_keys),
                 "remaining": len(cur),
                 "passes": passes,
                 "unresolved": unresolved,
@@ -2006,7 +2090,7 @@ def _bundle_compare_setup(a: Mapping[str, Any], b: Mapping[str, Any], feature: s
                 out[feat] = path
         return out
 
-    order = ("watchlist", "history", "ratings", "progress")
+    order = ("watchlist", "collection", "history", "ratings", "progress")
     a_children = _child_paths(a)
     b_children = _child_paths(b)
     features = [feat for feat in order if feat in a_children and feat in b_children]
@@ -2025,16 +2109,16 @@ def _with_feature_tag(item: Any, feature: str) -> Any:
     return {"feature": feature, **dict(item)}
 
 
-def _load_and_classify(a_path: str, b_path: str) -> dict[str, Any]:
-    """Load two snapshots, validate they're comparable, and classify items.
 
-    Shared by `diff_snapshots` and `diff_snapshots_extended`. Always
-    validates provider/instance match and detects bundle captures. For
-    bundle captures, returns early (only `a`/`b`/`bundle_a`/`bundle_b` are
-    populated) since each caller aggregates per-feature bundles differently.
-    For single-feature captures, also canonicalizes items and classifies
-    them into added/removed/updated/unchanged keys.
-    """
+
+def diff_snapshots(
+    a_path: str,
+    b_path: str,
+    *,
+    limit: int = 200,
+    max_depth: int = 4,
+    max_changes: int = 25,
+) -> dict[str, Any]:
     a = read_snapshot(a_path)
     b = read_snapshot(b_path)
 
@@ -2052,136 +2136,6 @@ def _load_and_classify(a_path: str, b_path: str) -> dict[str, Any]:
 
     bundle_a = kind_a == SNAPSHOT_BUNDLE_KIND or feat_a == "all"
     bundle_b = kind_b == SNAPSHOT_BUNDLE_KIND or feat_b == "all"
-
-    out: dict[str, Any] = {"a": a, "b": b, "bundle_a": bundle_a, "bundle_b": bundle_b}
-    if bundle_a or bundle_b:
-        return out
-
-    items_a_raw = a.get("items") or {}
-    items_b_raw = b.get("items") or {}
-    if not isinstance(items_a_raw, Mapping) or not isinstance(items_b_raw, Mapping):
-        raise ValueError("Invalid capture contents")
-
-    if feat_a != feat_b:
-        raise ValueError("Compare Captures only supports the same feature.")
-
-    feat = _norm_feature(feat_a)
-    items_a_raw = _canonicalize_index(prov_a, feat, items_a_raw)
-    items_b_raw = _canonicalize_index(prov_a, feat, items_b_raw)
-
-    history_multi = False
-    if feat_a == "history":
-        items_a = _history_items_by_base_key(items_a_raw)
-        items_b = _history_items_by_base_key(items_b_raw)
-        history_multi = True
-    else:
-        items_a = dict(items_a_raw)
-        items_b = dict(items_b_raw)
-
-    keys_a = set(str(k) for k in items_a.keys())
-    keys_b = set(str(k) for k in items_b.keys())
-    added_keys = sorted(keys_b - keys_a)
-    removed_keys = sorted(keys_a - keys_b)
-    common = sorted(keys_a & keys_b)
-
-    updated_keys: list[str] = []
-    unchanged_keys: list[str] = []
-    for k in common:
-        va = items_a.get(k)
-        vb = items_b.get(k)
-        if history_multi:
-            oa = va if isinstance(va, Mapping) else {}
-            ob = vb if isinstance(vb, Mapping) else {}
-            a_tmp = oa.get("watched_ats")
-            b_tmp = ob.get("watched_ats")
-            a_dates = a_tmp if isinstance(a_tmp, list) else []
-            b_dates = b_tmp if isinstance(b_tmp, list) else []
-            a_set = _minute_set([str(x) for x in a_dates])
-            b_set = _minute_set([str(x) for x in b_dates])
-            if a_set != b_set:
-                updated_keys.append(k)
-                continue
-            oa2 = dict(oa)
-            ob2 = dict(ob)
-            oa2.pop("watched_ats", None)
-            ob2.pop("watched_ats", None)
-            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
-                updated_keys.append(k)
-            else:
-                unchanged_keys.append(k)
-            continue
-        if va != vb:
-            updated_keys.append(k)
-        else:
-            unchanged_keys.append(k)
-
-    out.update(
-        {
-            "feat": feat,
-            "items_a_raw": items_a_raw,
-            "items_b_raw": items_b_raw,
-            "items_a": items_a,
-            "items_b": items_b,
-            "history_multi": history_multi,
-            "keys_a": keys_a,
-            "keys_b": keys_b,
-            "added_keys": added_keys,
-            "removed_keys": removed_keys,
-            "updated_keys": updated_keys,
-            "unchanged_keys": unchanged_keys,
-            "common": common,
-        }
-    )
-    return out
-
-
-def _history_watched_changes(va: Any, vb: Any, *, max_depth: int, max_changes: int) -> list[dict[str, Any]]:
-    """Build the `changes` list for a history_multi 'updated' row.
-
-    Reports watched_ats differences at minute precision as add/remove
-    markers, then diffs the remaining fields (with watched_ats stripped)
-    via `_diff_any` if they differ.
-    """
-    oa = va if isinstance(va, Mapping) else {}
-    ob = vb if isinstance(vb, Mapping) else {}
-    a_tmp = oa.get("watched_ats")
-    b_tmp = ob.get("watched_ats")
-    a_dates = a_tmp if isinstance(a_tmp, list) else []
-    b_dates = b_tmp if isinstance(b_tmp, list) else []
-    a_set = _minute_set([str(x) for x in a_dates])
-    b_set = _minute_set([str(x) for x in b_dates])
-    added_dates = sorted(b_set - a_set)
-    removed_dates = sorted(a_set - b_set)
-
-    changes: list[dict[str, Any]] = []
-    if added_dates:
-        changes.append({"path": "watched_ats.added", "old": [], "new": added_dates})
-    if removed_dates:
-        changes.append({"path": "watched_ats.removed", "old": removed_dates, "new": []})
-
-    oa2 = dict(oa)
-    ob2 = dict(ob)
-    oa2.pop("watched_ats", None)
-    ob2.pop("watched_ats", None)
-    if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
-        _diff_any(oa2, ob2, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
-    return changes
-
-
-
-def diff_snapshots(
-    a_path: str,
-    b_path: str,
-    *,
-    limit: int = 200,
-    max_depth: int = 4,
-    max_changes: int = 25,
-) -> dict[str, Any]:
-    loaded = _load_and_classify(a_path, b_path)
-    a = loaded["a"]
-    b = loaded["b"]
-    bundle_a = loaded["bundle_a"]
-    bundle_b = loaded["bundle_b"]
     if bundle_a or bundle_b:
         if bundle_a and bundle_b:
             a_children, b_children, features, _ = _bundle_compare_setup(a, b, "all")
@@ -2232,17 +2186,60 @@ def diff_snapshots(
             }
         raise ValueError("Compare Captures only supports two full captures or two matching feature captures.")
 
-    items_a_raw = loaded["items_a_raw"]
-    items_b_raw = loaded["items_b_raw"]
-    items_a = loaded["items_a"]
-    items_b = loaded["items_b"]
-    history_multi = loaded["history_multi"]
-    keys_a = loaded["keys_a"]
-    keys_b = loaded["keys_b"]
-    added_keys = loaded["added_keys"]
-    removed_keys = loaded["removed_keys"]
-    updated_keys = loaded["updated_keys"]
-    unchanged = len(loaded["common"]) - len(updated_keys)
+    items_a_raw = a.get("items") or {}
+    items_b_raw = b.get("items") or {}
+    if not isinstance(items_a_raw, Mapping) or not isinstance(items_b_raw, Mapping):
+        raise ValueError("Invalid capture contents")
+
+    if feat_a != feat_b:
+        raise ValueError("Compare Captures only supports the same feature.")
+
+    items_a_raw = _canonicalize_index(prov_a, _norm_feature(feat_a), items_a_raw)
+    items_b_raw = _canonicalize_index(prov_a, _norm_feature(feat_a), items_b_raw)
+
+    history_multi = False
+    if feat_a == "history":
+        items_a = _history_items_by_base_key(items_a_raw)
+        items_b = _history_items_by_base_key(items_b_raw)
+        history_multi = True
+    else:
+        items_a = dict(items_a_raw)
+        items_b = dict(items_b_raw)
+
+    keys_a = set(str(k) for k in items_a.keys())
+    keys_b = set(str(k) for k in items_b.keys())
+
+    added_keys = sorted(keys_b - keys_a)
+    removed_keys = sorted(keys_a - keys_b)
+
+    common = sorted(keys_a & keys_b)
+    updated_keys: list[str] = []
+    for k in common:
+        va = items_a.get(k)
+        vb = items_b.get(k)
+        if history_multi:
+            oa = va if isinstance(va, Mapping) else {}
+            ob = vb if isinstance(vb, Mapping) else {}
+            a_tmp = oa.get("watched_ats")
+            b_tmp = ob.get("watched_ats")
+            a_dates = a_tmp if isinstance(a_tmp, list) else []
+            b_dates = b_tmp if isinstance(b_tmp, list) else []
+            a_set = set(_iso_minute(x) or str(x) for x in a_dates)
+            b_set = set(_iso_minute(x) or str(x) for x in b_dates)
+            if a_set != b_set:
+                updated_keys.append(k)
+                continue
+            oa2 = dict(oa)
+            ob2 = dict(ob)
+            oa2.pop("watched_ats", None)
+            ob2.pop("watched_ats", None)
+            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
+                updated_keys.append(k)
+            continue
+        if va != vb:
+            updated_keys.append(k)
+
+    unchanged = len(common) - len(updated_keys)
 
     lim = max(1, min(int(limit or 200), 2000))
 
@@ -2256,7 +2253,28 @@ def diff_snapshots(
         changes: list[dict[str, Any]] = []
 
         if history_multi:
-            changes = _history_watched_changes(va, vb, max_depth=max_depth, max_changes=max_changes)
+            oa = va if isinstance(va, Mapping) else {}
+            ob = vb if isinstance(vb, Mapping) else {}
+            a_tmp = oa.get("watched_ats")
+            b_tmp = ob.get("watched_ats")
+            a_dates = a_tmp if isinstance(a_tmp, list) else []
+            b_dates = b_tmp if isinstance(b_tmp, list) else []
+            a_set = _minute_set([str(x) for x in a_dates])
+            b_set = _minute_set([str(x) for x in b_dates])
+            added_dates = sorted(b_set - a_set)
+            removed_dates = sorted(a_set - b_set)
+
+            if added_dates:
+                changes.append({"path": "watched_ats.added", "old": [], "new": added_dates})
+            if removed_dates:
+                changes.append({"path": "watched_ats.removed", "old": removed_dates, "new": []})
+
+            oa2 = dict(oa)
+            ob2 = dict(ob)
+            oa2.pop("watched_ats", None)
+            ob2.pop("watched_ats", None)
+            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
+                _diff_any(oa2, ob2, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
         else:
             _diff_any(va, vb, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
 
@@ -2306,11 +2324,23 @@ def diff_snapshots_extended(
     max_changes: int = 250,
 ) -> dict[str, Any]:
 
-    loaded = _load_and_classify(a_path, b_path)
-    a = loaded["a"]
-    b = loaded["b"]
-    bundle_a = loaded["bundle_a"]
-    bundle_b = loaded["bundle_b"]
+    a = read_snapshot(a_path)
+    b = read_snapshot(b_path)
+
+    kind_a = str(a.get("kind") or "").strip().lower()
+    kind_b = str(b.get("kind") or "").strip().lower()
+    feat_a = str(a.get("feature") or "").strip().lower()
+    feat_b = str(b.get("feature") or "").strip().lower()
+
+    prov_a = str(a.get("provider") or "").strip().upper()
+    prov_b = str(b.get("provider") or "").strip().upper()
+    inst_a = str(a.get("instance") or a.get("instance_id") or a.get("profile") or "default").strip().lower()
+    inst_b = str(b.get("instance") or b.get("instance_id") or b.get("profile") or "default").strip().lower()
+    if prov_a != prov_b or inst_a != inst_b:
+        raise ValueError("Compare Captures only supports the same provider and instance.")
+
+    bundle_a = kind_a == SNAPSHOT_BUNDLE_KIND or feat_a == "all"
+    bundle_b = kind_b == SNAPSHOT_BUNDLE_KIND or feat_b == "all"
     selected_feature = str(feature or "").strip().lower()
     if bundle_a or bundle_b:
         if not (bundle_a and bundle_b):
@@ -2342,18 +2372,64 @@ def diff_snapshots_extended(
         child_res["selected_feature"] = selected_feature
         return child_res
 
-    feat = loaded["feat"]
-    items_a_raw = loaded["items_a_raw"]
-    items_b_raw = loaded["items_b_raw"]
-    items_a = loaded["items_a"]
-    items_b = loaded["items_b"]
-    history_multi = loaded["history_multi"]
-    keys_a = loaded["keys_a"]
-    keys_b = loaded["keys_b"]
-    added_keys = loaded["added_keys"]
-    removed_keys = loaded["removed_keys"]
-    updated_keys = loaded["updated_keys"]
-    unchanged_keys = loaded["unchanged_keys"]
+    items_a_raw = a.get("items") or {}
+    items_b_raw = b.get("items") or {}
+    if not isinstance(items_a_raw, Mapping) or not isinstance(items_b_raw, Mapping):
+        raise ValueError("Invalid capture contents")
+
+    if feat_a != feat_b:
+        raise ValueError("Compare Captures only supports the same feature.")
+
+    feat = _norm_feature(feat_a)
+    items_a_raw = _canonicalize_index(prov_a, feat, items_a_raw)
+    items_b_raw = _canonicalize_index(prov_a, feat, items_b_raw)
+
+    history_multi = False
+    if feat_a == "history":
+        items_a = _history_items_by_base_key(items_a_raw)
+        items_b = _history_items_by_base_key(items_b_raw)
+        history_multi = True
+    else:
+        items_a = dict(items_a_raw)
+        items_b = dict(items_b_raw)
+
+    keys_a = set(str(k) for k in items_a.keys())
+    keys_b = set(str(k) for k in items_b.keys())
+    common = sorted(keys_a & keys_b)
+
+    added_keys = sorted(keys_b - keys_a)
+    removed_keys = sorted(keys_a - keys_b)
+
+    updated_keys: list[str] = []
+    unchanged_keys: list[str] = []
+    for k in common:
+        va = items_a.get(k)
+        vb = items_b.get(k)
+        if history_multi:
+            oa = va if isinstance(va, Mapping) else {}
+            ob = vb if isinstance(vb, Mapping) else {}
+            a_tmp = oa.get("watched_ats")
+            b_tmp = ob.get("watched_ats")
+            a_dates = a_tmp if isinstance(a_tmp, list) else []
+            b_dates = b_tmp if isinstance(b_tmp, list) else []
+            a_set = _minute_set([str(x) for x in a_dates])
+            b_set = _minute_set([str(x) for x in b_dates])
+            if a_set != b_set:
+                updated_keys.append(k)
+                continue
+            oa2 = dict(oa)
+            ob2 = dict(ob)
+            oa2.pop("watched_ats", None)
+            ob2.pop("watched_ats", None)
+            if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
+                updated_keys.append(k)
+            else:
+                unchanged_keys.append(k)
+            continue
+        if va != vb:
+            updated_keys.append(k)
+        else:
+            unchanged_keys.append(k)
 
     # Filter helpers
     want = str(kind or "all").strip().lower()
@@ -2385,8 +2461,10 @@ def diff_snapshots_extended(
             typ = str(b.get("type") or "")
             title = str(b.get("series_title") or b.get("show_title") or b.get("title") or "")
             year = int(b.get("year") or 0) if str(b.get("year") or "").isdigit() else 0
-            season = int(b.get("season") or -1) if str(b.get("season") or "").lstrip("-").isdigit() else -1
-            episode = int(b.get("episode") or -1) if str(b.get("episode") or "").lstrip("-").isdigit() else -1
+            season_raw = b.get("season")
+            episode_raw = b.get("episode")
+            season = int(season_raw) if season_raw is not None and str(season_raw).lstrip("-").isdigit() else -1
+            episode = int(episode_raw) if episode_raw is not None and str(episode_raw).lstrip("-").isdigit() else -1
         return (title.lower(), year, season, episode, typ, k)
 
     def _mk_row(status: str, k: str) -> dict[str, Any]:
@@ -2404,7 +2482,26 @@ def diff_snapshots_extended(
             row["new"] = vb
             changes: list[dict[str, Any]] = []
             if history_multi:
-                changes = _history_watched_changes(va, vb, max_depth=max_depth, max_changes=max_changes)
+                oa = va if isinstance(va, Mapping) else {}
+                ob = vb if isinstance(vb, Mapping) else {}
+                a_tmp = oa.get("watched_ats")
+                b_tmp = ob.get("watched_ats")
+                a_dates = a_tmp if isinstance(a_tmp, list) else []
+                b_dates = b_tmp if isinstance(b_tmp, list) else []
+                a_set = _minute_set([str(x) for x in a_dates])
+                b_set = _minute_set([str(x) for x in b_dates])
+                add_dates = sorted(b_set - a_set)
+                del_dates = sorted(a_set - b_set)
+                if add_dates:
+                    changes.append({"path": "watched_ats.added", "old": [], "new": add_dates})
+                if del_dates:
+                    changes.append({"path": "watched_ats.removed", "old": del_dates, "new": []})
+                oa2 = dict(oa)
+                ob2 = dict(ob)
+                oa2.pop("watched_ats", None)
+                ob2.pop("watched_ats", None)
+                if _cmp_record_minute(oa2) != _cmp_record_minute(ob2):
+                    _diff_any(oa2, ob2, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
             else:
                 _diff_any(va, vb, path="", out=changes, max_depth=max_depth, max_changes=max_changes)
             row["changes"] = changes

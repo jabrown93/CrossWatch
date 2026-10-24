@@ -12,10 +12,13 @@ import time
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from ..provider_instances import normalize_instance_id
+from cw_platform.provider_instances import normalize_instance_id
+
 from .db import get_conn
+from .run_scope import pair_id_from_scope, record_run_pairs, scope_key as _scope_key
 
 _LOG = logging.getLogger("crosswatch.event_archive")
+DETAIL_TITLE_BUDGET = 3800
 
 FIELDS = (
     "event_hash", "domain", "created_at", "run_id", "event_type", "severity",
@@ -191,6 +194,16 @@ def _pair_key(a: str, b: str) -> str:
     return "-".join(sorted([_norm_prov(a), _norm_prov(b)]))
 
 
+def _norm_pair_key(v: Any, fallback: Any = None) -> str | None:
+    raw = str(v or fallback or "").strip()
+    if not raw:
+        return None
+    parts = [p for p in (_norm_prov(x) for x in raw.split("-")) if p]
+    if len(parts) == 2:
+        return "-".join(sorted(parts))
+    return raw.upper()
+
+
 class RunRecorder:
 
     def __init__(self, inner_emit, *, run_id: str, conn: sqlite3.Connection | None = None):
@@ -208,6 +221,9 @@ class RunRecorder:
         self._b = ""
         self._two = False
         self._started = False
+        self._pair_id = ""
+        self._scope = ""
+        self._pair_stats: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     def emit(self, event: str, **fields: Any):
         try:
@@ -231,12 +247,74 @@ class RunRecorder:
             return self._a, self._b
         return self._src, self._dst
 
+    def _destination_route(self, provider: Any, instance: Any = None) -> tuple[str, str, str, str]:
+        src, dst = self._ctx_providers()
+        destination = _norm_prov(provider) or dst
+        reverse = self._two and destination == src and (
+            src != dst or instance is not None and normalize_instance_id(instance) == normalize_instance_id(self._si)
+        )
+        if reverse:
+            return dst, self._di, destination, self._si
+        return src, self._si, destination, self._di
+
     def _add(self, **kw: Any) -> None:
         kw.setdefault("run_id", self._run_id)
         kw.setdefault("feature", self._feature or None)
         kw.setdefault("pair_key", self._pair or None)
         kw.setdefault("source_kind", "runtime")
         self._buf.append(make_event(hash_extra=len(self._buf), **kw))
+
+    def _capture_pair_scope(self) -> None:
+        self._pair_id = pair_id_from_scope(os.environ.get("CW_PAIR_KEY"))
+        src, dst = self._ctx_providers()
+        self._scope = _scope_key(src, self._si or "default", dst, self._di or "default")
+
+    def _bump_pair_stats(self, *, src: str, dst: str, added: int = 0, removed: int = 0, updated: int = 0, errors: int = 0) -> None:
+        if not (added or removed or updated or errors):
+            return
+        scope = self._scope or _scope_key(src, self._si or "default", dst, self._di or "default")
+        key = (self._pair_id, scope, self._feature or "")
+        entry = self._pair_stats.get(key)
+        if entry is None:
+            entry = self._pair_stats[key] = {
+                "pair_id": self._pair_id,
+                "scope_key": scope,
+                "feature": self._feature or "",
+                "pair_key": self._pair or "",
+                "src_provider": src or "",
+                "src_instance": (self._si or "default").lower(),
+                "dst_provider": dst or "",
+                "dst_instance": (self._di or "default").lower(),
+                "added": 0, "removed": 0, "updated": 0, "errors": 0,
+            }
+        entry["added"] += int(added)
+        entry["removed"] += int(removed)
+        entry["updated"] += int(updated)
+        entry["errors"] += int(errors)
+
+    def _seen_blackbox_item(self, *, feature: Any, pair_key: Any, dst: Any, src_instance: Any, dst_instance: Any, item_key: Any) -> bool:
+        key = tuple(str(v or "") for v in (feature, pair_key, dst, src_instance, dst_instance, item_key))
+        for row in self._buf:
+            if row.get("event_type") != "blackbox_blocked" or row.get("operation") != "add":
+                continue
+            row_key = tuple(str(row.get(k) or "") for k in (
+                "feature", "pair_key", "destination_provider", "source_instance", "destination_instance", "item_key"
+            ))
+            if row_key == key:
+                return True
+        c = self._conn or get_conn()
+        if c is None:
+            return False
+        try:
+            return c.execute(
+                "SELECT 1 FROM events WHERE event_type='blackbox_blocked' AND operation='add' "
+                "AND COALESCE(feature,'')=? AND COALESCE(pair_key,'')=? "
+                "AND COALESCE(destination_provider,'')=? AND COALESCE(source_instance,'')=? "
+                "AND COALESCE(destination_instance,'')=? AND COALESCE(item_key,'')=? LIMIT 1",
+                key,
+            ).fetchone() is not None
+        except Exception:
+            return False
 
     def _observe(self, event: str, f: Mapping[str, Any]) -> None:
         if event == "run:start":
@@ -253,6 +331,9 @@ class RunRecorder:
         if event == "run:done":
             self._add(event_type="sync_run_finished", operation="run", detail=dict(f))
             self._flush(force=True)
+            if self._pair_stats:
+                record_run_pairs(self._run_id, list(self._pair_stats.values()), conn=self._conn)
+                self._pair_stats = {}
             record_run_finished(
                 self._run_id,
                 status="done",
@@ -282,6 +363,7 @@ class RunRecorder:
             self._di = os.environ.get("CW_PAIR_DST_INSTANCE") or ""
             self._feature = str(f.get("feature") or "")
             self._pair = _pair_key(self._src, self._dst)
+            self._capture_pair_scope()
             return
 
         if event == "two:start":
@@ -292,6 +374,7 @@ class RunRecorder:
             self._di = os.environ.get("CW_PAIR_DST_INSTANCE") or ""
             self._feature = str(f.get("feature") or "")
             self._pair = _pair_key(self._a, self._b)
+            self._capture_pair_scope()
             return
 
         if event in ("one:plan", "two:plan"):
@@ -309,8 +392,7 @@ class RunRecorder:
             return
 
         if event == "apply:unresolved":
-            dst = _norm_prov(f.get("provider")) or self._dst
-            src = self._src if self._src and self._src != dst else self._a
+            src, si, dst, di = self._destination_route(f.get("provider"), f.get("destination_instance"))
             for it in (f.get("items") or []):
                 if not isinstance(it, Mapping):
                     continue
@@ -320,8 +402,8 @@ class RunRecorder:
                     severity="warn",
                     source_provider=src or None,
                     destination_provider=dst or None,
-                    source_instance=self._si or None,
-                    destination_instance=self._di or None,
+                    source_instance=si or None,
+                    destination_instance=di or None,
                     reason_code=str(it.get("reason") or ""),
                     reason=str(it.get("reason") or ""),
                     **_item_fields(it),
@@ -334,21 +416,26 @@ class RunRecorder:
 
         if event.endswith("apply:add:done") or event.endswith("apply:remove:done") or event.endswith("apply:update:done"):
             op = "add" if "add" in event else ("remove" if "remove" in event else "update")
-            dst = _norm_prov(f.get("dst")) or self._dst
-            src, ctx_dst = self._ctx_providers()
-            if not dst:
-                dst = ctx_dst
-            src_eff = src if src and src != dst else (self._b if dst == self._a else self._a)
+            src, si, dst, di = self._destination_route(f.get("dst"), f.get("destination_instance"))
+            pair_src, pair_dst = self._ctx_providers()
             attempted = int(f.get("attempted") or 0)
             errors = int(f.get("errors") or 0)
+            self._bump_pair_stats(
+                src=pair_src or "",
+                dst=pair_dst or "",
+                added=int(f.get("added") or 0),
+                removed=int(f.get("removed") or 0),
+                updated=int(f.get("updated") or 0),
+                errors=errors,
+            )
             self._add(
                 event_type="write_attempted",
                 operation=op,
                 severity="warn" if errors else "info",
-                source_provider=src_eff or None,
+                source_provider=src or None,
                 destination_provider=dst or None,
-                source_instance=self._si or None,
-                destination_instance=self._di or None,
+                source_instance=si or None,
+                destination_instance=di or None,
                 reason_code="errors" if errors else None,
                 detail={k: f.get(k) for k in ("attempted", "count", "added", "removed", "updated", "skipped", "unresolved", "errors") if k in f},
             )
@@ -357,18 +444,39 @@ class RunRecorder:
                     event_type="write_failed",
                     operation=op,
                     severity="error",
-                    source_provider=src_eff or None,
+                    source_provider=src or None,
                     destination_provider=dst or None,
-                    source_instance=self._si or None,
-                    destination_instance=self._di or None,
+                    source_instance=si or None,
+                    destination_instance=di or None,
                     reason_code="errors",
                 )
             self._flush()
             return
 
+        if event == "dropped:tagged":
+            src, si, dst, di = self._destination_route(f.get("dst"), f.get("destination_instance"))
+            failed = int(f.get("errors") or 0)
+            not_found = int(f.get("not_found") or 0)
+            route = dict(
+                operation="tag_dropped", source_provider=src or None, destination_provider=dst or None,
+                source_instance=si or None, destination_instance=di or None,
+            )
+            titles = [str(row.get("title") or "") for row in _as_list(f.get("shows")) if isinstance(row, Mapping)]
+            self._add(
+                event_type="write_attempted", severity="warn" if failed or not_found else "info",
+                reason_code="errors" if failed else None, **route,
+                detail=_fit_titles({"attempted": int(f.get("attempted") or 0), "tagged": int(f.get("confirmed") or 0),
+                                    "skipped": int(f.get("skipped") or 0), "not_found": not_found, "failed": failed},
+                                   [title for title in titles if title]),
+            )
+            if failed:
+                self._add(event_type="write_failed", severity="error", reason_code="tag_dropped_failed",
+                          reason=str(f.get("error") or "tag_dropped_failed"), **route)
+            self._flush()
+            return
+
         if event == "archive:item_failures":
-            dst = _norm_prov(f.get("provider")) or self._dst
-            src = self._src if self._src and self._src != dst else self._a
+            src, si, dst, di = self._destination_route(f.get("provider"), f.get("destination_instance"))
             op = str(f.get("op") or "add")
             for row in (f.get("items") or []):
                 if not isinstance(row, Mapping):
@@ -381,7 +489,7 @@ class RunRecorder:
                 reason = str(row.get("reason") or "apply:add:failed")
                 base = dict(
                     source_provider=src or None, destination_provider=dst or None,
-                    source_instance=self._si or None, destination_instance=self._di or None,
+                    source_instance=si or None, destination_instance=di or None,
                     item_key=k, **_item_fields(it),
                 )
                 self._add(event_type="write_failed", operation=op, severity="error",
@@ -395,8 +503,7 @@ class RunRecorder:
             return
 
         if event == "archive:item_resolutions":
-            dst = _norm_prov(f.get("provider")) or self._dst
-            src = self._src if self._src and self._src != dst else self._a
+            src, si, dst, di = self._destination_route(f.get("provider"), f.get("destination_instance"))
             op = str(f.get("op") or "add")
             for row in (f.get("items") or []):
                 if not isinstance(row, Mapping):
@@ -409,7 +516,7 @@ class RunRecorder:
                 self._add(
                     event_type="unresolved_cleared", operation=op, severity="info",
                     source_provider=src or None, destination_provider=dst or None,
-                    source_instance=self._si or None, destination_instance=self._di or None,
+                    source_instance=si or None, destination_instance=di or None,
                     reason_code="unresolved_cleared", reason="unresolved_cleared",
                     item_key=k, **_item_fields(it),
                 )
@@ -418,16 +525,18 @@ class RunRecorder:
 
         if event == "debug" and str(f.get("msg") or "") == "blocked.counts":
             bb = int(f.get("blocked_blackbox") or 0)
-            dst_p = _norm_prov(f.get("dst")) or None
-            pair_k = str(f.get("pair") or self._pair) or None
+            src, si, dst, di = self._destination_route(f.get("dst"), f.get("destination_instance"))
+            dst_p = dst or None
+            pair_k = _norm_pair_key(f.get("pair"), self._pair)
             rows = f.get("blackbox_items") or []
             if bb > 0:
                 self._add(
                     event_type="blackbox_blocked",
                     severity="warn",
+                    source_provider=src or None,
                     destination_provider=dst_p,
-                    source_instance=self._si or None,
-                    destination_instance=self._di or None,
+                    source_instance=si or None,
+                    destination_instance=di or None,
                     pair_key=pair_k,
                     reason_code="blackbox",
                     detail={"blocked": bb},
@@ -438,12 +547,22 @@ class RunRecorder:
                 k = str(row.get("key") or "")
                 if not k:
                     continue
+                if self._seen_blackbox_item(
+                    feature=f.get("feature") or self._feature,
+                    pair_key=pair_k,
+                    dst=dst_p,
+                    src_instance=si,
+                    dst_instance=di,
+                    item_key=k,
+                ):
+                    continue
                 raw_it = row.get("item")
                 it: Mapping[str, Any] = raw_it if isinstance(raw_it, Mapping) else {}
                 self._add(
                     event_type="blackbox_blocked", operation="add", severity="warn",
-                    destination_provider=dst_p, source_instance=self._si or None,
-                    destination_instance=self._di or None, pair_key=pair_k, item_key=k,
+                    source_provider=src or None,
+                    destination_provider=dst_p, source_instance=si or None,
+                    destination_instance=di or None, pair_key=pair_k, item_key=k,
                     reason_code="blackbox", reason="blackbox", **_item_fields(it),
                 )
             if bb > 0 or rows:
@@ -460,6 +579,19 @@ class RunRecorder:
             correlate(conn=self._conn)
         except Exception as exc:
             _LOG.warning("event correlation after run failed: %s", exc)
+
+
+def _fit_titles(base: Mapping[str, Any], titles: list[str], limit: int = DETAIL_TITLE_BUDGET) -> dict[str, Any]:
+    kept: list[str] = []
+    for title in titles:
+        trial = {**base, "shows": [*kept, title[:200]], "shows_omitted": len(titles) - len(kept) - 1}
+        if len(json.dumps(trial, ensure_ascii=False, sort_keys=True)) > limit:
+            break
+        kept.append(title[:200])
+    out = {**base, "shows": kept}
+    if len(kept) < len(titles):
+        out["shows_omitted"] = len(titles) - len(kept)
+    return out
 
 
 def _item_fields(it: Mapping[str, Any]) -> dict[str, Any]:

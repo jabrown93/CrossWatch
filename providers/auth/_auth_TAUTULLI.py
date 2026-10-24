@@ -9,11 +9,12 @@ from typing import Any
 import requests
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
-from cw_platform.provider_instances import get_provider_block, ensure_instance_block, normalize_instance_id
+from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
 
 __VERSION__ = "2.0.0"
-UA = "CrossWatch/1.0"
+UA = http_user_agent(override_env="CW_TAUTULLI_UA")
 
 
 
@@ -25,7 +26,7 @@ def _load_config() -> dict[str, Any]:
 
 
 def _block(cfg: Mapping[str, Any], instance_id: Any = None) -> dict[str, Any]:
-    return get_provider_block(cfg or {}, "tautulli", instance_id)
+    return resolve_provider_block(cfg or {}, "tautulli", instance_id)
 
 
 def validate_credentials(server_url: str, api_key: str, *, timeout: float = 12.0, verify_ssl: bool = True) -> tuple[bool, str]:

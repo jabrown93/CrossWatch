@@ -3,17 +3,23 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import json
+import re
 import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..id_map import migrate_media_key
 from .db import crosswatch_db_path, get_conn
 from .schema import ID_KEYS
 
 _LOCK = threading.RLock()
-_FEATURES = ("watchlist", "history", "ratings", "progress", "playlists")
+_FEATURES = ("watchlist", "history", "ratings", "progress", "playlists", "collection")
+MEDIA_IDENTITY = 2
+_MEDIA_IDENTITY_META = "manual_policy_media_identity"
+_LEGACY_TMDB_BLOCK = re.compile(r"tmdb:\d+", re.IGNORECASE)
 
 
 def _now() -> int:
@@ -158,6 +164,68 @@ def _feature_blocks(policy: Mapping[str, Any]) -> list[tuple[str, str, str, Mapp
     return out
 
 
+def legacy_media_blocks(key: Any) -> list[str]:
+    text = str(key or "").strip()
+    return [text, f"{text}#show"] if _LEGACY_TMDB_BLOCK.fullmatch(text) else [text]
+
+
+def _migrate_media_block(block: dict[str, Any]) -> None:
+    aliases: dict[str, str] = {}
+    adds = block.get("adds")
+    raw_items = adds.get("items") if isinstance(adds, dict) else None
+    if isinstance(adds, dict) and isinstance(raw_items, Mapping):
+        items: dict[str, Any] = {}
+        for key, item in raw_items.items():
+            previous = str(key)
+            current = migrate_media_key(previous, item) if isinstance(item, Mapping) else previous
+            aliases[previous] = current
+            if current not in items or current == previous:
+                items[current] = item
+        adds["items"] = items
+
+    originals: dict[str, str] = {}
+    raw_mappings = block.get("mappings")
+    if isinstance(raw_mappings, Mapping):
+        mappings: dict[str, Any] = {}
+        for target, record in raw_mappings.items():
+            previous = str(target)
+            current = aliases.get(previous, previous)
+            if isinstance(record, Mapping):
+                record = dict(record)
+                original_key = record.get("original_key")
+                original = record.get("original")
+                if original_key and isinstance(original, Mapping):
+                    migrated = migrate_media_key(str(original_key), original)
+                    originals[str(original_key)] = migrated
+                    record["original_key"] = migrated
+            if current not in mappings or current == previous:
+                mappings[current] = record
+        block["mappings"] = mappings
+
+    if "blocks" in block:
+        blocks: list[str] = []
+        for key in _normalize_blocks(block.get("blocks")):
+            if key in originals:
+                blocks.append(originals[key])
+            elif key in aliases:
+                blocks.append(aliases[key])
+            else:
+                blocks.extend(legacy_media_blocks(key))
+        block["blocks"] = _normalize_blocks(blocks)
+
+
+def migrate_media_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    pairs = policy.get("pairs")
+    scopes = [policy, *(pairs.values() if isinstance(pairs, Mapping) else [])]
+    for scoped in scopes:
+        if not isinstance(scoped, Mapping):
+            continue
+        for _provider, _instance, _feature, block in _feature_blocks(scoped):
+            if isinstance(block, dict):
+                _migrate_media_block(block)
+    return policy
+
+
 def _item_to_row(feature_id: int, ordinal: int, item_key: str, item: Mapping[str, Any], ts: int) -> tuple[Any, ...]:
     raw_ids = item.get("ids")
     ids: Mapping[str, Any] = raw_ids if isinstance(raw_ids, Mapping) else {}
@@ -180,6 +248,7 @@ def _item_to_row(feature_id: int, ordinal: int, item_key: str, item: Mapping[str
         _b(item.get("watched")) if "watched" in item else None,
         _s(item.get("watched_at")),
         _s(item.get("last_watched_at")),
+        _s(item.get("collected_at")),
         _f(item.get("rating")),
         _f(item.get("user_rating")),
         _s(item.get("rated_at")),
@@ -208,6 +277,7 @@ def _row_to_item(row: Any) -> dict[str, Any]:
         ("show_title", "show_title"),
         ("watched_at", "watched_at"),
         ("last_watched_at", "last_watched_at"),
+        ("collected_at", "collected_at"),
         ("rated_at", "rated_at"),
         ("user_rated_at", "user_rated_at"),
         ("progress_at", "progress_at"),
@@ -274,6 +344,20 @@ def load_policy(base_path: str | Path, policy_path: str | Path | None = None) ->
             ).fetchall()
             items = {str(row["item_key"]): _row_to_item(row) for row in items_rows if row["item_key"] not in (None, "")}
             node[feature] = {"blocks": blocks, "adds": {"items": items}}
+            try:
+                mappings = json.loads(feature_row["mappings_json"] or "{}")
+            except (ValueError, TypeError):
+                mappings = {}
+            if isinstance(mappings, dict) and mappings:
+                node[feature]["mappings"] = {key: value for key, value in mappings.items() if key in items}
+
+        pairs = {str(row[0]): json.loads(row[1]) for row in conn.execute(
+            "SELECT pair_id,policy_json FROM manual_policy_pairs ORDER BY pair_id"
+        )}
+        if pairs:
+            out["pairs"] = pairs
+        if (providers or pairs) and _get_meta(conn, _MEDIA_IDENTITY_META) != MEDIA_IDENTITY:
+            save_policy(base_path, migrate_media_policy(out), policy_path)
         return out
 
 
@@ -315,6 +399,7 @@ def save_policy(base_path: str | Path, policy: Mapping[str, Any], policy_path: s
             "watched",
             "watched_at",
             "last_watched_at",
+            "collected_at",
             "rating",
             "user_rating",
             "rated_at",
@@ -330,14 +415,21 @@ def save_policy(base_path: str | Path, policy: Mapping[str, Any], policy_path: s
         ]
         item_sql = f"INSERT INTO manual_policy_add_items({','.join(item_columns)}) VALUES({','.join('?' for _ in item_columns)})"
         with conn:
+            conn.execute("DELETE FROM manual_policy_pairs")
+            conn.executemany("INSERT INTO manual_policy_pairs(pair_id,policy_json,updated_at) VALUES(?,?,?)", [
+                (str(pair_id), json.dumps(scoped, ensure_ascii=False), ts)
+                for pair_id, scoped in (policy.get("pairs") or {}).items()
+                if pair_id and isinstance(scoped, Mapping)
+            ])
             conn.execute("DELETE FROM manual_policy_add_items")
             conn.execute("DELETE FROM manual_policy_blocks")
             conn.execute("DELETE FROM manual_policy_features")
             _set_meta(conn, "manual_policy_version", version or 1, ts)
+            _set_meta(conn, _MEDIA_IDENTITY_META, MEDIA_IDENTITY, ts)
             for ordinal, (provider, instance, feature, block) in enumerate(_feature_blocks(policy)):
                 cur = conn.execute(
-                    "INSERT INTO manual_policy_features(provider,instance,feature,ordinal,updated_at) VALUES(?,?,?,?,?)",
-                    (provider, instance, feature, ordinal, ts),
+                    "INSERT INTO manual_policy_features(provider,instance,feature,ordinal,updated_at,mappings_json) VALUES(?,?,?,?,?,?)",
+                    (provider, instance, feature, ordinal, ts, json.dumps(block.get("mappings") or {}, ensure_ascii=False)),
                 )
                 feature_id_raw = cur.lastrowid
                 if feature_id_raw is None:
@@ -414,7 +506,7 @@ def has_policy(base_path: str | Path, policy_path: str | Path | None = None) -> 
         if conn is None:
             return False
         row = conn.execute("SELECT COUNT(*) FROM manual_policy_features").fetchone()
-        return bool(row and int(row[0] or 0) > 0)
+        return bool(row and int(row[0] or 0) > 0) or bool(conn.execute("SELECT 1 FROM manual_policy_pairs LIMIT 1").fetchone())
 
 
 def policy_mtime(base_path: str | Path) -> int | None:
@@ -431,6 +523,7 @@ def clear_policy(base_path: str | Path) -> None:
         if conn is None:
             return
         with conn:
+            conn.execute("DELETE FROM manual_policy_pairs")
             conn.execute("DELETE FROM manual_policy_add_items")
             conn.execute("DELETE FROM manual_policy_blocks")
             conn.execute("DELETE FROM manual_policy_features")

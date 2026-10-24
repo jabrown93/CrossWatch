@@ -9,13 +9,54 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
-from ._mod_common import build_session, make_snapshot_progress, request_with_retries, _confirmed_keys
+from ._mod_common import SimpleRateLimiter, build_session, make_snapshot_progress, request_with_retries
 from ._log import log as cw_log
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 
+
+def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
+    attempted: list[str] = []
+    for it in items or []:
+        try:
+            k = str(key_of(it) or "").strip()
+        except Exception:
+            k = ""
+        if k:
+            attempted.append(k)
+
+    unresolved_keys: set[str] = set()
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                if isinstance(u.get("key"), str) and u.get("key"):
+                    unresolved_keys.add(str(u.get("key")))
+                    continue
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                unresolved_keys.add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                try:
+                    k = str(key_of(obj) or "").strip()
+                except Exception:
+                    k = ""
+                if k:
+                    unresolved_keys.add(k)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in attempted:
+        if k in unresolved_keys or k in seen:
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
+
 __VERSION__ = "0.1"
-os.environ.setdefault("CW_ANILIST_VERSION", __VERSION__)
-os.environ.setdefault("CW_ANILIST_UA", f"CrossWatch/{__VERSION__} (AniList)")
+os.environ.setdefault("CW_ANILIST_UA", http_user_agent("AniList", override_env="CW_ANILIST_UA"))
 __all__ = ["get_manifest", "ANILISTModule", "OPS"]
 
 def _health(status: str, ok: bool, latency_ms: int) -> None:
@@ -59,9 +100,23 @@ except Exception as e:
         error=str(e),
     )
 
+try:
+    from .anilist import _history as feat_history
+except Exception as e:
+    feat_history = None
+    cw_log(
+        "ANILIST",
+        "module",
+        "warn",
+        "feature_import_failed",
+        import_feature="history",
+        error_type=e.__class__.__name__,
+        error=str(e),
+    )
+
 
 GQL_URL = "https://graphql.anilist.co"
-UA = os.environ.get("CW_ANILIST_UA") or os.environ.get("CW_UA") or f"CrossWatch/{__VERSION__} (AniList)"
+UA = os.environ.get("CW_ANILIST_UA") or os.environ.get("CW_UA") or http_user_agent("AniList", override_env="CW_ANILIST_UA")
 
 
 class ANILISTError(RuntimeError):
@@ -94,6 +149,14 @@ def label_anilist(method: str, url: str, kw: Mapping[str, Any]) -> str:
             variables = variables_raw if isinstance(variables_raw, Mapping) else {}
             if "Viewer" in q:
                 return "viewer"
+            if "SaveMediaListEntry" in q and "$progress" in q:
+                return "progress:save"
+            if "MediaListCollection" in q and "progress" in q:
+                return "history:index"
+            if "mediaListEntry" in q and "score(" in q:
+                return "ratings:lookup"
+            if "mediaListEntry" in q:
+                return "progress:lookup"
             if "MediaListCollection" in q and "score(" in q:
                 return "ratings:index"
             if "MediaListCollection" in q:
@@ -122,6 +185,19 @@ def label_anilist(method: str, url: str, kw: Mapping[str, Any]) -> str:
 
 
 
+DEFAULT_POST_PER_SEC = 0.45
+
+
+def _post_per_sec(raw_cfg: Mapping[str, Any]) -> float:
+    rl_raw = raw_cfg.get("rate_limit")
+    rl: Mapping[str, Any] = rl_raw if isinstance(rl_raw, Mapping) else {}
+    try:
+        value = float(rl.get("post_per_sec", DEFAULT_POST_PER_SEC))
+    except (TypeError, ValueError):
+        return DEFAULT_POST_PER_SEC
+    return value if value > 0 else DEFAULT_POST_PER_SEC
+
+
 @dataclass
 class ANILISTConfig:
     access_token: str
@@ -134,6 +210,12 @@ class ANILISTClient:
         self.cfg = cfg
         self.raw_cfg = raw_cfg
         self.session = build_session("ANILIST", ctx, feature_label=label_anilist)
+        post_rps = _post_per_sec(raw_cfg)
+        try:
+            self.session._rate_limiter = SimpleRateLimiter(rates_per_sec={"POST": post_rps})
+            self.session._rate_limiter_meta = {"post_per_sec": post_rps}
+        except Exception:
+            pass
         self._apply_headers(cfg.access_token)
         self._viewer_cache: dict[str, Any] | None = None
 
@@ -211,7 +293,20 @@ class ANILISTClient:
 
 
 def supported_features() -> dict[str, bool]:
-    return {"watchlist": bool(feat_watchlist), "ratings": bool(feat_ratings), "history": False, "playlists": False}
+    return {"watchlist": bool(feat_watchlist), "ratings": bool(feat_ratings), "history": bool(feat_history), "playlists": False}
+
+
+_HISTORY_CAPS: dict[str, Any] = {
+    "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+    "upsert": False,
+    "remove": True,
+    "observed_deletes": False,
+    "rewatches": {"read": False, "write": False},
+}
+
+
+def _feature_modules() -> dict[str, Any]:
+    return {"watchlist": feat_watchlist, "ratings": feat_ratings, "history": feat_history}
 
 
 def get_manifest() -> Mapping[str, Any]:
@@ -234,6 +329,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "unrate": True,
                 "from_date": False,
             },
+            "history": dict(_HISTORY_CAPS),
         },
     }
 
@@ -341,7 +437,7 @@ class ANILISTModule:
         features = {
             "watchlist": bool(feats.get("watchlist") and ok),
             "ratings": bool(feats.get("ratings") and ok),
-            "history": False,
+            "history": bool(feats.get("history") and ok),
             "playlists": False,
         }
 
@@ -374,7 +470,7 @@ class ANILISTModule:
         return tuple(k for k, v in feats.items() if v)
 
     def build_index(self, feature: str, **kwargs: Any) -> dict[str, dict[str, Any]]:
-        mod = {"watchlist": feat_watchlist, "ratings": feat_ratings}.get(str(feature or "").strip().lower())
+        mod = _feature_modules().get(str(feature or "").strip().lower())
         if not mod:
             _info("index_skipped", feature=feature, reason="disabled_or_missing")
             return {}
@@ -393,7 +489,7 @@ class ANILISTModule:
         if dry_run:
             return {"ok": True, "count": len(lst), "dry_run": True}
         feature_name = str(feature or "").strip().lower()
-        mod = {"watchlist": feat_watchlist, "ratings": feat_ratings}.get(feature_name)
+        mod = _feature_modules().get(feature_name)
         if not mod:
             _info("write_skipped", op="add", feature=feature, reason="disabled_or_missing")
             return {"ok": True, "count": 0, "unresolved": []}
@@ -428,10 +524,16 @@ class ANILISTModule:
         if dry_run:
             return {"ok": True, "count": len(lst), "dry_run": True}
         feature_name = str(feature or "").strip().lower()
-        mod = {"watchlist": feat_watchlist, "ratings": feat_ratings}.get(feature_name)
+        mod = _feature_modules().get(feature_name)
         if not mod:
             _info("write_skipped", op="remove", feature=feature, reason="disabled_or_missing")
             return {"ok": True, "count": 0, "unresolved": []}
+        detailed = getattr(mod, "remove_detailed", None)
+        if callable(detailed):
+            result = detailed(self, lst)
+            if not isinstance(result, dict):
+                raise TypeError("AniList detailed removal returned an invalid result")
+            return result
         count, unresolved = mod.remove(self, lst)
         confirmed_keys = _confirmed_keys(self.key_of, lst, unresolved)
         return {"ok": True, "count": int(count), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
@@ -458,6 +560,7 @@ class _ANILISTOPS:
                 "unrate": True,
                 "from_date": False,
             },
+            "history": dict(_HISTORY_CAPS),
         }
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
@@ -504,6 +607,9 @@ class _ANILISTOPS:
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
+
+    def order_remove_items(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]], *, feature: str) -> list[Mapping[str, Any]]:
+        return feat_history.order_removals(cfg, items) if feature == "history" and feat_history is not None else list(items)
 
 
 OPS = _ANILISTOPS()

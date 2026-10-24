@@ -3,8 +3,10 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping
 
+from cw_platform.history_events import history_sync_key, minimal_history_item
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 
 from ._common import (
@@ -36,12 +38,25 @@ FEATURE = "history"
 HISTORY_ID_FIELD = "_punchplay_history_ids"
 HISTORY_EVENT_ID_FIELD = "_punchplay_history_id"
 
+_WRITTEN_COORDS = re.compile(r"^cw:history:(?P<show>[a-z0-9_]+:[^#@:]+)#s(?P<season>\d+)e(?P<episode>\d+)(?!\d)", re.IGNORECASE)
+
 
 def _key_of(obj: Mapping[str, Any]) -> str:
     try:
         return str(canonical_key(id_minimal(obj)) or "").strip()
     except Exception:
         return ""
+
+
+def _rewatches_enabled(adapter: Any) -> bool:
+    cfg = getattr(adapter, "config", None)
+    return bool(isinstance(cfg, Mapping) and cfg.get("_cw_history_rewatches"))
+
+
+def _history_key(adapter: Any, item: Mapping[str, Any]) -> str:
+    if _rewatches_enabled(adapter):
+        return history_sync_key(item, event_mode=True)
+    return _key_of(item)
 
 
 def _as_int(value: Any) -> int | None:
@@ -72,6 +87,24 @@ def _row_data(row: Mapping[str, Any]) -> Mapping[str, Any]:
     return merged
 
 
+def _written_coords(data: Mapping[str, Any], show_tmdb: int) -> tuple[int, int] | None:
+    match = _WRITTEN_COORDS.match(str(_pick(data, "clientItemId", "client_item_id") or "").strip())
+    if not match:
+        return None
+    show = match.group("show").lower()
+    if show.startswith("tmdb:") and show != f"tmdb:{show_tmdb}":
+        return None
+    return int(match.group("season")), int(match.group("episode"))
+
+
+def _source_coords(data: Mapping[str, Any]) -> tuple[int, int] | None:
+    season = _as_int(data.get("sourceSeason"))
+    episode = _as_int(data.get("sourceEpisode"))
+    if season is None or episode is None or season < 0 or episode < 1:
+        return None
+    return season, episode
+
+
 def _row_to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
     data = _row_data(row)
     typ_raw = str(_pick(data, "kind", "type", "mediaType", "media_type") or "").strip().lower()
@@ -96,6 +129,7 @@ def _row_to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
         episode = _as_int(_pick(data, "episode"))
         if not show_tmdb or season is None or episode is None:
             return None
+        season, episode = _source_coords(data) or _written_coords(data, show_tmdb) or (season, episode)
         out: dict[str, Any] = {
             "type": "episode",
             "show_ids": {"tmdb": str(show_tmdb)},
@@ -103,11 +137,6 @@ def _row_to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
             "season": season,
             "episode": episode,
         }
-        ep_tmdb = _as_int(_pick(data, "episode_tmdb_id", "episodeTmdbId"))
-        if not ep_tmdb and _pick(data, "show_tmdb_id", "showTmdbId", "showTmdbID") is not None:
-            ep_tmdb = _as_int(_pick(data, "tmdbId"))
-        if ep_tmdb:
-            out["ids"] = {"tmdb": str(ep_tmdb)}
         series_title = str(_pick(data, "series_title", "show_title", "showTitle", "title") or "").strip()
         if series_title:
             out["series_title"] = series_title
@@ -134,14 +163,21 @@ def _row_to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
     return out
 
 
-def _collect_history_rows(rows: Any, collected: dict[str, dict[str, Any]]) -> int:
+def _collect_history_rows(adapter: Any, rows: Any, collected: dict[str, dict[str, Any]]) -> int:
     row_list = [r for r in rows if isinstance(r, Mapping)] if isinstance(rows, list) else []
+    event_mode = _rewatches_enabled(adapter)
     for row in row_list:
         minimal = _row_to_minimal(row)
         if not minimal:
             continue
-        key = _key_of(minimal)
+        key = _history_key(adapter, minimal)
         if not key:
+            continue
+        if event_mode:
+            if key in collected:
+                suffix = str(minimal.get(HISTORY_EVENT_ID_FIELD) or len(collected))
+                key = f"{key}~pp{suffix}"
+            collected[key] = minimal_history_item(minimal, key, event_mode=True)
             continue
         existing = collected.get(key)
         if existing is None:
@@ -159,13 +195,13 @@ def _collect_history_rows(rows: Any, collected: dict[str, dict[str, Any]]) -> in
     return len(row_list)
 
 
-def _index_from_snapshot(adapter: Any, *, per_page: int) -> dict[str, dict[str, Any]]:
+def _index_from_snapshot(adapter: Any) -> dict[str, dict[str, Any]]:
     collected: dict[str, dict[str, Any]] = {}
     pages = 0
     rows = 0
-    for page in snapshot_pages(adapter, "history", feature=FEATURE, limit=per_page):
+    for page in snapshot_pages(adapter, "history", feature=FEATURE):
         pages += 1
-        rows += _collect_history_rows(page, collected)
+        rows += _collect_history_rows(adapter, page, collected)
     _dbg(FEATURE, "snapshot_scanned", rows=rows, indexed=len(collected), pages=pages)
     return collected
 
@@ -191,7 +227,7 @@ def _index_from_history_endpoint(adapter: Any, *, per_page: int, max_pages: int)
         if not isinstance(data, Mapping):
             break
         rows = data.get("items")
-        row_count = _collect_history_rows(rows, collected)
+        row_count = _collect_history_rows(adapter, rows, collected)
 
         cursor = data.get("nextCursor") or None
         if not cursor or row_count <= 0:
@@ -206,7 +242,7 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     per_page = max(1, min(cfg_int(section, "history_per_page", HISTORY_PAGE_MAX), HISTORY_PAGE_MAX))
     max_pages = cfg_int(section, "history_max_pages", 5000)
 
-    collected = _index_from_snapshot(adapter, per_page=per_page)
+    collected = _index_from_snapshot(adapter)
     source = "snapshot"
     if not collected:
         collected = _index_from_history_endpoint(adapter, per_page=per_page, max_pages=max_pages)
@@ -216,8 +252,8 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     return collected
 
 
-def _payload_for(item: Mapping[str, Any]) -> tuple[dict[str, Any], str] | None:
-    key = _key_of(item)
+def _payload_for(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, Any], str] | None:
+    key = _history_key(adapter, item)
     if not key:
         return None
 
@@ -273,9 +309,9 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     unresolved_keys: list[str] = []
 
     for item in items or []:
-        built = _payload_for(item)
+        built = _payload_for(adapter, item)
         if built is None:
-            key = _key_of(item)
+            key = _history_key(adapter, item)
             if key:
                 unresolved_keys.append(key)
                 unresolved.append({"key": key, "status": "missing_supported_id_or_watched_at"})
@@ -315,7 +351,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     ok = True
 
     for item in items or []:
-        key = _key_of(item)
+        key = _history_key(adapter, item)
         if not key:
             continue
 
@@ -344,6 +380,11 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             unresolved_keys.append(key)
             unresolved.append({"key": key, "status": "missing_history_entry_id"})
             _dbg(FEATURE, "item_unresolved_before_write", key=key, reason="episode_delete_needs_entry_id")
+            continue
+        if _rewatches_enabled(adapter):
+            unresolved_keys.append(key)
+            unresolved.append({"key": key, "status": "missing_history_entry_id"})
+            _dbg(FEATURE, "item_unresolved_before_write", key=key, reason="event_delete_needs_entry_id")
             continue
 
         payload = ids_for_punchplay(item)

@@ -27,13 +27,13 @@ def _write_json(p: Path, obj: dict[str, Any]) -> None:
     except Exception:
         pass
 
-def _bb_path(dst: str, feature: str, pair: str | None = None) -> Path:
+def _bb_path(dst: str, feature: str, pair: str | None = None, instance: str | None = None) -> Path:
     dst = str(dst).strip().lower()
     feature = str(feature).strip().lower()
-    scope = str(pair).strip().lower() if pair else scope_safe()
+    scope = scope_safe(instance, pair=str(pair).strip().lower() if pair else None)
     scoped = STATE_DIR / f"{dst}_{feature}.{scope}.blackbox.json"
     legacy = STATE_DIR / f"{dst}_{feature}.blackbox.json"
-    if not scoped.exists() and legacy.exists():
+    if instance is None and not scoped.exists() and legacy.exists():
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)
@@ -41,13 +41,13 @@ def _bb_path(dst: str, feature: str, pair: str | None = None) -> Path:
             pass
     return scoped
 
-def _flap_path(dst: str, feature: str, pair: str | None = None) -> Path:
+def _flap_path(dst: str, feature: str, pair: str | None = None, instance: str | None = None) -> Path:
     dst = str(dst).strip().lower()
     feature = str(feature).strip().lower()
-    scope = str(pair).strip().lower() if pair else scope_safe()
+    scope = scope_safe(instance, pair=str(pair).strip().lower() if pair else None)
     scoped = STATE_DIR / f"{dst}_{feature}.{scope}.flap.json"
     legacy = STATE_DIR / f"{dst}_{feature}.flap.json"
-    if not scoped.exists() and legacy.exists():
+    if instance is None and not scoped.exists() and legacy.exists():
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)
@@ -81,21 +81,21 @@ def _load_bb_cfg(cfg: Mapping[str, Any] | None) -> dict[str, Any]:
         pass
     return dict(_DEFAULT_BB)
 
-def load_blackbox_keys(dst: str, feature: str, pair: str | None = None) -> set[str]:
+def load_blackbox_keys(dst: str, feature: str, pair: str | None = None, instance: str | None = None) -> set[str]:
     keys: set[str] = set()
-    glob = _read_json(_bb_path(dst, feature))
+    glob = _read_json(_bb_path(dst, feature, instance=instance))
     keys |= set(glob.keys())
     if pair:
-        prs = _read_json(_bb_path(dst, feature, pair))
+        prs = _read_json(_bb_path(dst, feature, pair, instance=instance))
         keys |= set(prs.keys())
     return keys
 
-def load_flap_counters(dst: str, feature: str) -> dict[str, dict[str, Any]]:
-    return _read_json(_flap_path(dst, feature))
+def load_flap_counters(dst: str, feature: str, instance: str | None = None) -> dict[str, dict[str, Any]]:
+    return _read_json(_flap_path(dst, feature, instance=instance))
 
-def inc_flap(dst: str, feature: str, key: str, *, reason: str, op: str, ts: int | None = None) -> int:
+def inc_flap(dst: str, feature: str, key: str, *, reason: str, op: str, ts: int | None = None, instance: str | None = None) -> int:
     ts = int(ts or time.time())
-    path = _flap_path(dst, feature)
+    path = _flap_path(dst, feature, instance=instance)
     m = _read_json(path)
     row = m.setdefault(key, {})
     row["consecutive"] = int(row.get("consecutive") or 0) + 1
@@ -105,9 +105,9 @@ def inc_flap(dst: str, feature: str, key: str, *, reason: str, op: str, ts: int 
     _write_json(path, m)
     return int(row["consecutive"])
 
-def reset_flap(dst: str, feature: str, key: str, *, ts: int | None = None) -> None:
+def reset_flap(dst: str, feature: str, key: str, *, ts: int | None = None, instance: str | None = None) -> None:
     ts = int(ts or time.time())
-    path = _flap_path(dst, feature)
+    path = _flap_path(dst, feature, instance=instance)
     m = _read_json(path)
     row = m.setdefault(key, {})
     row["consecutive"] = 0
@@ -116,8 +116,8 @@ def reset_flap(dst: str, feature: str, key: str, *, ts: int | None = None) -> No
     row["last_success_ts"] = ts
     _write_json(path, m)
 
-def _promote(dst: str, feature: str, key: str, *, reason: str, ts: int, pair: str | None) -> None:
-    path = _bb_path(dst, feature, pair)
+def _promote(dst: str, feature: str, key: str, *, reason: str, ts: int, pair: str | None, instance: str | None = None) -> None:
+    path = _bb_path(dst, feature, pair, instance=instance)
     data = _read_json(path)
     if key not in data:
         data[key] = {"reason": str(reason or "flapper"), "since": int(ts)}
@@ -148,6 +148,7 @@ def record_attempts(
     op: str = "add",
     pair: str | None = None,
     cfg: Mapping[str, Any] | None = None,
+    instance: str | None = None,
 ) -> dict[str, Any]:
     bb = _load_bb_cfg(cfg)
     ordered_keys, unique_keys = _normalize_keys(keys)
@@ -164,11 +165,11 @@ def record_attempts(
         }
 
     ts = int(time.time())
-    flap_path = _flap_path(dst, feature)
+    flap_path = _flap_path(dst, feature, instance=instance)
     flap_data = _read_json(flap_path)
 
     promote_after = int(bb.get("promote_after", 3) or 3)
-    bb_path = _bb_path(dst, feature, scoped_pair)
+    bb_path = _bb_path(dst, feature, scoped_pair, instance=instance)
     bb_data = _read_json(bb_path)
 
     flap_changed = False
@@ -191,11 +192,13 @@ def record_attempts(
             should_promote = True
             promote_reason = f"flapper:consecutive>={promote_after}"
 
-        if should_promote and key not in bb_data:
-            bb_data[key] = {"reason": promote_reason or str(reason or "flapper"), "since": int(ts)}
-            bb_changed = True
-            promoted += 1
-            promoted_keys.append(key)
+        if should_promote:
+            flap_data.pop(key, None)
+            if key not in bb_data:
+                bb_data[key] = {"reason": promote_reason or str(reason or "flapper"), "since": int(ts)}
+                bb_changed = True
+                promoted += 1
+                promoted_keys.append(key)
 
     if flap_changed:
         _write_json(flap_path, flap_data)
@@ -205,6 +208,56 @@ def record_attempts(
     return {"ok": True, "count": len(ordered_keys), "promoted": promoted, "promoted_keys": promoted_keys, "pair": scoped_pair or "global"}
 
 
+def _feature_files(dst: str, feature: str, suffix: str, instance: str | None = None) -> list[Path]:
+    prefix = f"{str(dst).strip().lower()}_{str(feature).strip().lower()}."
+    try:
+        if not STATE_DIR.exists():
+            return []
+        return [p for p in STATE_DIR.glob(f"{prefix}*") if p.is_file() and p.name.endswith(suffix) and (instance is None or p.name.endswith(f".{scope_safe(instance)}{suffix}"))]
+    except Exception:
+        return []
+
+
+def clear_keys(dst: str, feature: str, keys: Iterable[str], instance: str | None = None) -> dict[str, Any]:
+    _, unique_keys = _normalize_keys(keys)
+    key_set = set(unique_keys)
+    if not key_set:
+        return {"ok": True, "blackbox_removed": 0, "flap_removed": 0}
+    removed = {".blackbox.json": 0, ".flap.json": 0}
+    for suffix in removed:
+        for path in _feature_files(dst, feature, suffix, instance=instance):
+            data = _read_json(path)
+            hits = [k for k in data if k in key_set]
+            if not hits:
+                continue
+            for k in hits:
+                data.pop(k, None)
+            removed[suffix] += len(hits)
+            _write_json(path, data)
+    return {"ok": True, "blackbox_removed": removed[".blackbox.json"], "flap_removed": removed[".flap.json"]}
+
+
+def clear_path_keys(path: Path, keys: Iterable[str]) -> dict[str, Any]:
+    _, unique_keys = _normalize_keys(keys)
+    key_set = set(unique_keys)
+    removed = {".blackbox.json": 0, ".flap.json": 0}
+    name = Path(path).name
+    if not key_set or not name.endswith(".blackbox.json"):
+        return {"ok": True, "blackbox_removed": 0, "flap_removed": 0}
+    stem = name[: -len(".blackbox.json")]
+    for suffix in removed:
+        target = Path(path).with_name(f"{stem}{suffix}")
+        data = _read_json(target)
+        hits = [k for k in data if k in key_set]
+        if not hits:
+            continue
+        for k in hits:
+            data.pop(k, None)
+        removed[suffix] += len(hits)
+        _write_json(target, data)
+    return {"ok": True, "blackbox_removed": removed[".blackbox.json"], "flap_removed": removed[".flap.json"]}
+
+
 def record_success(
     dst: str,
     feature: str,
@@ -212,28 +265,33 @@ def record_success(
     *,
     pair: str | None = None,
     cfg: Mapping[str, Any] | None = None,
+    instance: str | None = None,
 ) -> dict[str, Any]:
-    ts = int(time.time())
     ordered_keys, unique_keys = _normalize_keys(keys)
     if not unique_keys:
         return {"ok": True, "count": 0}
+    cleared = clear_keys(dst, feature, unique_keys, instance=instance)
+    return {"ok": True, "count": len(ordered_keys), "blackbox_removed": cleared["blackbox_removed"]}
 
-    flap_path = _flap_path(dst, feature)
-    flap_data = _read_json(flap_path)
-    changed = False
+def _prune_flap_file(p: Path, *, now: int, cooldown_days: int) -> int:
+    data = _read_json(p)
+    if not data:
+        return 0
+    blocked = set(_read_json(p.with_name(p.name[: -len(".flap.json")] + ".blackbox.json")).keys())
+    removed = 0
+    for k in list(data.keys()):
+        raw = data.get(k)
+        row: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        cons = int(row.get("consecutive") or 0)
+        last = int(row.get("last_attempt_ts") or 0)
+        stale = not last or (now - last) > (cooldown_days * 86400)
+        if cons <= 0 or stale or k in blocked:
+            data.pop(k, None)
+            removed += 1
+    if removed:
+        _write_json(p, data)
+    return removed
 
-    for key in unique_keys:
-        row = flap_data.setdefault(key, {})
-        row["consecutive"] = 0
-        row["last_reason"] = "ok"
-        row["last_op"] = str(row.get("last_op") or "")
-        row["last_success_ts"] = ts
-        changed = True
-
-    if changed:
-        _write_json(flap_path, flap_data)
-
-    return {"ok": True, "count": len(ordered_keys)}
 
 def prune_blackbox(*, cooldown_days: int = 30) -> tuple[int, int]:
     scanned = 0
@@ -258,4 +316,7 @@ def prune_blackbox(*, cooldown_days: int = 30) -> tuple[int, int]:
                 removed += 1
         if changed:
             _write_json(p, data)
+    for p in STATE_DIR.iterdir():
+        if p.is_file() and p.name.endswith(".flap.json"):
+            _prune_flap_file(p, now=now, cooldown_days=cooldown_days)
     return (scanned, removed)

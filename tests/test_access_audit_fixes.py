@@ -154,15 +154,14 @@ def test_run_sync_allows_own_pair_and_pins_server_side_scope(monkeypatch) -> Non
     assert "pair_scope" not in overrides
 
 
-def test_run_pairs_thread_scope_filter_precedes_single_pair_selection() -> None:
+def test_run_pairs_thread_passes_pair_scope_without_narrowing_config() -> None:
     from api import syncAPI as sync_api
     import inspect
 
     src = inspect.getsource(sync_api._run_pairs_thread)
-    scope_at = src.find('cfg["pairs"] = [p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") in req_pair_ids]')
-    single_at = src.find('if req_pair_id:\n            pair = next(')
-    assert scope_at > 0 and single_at > 0
-    assert scope_at < single_at
+    assert 'cfg["pairs"] = [p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") in req_pair_ids]' not in src
+    assert 'cfg["pairs"] = [pair]' not in src
+    assert "pair_scope_ids=sorted(pair_scope_ids)" in src
 
 
 # H2 - the OIDC login callback must be bound to the browser that started the flow
@@ -320,6 +319,40 @@ def test_sync_log_reachable_for_full_access_managed_users() -> None:
     assert crosswatch._non_admin_permission_allowed(readonly, "/api/logs/stream", "GET") is False
 
 
+def test_details_debug_tab_requires_runtime_debug() -> None:
+    from pathlib import Path
+
+    import ui_frontend
+
+    html = ui_frontend.get_index_html(include_admin=True)
+    details_js = Path("assets/helpers/details-log.js").read_text("utf-8")
+
+    assert 'id="det-tab-debug" class="det-tab" type="button"\n                role="tab" aria-selected="false" aria-controls="det-panel-debug" data-tab="debug" hidden disabled aria-hidden="true" aria-disabled="true"' in html
+    assert 'id="det-panel-debug" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-debug" hidden aria-hidden="true"' in html
+    assert "function _currentDetailsDebugEnabled()" in details_js
+    assert 'if (cfg && typeof cfg === "object" && cfg.runtime && typeof cfg.runtime === "object")' in details_js
+    assert "return _isAppDebugMode(cfg);" in details_js
+    assert "return !!window.appDebug;" in details_js
+    assert 'const t = managed ? "sync" : (tab === "debug" ? (_canUseDebugDetailsTab() ? "debug" : "sync") : (tab === "watcher" ? "watcher" : "sync"));' in details_js
+    assert "async function openDebugLog()" in details_js
+    assert "const available = await refreshDetailsDebugAvailability(false);" in details_js
+    assert 'url.searchParams.set("tag", "DEBUG");' in details_js
+    assert 'window.addEventListener("settings-changed", () => {' in details_js
+
+
+def test_debug_log_stream_is_disabled_when_runtime_debug_is_off(monkeypatch) -> None:
+    import asyncio
+    import crosswatch
+
+    monkeypatch.setattr(crosswatch, "_is_debug_enabled", lambda: False)
+    monkeypatch.setattr(crosswatch, "_is_mods_debug_enabled", lambda: False)
+
+    response = asyncio.run(crosswatch.api_logs_stream_initial(_request("/api/logs/stream"), tag="DEBUG"))
+
+    assert response.status_code == 403
+    assert json.loads(response.body)["error"] == "Debug logging is disabled"
+
+
 def test_run_log_visibility_requires_owning_the_whole_run(monkeypatch) -> None:
     from api import syncAPI as sync_api
 
@@ -387,7 +420,7 @@ def test_safe_next_rejects_login_and_logout_with_query() -> None:
 def test_login_page_next_guard_rejects_backslash() -> None:
     from api.appAuthAPI import _login_html
 
-    html = _login_html("admin")
+    html = _login_html()
     assert "u.origin === location.origin" in html
     assert "!next.includes('\\\\')" in html
 
@@ -590,10 +623,10 @@ def test_captures_scheduler_queue_is_hidden_from_managed_users() -> None:
 def test_playback_ui_splits_write_actions_from_admin_settings() -> None:
     import pathlib
 
-    src = pathlib.Path("assets/js/playback_progress.js").read_text(encoding="utf-8")
-    assert "const isReadOnly = () => isManagedUser() && !canWrite();" in src
-    assert "const canEditSettings = () => !isManagedUser();" in src
-    assert 'document.getElementById("pp-settings")?.classList.toggle("hidden", !canEditSettings());' in src
+    src = pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8")
+    assert 'const canAct = () => !viewingAs() && (!isManaged() || doc?.dataset?.cwPermWrite === "on");' in src
+    assert "const canConfigure = () => !isManaged();" in src
+    assert 'q("settings")?.toggleAttribute("hidden", !canConfigure());' in src
 
 
 def test_insights_snapshot_picker_is_admin_only() -> None:
@@ -706,7 +739,7 @@ def test_events_clear_is_hidden_from_managed_users() -> None:
     assert 'if _managed_request(request):' in pathlib.Path("api/eventsAPI.py").read_text(encoding="utf-8")
     assert eventsAPI.events_clear.__module__ == "api.eventsAPI"
 
-    modal = pathlib.Path("assets/js/modals/events/index.js").read_text(encoding="utf-8")
+    modal = pathlib.Path("assets/js/events/index.js").read_text(encoding="utf-8")
     assert '${isAdmin ? `<button class="ev-tbtn" id="ev-clear"' in modal
     assert 'Q("#ev-clear", root)?.addEventListener' in modal
     assert 'showToast("Clear failed.", null, "error")' in modal
@@ -727,13 +760,13 @@ def test_user_shapes_expose_created_at_and_preferences() -> None:
 
     managed = _public_user("a" * 32, {"username": "Pascal", "created_at": 1770000000, "preferences": {"quick_add": False}})
     assert managed["created_at"] == 1770000000
-    assert managed["preferences"] == {"playing_card": True, "quick_add": False}
+    assert managed["preferences"] == {"playing_card": True, "quick_add": False, "timezone": "auto", "time_format": "auto"}
 
     admin = _admin_identity({"username": "admin", "created_at": 1760000000})
     assert admin["created_at"] == 1760000000
-    assert admin["preferences"] == {"playing_card": True, "quick_add": True}
+    assert admin["preferences"] == {"playing_card": True, "quick_add": True, "timezone": "auto", "time_format": "auto"}
 
-    assert clean_user_preferences(None) == {"playing_card": True, "quick_add": True}
+    assert clean_user_preferences(None) == {"playing_card": True, "quick_add": True, "timezone": "auto", "time_format": "auto"}
 
 
 def test_managed_user_creation_stamps_created_at() -> None:
@@ -822,7 +855,7 @@ def test_profile_hero_has_both_art_layers_and_now_playing_readout() -> None:
                    'class="cw-profile-last-poster"'):
         assert marker in html, marker
     assert "profile-last-details" not in html
-    assert ".cw-profile-shell{width:calc(100vw - 40px);max-width:none;" in css
+    assert ".cw-profile-shell{width:100%;max-width:none;" in css
     assert "width:min(1380px,calc(100vw - 40px))" not in css
 
 
@@ -840,11 +873,14 @@ def test_profile_overview_uses_the_new_pair_layout() -> None:
     assert 'id="dashboard-widgets-card"' in html
 
 
-def test_profile_preferences_tab_and_panel_exist() -> None:
+def test_profile_settings_tab_and_panel_exist() -> None:
     html = _profile_html()
 
-    assert 'data-profile-tab="preferences"' in html
-    assert 'id="profile-panel-preferences"' in html
+    assert 'data-profile-tab="account"' in html
+    assert 'id="profile-panel-account"' in html
+    assert 'data-profile-tab="security"' not in html
+    assert 'data-profile-tab="preferences"' not in html
+    assert 'id="settings-interface"' in html
     assert 'id="profile-pref-playing-card"' in html
     assert 'id="profile-pref-quick-add"' in html
     assert html.count('id="profile-pref-playing-card" type="checkbox" checked') == 1
@@ -992,7 +1028,7 @@ def test_profile_widget_items_open_the_profile_preview_drawer() -> None:
 
     js = pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
     helper = js[js.index("function openProfileWidgetPreview"):js.index("function historyCard")]
-    click = js[js.index('const itemLink = event.target?.closest?.("[data-cw-widget-item]")'):js.index('const btn = event.target?.closest?.("[data-cw-widget-more]")')]
+    click = js[js.index('const itemLink = event.target?.closest?.("[data-cw-widget-item]")'):js.index('document.addEventListener("tab-changed", (event) => {')]
 
     assert "ON_PROFILE_PAGE" in helper
     assert "window.CW?.WatchlistPreview?.openPreviewDrawer || window.openPreviewDrawer" in helper
@@ -1051,7 +1087,8 @@ def test_profile_widget_skin_is_scoped_and_unmuted() -> None:
     assert "cw-dash-title-row>.material-symbols-rounded{display:none}" in skin
     assert ".cw-dash-title-row h3{font-size:16px" in skin
     assert ".cw-dash-widget.is-auto-collapsed{opacity:1}" in skin
-    assert ".cw-dashboard-layout-tools{top:-54px" in skin
+    assert "#dashboard-widgets-card{padding-top:48px}" in skin
+    assert ".cw-dashboard-layout-tools{top:-48px" in skin
     assert '#placeholder-card[data-widget-size="small"][data-widget-view="grid"] .poster{' in skin
     assert "grid-template-columns:clamp(150px,34%,220px) minmax(190px,1fr) auto!important" in skin
     assert "#placeholder-card[data-widget-size=\"small\"][data-widget-view=\"grid\"] .poster .wl-status" in skin
@@ -1103,7 +1140,7 @@ def test_main_dashboard_styles_are_not_touched() -> None:
     assert "cw-profile-page" not in main_css
 
 
-def test_preferences_tab_is_hidden_from_read_only_users() -> None:
+def test_settings_interface_limits_read_only_users_to_display_preferences() -> None:
     import ui_frontend
 
     def page(**kw: Any) -> str:
@@ -1114,11 +1151,30 @@ def test_preferences_tab_is_hidden_from_read_only_users() -> None:
 
     for html in (page(is_admin=True, username="a"),
                  page(is_admin=False, username="f", permissions=full)):
-        assert 'data-profile-tab="preferences"' in html
-        assert 'id="profile-panel-preferences"' in html
+        assert 'data-profile-tab="account"' in html
+        assert 'id="settings-interface"' in html
+        assert 'data-settings-nav="interface"' in html
 
     ro = page(is_admin=False, username="r", permissions=readonly)
-    assert 'data-profile-tab="preferences"' not in ro
-    assert 'id="profile-panel-preferences"' not in ro
+    assert 'data-profile-tab="account"' in ro
+    assert 'id="settings-security"' in ro
+    assert 'id="settings-interface"' in ro
+    assert 'data-settings-nav="interface"' in ro
+    assert 'id="profile-pref-timezone"' in ro
+    assert 'id="profile-pref-time-format"' in ro
     assert 'id="profile-pref-playing-card"' not in ro
     assert ro.count("<section") == ro.count("</section>")
+
+
+def test_profile_view_as_is_admin_only() -> None:
+    import ui_frontend
+
+    full = {"dashboard": True, "watchlist": True, "playback": True, "write": True}
+    admin = ui_frontend.get_profile_html({"is_admin": True, "username": "a"})
+    user = ui_frontend.get_profile_html({"is_admin": False, "username": "u", "permissions": full})
+
+    assert 'id="cw-view-as-select"' in admin
+    assert 'id="profile-view-as-banner"' in admin
+    assert "/assets/helpers/profile-select.js" in admin
+    assert 'id="cw-view-as-select"' not in user
+    assert 'id="profile-view-as-banner"' not in user

@@ -66,13 +66,13 @@ def test_unrelated_vars_are_ignored() -> None:
 
 
 def test_env_locked_paths_are_dotted_and_sorted() -> None:
-    got = env_locked_paths({"CW_OIDC_ISSUER": "x", "CW_API_KEY": "y"})
+    got = env_locked_paths({"CW_OIDC_ISSUER": "x", "CW_CFG__security__api_key": "y"})
     assert got == ["app_auth.oidc.issuer", "security.api_key"]
 
 
 def test_env_var_for_path_prefers_alias() -> None:
     assert env_var_for_path("app_auth.oidc.client_secret") == "CW_OIDC_CLIENT_SECRET"
-    assert env_var_for_path(("security", "api_key")) == "CW_API_KEY"
+    assert env_var_for_path(("app_auth", "oidc", "issuer")) == "CW_OIDC_ISSUER"
 
 
 def test_env_var_for_path_falls_back_to_generic() -> None:
@@ -88,11 +88,11 @@ def test_apply_writes_values_and_reports_paths() -> None:
 
 def test_apply_creates_missing_intermediate_dicts() -> None:
     cfg: dict[str, object] = {}
-    apply_env_overrides(cfg, {"CW_API_KEY": "machine-key"})
+    apply_env_overrides(cfg, {"CW_CFG__security__api_key": "machine-key"})
     assert cfg == {"security": {"api_key": "machine-key"}}
 
 
 def test_apply_replaces_non_dict_intermediate() -> None:
     cfg: dict[str, object] = {"security": "not-a-dict"}
-    apply_env_overrides(cfg, {"CW_API_KEY": "machine-key"})
+    apply_env_overrides(cfg, {"CW_CFG__security__api_key": "machine-key"})
     assert cfg == {"security": {"api_key": "machine-key"}}

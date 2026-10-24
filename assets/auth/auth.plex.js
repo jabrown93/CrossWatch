@@ -507,7 +507,7 @@ function ensurePlexInstanceUI() {
       },
       classify: (status, cfg) => {
         const p = getPlexCfgBlock(cfg || {});
-        return String(p.account_token || "").trim() ? { state: "authorized" } : { state: "pending" };
+        return String(p.account_token || "").trim() && !p._pending_pin ? { state: "authorized" } : { state: "pending" };
       },
       onAuthorized: async (cfg) => {
         try { plexQcStop(); } catch {}
@@ -574,8 +574,9 @@ async function plexDeleteToken() {
 
 
   function getPlexState() {
-    const st = (w.__plexState ||= { hist: new Set(), rate: new Set(), prog: new Set(), scr: new Set(), libs: [], hydrated: false, connected: false });
+    const st = (w.__plexState ||= { hist: new Set(), rate: new Set(), prog: new Set(), coll: new Set(), scr: new Set(), libs: [], hydrated: false, connected: false });
     st.prog ||= new Set();
+    st.coll ||= new Set();
     return st;
   }
 
@@ -589,6 +590,7 @@ async function plexDeleteToken() {
       st.hist = new Set((p.history?.libraries || []).map(x => String(x)));
       st.rate = new Set((p.ratings?.libraries || []).map(x => String(x)));
       st.prog = new Set((p.progress?.libraries || []).map(x => String(x)));
+      st.coll = new Set((p.collection?.libraries || []).map(x => String(x)));
       st.scr  = new Set((p.scrobble?.libraries || []).map(x => String(x)));
       st.hydrated = true;
       w.__plexHydrated = true;
@@ -596,7 +598,7 @@ async function plexDeleteToken() {
       await waitFor("#plex_server_url"); await waitFor("#plex_username");
       const set = (id, val) => { const el = $(id); if (el != null && val != null) el.value = String(val); };
       const tok = String(p.account_token || '').trim();
-      if (tok) setPlexConnected();
+      if (tok && !p._pending_pin) setPlexConnected();
       else setPlexSuccess(false);
       set("plex_pin", p._pending_pin?.code || "");
       set("plex_server_url", p.server_url || "");
@@ -608,12 +610,13 @@ async function plexDeleteToken() {
       await refreshPlexSelectedUserScopeNotice();
       try { const cb = $("plex_verify_ssl"); if (cb) cb.checked = !!p.verify_ssl; } catch {}
 
-      ["plex_lib_history", "plex_lib_ratings", "plex_lib_progress", "plex_lib_scrobble"].forEach(id => {
+      ["plex_lib_history", "plex_lib_ratings", "plex_lib_progress", "plex_lib_collection", "plex_lib_scrobble"].forEach(id => {
         const el = $(id); if (!el) return;
         Array.from(el.options || []).forEach(o => {
           if (id === "plex_lib_history") o.selected = st.hist.has(o.value);
           if (id === "plex_lib_ratings") o.selected = st.rate.has(o.value);
           if (id === "plex_lib_progress") o.selected = st.prog.has(o.value);
+          if (id === "plex_lib_collection") o.selected = st.coll.has(o.value);
           if (id === "plex_lib_scrobble") o.selected = st.scr.has(o.value);
         });
       });
@@ -1006,6 +1009,7 @@ const tags = [
       fill("plex_lib_history");
       fill("plex_lib_ratings");
       fill("plex_lib_progress");
+      fill("plex_lib_collection");
       fill("plex_lib_scrobble");
     } catch (e) {
       console.warn("[plex] library select fill failed", e);
@@ -1051,8 +1055,8 @@ const tags = [
     const host = $("plex_lib_matrix");
     if (!host || !w.cwWhitelistTable) return;
     const st = getPlexState();
-    const setKey = { hist: "hist", rate: "rate", prog: "prog", scr: "scr" };
-    const selId  = { hist: "plex_lib_history", rate: "plex_lib_ratings", prog: "plex_lib_progress", scr: "plex_lib_scrobble" };
+    const setKey = { hist: "hist", rate: "rate", prog: "prog", coll: "coll", scr: "scr" };
+    const selId  = { hist: "plex_lib_history", rate: "plex_lib_ratings", prog: "plex_lib_progress", coll: "plex_lib_collection", scr: "plex_lib_scrobble" };
     const syncSelects = () => {
       Object.keys(selId).forEach((k) => {
         const sel = $(selId[k]); if (!sel) return;
@@ -1066,10 +1070,12 @@ const tags = [
         { key: "hist", label: "History" },
         { key: "rate", label: "Ratings" },
         { key: "prog", label: "Progress" },
-        { key: "scr",  label: "Scrobble" },
+        { key: "coll", label: "Collections" },
+        { key: "scr",  label: "Scrobble", title: "Libraries watchers and webhooks read from. Scrobble destinations use History and Progress, or the libraries set on the route." },
       ],
       getLibs: () => getPlexState().libs || [],
       isOn: (fk, id) => st[setKey[fk]].has(String(id)),
+      selectedIds: () => Object.values(setKey).flatMap((k) => [...st[k]]),
       setOn: (fk, id, on) => { const s = st[setKey[fk]]; if (on) s.add(String(id)); else s.delete(String(id)); },
       commit: syncSelects,
       load: async () => { await plexLoadLibraries(); syncSelects(); },
@@ -1111,17 +1117,19 @@ const tags = [
     const st = getPlexState();
     const uiReady = !!st.hydrated ||
       !!document.querySelector("#plex_lib_matrix .cw-wl-row") ||
-      !!document.querySelector("#plex_lib_history option, #plex_lib_ratings option, #plex_lib_progress option, #plex_lib_scrobble option");
+      !!document.querySelector("#plex_lib_history option, #plex_lib_ratings option, #plex_lib_progress option, #plex_lib_collection option, #plex_lib_scrobble option");
     if (uiReady) {
       const toInts = (set) => Array.from(set || []).map(x => parseInt(String(x), 10)).filter(Number.isFinite);
       const hist = toInts(st.hist);
       const rate = toInts(st.rate);
       const prog = toInts(st.prog);
+      const coll = toInts(st.coll);
       const scr  = toInts(st.scr);
       plex.scrobble = Object.assign({}, plex.scrobble || {}, { libraries: scr });
       plex.history  = Object.assign({}, plex.history  || {}, { libraries: hist });
       plex.ratings  = Object.assign({}, plex.ratings  || {}, { libraries: rate });
       plex.progress = Object.assign({}, plex.progress || {}, { libraries: prog });
+      plex.collection = Object.assign({}, plex.collection || {}, { libraries: coll });
     }
     return cfg;
   }

@@ -39,46 +39,6 @@ def _request(headers: dict[str, str] | None = None, *, client_ip: str = "127.0.0
 # --- GHSA-vrw5-p3r4-4927: static API key is unrestricted admin -----------------
 
 
-def test_api_key_brute_force_is_rate_limited() -> None:
-    """A wrong key must cost the caller the same lockout a wrong password does.
-
-    Uses a dedicated client IP and restores the shared _LOGIN_FAILS bucket, so
-    this cannot leak a lockout into the other auth tests.
-    """
-    from api import appAuthAPI as auth
-
-    ip = "10.99.0.7"
-    cfg = {"security": {"api_key": "k" * 40}}
-    saved = dict(auth._LOGIN_FAILS)
-    try:
-        auth._LOGIN_FAILS.pop(ip, None)
-        for _ in range(3):
-            assert auth.api_key_authenticated(cfg, _request({"x-api-key": "wrong"}, client_ip=ip)) is False
-        # Lockout is now active, so even the correct key is refused.
-        assert auth.api_key_authenticated(cfg, _request({"x-api-key": "k" * 40}, client_ip=ip)) is False
-    finally:
-        auth._LOGIN_FAILS.clear()
-        auth._LOGIN_FAILS.update(saved)
-
-
-def test_api_key_absent_header_is_not_a_failed_attempt() -> None:
-    """Not sending the header at all is a cookie-auth request, not a guess."""
-    from api import appAuthAPI as auth
-
-    ip = "10.99.0.8"
-    cfg = {"security": {"api_key": "k" * 40}}
-    saved = dict(auth._LOGIN_FAILS)
-    try:
-        auth._LOGIN_FAILS.pop(ip, None)
-        for _ in range(10):
-            assert auth.api_key_authenticated(cfg, _request(client_ip=ip)) is False
-        assert ip not in auth._LOGIN_FAILS
-        assert auth.api_key_authenticated(cfg, _request({"x-api-key": "k" * 40}, client_ip=ip)) is True
-    finally:
-        auth._LOGIN_FAILS.clear()
-        auth._LOGIN_FAILS.update(saved)
-
-
 def _stub_env(monkeypatch, cfg_api, load_cfg, save_cfg) -> None:
     monkeypatch.setattr(
         cfg_api,
@@ -101,43 +61,6 @@ def _stub_env(monkeypatch, cfg_api, load_cfg, save_cfg) -> None:
 def _stub_request() -> Any:
     """api_config_save only touches request.app; the checks under test run first."""
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-
-
-def test_config_save_rejects_short_api_key(monkeypatch) -> None:
-    from api import configAPI as cfg_api
-
-    saved: dict = {}
-    _stub_env(monkeypatch, cfg_api, lambda: {}, lambda cfg: saved.update(cfg))
-
-    with pytest.raises(HTTPException) as exc:
-        cfg_api.api_config_save(_stub_request(), {"security": {"api_key": "test"}})
-
-    assert exc.value.status_code == 400
-    assert "security.api_key" in str(exc.value.detail)
-    assert not saved
-
-
-def test_config_save_accepts_long_api_key(monkeypatch) -> None:
-    from api import configAPI as cfg_api
-
-    saved: dict = {}
-    _stub_env(monkeypatch, cfg_api, lambda: {}, lambda cfg: saved.update(cfg))
-
-    cfg_api.api_config_save(_stub_request(), {"security": {"api_key": "a" * 32}})
-    assert saved["security"]["api_key"] == "a" * 32
-
-
-def test_config_save_does_not_relitigate_an_existing_short_key(monkeypatch) -> None:
-    """An already-set short key (or an env-locked one) must not wedge every
-    unrelated config save — only a *changed* key is validated."""
-    from api import configAPI as cfg_api
-
-    current = {"security": {"api_key": "legacy-short"}}
-    saved: dict = {}
-    _stub_env(monkeypatch, cfg_api, lambda: dict(current), lambda cfg: saved.update(cfg))
-
-    cfg_api.api_config_save(_stub_request(), {"runtime": {"debug": True}})
-    assert saved["security"]["api_key"] == "legacy-short"
 
 
 # --- GHSA-c24r-xxq7-rfq3: per-profile media-account visibility -----------------
@@ -273,25 +196,6 @@ def test_avatar_response_is_closed_when_image_is_oversized(monkeypatch) -> None:
         {"oidc_identity": {"picture": "https://cdn.example.com/a.png", "linked_at": 1}}
     )
     assert stub.closed is True
-
-
-def test_api_key_success_clears_the_failure_record() -> None:
-    """Mirrors the password success path: a working client's occasional typo
-    must not accumulate toward a lockout, and must not spill onto login."""
-    from api import appAuthAPI as auth
-
-    ip = "10.99.0.9"
-    cfg = {"security": {"api_key": "k" * 40}}
-    saved = dict(auth._LOGIN_FAILS)
-    try:
-        auth._LOGIN_FAILS.pop(ip, None)
-        assert auth.api_key_authenticated(cfg, _request({"x-api-key": "wrong"}, client_ip=ip)) is False
-        assert ip in auth._LOGIN_FAILS
-        assert auth.api_key_authenticated(cfg, _request({"x-api-key": "k" * 40}, client_ip=ip)) is True
-        assert ip not in auth._LOGIN_FAILS
-    finally:
-        auth._LOGIN_FAILS.clear()
-        auth._LOGIN_FAILS.update(saved)
 
 
 class TestCrossHostRedirects:
@@ -490,30 +394,6 @@ class TestPublicOnlyFetch:
 
 
 # --- Codex PR #116 fourth-pass follow-ups -------------------------------------
-
-
-def test_env_supplied_short_api_key_is_refused() -> None:
-    """CW_API_KEY is injected straight into security.api_key and never passes
-    through api_config_save(), so the length floor has to hold at the
-    authentication choke point that every source routes through."""
-    from api import appAuthAPI as auth
-
-    assert auth.api_key_authenticated({"security": {"api_key": "test"}}, _request({"x-api-key": "test"})) is False
-    ok = "k" * auth.MIN_API_KEY_LENGTH
-    assert auth.api_key_authenticated({"security": {"api_key": ok}}, _request({"x-api-key": ok})) is True
-
-
-def test_config_save_rejects_short_api_key_using_the_shared_floor(monkeypatch) -> None:
-    from api import appAuthAPI as auth
-    from api import configAPI as cfg_api
-
-    saved: dict = {}
-    _stub_env(monkeypatch, cfg_api, lambda: {}, lambda cfg: saved.update(cfg))
-    short = "k" * (auth.MIN_API_KEY_LENGTH - 1)
-    with pytest.raises(HTTPException) as exc:
-        cfg_api.api_config_save(_stub_request(), {"security": {"api_key": short}})
-    assert exc.value.status_code == 400
-    assert not saved
 
 
 class _Peer:

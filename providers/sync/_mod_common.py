@@ -3,21 +3,33 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.app_version import user_agent as http_user_agent
+
 import json
 import os
 import time
 import threading
-from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 import requests
 
-from cw_platform.provider_instances import normalize_instance_id
-
 from ._log import log as cw_log
+from cw_platform.run_control import raise_if_cancelled
 
 __VERSION__ = "0.2.1"
+MAX_RETRY_AFTER_SLEEP_S = 60.0
+CANCEL_SLEEP_SLICE_S = 0.25
+
+
+def observation_time(adapter: Any, fallback: Callable[[], str] | None = None) -> str:
+    config = getattr(adapter, "config", None) or getattr(adapter, "raw_cfg", None)
+    planned_at = config.get("_cw_interactive_planned_at") if isinstance(config, Mapping) else None
+    if isinstance(planned_at, (int, float)) and planned_at > 0:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(planned_at))
+    return fallback() if fallback is not None else ""
+
+
 __all__ = [
     "HitSession",
     "make_emitter",
@@ -33,17 +45,6 @@ __all__ = [
     "label_jellyfin",
     "label_emby",
     "SimpleRateLimiter",
-    "_confirmed_keys",
-    "_unresolved_keys",
-    "_pair_scope",
-    "_safe_scope",
-    "_is_capture_mode",
-    "_chunk_items",
-    "_pick_instance_id",
-    "_merge_instance_block",
-    "_iso_ok",
-    "_iso_z",
-    "_max_iso",
     "unresolved_key",
     "unresolved_keys",
     "dedup_keys",
@@ -488,10 +489,12 @@ class HitSession(requests.Session):
         emit_hits: bool | None = None,
     ):
         super().__init__()
+        self.headers["User-Agent"] = http_user_agent(provider, override_env=f"CW_{provider.upper()}_UA")
         self._provider = provider
         self._emit = emit
         self._label = feature_label or (lambda m, u, kw: default_feature_label(provider, m, u, kw))
         self._emit_hits = bool(os.getenv("CW_API_HITS")) if emit_hits is None else bool(emit_hits)
+        self._on_request: Callable[[Mapping[str, Any]], object] | None = None
         self._rate_limiter = None
         self._rate_limiter_meta = None
         try:
@@ -514,7 +517,9 @@ class HitSession(requests.Session):
         state["total_sleep_s"] = float(state["total_sleep_s"]) + float(slept)
 
         window_age = now - float(state["window_start"])
-        if slept < self._rl_log_min_sleep_s and window_age < self._rl_log_every_s:
+        if window_age < self._rl_log_every_s:
+            return
+        if float(state["total_sleep_s"]) < self._rl_log_min_sleep_s:
             return
 
         try:
@@ -562,6 +567,11 @@ class HitSession(requests.Session):
                     self._emit("api:hit", {"provider": self._provider, "feature": feature})
                 except Exception:
                     pass
+            if self._on_request is not None:
+                try:
+                    self._on_request({"event": "api:request", "provider": self._provider, "feature": feature})
+                except Exception:
+                    pass
 
 
 def build_session(
@@ -571,7 +581,11 @@ def build_session(
     feature_label: FeatureLabelFn | None = None,
     emit_hits: bool | None = None,
 ) -> HitSession:
-    return HitSession(provider, make_emitter(ctx), feature_label, emit_hits)
+    session = HitSession(provider, make_emitter(ctx), feature_label, emit_hits)
+    callback = getattr(getattr(ctx, "interactive", None), "on_progress", None)
+    if callable(callback):
+        session._on_request = callback
+    return session
 
 
 def parse_rate_limit(h: Mapping[str, Any]) -> dict[str, int | None]:
@@ -600,6 +614,16 @@ def safe_json(resp: requests.Response) -> Any:
         return {}
 
 
+def _sleep_cancellable(seconds: float) -> None:
+    remaining = max(0.0, float(seconds or 0.0))
+    while remaining > 0:
+        raise_if_cancelled()
+        step = min(CANCEL_SLEEP_SLICE_S, remaining)
+        time.sleep(step)
+        remaining -= step
+    raise_if_cancelled()
+
+
 def request_with_retries(
     session: requests.Session,
     method: str,
@@ -620,23 +644,25 @@ def request_with_retries(
     except Exception:
         api_feature = None
 
-    method_upper = str(method).upper()
-    retry_ambiguous = method_upper in {"GET", "HEAD", "OPTIONS"} or idempotent
-    last: Any = None
+    # Fork: a non-idempotent request that errored or 5xx-ed may have landed; only
+    # 429 (rejected before processing) is safe to replay for those.
+    retry_ambiguous = str(method).upper() in {"GET", "HEAD", "OPTIONS"} or idempotent
+    last_resp: requests.Response | None = None
+    last_exc: Exception | None = None
     for i in range(max(1, int(max_retries))):
-        t0 = time.monotonic()
+        raise_if_cancelled()
         try:
+            t0 = time.monotonic()
             resp = session.request(method, url, timeout=timeout, **kwargs)
             dur_ms = int((time.monotonic() - t0) * 1000)
-            retry_status = resp.status_code in retry_on and (resp.status_code == 429 or retry_ambiguous)
-            if retry_status and i < max_retries - 1:
+            if resp.status_code in retry_on and (resp.status_code == 429 or retry_ambiguous) and i < max_retries - 1:
                 wait = backoff_base * (2**i)
                 retry_after: float | None = None
                 try:
                     if resp.status_code == 429:
                         ra = resp.headers.get("Retry-After")
                         if ra:
-                            retry_after = float(ra)
+                            retry_after = min(float(ra), MAX_RETRY_AFTER_SLEEP_S)
                             wait = max(wait, retry_after)
                 except Exception:
                     pass
@@ -675,17 +701,19 @@ def request_with_retries(
                         dur_ms=dur_ms,
                     )
 
-                time.sleep(wait)
-                last = resp
+                _sleep_cancellable(wait)
+                last_resp = resp
                 continue
             return resp
         except Exception as e:
+            if getattr(e, "cw_no_retry", False):
+                raise
             dur_ms: int | None = None
             try:
                 dur_ms = int((time.monotonic() - t0) * 1000)
             except Exception:
                 dur_ms = None
-            last = e
+            last_exc = e
             if retry_ambiguous and i < max_retries - 1:
                 wait = backoff_base * (2**i)
                 _http_log(
@@ -701,7 +729,7 @@ def request_with_retries(
                     dur_ms=dur_ms,
                     error=f"{type(e).__name__}: {e}",
                 )
-                time.sleep(wait)
+                _sleep_cancellable(wait)
             else:
                 _http_log(
                     session,
@@ -716,157 +744,13 @@ def request_with_retries(
                     error=f"{type(e).__name__}: {e}",
                 )
                 break
-    if isinstance(last, requests.Response):
-        return last
+    if last_resp is not None and last_exc is None:
+        return last_resp
     msg = f"request failed after retries: {method} {url}"
-    if last is not None:
-        msg = f"{msg} ({type(last).__name__}: {last})"
+    if last_exc is not None:
+        msg = f"{msg} ({type(last_exc).__name__}: {last_exc})"
     _http_log(session, "error", "http_request_failed", method=method, url=url, api_feature=api_feature, max_retries=max_retries, error=msg)
     raise requests.RequestException(msg)
 
 
-def _unresolved_keys(key_of, unresolved: Any) -> list[str]:
-    keys: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: Any) -> None:
-        key = str(value or "").strip()
-        if key and key not in seen:
-            seen.add(key)
-            keys.append(key)
-
-    if unresolved:
-        for u in unresolved:
-            obj: Any = u
-            if isinstance(u, Mapping):
-                add(u.get("key"))
-                if isinstance(u.get("unresolved_key"), str):
-                    add(u.get("unresolved_key"))
-                if "item" in u:
-                    obj = u.get("item")
-            if isinstance(obj, str) and obj:
-                add(obj)
-                continue
-            if isinstance(obj, Mapping):
-                if obj.get("_cw_rewatch_sync") is True:
-                    add(obj.get("_cw_event_key"))
-                try:
-                    add(key_of(obj))
-                except Exception:
-                    pass
-    return keys
-
-
-def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
-    attempted: list[str] = []
-    for it in items or []:
-        try:
-            k = str(it.get("_cw_event_key") or "").strip() if isinstance(it, Mapping) and it.get("_cw_rewatch_sync") is True else ""
-            if not k:
-                k = str(key_of(it) or "").strip()
-        except Exception:
-            k = ""
-        if k:
-            attempted.append(k)
-
-    unresolved_key_set = set(_unresolved_keys(key_of, unresolved))
-
-    out: list[str] = []
-    seen: set[str] = set()
-    for k in attempted:
-        if k in unresolved_key_set or k in seen:
-            continue
-        out.append(k)
-        seen.add(k)
-    return out
-
-
-def _pair_scope() -> str | None:
-    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return None
-
-
-def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _safe_scope(value: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
-    s = s.strip("_ ")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:96] if s else "default"
-
-
-def _chunk_items(seq: list[Any], n: int) -> Iterable[list[Any]]:
-    size = max(1, int(n or 1))
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
-def _pick_instance_id(provider: str) -> str:
-    prov = str(provider or "").upper().strip()
-    for k in ("CW_SNAPSHOT_INSTANCE", "CW_INSTANCE_ID", "CW_PROFILE", "CW_PROVIDER_INSTANCE", "CW_INSTANCE"):
-        v = (os.environ.get(k) or "").strip()
-        if v:
-            return normalize_instance_id(v)
-    if (os.environ.get("CW_PAIR_SRC") or "").upper().strip() == prov:
-        v = (os.environ.get("CW_PAIR_SRC_INSTANCE") or os.environ.get("CW_SRC_INSTANCE") or "").strip()
-        if v:
-            return normalize_instance_id(v)
-    if (os.environ.get("CW_PAIR_DST") or "").upper().strip() == prov:
-        v = (os.environ.get("CW_PAIR_DST_INSTANCE") or os.environ.get("CW_DST_INSTANCE") or "").strip()
-        if v:
-            return normalize_instance_id(v)
-    v = (os.environ.get("CW_PAIR_INSTANCE") or "").strip()
-    return normalize_instance_id(v)
-
-
-def _merge_instance_block(raw: Any, inst: str) -> dict[str, Any]:
-    base = dict(raw or {}) if isinstance(raw, Mapping) else {}
-    if inst == "default":
-        base.pop("instances", None)
-        return base
-    insts = base.get("instances")
-    if isinstance(insts, Mapping) and isinstance(insts.get(inst), Mapping):
-        merged = dict(base)
-        merged.update(dict(insts.get(inst) or {}))
-        merged.pop("instances", None)
-        return merged
-    base.pop("instances", None)
-    return base
-
-
-def _iso_ok(value: Any) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return True
-    except Exception:
-        return False
-
-
-def _iso_z(value: str | None) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("invalid ISO timestamp")
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _max_iso(a: str | None, b: str | None) -> str | None:
-    if not _iso_ok(a):
-        return _iso_z(b) if _iso_ok(b) else None
-    if not _iso_ok(b):
-        return _iso_z(a)
-    a_z = _iso_z(a)
-    b_z = _iso_z(b)
-    dt_a = datetime.fromisoformat(a_z.replace("Z", "+00:00"))
-    dt_b = datetime.fromisoformat(b_z.replace("Z", "+00:00"))
-    return _iso_z(a if dt_a >= dt_b else b)
+request_with_retry = request_with_retries

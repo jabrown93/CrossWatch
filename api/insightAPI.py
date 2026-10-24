@@ -8,6 +8,7 @@ import json
 import re
 import threading
 import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
@@ -15,7 +16,8 @@ from typing import Any, Callable
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from cw_platform.modules_registry import sync_provider_names
+from cw_platform.memory_release import register_cache
+from cw_platform.modules_registry import provider_names, sync_provider_names
 from cw_platform.provider_instances import (
     ensure_instance_block,
     get_provider_block,
@@ -84,18 +86,143 @@ def _load_state_features(features: set[str] | list[str] | tuple[str, ...]) -> di
         return {}
 
 
+_DERIVED_LOCK = threading.RLock()
+_DERIVED_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
+_DERIVED_CACHE_MAX = 6
+_TITLEMAP_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
+_TITLEMAP_CACHE_MAX = 4
+_REAL_LOAD_STATE_FEATURES = _load_state_features
+
+
+def _state_fingerprint(features: set[str] | list[str] | tuple[str, ...]) -> Any:
+    if _load_state_features is not _REAL_LOAD_STATE_FEATURES:
+        return None
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.local_db import state as sqlite_state
+
+        return sqlite_state.fingerprint(CONFIG, features)
+    except Exception:
+        return None
+
+
+def _state_provider_names(features: set[str] | list[str] | tuple[str, ...]) -> list[str]:
+    if _load_state_features is not _REAL_LOAD_STATE_FEATURES:
+        return list((_load_state_features(features) or {}).get("providers") or {})
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.local_db import state as sqlite_state
+
+        return sqlite_state.provider_names(CONFIG, features)
+    except Exception:
+        return []
+
+
+def _provider_instances(
+    features: set[str] | list[str] | tuple[str, ...],
+    state_getter: Callable[[], dict[str, Any]],
+) -> dict[str, list[str]]:
+    wanted = {str(f or "").strip().lower() for f in features or [] if str(f or "").strip()}
+    out: dict[str, list[str]] = {}
+    if _load_state_features is _REAL_LOAD_STATE_FEATURES:
+        try:
+            from cw_platform.config_base import CONFIG
+            from cw_platform.local_db import state as sqlite_state
+
+            for row in sqlite_state.feature_inventory(CONFIG):
+                if wanted and str(row.get("feature") or "").lower() not in wanted:
+                    continue
+                key = str(row.get("provider") or "").strip().lower()
+                if not key:
+                    continue
+                insts = out.setdefault(key, ["default"])
+                iid = str(row.get("instance") or "").strip()
+                if iid and iid != "default" and iid not in insts:
+                    insts.append(iid)
+            return out
+        except Exception:
+            out = {}
+    for provider, pdata in ((state_getter() or {}).get("providers") or {}).items():
+        key = str(provider or "").strip().lower()
+        if not key:
+            continue
+        insts = ["default"]
+        inst_block = (pdata or {}).get("instances") if isinstance(pdata, dict) else None
+        if isinstance(inst_block, dict):
+            for iid in inst_block.keys():
+                sid = str(iid or "").strip()
+                if sid and sid not in insts:
+                    insts.append(sid)
+        out[key] = insts
+    return out
+
+
+def _generation_of(key: Any) -> Any:
+    return key[0] if isinstance(key, tuple) and key else key
+
+
+def _lru_get(cache: "OrderedDict[Any, Any]", key: Any) -> Any:
+    if key is None:
+        return None
+    with _DERIVED_LOCK:
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
+
+
+def _lru_put(cache: "OrderedDict[Any, Any]", limit: int, key: Any, value: Any) -> None:
+    if key is None:
+        return
+    with _DERIVED_LOCK:
+        gen = _generation_of(key)
+        for stale in [k for k in cache if _generation_of(k) != gen]:
+            cache.pop(stale, None)
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+
+def _clear_insight_caches() -> None:
+    with _DERIVED_LOCK:
+        _DERIVED_CACHE.clear()
+        _TITLEMAP_CACHE.clear()
+    with _SHADOW_CACHE_LOCK:
+        _SHADOW_CACHE.clear()
+
+
+register_cache("insights", _clear_insight_caches)
+
+
+def _derived_cache_get(key: Any) -> Any:
+    return _lru_get(_DERIVED_CACHE, key)
+
+
+def _derived_cache_put(key: Any, value: Any) -> None:
+    _lru_put(_DERIVED_CACHE, _DERIVED_CACHE_MAX, key, value)
+
+
+def _titlemap_cache_get(key: Any) -> Any:
+    return _lru_get(_TITLEMAP_CACHE, key)
+
+
+def _titlemap_cache_put(key: Any, value: Any) -> None:
+    _lru_put(_TITLEMAP_CACHE, _TITLEMAP_CACHE_MAX, key, value)
+
+
 _AUTH_KEYS = {
     "plex": ("account_token", "token", "access_token"),
     "emby": ("access_token", "api_key", "token"),
     "jellyfin": ("access_token", "api_key", "token"),
     "trakt": ("access_token", "refresh_token"),
     "simkl": ("access_token", "refresh_token"),
+    "wetrakr": ("access_token", "refresh_token"),
     "anilist": ("access_token", "token"),
     "mdblist": ("api_key", "access_token"),
     "publicmetadb": ("api_key",),
     "nuvio": ("access_token", "refresh_token", "profile_id"),
 }
-_SETTINGS_PROVIDERS = [*_AUTH_KEYS, "tmdb", "tautulli"]
 
 
 def _txt(v: Any) -> str:
@@ -130,13 +257,16 @@ def _settings_auth_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         if provider == "tautulli":
             tb = _dict(block) or _dict(cfg.get("tautulli")) or _dict(_dict(cfg.get("auth")).get("tautulli"))
             return bool(_txt(tb.get("server_url") or tb.get("server")))
+        if provider == "tracearr":
+            b = _dict(block)
+            return bool(_txt(b.get("server_url") or b.get("server"))) and _has(b, "api_key")
         if provider == "nuvio":
             b = _dict(block)
             return bool(_txt(b.get("profile_id"))) and _has(b, "access_token", "refresh_token")
         return _has(block, *_AUTH_KEYS.get(provider, ("access_token", "api_key", "token")))
 
     profiles: list[dict[str, Any]] = []
-    for provider in _SETTINGS_PROVIDERS:
+    for provider in provider_names(upper=False):
         base = _dict(cfg.get(provider))
         instances = _dict(base.get("instances"))
         blocks = [base, *instances.values()]
@@ -321,7 +451,7 @@ def register_insights(app: FastAPI) -> None:
 
     @app.post("/api/crosswatch/select-snapshot", tags=["insight"])
     def api_select_snapshot(
-        feature: str = Query(..., pattern="^(watchlist|history|ratings|progress)$"),
+        feature: str = Query(..., pattern="^(watchlist|history|ratings|progress|collection)$"),
         snapshot: str = Query(...),
         provider_instance: str = Query("default"),
     ) -> dict[str, Any]:
@@ -481,8 +611,10 @@ def register_insights(app: FastAPI) -> None:
                     return 1
                 if f == "ratings":
                     return 2
-                if f == "playlists":
+                if f == "collection":
                     return 3
+                if f == "playlists":
+                    return 4
                 return 9
 
             def _rank_source(v: Any) -> int:
@@ -555,7 +687,7 @@ def register_insights(app: FastAPI) -> None:
                 if not isinstance(pdata, dict):
                     continue
 
-                for feat in ("history", "ratings", "watchlist", "playlists"):
+                for feat in ("history", "ratings", "watchlist", "playlists", "collection"):
                     for node in _iter_nodes(pdata, feat):
                         baseline = node.get("baseline")
                         base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
@@ -637,7 +769,7 @@ def register_insights(app: FastAPI) -> None:
             for _, pdata in provs.items():
                 if not isinstance(pdata, dict):
                     continue
-                for feat in ("history", "ratings", "watchlist", "playlists"):
+                for feat in ("history", "ratings", "watchlist", "playlists", "collection"):
                     for node in _iter_nodes(pdata, feat):
                         baseline = node.get("baseline")
                         base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
@@ -1036,7 +1168,7 @@ def register_insights(app: FastAPI) -> None:
 
             return out
 
-        base_feats: tuple[str, ...] = ("watchlist", "ratings", "history", "progress", "playlists")
+        base_feats: tuple[str, ...] = ("watchlist", "ratings", "history", "progress", "playlists", "collection")
 
         def _features_from(obj: Any) -> list[str]:
             keys: list[str] = []
@@ -1069,7 +1201,6 @@ def register_insights(app: FastAPI) -> None:
         feature_keys = _features_from(getattr(STATS, "data", {}) or {})
         state_features = set(feature_keys)
         state_features.update(base_feats)
-        state: dict[str, Any] | None = _load_state_features(state_features)
         events_raw: list[dict[str, Any]] = []
         _lane_cache: dict[tuple[int, int, int], tuple[dict[str, dict[str, Any]], dict[str, bool]]] = {}
         cfg = load_config() or {}
@@ -1077,10 +1208,9 @@ def register_insights(app: FastAPI) -> None:
         user_filter: dict[str, list[str]] = {}
 
         try:
-            from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
+            from api.appAuthAPI import effective_request_profile_id
 
-            token = request.cookies.get(COOKIE_NAME)
-            scoped_profile = effective_user_profile_id(cfg, token, user_profile)
+            scoped_profile = effective_request_profile_id(cfg, request, user_profile)
         except Exception:
             scoped_profile = "__none__"
 
@@ -1170,7 +1300,33 @@ def register_insights(app: FastAPI) -> None:
                 out["wall"] = [item for item in wall_items if isinstance(item, dict) and _item_matches_scope(item)]
             return out
 
-        state = _scope_state(state)
+        from services.media_scope import MediaScope
+
+        media_scope = MediaScope(cfg)
+        _state_holder: dict[str, Any] = {}
+
+        def _state() -> dict[str, Any]:
+            if "v" not in _state_holder:
+                loaded = _load_state_features(state_features)
+                scoped = _scope_state(media_scope.state(loaded if isinstance(loaded, dict) else {}))
+                _state_holder["v"] = scoped if isinstance(scoped, dict) else {}
+            value = _state_holder["v"]
+            return value if isinstance(value, dict) else {}
+
+        derived_key = None
+        try:
+            fp = _state_fingerprint(state_features)
+            if fp is not None:
+                derived_key = (
+                    fp,
+                    tuple(feature_keys),
+                    media_scope.fingerprint(),
+                    tuple(sorted((p, tuple(sorted(v))) for p, v in wanted_instances.items())),
+                )
+        except Exception:
+            derived_key = None
+
+        derived = _derived_cache_get(derived_key)
 
         def _safe_parse_epoch(v: Any) -> int:
             try:
@@ -1290,12 +1446,46 @@ def register_insights(app: FastAPI) -> None:
                 return True
             return False
 
+        def _norm_identity_text(value: Any) -> str:
+            return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())).strip()
+
+        def _year_identity(value: Any) -> str:
+            try:
+                year = int(value or 0)
+            except Exception:
+                return ""
+            return str(year) if year > 0 else ""
+
+        def _id_map(rec: dict[str, Any], key: str) -> dict[str, Any]:
+            value = rec.get(key)
+            return value if isinstance(value, dict) else {}
+
+        def _pick_identity(
+            *,
+            title: Any,
+            year: Any,
+            ids: dict[str, Any],
+            id_keys: tuple[str, ...],
+            prefix: str,
+            suffix: str = "",
+        ) -> str | None:
+            norm_title = _norm_identity_text(title)
+            norm_year = _year_identity(year)
+            if norm_title:
+                return f"{prefix}:title:{norm_title}|year:{norm_year}{suffix}"
+            for idk in id_keys:
+                value = ids.get(idk)
+                if value:
+                    return f"{prefix}:{idk}:{str(value).strip().lower()}{suffix}"
+            return None
+
         def _compute_history_breakdown(
             state_obj: dict[str, Any] | None,
             feature: str = "history",
         ) -> dict[str, int]:
             movies: set[str] = set()
             shows: set[str] = set()
+            seasons: set[str] = set()
             anime: set[str] = set()
             episodes: set[str] = set()
 
@@ -1337,7 +1527,12 @@ def register_insights(app: FastAPI) -> None:
                             if _is_presence_stub(rec):
                                 continue
 
-                            if feature == "history" and not (rec.get("watched_at") or rec.get("last_watched_at")):
+                            if feature == "history" and not (
+                                rec.get("watched_at")
+                                or rec.get("last_watched_at")
+                                or rec.get("last_watched")
+                                or rec.get("watched") is True
+                            ):
                                 continue
                             if feature == "ratings" and not (
                                 rec.get("rated_at") or rec.get("user_rated_at") or rec.get("rating") or rec.get("user_rating")
@@ -1345,8 +1540,8 @@ def register_insights(app: FastAPI) -> None:
                                 continue
 
                             typ = str(rec.get("type") or "").strip().lower()
-                            ids = (rec.get("ids") or {}) or {}
-                            show_ids_field = (rec.get("show_ids") or {}) or {}
+                            ids = _id_map(rec, "ids")
+                            show_ids_field = _id_map(rec, "show_ids")
                             has_show_meta = bool(
                                 show_ids_field
                                 or rec.get("series_title")
@@ -1354,118 +1549,84 @@ def register_insights(app: FastAPI) -> None:
                             )
                             is_anime = bool(
                                 typ == "anime"
-                                or ids.get("anilist") or ids.get("mal")
-                                or show_ids_field.get("anilist") or show_ids_field.get("mal")
+                                or ids.get("anilist") or ids.get("mal") or ids.get("kitsu")
+                                or show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")
                             )
 
                             if typ == "episode":
                                 s = int(rec.get("season") or 0)
                                 ep = int(rec.get("episode") or 0)
-
-                                ep_sig: str | None = None
-                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
-                                    v = ids.get(idk)
-                                    if v:
-                                        ep_sig = f"{idk}:{str(v).lower()}|s{s}e{ep}"
-                                        break
-                                if ep_sig is None:
-                                    t = str(rec.get("title") or rec.get("name") or "").strip().lower()
-                                    y = str(rec.get("year") or "")
-                                    ep_sig = f"{t}|year:{y}|s{s}e{ep}"
+                                show_title = rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name")
+                                show_year = rec.get("series_year") or rec.get("year")
+                                ep_sig = _pick_identity(
+                                    title=show_title,
+                                    year=show_year,
+                                    ids=show_ids_field or ids,
+                                    id_keys=("tmdb", "imdb", "tvdb", "anilist", "mal", "kitsu", "slug"),
+                                    prefix="episode",
+                                    suffix=f"|s{s}e{ep}",
+                                )
                                 if ep_sig:
                                     episodes.add(ep_sig)
 
-                                show_ids = show_ids_field or ids
-                                show_sig: str | None = None
-                                for idk in ("tmdb", "imdb", "tvdb", "anilist", "mal", "slug"):
-                                    v = show_ids.get(idk)
-                                    if v:
-                                        show_sig = f"{idk}:{str(v).lower()}"
-                                        break
-                                if show_sig is None:
-                                    title = (
-                                        rec.get("series_title")
-                                        or rec.get("show_title")
-                                        or rec.get("title")
-                                        or rec.get("name")
-                                    )
-                                    if title:
-                                        y = rec.get("series_year") or rec.get("year")
-                                        show_sig = f"{str(title).strip().lower()}|year:{y}"
+                                show_sig = _pick_identity(
+                                    title=show_title,
+                                    year=show_year,
+                                    ids=show_ids_field or ids,
+                                    id_keys=("tmdb", "imdb", "tvdb", "anilist", "mal", "kitsu", "slug"),
+                                    prefix="show",
+                                )
                                 if show_sig:
                                     (anime if is_anime else shows).add(show_sig)
                                 continue
 
                             if is_anime:
-                                sig: str | None = None
-                                ids_anime = show_ids_field if (show_ids_field.get("anilist") or show_ids_field.get("mal")) else ids
-                                for idk in ("anilist", "mal", "slug","tmdb", "imdb", "tvdb"):
-                                    v = ids_anime.get(idk)
-                                    if v:
-                                        sig = f"{idk}:{str(v).lower()}"
-                                        break
-                                if sig is None:
-                                    title = str(rec.get("title") or rec.get("name") or "").strip().lower()
-                                    y = str(rec.get("year") or "")
-                                    sig = f"{title}|year:{y}"
+                                ids_anime = show_ids_field if (show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")) else ids
+                                sig = _pick_identity(
+                                    title=rec.get("title") or rec.get("name"),
+                                    year=rec.get("year"),
+                                    ids=ids_anime,
+                                    id_keys=("anilist", "mal", "kitsu", "slug", "tmdb", "imdb", "tvdb"),
+                                    prefix="anime",
+                                )
                                 if sig:
                                     anime.add(sig)
                                 continue
 
                             if typ == "movie" and not has_show_meta:
-                                sig: str | None = None
-                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
-                                    v = ids.get(idk)
-                                    if v:
-                                        sig = f"{idk}:{str(v).lower()}"
-                                        break
-                                if sig is None:
-                                    title = str(rec.get("title") or rec.get("name") or "").strip().lower()
-                                    y = str(rec.get("year") or "")
-                                    sig = f"{title}|year:{y}"
-                                movies.add(sig)
+                                sig = _pick_identity(
+                                    title=rec.get("title") or rec.get("name"),
+                                    year=rec.get("year"),
+                                    ids=ids,
+                                    id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                                    prefix="movie",
+                                )
+                                if sig:
+                                    movies.add(sig)
                                 continue
 
                             if typ == "show" or (typ == "movie" and has_show_meta):
                                 ids_show = show_ids_field or ids
-                                show_sig: str | None = None
-                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
-                                    v = ids_show.get(idk)
-                                    if v:
-                                        show_sig = f"{idk}:{str(v).lower()}"
-                                        break
-                                if show_sig is None:
-                                    title = (
-                                        rec.get("series_title")
-                                        or rec.get("show_title")
-                                        or rec.get("title")
-                                        or rec.get("name")
-                                    )
-                                    if title:
-                                        y = rec.get("series_year") or rec.get("year")
-                                        show_sig = f"{str(title).strip().lower()}|year:{y}"
+                                show_sig = _pick_identity(
+                                    title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                                    year=rec.get("series_year") or rec.get("year"),
+                                    ids=ids_show,
+                                    id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                                    prefix="show",
+                                )
                                 if show_sig:
                                     shows.add(show_sig)
                                 continue
 
                             if has_show_meta:
                                 ids_show = show_ids_field or ids
-                                show_sig: str | None = None
-                                for idk in ("tmdb", "imdb", "tvdb", "slug"):
-                                    v = ids_show.get(idk)
-                                    if v:
-                                        show_sig = f"{idk}:{str(v).lower()}"
-                                        break
-                                if show_sig is None:
-                                    title = (
-                                        rec.get("series_title")
-                                        or rec.get("show_title")
-                                        or rec.get("title")
-                                        or rec.get("name")
-                                    )
-                                    if title:
-                                        y = rec.get("series_year") or rec.get("year")
-                                        show_sig = f"{str(title).strip().lower()}|year:{y}"
+                                show_sig = _pick_identity(
+                                    title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                                    year=rec.get("series_year") or rec.get("year"),
+                                    ids=ids_show,
+                                    id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                                    prefix="show",
+                                )
                                 if show_sig:
                                     shows.add(show_sig)
             except Exception as exc:
@@ -1477,9 +1638,193 @@ def register_insights(app: FastAPI) -> None:
             return {
                 "movies": len(movies),
                 "shows": len(shows),
+                "seasons": len(seasons),
                 "anime": len(anime),
                 "episodes": len(episodes),
             }
+
+        def _compute_collection_breakdown(state_obj: dict[str, Any] | None) -> dict[str, int]:
+            movies: set[str] = set()
+            shows: set[str] = set()
+            seasons: set[str] = set()
+            anime: set[str] = set()
+            episodes: set[str] = set()
+
+            try:
+                prov_block = (state_obj or {}).get("providers") or {}
+                for _prov_name, prov_data in prov_block.items():
+                    if not isinstance(prov_data, dict):
+                        continue
+
+                    for _inst_id, feat_block in _iter_provider_feature_nodes(prov_data, "collection"):
+                        node = feat_block.get("baseline") or feat_block
+                        items = (node.get("items") if isinstance(node, dict) else None) or {}
+
+                        if isinstance(items, dict):
+                            it = items.values()
+                        elif isinstance(items, list):
+                            it = items
+                        else:
+                            continue
+
+                        for rec in it:
+                            if not isinstance(rec, dict) or _is_presence_stub(rec):
+                                continue
+                            sig = _collection_identity(rec)
+                            if not sig:
+                                continue
+                            typ = str(rec.get("type") or "").strip().lower()
+                            ids = _id_map(rec, "ids")
+                            show_ids_field = _id_map(rec, "show_ids")
+                            is_anime = bool(
+                                typ == "anime"
+                                or ids.get("anilist") or ids.get("mal") or ids.get("kitsu")
+                                or show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")
+                            )
+                            if typ == "episode":
+                                episodes.add(sig)
+                            elif typ == "season":
+                                seasons.add(sig)
+                            elif is_anime:
+                                anime.add(sig)
+                            elif typ == "movie" and not (show_ids_field or rec.get("series_title") or rec.get("show_title")):
+                                movies.add(sig)
+                            else:
+                                shows.add(sig)
+            except Exception as exc:
+                _append_log("INSIGHTS", f"[!] collection breakdown failed: {exc}")
+
+            return {
+                "movies": len(movies),
+                "shows": len(shows),
+                "seasons": len(seasons),
+                "anime": len(anime),
+                "episodes": len(episodes),
+            }
+
+        def _collection_identity(rec: dict[str, Any]) -> str | None:
+            typ = str(rec.get("type") or "").strip().lower()
+            ids = _id_map(rec, "ids")
+            show_ids_field = _id_map(rec, "show_ids")
+            has_show_meta = bool(
+                show_ids_field
+                or rec.get("series_title")
+                or rec.get("show_title")
+            )
+            is_anime = bool(
+                typ == "anime"
+                or ids.get("anilist") or ids.get("mal") or ids.get("kitsu")
+                or show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")
+            )
+            if typ == "episode":
+                s = int(rec.get("season") or 0)
+                ep = int(rec.get("episode") or 0)
+                return _pick_identity(
+                    title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                    year=rec.get("series_year") or rec.get("year"),
+                    ids=show_ids_field or ids,
+                    id_keys=("tmdb", "imdb", "tvdb", "anilist", "mal", "kitsu", "slug"),
+                    prefix="episode",
+                    suffix=f"|s{s}e{ep}",
+                )
+            if typ == "season":
+                s = int(rec.get("season") or rec.get("number") or 0)
+                return _pick_identity(
+                    title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                    year=rec.get("series_year") or rec.get("year"),
+                    ids=show_ids_field or ids,
+                    id_keys=("tmdb", "imdb", "tvdb", "anilist", "mal", "kitsu", "slug"),
+                    prefix="season",
+                    suffix=f"|s{s}",
+                )
+            if is_anime:
+                ids_anime = show_ids_field if (show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")) else ids
+                return _pick_identity(
+                    title=rec.get("title") or rec.get("name"),
+                    year=rec.get("year"),
+                    ids=ids_anime,
+                    id_keys=("anilist", "mal", "kitsu", "slug", "tmdb", "imdb", "tvdb"),
+                    prefix="anime",
+                )
+            if typ == "movie" and not has_show_meta:
+                return _pick_identity(
+                    title=rec.get("title") or rec.get("name"),
+                    year=rec.get("year"),
+                    ids=ids,
+                    id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                    prefix="movie",
+                )
+            return _pick_identity(
+                title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                year=rec.get("series_year") or rec.get("year"),
+                ids=show_ids_field or ids,
+                id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                prefix="show",
+            )
+
+        def _identity_item_count(recs: list[dict[str, Any]], feature: str | None = None) -> int:
+            identities: set[str] = set()
+            for idx, rec in enumerate(recs):
+                if not isinstance(rec, dict):
+                    continue
+                if feature == "collection":
+                    sig = _collection_identity(rec)
+                    identities.add(sig or f"raw:{idx}")
+                    continue
+                typ = str(rec.get("type") or "").strip().lower()
+                ids = _id_map(rec, "ids")
+                show_ids_field = _id_map(rec, "show_ids")
+                has_show_meta = bool(
+                    show_ids_field
+                    or rec.get("series_title")
+                    or rec.get("show_title")
+                )
+                is_anime = bool(
+                    typ == "anime"
+                    or ids.get("anilist") or ids.get("mal") or ids.get("kitsu")
+                    or show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")
+                )
+                sig: str | None = None
+
+                if typ == "episode":
+                    s = int(rec.get("season") or 0)
+                    ep = int(rec.get("episode") or 0)
+                    sig = _pick_identity(
+                        title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                        year=rec.get("series_year") or rec.get("year"),
+                        ids=show_ids_field or ids,
+                        id_keys=("tmdb", "imdb", "tvdb", "anilist", "mal", "kitsu", "slug"),
+                        prefix="episode",
+                        suffix=f"|s{s}e{ep}",
+                    )
+                elif is_anime:
+                    ids_anime = show_ids_field if (show_ids_field.get("anilist") or show_ids_field.get("mal") or show_ids_field.get("kitsu")) else ids
+                    sig = _pick_identity(
+                        title=rec.get("title") or rec.get("name"),
+                        year=rec.get("year"),
+                        ids=ids_anime,
+                        id_keys=("anilist", "mal", "kitsu", "slug", "tmdb", "imdb", "tvdb"),
+                        prefix="anime",
+                    )
+                elif typ == "movie" and not has_show_meta:
+                    sig = _pick_identity(
+                        title=rec.get("title") or rec.get("name"),
+                        year=rec.get("year"),
+                        ids=ids,
+                        id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                        prefix="movie",
+                    )
+                else:
+                    sig = _pick_identity(
+                        title=rec.get("series_title") or rec.get("show_title") or rec.get("title") or rec.get("name"),
+                        year=rec.get("series_year") or rec.get("year"),
+                        ids=show_ids_field or ids,
+                        id_keys=("tmdb", "imdb", "tvdb", "slug"),
+                        prefix="show",
+                    )
+
+                identities.add(sig or f"raw:{idx}")
+            return len(identities)
 
 
 
@@ -1550,6 +1895,12 @@ def register_insights(app: FastAPI) -> None:
                         bucket = "remove"
                     elif anyin(action, ("update", "edit", "rename", "move", "reorder")):
                         bucket = "update"
+                elif feat == "collection" or ("collection" in feat) or ("collect" in action) or ("library" in feat):
+                    lane_name = "collection"
+                    if anyin(action, ("uncollect", "remove", "delete", "del", "rm", "clear")):
+                        bucket = "remove"
+                    elif anyin(action, ("update", "edit", "upgrade", "replace", "fix")):
+                        bucket = "update"
                 else:
                     is_history_feat = feat in ("history", "watch", "watched") or ("history" in action)
                     is_add_like = anyin(action, ("watch", "scrobble", "checkin", "mark_watched", "history_add", "add_history"))
@@ -1597,12 +1948,17 @@ def register_insights(app: FastAPI) -> None:
                 if wanted_instances:
                     events_raw = [e for e in events_raw if isinstance(e, dict) and _event_matches_scope(e)]
                 if int(include_events):
-                    state_for_maps = state or {}
-                    key_map, id_map = _build_show_title_maps(state_for_maps)
-                    movie_key_map, movie_id_map = _build_movie_title_maps(state_for_maps)
-                    _extend_show_title_maps_from_cw_state(id_map)
-                    _extend_movie_title_maps_from_cw_state(movie_key_map, movie_id_map)
-                    _extend_title_maps_from_db(key_map, id_map, movie_key_map, movie_id_map)
+                    maps = _titlemap_cache_get(derived_key)
+                    if maps is None:
+                        state_for_maps = _state() or {}
+                        key_map, id_map = _build_show_title_maps(state_for_maps)
+                        movie_key_map, movie_id_map = _build_movie_title_maps(state_for_maps)
+                        _extend_show_title_maps_from_cw_state(id_map)
+                        _extend_movie_title_maps_from_cw_state(movie_key_map, movie_id_map)
+                        _extend_title_maps_from_db(key_map, id_map, movie_key_map, movie_id_map)
+                        maps = (key_map, id_map, movie_key_map, movie_id_map)
+                        _titlemap_cache_put(derived_key, maps)
+                    key_map, id_map, movie_key_map, movie_id_map = maps
 
                     events = [
                         _format_event_title(
@@ -1642,26 +1998,35 @@ def register_insights(app: FastAPI) -> None:
         rows: list[dict[str, Any]] = []
         try:
             history_limit = max(0, int(history))
-            if history_limit > 0 and not wanted_instances:
-                from cw_platform.local_db.sync_reports import base_path_from_report_dir, list_reports
+            if not wanted_instances:
+                def _history_rows() -> list[dict[str, Any]]:
+                    from cw_platform.local_db.sync_reports import base_path_from_report_dir, list_reports
 
-                rows = list_reports(
-                    base_path_from_report_dir(REPORT_DIR),
-                    limit=history_limit,
-                    feature_keys=feature_keys,
-                )
+                    return list_reports(
+                        base_path_from_report_dir(REPORT_DIR),
+                        limit=history_limit,
+                        feature_keys=feature_keys,
+                    )
+
+                rows = _history_rows() if history_limit > 0 else []
         except Exception as e:
             _append_log("INSIGHTS", f"[!] report load failed: {e}")
 
-        wall_raw = _load_wall_snapshot()
+        if media_scope.active({"watchlist"}):
+            from services.watchlist import build_watchlist
+
+            wall_raw = build_watchlist(_state(), tmdb_ok=False)
+        else:
+            wall_raw = _load_wall_snapshot()
         wall: list[Any]
         if isinstance(wall_raw, list):
             wall = wall_raw
         else:
             wall = []
 
-        if not wall and state:
-            wall = list(state.get("wall") or [])
+        if not wall and not media_scope.active({"watchlist"}):
+            cached_wall = (derived or {}).get("wall")
+            wall = list(cached_wall) if isinstance(cached_wall, list) else list((_state() or {}).get("wall") or [])
         if wanted_instances:
             wall = [item for item in wall if isinstance(item, dict) and _item_matches_scope(item)]
 
@@ -1682,14 +2047,14 @@ def register_insights(app: FastAPI) -> None:
                     snap_dir = Path(root_dir).joinpath("snapshots")
                     selected: dict[str, str] = {
                         feat: str((block or {}).get(f"restore_{feat}") or "latest").strip() or "latest"
-                        for feat in ("watchlist", "history", "ratings", "progress")
+                        for feat in ("watchlist", "history", "ratings", "progress", "collection")
                     }
 
                     files: list[Path] = []
                     if snap_dir.is_dir():
                         files = list(snap_dir.glob("*.json"))
 
-                    by_feat: dict[str, list[str]] = {"watchlist": [], "history": [], "ratings": [], "progress": [], "playlists": []}
+                    by_feat: dict[str, list[str]] = {"watchlist": [], "history": [], "ratings": [], "progress": [], "playlists": [], "collection": []}
                     for p in files:
                         name = p.name
                         for feat in by_feat.keys():
@@ -1805,16 +2170,16 @@ def register_insights(app: FastAPI) -> None:
             "method": "tmdb" if tmdb_hits and not tmdb_misses else ("mixed" if tmdb_hits else "estimate"),
         }
 
-        prov_block: dict[str, Any] = (state or {}).get("providers") or {}
         providers_set: set[str] = {provider.lower() for provider in wanted_instances} if wanted_instances else set(sync_provider_names(upper=False))
-        try:
-            providers_set.update(
-                str(k).strip().lower()
-                for k in prov_block.keys()
-                if isinstance(k, str) and str(k).strip()
-            )
-        except Exception:
-            pass
+        if not wanted_instances:
+            try:
+                providers_set.update(
+                    str(k).strip().lower()
+                    for k in _state_provider_names(state_features)
+                    if isinstance(k, str) and str(k).strip()
+                )
+            except Exception:
+                pass
 
         try:
             raw_pairs = (cfg.get("pairs") or cfg.get("connections") or [])
@@ -1871,20 +2236,31 @@ def register_insights(app: FastAPI) -> None:
 
         def _count_items(node: Any, feature: str | None = None) -> int:
             try:
-                if feature in ("history", "ratings") and isinstance(node, dict):
+                if feature in ("watchlist", "history", "ratings", "progress", "collection") and isinstance(node, dict):
                     recs = _iter_feature_items(node)
                     if feature == "history":
-                        return sum(
-                            1
+                        recs = [
+                            r
                             for r in recs
-                            if (not _is_presence_stub(r)) and (r.get("watched_at") or r.get("last_watched_at"))
-                        )
-                    return sum(
-                        1
-                        for r in recs
-                        if (not _is_presence_stub(r))
-                        and (r.get("rated_at") or r.get("user_rated_at") or r.get("rating") or r.get("user_rating"))
-                    )
+                            if (not _is_presence_stub(r))
+                            and (
+                                r.get("watched_at")
+                                or r.get("last_watched_at")
+                                or r.get("last_watched")
+                                or r.get("watched") is True
+                            )
+                        ]
+                    elif feature == "ratings":
+                        recs = [
+                            r
+                            for r in recs
+                            if (not _is_presence_stub(r))
+                            and (r.get("rated_at") or r.get("user_rated_at") or r.get("rating") or r.get("user_rating"))
+                        ]
+                    else:
+                        recs = [r for r in recs if not _is_presence_stub(r)]
+
+                    return _identity_item_count(recs, feature)
 
                 if isinstance(node, dict):
                     base = node.get("baseline") or {}
@@ -1940,30 +2316,21 @@ def register_insights(app: FastAPI) -> None:
             return out
 
         def _sum_mse(parts: list[dict[str, int]]) -> dict[str, int]:
-            out = {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}
+            out = {"movies": 0, "shows": 0, "seasons": 0, "anime": 0, "episodes": 0}
             for p in parts:
                 if not isinstance(p, dict):
                     continue
                 out["movies"] += int(p.get("movies") or 0)
                 out["shows"] += int(p.get("shows") or 0)
+                out["seasons"] += int(p.get("seasons") or 0)
                 out["anime"] += int(p.get("anime") or 0)
                 out["episodes"] += int(p.get("episodes") or 0)
             return out
 
         instances_by_provider: dict[str, list[str]] = {k: ["default"] for k in providers_set}
         try:
-            for prov_upper, pdata in (prov_block or {}).items():
-                key = str(prov_upper or "").strip().lower()
-                if not key:
-                    continue
-                insts: list[str] = ["default"]
-                inst_block = (pdata or {}).get("instances")
-                if isinstance(inst_block, dict):
-                    for iid in inst_block.keys():
-                        s = str(iid or "").strip()
-                        if s and s not in insts:
-                            insts.append(s)
-                instances_by_provider[key] = insts
+            for key, insts in _provider_instances(state_features, _state).items():
+                instances_by_provider[key] = list(insts)
         except Exception:
             pass
         if wanted_instances:
@@ -1979,15 +2346,55 @@ def register_insights(app: FastAPI) -> None:
             feat: {k: 0 for k in providers_set} for feat in feature_keys
         }
 
+        if derived is None:
+            raw_counts: dict[str, dict[str, dict[str, int]]] = {}
+            raw_mse: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
+            prov_block: dict[str, Any] = (_state() or {}).get("providers") or {}
+            try:
+                for prov_upper, pdata in (prov_block or {}).items():
+                    key = str(prov_upper or "").strip().lower()
+                    if not key:
+                        continue
+                    for feat in feature_keys:
+                        inst_counts: dict[str, int] = {}
+                        inst_mse: dict[str, dict[str, int]] = {}
+                        for inst_id, node in _iter_provider_feature_nodes(pdata, feat):
+                            inst_counts[inst_id] = _count_items(node, feat)
+                            try:
+                                if feat == "collection":
+                                    per_counts = _compute_collection_breakdown({"providers": {prov_upper: {feat: node}}}) or {}
+                                else:
+                                    per_counts = _compute_history_breakdown(
+                                        {"providers": {prov_upper: {feat: node}}},
+                                        feat,
+                                    ) or {}
+                            except Exception:
+                                per_counts = {}
+                            inst_mse[inst_id] = {
+                                "movies": int(per_counts.get("movies") or 0),
+                                "shows": int(per_counts.get("shows") or 0),
+                                "seasons": int(per_counts.get("seasons") or 0),
+                                "anime": int(per_counts.get("anime") or 0),
+                                "episodes": int(per_counts.get("episodes") or 0),
+                            }
+                        raw_counts.setdefault(feat, {})[key] = inst_counts
+                        raw_mse.setdefault(feat, {})[key] = inst_mse
+            except Exception:
+                pass
+            derived = {
+                "counts": raw_counts,
+                "mse": raw_mse,
+                "history_counts": _compute_history_breakdown(_state()),
+                "wall": list((_state() or {}).get("wall") or []),
+            }
+            _derived_cache_put(derived_key, derived)
+
         try:
-            for prov_upper, pdata in (prov_block or {}).items():
-                key = str(prov_upper or "").strip().lower()
-                if not key:
+            for feat, provs in (derived.get("counts") or {}).items():
+                if feat not in providers_instances_by_feature:
                     continue
-                for feat in feature_keys:
-                    inst_counts: dict[str, int] = {}
-                    for inst_id, node in _iter_provider_feature_nodes(pdata, feat):
-                        inst_counts[inst_id] = _count_items(node, feat)
+                for key, stored in provs.items():
+                    inst_counts = dict(stored)
                     if "default" not in inst_counts and not wanted_instances:
                         inst_counts["default"] = 0
                     providers_instances_by_feature[feat][key] = inst_counts
@@ -2016,41 +2423,22 @@ def register_insights(app: FastAPI) -> None:
                         existing[inst] = max(int(existing.get(inst) or 0), int(inst_count or 0))
 
         providers_instances_mse_by_feature: dict[str, dict[str, dict[str, dict[str, int]]]] = {
-            feat: {k: {"default": {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}} for k in providers_set}
+            feat: {k: {"default": {"movies": 0, "shows": 0, "seasons": 0, "anime": 0, "episodes": 0}} for k in providers_set}
             for feat in feature_keys
         }
         providers_mse_by_feature: dict[str, dict[str, dict[str, int]]] = {
-            feat: {k: {"movies": 0, "shows": 0, "anime": 0, "episodes": 0} for k in providers_set}
+            feat: {k: {"movies": 0, "shows": 0, "seasons": 0, "anime": 0, "episodes": 0} for k in providers_set}
             for feat in feature_keys
         }
 
         try:
-            for prov_upper, pdata in (prov_block or {}).items():
-                key = str(prov_upper or "").strip().lower()
-                if not key:
+            for feat, provs in (derived.get("mse") or {}).items():
+                if feat not in providers_instances_mse_by_feature:
                     continue
-
-                for feat in feature_keys:
-                    inst_mse: dict[str, dict[str, int]] = {}
-                    for inst_id, node in _iter_provider_feature_nodes(pdata, feat):
-                        try:
-                            per_counts = _compute_history_breakdown(
-                                {"providers": {prov_upper: {feat: node}}},
-                                feat,
-                            ) or {}
-                        except Exception:
-                            per_counts = {}
-
-                        inst_mse[inst_id] = {
-                            "movies": int(per_counts.get("movies") or 0),
-                            "shows": int(per_counts.get("shows") or 0),
-                            "anime": int(per_counts.get("anime") or 0),
-                            "episodes": int(per_counts.get("episodes") or 0),
-                        }
-
+                for key, stored in provs.items():
+                    inst_mse = {inst: dict(vals) for inst, vals in stored.items()}
                     if "default" not in inst_mse and not wanted_instances:
-                        inst_mse["default"] = {"movies": 0, "shows": 0, "anime": 0, "episodes": 0}
-
+                        inst_mse["default"] = {"movies": 0, "shows": 0, "seasons": 0, "anime": 0, "episodes": 0}
                     providers_instances_mse_by_feature[feat][key] = inst_mse
                     providers_mse_by_feature[feat][key] = _sum_mse(list(inst_mse.values()))
         except Exception:
@@ -2059,8 +2447,6 @@ def register_insights(app: FastAPI) -> None:
 
 
         now_ts = int(time.time())
-        week_floor = now_ts - 7 * 86400
-        month_floor = now_ts - 30 * 86400
 
         def _last_run_lane(feat: str) -> dict[str, Any]:
             for row in rows:
@@ -2111,6 +2497,7 @@ def register_insights(app: FastAPI) -> None:
             return out
 
         week_tot = _lane_totals(7)
+        month_tot = _lane_totals(30)
 
         ts_grid = [r["ts"] for r in series_by_feature.get("watchlist", [])]
         if len(ts_grid) < 2:
@@ -2143,23 +2530,13 @@ def register_insights(app: FastAPI) -> None:
                 out_series.append({"ts": ts_grid[i], "count": v})
             series_by_feature[f] = list(reversed(out_series))
 
-        def _val_at(series_list: list[dict[str, int]], floor_ts: int) -> int:
-            try:
-                arr = sorted(series_list or [], key=lambda r: int(r.get("ts") or 0))
-                if not arr:
-                    return 0
-                val = int(arr[0].get("count") or 0)
-                for r in arr:
-                    t = int(r.get("ts") or 0)
-                    if t <= floor_ts:
-                        val = int(r.get("count") or 0)
-                    else:
-                        break
-                return val
-            except Exception:
-                return 0
-            
-        history_counts = _compute_history_breakdown(state)
+        def _window_totals(feat: str, totals: dict[str, tuple[int, int, int]]) -> tuple[int, int]:
+            lane = totals.get(feat)
+            if isinstance(lane, tuple) and len(lane) == 3:
+                return int(lane[0] or 0), int(lane[1] or 0)
+            return 0, 0
+
+        history_counts = derived.get("history_counts") or {}
 
         feats_out: dict[str, dict[str, Any]] = {}
         for feat in feature_keys:
@@ -2167,17 +2544,19 @@ def register_insights(app: FastAPI) -> None:
             add_last = int(last_lane.get("added") or 0)
             rem_last = int(last_lane.get("removed") or 0)
             upd_last = int(last_lane.get("updated") or 0)
-            t = week_tot.get(feat)
-            if isinstance(t, tuple) and len(t) == 3:
-                wa, wr, wu = t
-            else:
-                wa, wr, wu = (0, 0, 0)
 
             s = series_by_feature.get(feat, [])
+            now_val = _union_now(feat)
+            week_added, week_removed = _window_totals(feat, week_tot)
+            month_added, month_removed = _window_totals(feat, month_tot)
+            week_added = min(week_added, now_val + week_removed)
+            month_added = min(month_added, now_val + month_removed)
             feats_out[feat] = {
-                "now": _union_now(feat),
-                "week": _val_at(s, week_floor),
-                "month": _val_at(s, month_floor),
+                "now": now_val,
+                "week": week_added,
+                "month": month_added,
+                "week_removed": week_removed,
+                "month_removed": month_removed,
                 "added": add_last,
                 "removed": rem_last,
                 "updated": upd_last,

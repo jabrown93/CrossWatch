@@ -128,7 +128,7 @@ def _active_item_ids(http: Any, uid: str) -> set[str]:
 def _target_state(http: Any, uid: str, item_id: str) -> dict[str, Any]:
     response = http.get(
         f"/Users/{uid}/Items/{item_id}",
-        params={"Fields": "UserData,RunTimeTicks,LibraryId,CollectionFolderId"},
+        params={"Fields": "UserData,UserDataLastPlayedDate,UserDataPlayCount,RunTimeTicks,LibraryId,CollectionFolderId"},
     )
     if getattr(response, "status_code", 0) != 200:
         raise RuntimeError(f"target_state_http_{getattr(response, 'status_code', 0)}")
@@ -138,7 +138,7 @@ def _target_state(http: Any, uid: str, item_id: str) -> dict[str, Any]:
         "watched": bool(user_data.get("Played") or user_data.get("IsPlayed")),
         "progress_ms": _ticks_to_ms(user_data.get("PlaybackPositionTicks")),
         "duration_ms": _ticks_to_ms(row.get("RunTimeTicks")),
-        "timestamp": user_data.get("LastPlayedDate") or user_data.get("LastPlayed") or row.get("DateLastSaved"),
+        "timestamp": user_data.get("LastPlayedDate") or user_data.get("LastPlayed"),
         "library_id": row.get("LibraryId") or row.get("CollectionFolderId"),
     }
 
@@ -189,7 +189,7 @@ def build_index(adapter: Any, **_kwargs: Any) -> Mapping[str, dict[str, Any]]:
     base_params: dict[str, Any] = {
         "Recursive": True,
         "IncludeItemTypes": "Movie,Episode",
-        "Fields": "UserData,ProviderIds,RunTimeTicks,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesId,ParentId,CollectionFolderId,AncestorIds,LibraryId,Name",
+        "Fields": "UserData,UserDataLastPlayedDate,UserDataPlayCount,ProviderIds,RunTimeTicks,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesId,ParentId,CollectionFolderId,AncestorIds,LibraryId,Name",
         "EnableUserData": True,
         "Filters": "IsResumable",
     }
@@ -305,7 +305,7 @@ def build_index(adapter: Any, **_kwargs: Any) -> Mapping[str, dict[str, Any]]:
             chosen_viewOffset=int(selected.get("progress_ms") or 0),
             duration_ms=selected.get("duration_ms"),
             ids=dict(selected.get("ids") or {}),
-            emby_item_id=str((selected.get("ids") or {}).get("emby") or ""),
+            emby_item_id=str(selected.get("emby_item_id") or ""),
             action=action,
         )
 
@@ -380,7 +380,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                     timestamp_tolerance_seconds=tolerance,
                 )
                 context = {
-                    "provider": "emby", "provider_instance": os.getenv("CW_PAIR_DST_INSTANCE") or "default",
+                    "key": str(ck),
+                    "provider": "emby", "provider_instance": getattr(adapter, "instance_id", None) or os.getenv("CW_PAIR_DST_INSTANCE") or "default",
                     "remote_item_id": str(iid), "library_id": target.get("library_id") or it0.get("library_id"),
                     "source_timestamp": pa, "target_timestamp": target.get("timestamp"),
                     "source_progress": ms, "target_progress": target.get("progress_ms"), "reason": decision.reason,

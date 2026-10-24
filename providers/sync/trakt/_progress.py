@@ -3,6 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.interactive_reads import accepted_result, replaying, retained_read, replace_retained
+
 import math
 import os
 from collections.abc import Iterable, Mapping
@@ -13,6 +15,7 @@ from providers.sync._log import log as cw_log
 from providers.sync._progress_policy import decide_progress_write, progress_materially_equal, select_progress_record
 
 from ._common import _fix_imdb
+from ._pagination import TraktPager
 
 
 _PROVIDER = "TRAKT"
@@ -154,24 +157,21 @@ def _item_from_row(row: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] |
     return key, item, None
 
 
-def _progress_page(adapter: Any, media_type: str, page: int, limit: int) -> list[Mapping[str, Any]] | None:
+def _progress_page(adapter: Any, media_type: str, page: int, limit: int, *, pager: TraktPager) -> list[Mapping[str, Any]]:
     response = adapter.client.get(
         f"{adapter.client.BASE}/sync/playback/{media_type}",
         params={"extended": "full", "page": int(page), "limit": int(limit)},
     )
-    if not (200 <= int(getattr(response, "status_code", 0) or 0) < 300):
-        _warn("index_http_failed", media_type=media_type, page=page, status=getattr(response, "status_code", None))
-        return None
-    data = response.json() if (getattr(response, "text", "") or "").strip() else []
-    return data if isinstance(data, list) else []
+    return pager.read(response, page)
 
 
+@retained_read
 def build_index(adapter: Any, **_kwargs: Any) -> dict[str, dict[str, Any]]:
-    limit = 100
+    limit = 250
     try:
-        limit = max(1, min(100, int(getattr(adapter.cfg, "progress_per_page", 100) or 100)))
+        limit = max(1, min(250, int(getattr(adapter.cfg, "progress_per_page", 250) or 250)))
     except Exception:
-        limit = 100
+        limit = 250
     try:
         max_pages = max(1, int(getattr(adapter.cfg, "progress_max_pages", 100) or 100))
     except Exception:
@@ -182,9 +182,10 @@ def build_index(adapter: Any, **_kwargs: Any) -> dict[str, dict[str, Any]]:
     rows_seen = 0
     for media_type in ("movies", "episodes"):
         page = 1
-        while page <= max_pages:
-            rows = _progress_page(adapter, media_type, page, limit)
-            if rows is None:
+        pager = TraktPager("progress", max_pages)
+        while True:
+            rows = _progress_page(adapter, media_type, page, limit, pager=pager)
+            if not rows:
                 break
             rows_seen += len(rows)
             for row in rows:
@@ -198,8 +199,6 @@ def build_index(adapter: Any, **_kwargs: Any) -> dict[str, dict[str, Any]]:
                 selected, action = select_progress_record(out.get(key), item)
                 out[key] = selected
                 _dbg("item", canonical_key=key, media_type=item.get("type"), progress_ms=item.get("progress_ms"), duration_ms=item.get("duration_ms"), action=action)
-            if len(rows) < limit:
-                break
             page += 1
     _info("index_done", count=len(out), rows=rows_seen, skipped=sum(skipped.values()), skipped_reasons=skipped)
     return out
@@ -374,15 +373,34 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
         return _result(len(unresolved) == 0, len(pending), len(pending), [], unresolved, results, skipped, dry_run=True)
 
     failed = False
+    failed_keys: set[str] = set()
+    written_items: dict[str, dict[str, Any]] = {}
     for key, item, body in pending:
         response = adapter.client.post(f"{adapter.client.BASE}/scrobble/pause", json=body)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 201:
             failed = True
+            failed_keys.add(key)
             row = _unresolved(item, f"http:{status}", status="failed", remote_status=status)
             unresolved.append(row)
             results.append(row)
             _warn("write_failed", op="add", canonical_key=key, status=status)
+        elif replaying():
+            written = dict(item)
+            written.pop("_trakt_playback_id", None)
+            try:
+                remote_id = _positive_int((response.json() or {}).get("id"))
+            except (ValueError, TypeError, AttributeError):
+                remote_id = None
+            if remote_id is not None:
+                written["_trakt_playback_id"] = remote_id
+            written_items[key] = written
+
+    if replaying():
+        accepted = [key for key, _item, _body in pending if key not in failed_keys]
+        current.update(written_items)
+        replace_retained(build_index, current)
+        return accepted_result(_result(not unresolved, len(accepted), len(pending), accepted, unresolved, results, skipped), accepted)
 
     after = build_index(adapter) if pending and not failed else current
     confirmed: list[str] = []
@@ -431,6 +449,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = 
         return _result(len(unresolved) == 0, len(pending), len(pending), [], unresolved, results, skipped, dry_run=True)
 
     failed = False
+    failed_keys: set[str] = set()
     confirmed: list[str] = []
     for key, playback_id, item in pending:
         response = adapter.client.delete(f"{adapter.client.BASE}/sync/playback/{playback_id}")
@@ -439,10 +458,18 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = 
             confirmed.append(key)
         else:
             failed = True
+            failed_keys.add(key)
             row = _unresolved(item, f"http:{status}", status="failed", remote_status=status)
             unresolved.append(row)
             results.append(row)
             _warn("write_failed", op="remove", canonical_key=key, playback_id=playback_id, status=status)
+
+    if replaying():
+        accepted = [key for key, _remote_id, _item in pending if key not in failed_keys]
+        for key in accepted:
+            current.pop(key, None)
+        replace_retained(build_index, current)
+        return _result(not unresolved, len(accepted), len(pending), accepted, unresolved, results, skipped)
 
     after = build_index(adapter) if pending and not failed else current
     verified: list[str] = []

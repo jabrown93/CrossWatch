@@ -14,10 +14,14 @@ maintained, or endorsed by the Copyright Holder.
 
 Material changes relative to upstream cenodude/CrossWatch:
 
-- Authentication: an OIDC/SSO login provider (`api/authOIDCAPI.py`,
-  `services/authOIDC.py`), static API-key authentication over an `x-api-key`
-  header for programmatic access, and a first-run setup-token gate
-  (`api/appAuthAPI.py`). None of these exist upstream.
+- Authentication: OIDC login auto-redirect, ID-token verification via authlib
+  (`services/authOidc.py`), and a first-run setup-token gate
+  (`api/appAuthAPI.py`).
+- Configuration: any setting can be supplied from the environment and is never
+  written back to config.json (`cw_platform/config_env.py`).
+- Sync safety: non-idempotent writes are not retried; mass-delete protection is
+  on by default.
+- See FORK.md for the full list.
 - Security hardening: secrets redacted from config output and logs; outbound
   provider requests guarded against SSRF on every redirect hop (which also
   covers Jellyfin Quick Connect); unrecognized webhook profile tokens rejected

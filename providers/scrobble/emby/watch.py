@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import time, threading
+import re, time, threading
 from typing import Any, Iterable, Mapping, cast
 
 import requests
@@ -13,12 +13,16 @@ try:
 except Exception:
     BASE_LOG = None
 
+from cw_platform.app_version import app_version
 from cw_platform.config_base import load_config
+from providers.scrobble._log_dedupe import LogDeduplicator
+from providers.scrobble._show_tmdb import show_tmdb_id
 from providers.scrobble.scrobble import Dispatcher, ScrobbleSink, ScrobbleEvent, MediaType, mask_account as _mask_account
 from providers.scrobble.currently_watching import update_from_event as _cw_update, update_from_payload as _cw_update_payload
+from providers.scrobble.media_filters import event_ignore_reason, log_media_filter_drop
+from providers.scrobble.routes import watch_poll_seconds
 from providers.scrobble.sources import source_enabled
 
-TRAKT_API = "https://api.trakt.tv"
 _HTTP = requests.Session()
 
 _CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
@@ -27,7 +31,6 @@ OFFLINE_INITIAL_RETRY_SECONDS = 30.0
 OFFLINE_MAX_RETRY_SECONDS = 300.0
 OFFLINE_TIMEOUT_SECONDS = 2.0
 
-_TRAKT_ID_CACHE: dict[tuple, Any] = {}
 _VIEW_CACHE_TTL_SECS = 60.0
 _SERIES_IDS_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any] | None]] = {}
 _SERIES_IDS_CACHE_TTL_SECS = 60 * 60
@@ -87,44 +90,6 @@ def _series_ids_cache_put(base: str, uid: str, series_id: str, val: dict[str, An
         pass
 
 
-def _trakt_tokens(cfg: dict[str, Any]) -> dict[str, str]:
-    tr = cfg.get("trakt") or {}
-    au = (cfg.get("auth") or {}).get("trakt") or {}
-    return {
-        "client_id": str(tr.get("client_id") or "").strip(),
-        "access_token": str(au.get("access_token") or tr.get("access_token") or "").strip(),
-    }
-
-
-def _trakt_headers(cfg: dict[str, Any]) -> dict[str, str]:
-    t = _trakt_tokens(cfg)
-    headers: dict[str, str] = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "trakt-api-version": "2",
-        "trakt-api-key": t["client_id"],
-    }
-    if t["access_token"]:
-        headers["Authorization"] = f"Bearer {t['access_token']}"
-    return headers
-
-
-def _cache_get(key: tuple) -> Any | None:
-    try:
-        return _TRAKT_ID_CACHE.get(key)
-    except Exception:
-        return None
-
-
-def _cache_put(key: tuple, value: Any) -> None:
-    try:
-        if len(_TRAKT_ID_CACHE) > 2048:
-            _TRAKT_ID_CACHE.clear()
-        _TRAKT_ID_CACHE[key] = value
-    except Exception:
-        pass
-
-
 def _as_set_str(v: Any) -> set[str]:
     it = v if isinstance(v, (list, tuple, set)) else ([v] if v is not None else [])
     out: set[str] = set()
@@ -167,7 +132,7 @@ def _hdr(tok: str, cfg: dict[str, Any]) -> dict[str, str]:
         "Accept": "application/json",
         "X-Emby-Token": tok,
         "X-MediaBrowser-Token": tok,
-        "Authorization": f'Emby Client="CrossWatch", Device="CrossWatch", DeviceId="{did}", Version="1.0.0"',
+        "Authorization": f'Emby Client="CrossWatch", Device="CrossWatch", DeviceId="{did}", Version="{app_version()}"',
     }
 
 
@@ -309,92 +274,6 @@ def _series_ids_from_payload(md: Mapping[str, Any], root: Mapping[str, Any]) -> 
     return out
 
 
-def _guid_search_episode(epi_hint: dict[str, Any], cfg: dict[str, Any], logger=None) -> dict[str, Any]:
-    try:
-        t = _trakt_tokens(cfg)
-        if not t.get("client_id"):
-            return {}
-        q = {k: epi_hint.get(k) for k in ("tmdb", "imdb", "tvdb") if epi_hint.get(k)}
-        if not q:
-            return {}
-        r = _HTTP.get(
-            f"{TRAKT_API}/search/episode",
-            params=q,
-            headers=_trakt_headers(cfg),
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return {}
-        arr = r.json() or []
-        for it in arr:
-            ep = (it or {}).get("episode") or {}
-            ids = (ep.get("ids") or {})
-            if ids.get("trakt"):
-                return {k: ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if ids.get(k)}
-    except Exception:
-        pass
-    return {}
-
-
-def _show_ids_from_episode_hint(ids_hint: dict[str, Any], cfg: dict[str, Any], logger=None) -> dict[str, Any]:
-    cache_key = (
-        "show_ids_from_episode_hint",
-        ids_hint.get("imdb"),
-        ids_hint.get("tmdb"),
-        ids_hint.get("tvdb"),
-    )
-    c = _cache_get(cache_key)
-    if isinstance(c, dict):
-        return c
-    if c is not None:
-        return {}
-
-    t = _trakt_tokens(cfg)
-    if not t.get("client_id"):
-        _cache_put(cache_key, None)
-        return {}
-
-    try:
-        out = _guid_search_episode(ids_hint, cfg, logger=logger)
-        if out:
-            _cache_put(cache_key, out)
-            return out
-    except Exception:
-        pass
-
-    for key in ("tmdb", "imdb", "tvdb"):
-        val = ids_hint.get(key)
-        if not val:
-            continue
-        try:
-            r = _HTTP.get(
-                f"{TRAKT_API}/search/{key}/{val}",
-                params={"type": "episode", "limit": 1},
-                headers=_trakt_headers(cfg),
-                timeout=10,
-            )
-            if r.status_code != 200:
-                continue
-            arr = r.json() or []
-        except Exception:
-            continue
-
-        for hit in arr:
-            show_ids = ((hit.get("show") or {}).get("ids") or {})
-            out = {k: show_ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if show_ids.get(k)}
-            if out:
-                if logger and _is_debug():
-                    try:
-                        logger(f"resolved SHOW ids from episode hint: {out}", "DEBUG")
-                    except Exception:
-                        pass
-                _cache_put(cache_key, out)
-                return out
-
-    _cache_put(cache_key, None)
-    return {}
-
-
 def _enrich_episode_ids(
     item: dict[str, Any],
     sess: dict[str, Any],
@@ -453,12 +332,10 @@ def _enrich_episode_ids(
                         hint[key] = val
             except Exception:
                 pass
-            if hint:
-                extra = _show_ids_from_episode_hint(hint, cfg, logger=logger) or {}
-                for key in ("tmdb", "imdb", "tvdb"):
-                    val = extra.get(key)
-                    if val is not None and f"{key}_show" not in cw_ids:
-                        cw_ids[f"{key}_show"] = val
+            known = {key: cw_ids.get(f"{key}_show") for key in ("imdb", "tvdb")}
+            tmdb_show = show_tmdb_id(cfg, known, hint)
+            if tmdb_show:
+                cw_ids["tmdb_show"] = tmdb_show
         except Exception:
             pass
 
@@ -538,7 +415,7 @@ class EmbyWatchService:
     def __init__(
         self,
         sinks: Iterable[ScrobbleSink] | None = None,
-        poll_secs: float = 1.5,
+        poll_secs: float = 10.0,
         dispatcher: Any | None = None,
         cfg_provider: Any | None = None,
         instance_id: Any = None,
@@ -560,9 +437,11 @@ class EmbyWatchService:
             self._sinks,
             cfg_provider=lambda: _cfg_for_dispatch(self._active_cfg(), self._server_id),
         )
-        self._poll = max(0.5, float(poll_secs))
+        self._default_poll = max(0.5, float(poll_secs))
+        self._poll = self._default_poll
         self._idle_steps = 0
-        self._max_idle_sleep = 6.0
+        self._default_idle_sleep = 30.0
+        self._max_idle_sleep = self._default_idle_sleep
 
         self._stop = threading.Event()
         self._bg: threading.Thread | None = None
@@ -571,7 +450,7 @@ class EmbyWatchService:
         self._allowed_sessions: set[str] = set()
         self._scrobble_whitelist_sessions: set[str] = set()
         self._filtered_sessions: set[str] = set()
-        self._route_filtered_ts: dict[str, float] = {}
+        self._route_filter_logs = LogDeduplicator()
         self._cw_last_heartbeat: dict[str, float] = {}
         self._best_offset: dict[str, tuple[int, int, float]] = {}
         self._last_seek_emit: dict[str, float] = {}
@@ -758,6 +637,14 @@ class EmbyWatchService:
 
     def _passes_filters(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> bool:
         sk = str(ev.session_key or "")
+        ignore_reason = event_ignore_reason(ev, cfg)
+        if ignore_reason:
+            log_media_filter_drop(ev, ignore_reason)
+            if sk:
+                self._allowed_sessions.discard(sk)
+                self._scrobble_whitelist_sessions.discard(sk)
+            return False
+
         libs = self._scrobble_whitelist(cfg)
 
         if libs:
@@ -831,7 +718,7 @@ class EmbyWatchService:
 
     def _current_sessions(self, cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
         try:
-            q = "/Sessions?ActiveWithinSeconds=15"
+            q = f"/Sessions?ActiveWithinSeconds={max(15, int(self._poll * 2))}"
             all_sessions = _get_json(self._base, self._tok, q, cfg=cfg, timeout=self._request_timeout(cfg)) or []
             self._mark_online()
             playing: list[dict[str, Any]] = []
@@ -908,6 +795,7 @@ class EmbyWatchService:
             self._clear_currently_watching(ev2)
             return False
 
+        self._route_filter_logs.discard((ev2.server_uuid, ev2.session_key))
         try:
             _cw_update("emby", ev2, provider_instance=str(self._instance_id or "default"))
         except Exception:
@@ -948,6 +836,7 @@ class EmbyWatchService:
             self._clear_currently_watching(ev)
             return
 
+        self._route_filter_logs.discard((ev.server_uuid, ev.session_key))
         try:
             _cw_update("emby", ev, provider_instance=str(self._instance_id or "default"))
         except Exception:
@@ -969,18 +858,14 @@ class EmbyWatchService:
 
     def _throttled_route_filtered_log(self, ev: ScrobbleEvent, kind: str = "event") -> None:
         sk = str(ev.session_key or "")
-        key = f"{kind}|{ev.account}|{ev.server_uuid}|{sk or '?'}"
-        now = time.time()
-        last = self._route_filtered_ts.get(key, 0.0)
-        if now - last >= 30.0:
-            self._dbg(f"{kind} filtered by route dispatcher: user={_mask_account(ev.account)} server={ev.server_uuid} sess={sk}")
-            self._route_filtered_ts[key] = now
+        if self._route_filter_logs.should_log((ev.server_uuid, ev.session_key), ev.account):
+            self._dbg(f"{kind} not dispatched: user={_mask_account(ev.account)} server={ev.server_uuid} sess={sk}")
 
     def _clear_currently_watching(self, ev: ScrobbleEvent) -> None:
         try:
             _cw_update_payload(
                 "emby",
-                ev.media_type,
+                str(ev.media_type),
                 ev.title or "",
                 ev.year,
                 ev.season,
@@ -996,9 +881,58 @@ class EmbyWatchService:
         except Exception:
             pass
 
+    def _emit_synthetic_stop(
+        self,
+        sid: str,
+        memo: Mapping[str, Any],
+        cfg: dict[str, Any],
+        now: float,
+        best_offset: tuple[int, int, float] | None,
+    ) -> None:
+        meta = memo.get("meta") or {}
+        if not meta:
+            return
+        last_em = self._last_emit.get(sid)
+        if last_em and last_em[0] == "stop":
+            return
+        last_p = max(1, int(memo.get("p") or 0))
+        dt = now - float(memo.get("ts", 0))
+        preserve_stop = str(memo.get("state") or "").strip().lower() == "playing" and dt <= max(5.0, self._poll * 2)
+        fake = {
+            "Id": sid,
+            "UserName": meta.get("account"),
+            "NowPlayingItem": {},
+            "PlayState": {},
+            "_cw_preserve_stop": preserve_stop,
+            "_cw_stop_src": "poll-disappear",
+        }
+        mt_raw = str(meta.get("media_type") or "").strip().lower()
+        mt: MediaType = "episode" if mt_raw == "episode" else "movie"
+        position_ms = int(best_offset[0]) if best_offset and best_offset[0] is not None else None
+        duration_ms = int(best_offset[1]) if best_offset and best_offset[1] is not None and best_offset[1] > 0 else None
+        ev = ScrobbleEvent(
+            action="stop",
+            media_type=mt,
+            ids=_normalize_ids(dict(meta.get("ids") or {})),
+            title=meta.get("title"),
+            year=meta.get("year"),
+            season=meta.get("season"),
+            number=meta.get("number"),
+            progress=last_p,
+            account=meta.get("account"),
+            server_uuid=self._server_id,
+            session_key=sid,
+            raw=fake,
+            position_ms=position_ms,
+            duration_ms=duration_ms,
+        )
+        self._emit(ev, cfg)
+
     def _tick(self) -> bool:
         now = time.time()
         cfg = self._active_cfg()
+        self._poll = watch_poll_seconds(cfg, self._default_poll)
+        self._max_idle_sleep = watch_poll_seconds(cfg, self._default_idle_sleep, "idle_poll_seconds")
         cur = self._current_sessions(cfg)
         if cur is None:
             return False
@@ -1047,6 +981,11 @@ class EmbyWatchService:
             emit_action: str | None = None
             did_emit = False
             seek_emitted = False
+
+            if last_key and key != last_key:
+                self._emit_synthetic_stop(sid, last, cfg, now, self._best_offset.get(sid))
+                self._best_offset.pop(sid, None)
+                self._last_seek_emit.pop(sid, None)
 
             if off_ms is not None and dur_ms is not None and dur_ms > 0:
                 prev = self._best_offset.get(sid)
@@ -1177,42 +1116,7 @@ class EmbyWatchService:
                 continue
 
             if last_p >= force_at or dt >= 2.0:
-                preserve_stop = str(memo.get("state") or "").strip().lower() == "playing" and dt <= 5.0
-                fake = {
-                    "Id": sid,
-                    "UserName": meta.get("account"),
-                    "NowPlayingItem": {},
-                    "PlayState": {},
-                    "_cw_preserve_stop": preserve_stop,
-                    "_cw_stop_src": "poll-disappear",
-                }
-                mt_raw = str(meta.get("media_type") or "").strip().lower()
-                mt: MediaType = "episode" if mt_raw == "episode" else "movie"
-
-                ids_stop = _normalize_ids(dict(meta.get("ids") or {}))
-                best_offset = self._best_offset.get(sid)
-                position_ms = int(best_offset[0]) if best_offset and best_offset[0] is not None else None
-                duration_ms = int(best_offset[1]) if best_offset and best_offset[1] is not None and best_offset[1] > 0 else None
-
-                ev = ScrobbleEvent(
-                    action="stop",
-                    media_type=mt,
-                    ids=ids_stop,
-                    title=meta.get("title"),
-                    year=meta.get("year"),
-                    season=meta.get("season"),
-                    number=meta.get("number"),
-                    progress=last_p,
-                    account=meta.get("account"),
-                    server_uuid=self._server_id,
-                    session_key=sid,
-                    raw=fake,
-                    position_ms=position_ms,
-                    duration_ms=duration_ms,
-                )
-                last_em = self._last_emit.get(sid)
-                if not (last_em and last_em[0] == "stop"):
-                    self._emit(ev, cfg)
+                self._emit_synthetic_stop(sid, memo, cfg, now, self._best_offset.get(sid))
 
                 del self._last[sid]
                 try:
@@ -1259,8 +1163,8 @@ class EmbyWatchService:
                 self._idle_steps = 0
                 sleep_for = self._poll
             else:
-                self._idle_steps = min(self._idle_steps + 1, 10)
-                sleep_for = min(self._poll * (1.0 + (0.5 * self._idle_steps)), self._max_idle_sleep)
+                self._idle_steps = min(self._idle_steps + 1, 12)
+                sleep_for = min(self._poll * (1.5 ** self._idle_steps), max(self._max_idle_sleep, self._poll))
             if self._offline:
                 sleep_for = self._offline_retry
             self._stop.wait(sleep_for)

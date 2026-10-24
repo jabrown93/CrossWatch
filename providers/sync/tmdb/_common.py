@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -12,12 +13,33 @@ from typing import Any, Mapping
 
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import canonical_key, ids_from, minimal as id_minimal
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 
 STATE_DIR = Path("/config/.cw_state")
-# STATE_DIR is created lazily on first write (see write_json / _migrate_legacy_json).
-# Don't mkdir at import time — it crashes when /config is absent or unwritable (e.g. CI),
-# and the other sync providers already defer directory creation the same way.
+# Fork: STATE_DIR is created lazily on first write; mkdir at import crashes when
+# /config is absent or unwritable (e.g. CI).
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -39,6 +61,8 @@ def _legacy_path(path: Path) -> Path | None:
 
 
 def _migrate_legacy_json(path: Path) -> None:
+    if str(_pair_scope() or "").startswith("cw2_"):
+        return
     if path.exists() or _pair_scope() is None:
         return
     legacy = _legacy_path(path)
@@ -102,6 +126,18 @@ def as_int(v: Any) -> int | None:
         return int(float(s)) if ("." in s or "e" in s.lower()) else int(s)
     except Exception:
         return None
+
+
+def half_point(v: Any) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        num = float(v)
+    except Exception:
+        return None
+    if not math.isfinite(num) or num <= 0:
+        return None
+    return max(0.5, min(10.0, math.floor(num * 2.0 + 0.5) / 2.0))
 
 
 def _norm_kind(t: Any) -> str:

@@ -10,10 +10,28 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .._log import log as cw_log
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 
 
 STATE_DIR = Path("/config/.cw_state")
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -31,7 +49,7 @@ def state_file(name: str) -> Path:
         legacy = STATE_DIR / name
 
     # Auto-migrate legacy state to scoped file
-    if (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
+    if not str(_pair_scope() or "").startswith("cw2_") and (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)

@@ -8,8 +8,10 @@ from collections.abc import Mapping, MutableMapping
 from typing import Any, cast
 from urllib.parse import urljoin
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
 from cw_platform.url_validation import guarded_request
+from cw_platform.value_coercion import coerce_bool
 
 try:
     from _logging import log as _real_log
@@ -27,7 +29,7 @@ def log(msg: str, level: str = "INFO", module: str = "AUTH", **_: Any) -> None:
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
 
-UA = "CrossWatch/1.0"
+UA = http_user_agent(override_env="CW_EMBY_UA")
 __VERSION__ = "2.0.0"
 HTTP_TIMEOUT_POST = 15
 HTTP_TIMEOUT_GET = 10
@@ -44,7 +46,7 @@ def _clean_base(url: str) -> str:
 def _mb_auth_value(token: str | None, device_id: str) -> str:
     base = (
         f'MediaBrowser Client="CrossWatch", Device="Web", '
-        f'DeviceId="{device_id}", Version="1.0"'
+        f'DeviceId="{device_id}", Version="{app_version()}"'
     )
     return f'{base}, Token="{token}"' if token else base
 
@@ -152,10 +154,11 @@ class EmbyAuth(AuthProvider):
         headers = _headers(token=None, device_id=dev_id)
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         payload = {"Username": user, "Pw": pw}
+        verify_ssl = coerce_bool(em.get("verify_ssl", False))
 
         log("Emby: authenticating...", level="INFO", module="AUTH")
         try:
-            r = guarded_request("POST", url, field_name="emby.server", data=payload, headers=headers, timeout=(5, 10))
+            r = guarded_request("POST", url, field_name="emby.server", data=payload, headers=headers, timeout=(5, 10), verify=verify_ssl)
         except ValueError as e:
             raise RuntimeError(f"Blocked: {e}")
         except rx.ConnectTimeout:
@@ -194,6 +197,7 @@ class EmbyAuth(AuthProvider):
                 field_name="emby.server",
                 headers=_headers(token, dev_id),
                 timeout=10,
+                verify=verify_ssl,
             )
             if me.ok:
                 info = me.json() or {}
@@ -333,11 +337,12 @@ def html() -> str:
           </div>
 
           <div class="cw-subpanel" data-sub="whitelist">
-            <div style="max-width:980px">
+            <div style="width:100%;max-width:none">
               <div id="emby_lib_matrix"></div>
               <select id="emby_lib_history" data-cfg-path="emby.history.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
               <select id="emby_lib_ratings" data-cfg-path="emby.ratings.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
               <select id="emby_lib_progress" data-cfg-path="emby.progress.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
+              <select id="emby_lib_collection" data-cfg-path="emby.collection.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
               <select id="emby_lib_scrobble" data-cfg-path="emby.scrobble.libraries" data-cfg-instance-root="emby" class="lm-hidden" multiple></select>
             </div>
           </div>

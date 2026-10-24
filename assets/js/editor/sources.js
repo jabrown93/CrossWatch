@@ -4,7 +4,7 @@
   const NS = (window.CW ||= {});
   const Editor = (NS.Editor ||= {});
 
-  const SOURCES = ["state", "manual", "playlist"];
+  const SOURCES = ["state", "playlist"];
 
   function stateOf(ctx) {
     return (ctx && ctx.state) || {};
@@ -16,22 +16,14 @@
     return s;
   }
 
-  function isTrackerSource(state) {
-    return false;
-  }
-
-  function isManualSource(state) {
-    return stateOf({ state }).source === "manual";
-  }
-
   function isProviderPickerSource(state) {
     const s = stateOf({ state });
-    return s.source === "state" || isManualSource(s);
+    return s.source === "state";
   }
 
   function isPolicySource(state) {
     const s = stateOf({ state });
-    return s.source === "state" || isManualSource(s);
+    return s.source === "state";
   }
 
   function hasPlaylistEndpoints(state) {
@@ -53,17 +45,7 @@
     } else if (playlistOpt) {
       playlistOpt.textContent = "Playlist Endpoint";
     }
-    const manual = sourceSel.querySelector('option[value="manual"]');
-    if (manual) {
-      manual.textContent = "Manual Overrides";
-    } else {
-      const opt = document.createElement("option");
-      opt.value = "manual";
-      opt.textContent = "Manual Overrides";
-      const currentPlaylistOpt = sourceSel.querySelector('option[value="playlist"]');
-      if (currentPlaylistOpt) sourceSel.insertBefore(opt, currentPlaylistOpt);
-      else sourceSel.appendChild(opt);
-    }
+    sourceSel.querySelector('option[value="manual"]')?.remove();
     if (showPlaylist && !sourceSel.querySelector('option[value="playlist"]')) {
       const opt = document.createElement("option");
       opt.value = "playlist";
@@ -123,6 +105,7 @@
     if (ctx.instanceLabel) ctx.instanceLabel.style.display = providerPicker ? "" : "none";
     if (ctx.instanceSel) ctx.instanceSel.style.display = providerPicker ? "" : "none";
     ctx.syncProfileIconSelect?.(ctx.instanceSel, providerPicker);
+    ctx.syncPlaylistEndpointIconSelect?.(snapSel, isPlaylist);
 
     if (isPlaylist) {
       const list = Array.isArray(state.playlistEndpoints) ? state.playlistEndpoints : [];
@@ -134,7 +117,7 @@
       const next = opts.includes(state.snapshot) ? state.snapshot : opts[0] || "";
       if (next !== state.snapshot) state.snapshot = next;
       snapSel.value = state.snapshot || "";
-      ctx.syncProviderIconSelect?.(snapSel, false);
+      ctx.syncPlaylistEndpointIconSelect?.(snapSel, true);
       syncSnapshotControlVisibility(ctx);
       return;
     }
@@ -142,7 +125,8 @@
     if (providerPicker) {
       const list = Array.isArray(state.snapshots) ? state.snapshots : [];
       const label = typeof ctx.providerLabel === "function" ? ctx.providerLabel : ((p, fallback) => fallback || p);
-      snapSel.innerHTML = list.map(p => `<option value="${p}">${label(p, p)}</option>`).join("");
+      const all = ctx.allProviders && list.length > 1 ? `<option value="${ctx.allProviders}">All providers</option>` : "";
+      snapSel.innerHTML = all + list.map(p => `<option value="${p}">${label(p, p)}</option>`).join("");
       const opts = Array.from(snapSel.options).map(o => o.value);
       const next = opts.includes(state.snapshot) ? state.snapshot : opts[0] || "";
       if (next !== state.snapshot) state.snapshot = next;
@@ -163,7 +147,6 @@
       ctx.sourceSel.querySelector('option[value="pair"]')?.remove();
       ensureSourceOptions(ctx.sourceSel, state);
     }
-    const isManual = isManualSource(state);
     const providerPicker = isProviderPickerSource(state);
     const isPlaylist = state.source === "playlist";
     const policy = isPolicySource(state);
@@ -182,9 +165,7 @@
 
     const sub = ctx.host?.querySelector(".cw-sub");
     if (sub) {
-      sub.textContent = isManual
-        ? "Edit the manual override policy applied during future syncs."
-        : "Edit your current state or playlist endpoints";
+      sub.textContent = "Fix, add or remove what CrossWatch syncs";
     }
 
     if (isPlaylist) {
@@ -220,19 +201,16 @@
       stateHint.style.display = "block";
       return;
     }
-    if (mode === "manual") {
-      stateHint.innerHTML =
-        "<strong>No manual overrides found.</strong> Add a row here or edit a baseline row in Current State to create an override.";
-      stateHint.style.display = "block";
-      return;
-    }
     stateHint.style.display = "none";
   }
 
   async function loadSnapshots(ctx = {}) {
     const state = stateOf(ctx);
     try {
-      const endpointData = await ctx.fetchJSON("/api/editor/playlists/endpoints").catch(() => null);
+      const [endpointData, providerData] = await Promise.all([
+        ctx.fetchJSON("/api/editor/playlists/endpoints").catch(() => null),
+        isProviderPickerSource(state) ? ctx.fetchJSON("/api/editor/state/providers") : Promise.resolve(null),
+      ]);
       state.playlistEndpoints = Array.isArray(endpointData && endpointData.endpoints) ? endpointData.endpoints : [];
       state.playlistEndpointsLoaded = true;
       if (state.source === "playlist" && !state.playlistEndpoints.length) {
@@ -250,12 +228,14 @@
         return;
       }
       if (isProviderPickerSource(state)) {
-        const data = await ctx.fetchJSON(`/api/editor/state/providers`);
+        const data = providerData || await ctx.fetchJSON(`/api/editor/state/providers`);
         state.snapshots = Array.isArray(data.providers) ? data.providers : [];
         rebuildSnapshots(ctx);
 
         const prov = state.snapshot || (ctx.snapSel ? (ctx.snapSel.value || "") : "");
-        if (prov) {
+        if (prov && prov === ctx.allProviders) {
+          if (prov !== state.snapshot) state.snapshot = prov;
+        } else if (prov) {
           const nextInst = await ctx.loadInstanceOptions?.(prov, ctx.instanceSel, state.instance);
           if (prov !== state.snapshot || nextInst !== state.instance) {
             state.snapshot = prov;
@@ -270,7 +250,7 @@
           }
         }
 
-        if (!state.snapshots.length) showStateHint(isManualSource(state) ? "manual" : "state", ctx);
+        if (!state.snapshots.length) showStateHint("state", ctx);
         else showStateHint(null, ctx);
         return;
       }
@@ -284,11 +264,8 @@
   Editor.Sources = {
     SOURCES,
     normalizeSource,
-    isTrackerSource,
-    isManualSource,
     isProviderPickerSource,
     isPolicySource,
-    ensureTrackerOption: ensureSourceOptions,
     ensureSourceOptions,
     currentPlaylistEndpoint,
     playlistEditable,

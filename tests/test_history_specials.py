@@ -8,7 +8,9 @@ import pytest
 
 from cw_platform.id_map import canonical_key, minimal
 from cw_platform.orchestrator import _applier, _unresolved
-from cw_platform.orchestrator._pairs_oneway import compute_effective_add
+from cw_platform.orchestrator._pairs_oneway import compute_effective_add, current_attempt_unresolved_keys
+from providers.sync.emby._common import normalize as emby_normalize
+from providers.sync.jellyfin._common import normalize as jellyfin_normalize
 from providers.sync.mdblist import _history as mdblist_history
 from providers.sync.mdblist._history import _bucketize, _items_for_not_found
 from providers.sync import _mod_MDBLIST as mdblist_mod
@@ -55,6 +57,55 @@ def test_special_episode_canonical_key_keeps_season_zero() -> None:
     item = {"type": "episode", "show_ids": {"tmdb": "63372"}, "season": 0, "episode": 1}
 
     assert canonical_key(item) == "tmdb:63372#s00e01"
+
+
+@pytest.mark.parametrize("normalize", [jellyfin_normalize, emby_normalize], ids=["jellyfin", "emby"])
+@pytest.mark.parametrize("field", ["ParentIndexNumber", "SeasonIndexNumber", "season", "season_number"])
+@pytest.mark.parametrize("season", [0, "0", 2])
+def test_media_server_episode_normalization_preserves_season(normalize, field, season) -> None:
+    row = {
+        "Type": "Episode",
+        "Name": "Episode",
+        "ParentIndexNumber": None,
+        "SeasonIndexNumber": None,
+        "season": None,
+        "season_number": None,
+        "IndexNumber": 6,
+        field: season,
+    }
+
+    parsed = normalize(row)
+    parsed["show_ids"] = {"tmdb": "958"}
+
+    assert parsed["season"] == int(season)
+    assert parsed["episode"] == 6
+    assert canonical_key(parsed) == f"tmdb:958#s{int(season):02d}e06"
+
+
+@pytest.mark.parametrize("normalize", [jellyfin_normalize, emby_normalize], ids=["jellyfin", "emby"])
+@pytest.mark.parametrize("fallback", [None, 2])
+def test_media_server_special_does_not_use_season_fallback(normalize, fallback) -> None:
+    row = {"Type": "Episode", "ParentIndexNumber": 0, "IndexNumber": 6}
+    if fallback is not None:
+        row.update(SeasonIndexNumber=fallback, season=fallback, season_number=fallback)
+
+    parsed = normalize(row)
+    parsed.update(show_ids={"tmdb": "958"}, watched_at=WATCHED_AT)
+    entry, reason = simkl_history._episode_add_entry(SimpleNamespace(config={}), parsed)
+
+    assert parsed["season"] == 0
+    assert reason is None
+    assert entry is not None
+    assert entry[1:3] == (0, 6)
+
+
+@pytest.mark.parametrize("normalize", [jellyfin_normalize, emby_normalize], ids=["jellyfin", "emby"])
+def test_media_server_missing_season_is_not_a_special(normalize) -> None:
+    parsed = normalize({"Type": "Episode", "IndexNumber": 6})
+    parsed.update(show_ids={"tmdb": "958"}, watched_at=WATCHED_AT)
+
+    assert "season" not in parsed
+    assert simkl_history._episode_add_entry(SimpleNamespace(config={}), parsed) == (None, "missing_season")
 
 
 def test_publicmetadb_special_episode_round_trip_shape() -> None:
@@ -306,10 +357,10 @@ def test_mdblist_rewatch_remove_without_play_id_does_not_unwatch_item(monkeypatc
 
 
 def test_mdblist_rewatch_index_incomplete_snapshot_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    pages: list[int] = []
+    pages: list[str | None] = []
 
     def fake_request(adapter, method, url, **kwargs):
-        pages.append(int(kwargs.get("params", {}).get("offset") or 0))
+        pages.append(kwargs.get("params", {}).get("cursor"))
         if len(pages) == 1:
             return _MDBListResponse(
                 payload={
@@ -319,7 +370,8 @@ def test_mdblist_rewatch_index_incomplete_snapshot_raises(monkeypatch: pytest.Mo
                             "watched_at": "2026-01-01T00:00:00Z",
                             "movie": {"title": "Heat", "year": 1995, "ids": {"tmdb": 949}},
                         }
-                    ]
+                    ],
+                    "pagination": {"next_cursor": "next-page"},
                 }
             )
         return _MDBListResponse(status_code=500, payload={"error": "boom"})
@@ -330,7 +382,7 @@ def test_mdblist_rewatch_index_incomplete_snapshot_raises(monkeypatch: pytest.Mo
     with pytest.raises(mdblist_history.MDBListFetchError):
         mdblist_history.build_index(_mdblist_adapter())
 
-    assert len(pages) == 2
+    assert pages == [None, "next-page"]
 
 
 def test_mdblist_rewatch_remove_show_falls_back_to_item_remove(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1379,6 +1431,47 @@ def test_applier_prefers_provider_unresolved_keys(monkeypatch) -> None:
     assert norm["skipped"] == 0
 
 
+def test_applier_dedupes_provider_unresolved_rows(monkeypatch) -> None:
+    stored: list[dict[str, object]] = []
+    emitted: list[dict[str, object]] = []
+
+    def record(_dst, _feature, items, **_kwargs):
+        stored.extend(dict(item) for item in items)
+        return {"ok": True}
+
+    def emit(event, **fields):
+        if event == "apply:unresolved":
+            emitted.append(dict(fields))
+
+    monkeypatch.setattr(_applier, "record_unresolved", record)
+    item = {
+        "type": "episode",
+        "series_title": "Pray, Obey, Kill",
+        "season": 1,
+        "episode": 5,
+        "show_ids": {"tmdb": "123"},
+        "ids": {"tmdb": "123"},
+        "watched_at": WATCHED_AT,
+    }
+    res = {
+        "ok": False,
+        "count": 0,
+        "unresolved": [
+            {"item": minimal(item), "hint": "provider_not_found:shows", "reason": "provider_not_found:shows"},
+            {"item": minimal(item), "hint": "provider_not_found:episodes", "reason": "provider_not_found:episodes"},
+        ],
+    }
+
+    norm = _applier._normalize(res, [item], "apply:add", dst="ANY", feature="history", emit=emit)
+
+    assert norm["unresolved"] == 1
+    assert norm["unresolved_keys"] == [canonical_key(item)]
+    assert len(stored) == 1
+    assert stored[0]["_cw_unresolved_hint"] == "provider_not_found:episodes"
+    assert emitted[0]["count"] == 1
+    assert emitted[0]["reason_counts"] == {"provider_not_found:episodes": 1}
+
+
 def test_applier_exact_skipped_adds_do_not_become_unresolved(monkeypatch) -> None:
     monkeypatch.setattr(_applier, "record_unresolved", lambda *a, **k: {"ok": True})
     items = [{"type": "movie", "ids": {"tmdb": str(i)}} for i in range(3)]
@@ -1420,6 +1513,35 @@ def test_exact_skipped_add_keys_count_as_success_without_added_count() -> None:
     assert decision["prov_confirmed"] == 0
     assert decision["success_keys"] == keys
     assert decision["failed_keys"] == []
+
+
+def test_retry_backlog_does_not_make_confirmed_adds_still_unresolved() -> None:
+    attempted = ["tmdb:240605#s03e28", "tmdb:197106#s02e04"]
+    unresolved_before = set(attempted)
+    unresolved_after = set(attempted)
+    provider_unresolved = {"tmdb:197106#s02e04"}
+
+    still_unresolved = current_attempt_unresolved_keys(
+        attempted,
+        unresolved_before,
+        unresolved_after,
+        provider_unresolved,
+    )
+    decision = compute_effective_add(
+        attempted_keys=attempted,
+        prov_confirmed=1,
+        confirmed_keys=["tmdb:240605#s03e28"],
+        still_unresolved=still_unresolved,
+        skipped_keys=set(),
+        have_exact_keys=True,
+        verify_after_write=False,
+        provider_skipped=False,
+    )
+
+    assert still_unresolved == {"tmdb:197106#s02e04"}
+    assert decision["effective"] == 1
+    assert decision["success_keys"] == ["tmdb:240605#s03e28"]
+    assert decision["failed_keys"] == ["tmdb:197106#s02e04"]
 
 
 def test_unresolved_reports_simkl_source_and_cache_gets_trakt_item(monkeypatch) -> None:

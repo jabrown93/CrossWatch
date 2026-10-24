@@ -7,7 +7,9 @@ import time
 import requests
 from typing import Any, Mapping, Callable
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
+from cw_platform.trakt_http import paced_request as trakt_paced_request
 
 try:
     from _logging import log as BASE_LOG
@@ -17,8 +19,9 @@ except Exception:
 from providers.scrobble.currently_watching import update_from_payload as _cw_update
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble.scrobble import mask_account as _mask_account
+from providers.scrobble._show_tmdb import show_tmdb_id
 from providers.scrobble.sources import source_enabled
-from providers.webhooks.config import configured_webhook_sinks, profile_scoped_webhook
+from providers.webhooks.config import configured_webhook_sinks, profile_scoped_webhook, webhook_sink_instance
 from providers.webhooks.dispatch import dispatch_scrobble as _dispatch_scrobble
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
@@ -89,7 +92,7 @@ def _jf_conn(cfg: dict[str, Any]) -> tuple[str, str, str, float, bool, str]:
 
 
 def _jf_headers(tok: str, did: str) -> dict[str, str]:
-    auth = f'MediaBrowser Client="CrossWatch", Device="CrossWatch", DeviceId="{did}", Version="1.0.0", Token="{tok}"'
+    auth = f'MediaBrowser Client="CrossWatch", Device="CrossWatch", DeviceId="{did}", Version="{app_version()}", Token="{tok}"'
     return {
         'Accept': 'application/json',
         'X-Emby-Token': tok,
@@ -343,7 +346,7 @@ def _tokens(cfg: dict[str, Any]) -> dict[str, str]:
 
 def _app_meta(cfg: dict[str, Any]) -> dict[str, str]:
     rt = (cfg.get("runtime") or {})
-    av = str(rt.get("version") or "CrossWatch/Scrobble")
+    av = app_version()
     ad = (rt.get("build_date") or "").strip()
     meta: dict[str, str] = {"app_version": av}
     if ad:
@@ -358,7 +361,7 @@ def _headers(cfg: dict[str, Any]) -> dict[str, str]:
         "Accept": "application/json",
         "trakt-api-version": "2",
         "trakt-api-key": t["client_id"],
-        "User-Agent": "CrossWatch/Scrobble",
+        "User-Agent": http_user_agent("Scrobble", override_env="CW_TRAKT_UA"),
     }
     if t["access_token"]:
         h["Authorization"] = f"Bearer {t['access_token']}"
@@ -367,7 +370,7 @@ def _headers(cfg: dict[str, Any]) -> dict[str, str]:
 
 def _del_trakt(path: str, cfg: dict[str, Any]) -> requests.Response:
     url = f"{TRAKT_API}{path}"
-    r = requests.delete(url, headers=_headers(cfg), timeout=12)
+    r = trakt_paced_request(requests.delete, "DELETE", url, headers=_headers(cfg), timeout=12)
     if r.status_code == 401:
         try:
             from providers.auth._auth_TRAKT import PROVIDER as TRAKT_AUTH
@@ -377,7 +380,7 @@ def _del_trakt(path: str, cfg: dict[str, Any]) -> requests.Response:
         except Exception:
             return r
         try:
-            r = requests.delete(url, headers=_headers(cfg), timeout=12)
+            r = trakt_paced_request(requests.delete, "DELETE", url, headers=_headers(cfg), timeout=12)
         except Exception:
             pass
     return r
@@ -385,7 +388,7 @@ def _del_trakt(path: str, cfg: dict[str, Any]) -> requests.Response:
 
 def _get_trakt_watching(cfg: dict[str, Any]) -> None:
     try:
-        r = requests.get(f"{TRAKT_API}/users/me/watching", headers=_headers(cfg), timeout=8)
+        r = trakt_paced_request(requests.get, "GET", f"{TRAKT_API}/users/me/watching", headers=_headers(cfg), timeout=8)
         try:
             body: Any = r.json()
         except Exception:
@@ -398,7 +401,7 @@ def _get_trakt_watching(cfg: dict[str, Any]) -> None:
 def _post_trakt(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> requests.Response:
     url = f"{TRAKT_API}{path}"
     body = {**body, **_app_meta(cfg)}
-    r = requests.post(url, json=body, headers=_headers(cfg), timeout=15)
+    r = trakt_paced_request(requests.post, "POST", url, json=body, headers=_headers(cfg), timeout=15)
 
     if r.status_code == 401:
         try:
@@ -408,7 +411,7 @@ def _post_trakt(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> request
             _save_config(cfg)
         except Exception:
             pass
-        r = requests.post(url, json=body, headers=_headers(cfg), timeout=15)
+        r = trakt_paced_request(requests.post, "POST", url, json=body, headers=_headers(cfg), timeout=15)
 
     if r.status_code in (429, 500, 502, 503, 504):
         try:
@@ -416,7 +419,7 @@ def _post_trakt(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> request
         except Exception:
             ra = 1.0
         time.sleep(min(max(ra, 0.5), 3.0))
-        r = requests.post(url, json=body, headers=_headers(cfg), timeout=15)
+        r = trakt_paced_request(requests.post, "POST", url, json=body, headers=_headers(cfg), timeout=15)
     return r
 
 
@@ -507,7 +510,7 @@ def _guid_search_episode(ids_hint: dict[str, Any], cfg: dict[str, Any], logger: 
         if not val:
             continue
         try:
-            r = requests.get(
+            r = trakt_paced_request(requests.get, "GET",
                 f"{TRAKT_API}/search/{key}/{val}",
                 params={"type": "episode", "limit": 1},
                 headers=_headers(cfg),
@@ -540,7 +543,7 @@ def _resolve_trakt_movie_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger
         if not val:
             continue
         try:
-            r = requests.get(
+            r = trakt_paced_request(requests.get, "GET",
                 f"{TRAKT_API}/search/{k}/{val}",
                 params={"type": "movie", "limit": 1},
                 headers=_headers(cfg),
@@ -571,7 +574,7 @@ def _resolve_trakt_show_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger:
         if not val:
             continue
         try:
-            r = requests.get(
+            r = trakt_paced_request(requests.get, "GET",
                 f"{TRAKT_API}/search/{k}/{val}",
                 params={"type": "show", "limit": 1},
                 headers=_headers(cfg),
@@ -590,44 +593,6 @@ def _resolve_trakt_show_id(ids_all: dict[str, Any], cfg: dict[str, Any], logger:
             _emit(logger, f"trakt show id resolve error: {e}", "DEBUG")
     _cache_put(key, None)
     return None
-
-
-def _trakt_show_ids_from_imdb_show(imdb_show: str, cfg: dict[str, Any], logger: Callable[..., None] | Any | None = None) -> dict[str, Any]:
-    imdb_show = str(imdb_show or "").strip()
-    if not imdb_show:
-        return {}
-
-    key = ("show_ids_imdb", imdb_show)
-    c = _cache_get(key)
-    if isinstance(c, dict):
-        return c
-    if c is not None:
-        return {}
-
-    try:
-        r = requests.get(
-            f"{TRAKT_API}/search/imdb/{imdb_show}",
-            params={"type": "show", "limit": 1},
-            headers=_headers(cfg),
-            timeout=10,
-        )
-        if r.status_code != 200:
-            _cache_put(key, None)
-            return {}
-        arr = r.json() or []
-        if not arr:
-            _cache_put(key, None)
-            return {}
-        ids = (((arr[0] or {}).get("show") or {}).get("ids") or {})
-        out = {k: ids[k] for k in ("trakt", "tmdb", "imdb", "tvdb") if ids.get(k)}
-        _cache_put(key, out if out else None)
-        if out:
-            _emit(logger, f"trakt show ids from imdb_show {imdb_show}: {out}", "DEBUG")
-        return out
-    except Exception as e:
-        _emit(logger, f"trakt show ids from imdb_show {imdb_show} error: {e}", "DEBUG")
-        _cache_put(key, None)
-        return {}
 
 
 def _resolve_trakt_episode_id(
@@ -653,7 +618,7 @@ def _resolve_trakt_episode_id(
     show_tid = _resolve_trakt_show_id(ids_all, cfg, logger=logger)
     if show_tid and isinstance(s, int) and isinstance(e, int):
         try:
-            r = requests.get(
+            r = trakt_paced_request(requests.get, "GET",
                 f"{TRAKT_API}/shows/{show_tid}/seasons/{s}/episodes/{e}",
                 headers=_headers(cfg),
                 timeout=10,
@@ -725,7 +690,7 @@ def _show_ids_from_episode_hint(
         if not val:
             continue
         try:
-            r = requests.get(
+            r = trakt_paced_request(requests.get, "GET",
                 f"{TRAKT_API}/search/{key}/{val}",
                 params={"type": "episode", "limit": 1},
                 headers=_headers(cfg),
@@ -779,18 +744,10 @@ def _cw_ids_for_payload(
             hint = {**(_ids_from_providerids(md, root) or {}), **(ids_all or {})}
         except Exception:
             hint = dict(ids_all or {})
-        extra = _show_ids_from_episode_hint(hint, cfg, logger=logger) or {}
-        for key in ("tmdb", "imdb", "tvdb"):
-            val = extra.get(key)
-            if val is not None:
-                cw_ids.setdefault(f"{key}_show", val)
-
-    if "tmdb_show" not in cw_ids and cw_ids.get("imdb_show"):
-        extra2 = _trakt_show_ids_from_imdb_show(str(cw_ids["imdb_show"]), cfg, logger=logger)
-        for key in ("tmdb", "imdb", "tvdb"):
-            val = extra2.get(key)
-            if val is not None:
-                cw_ids.setdefault(f"{key}_show", val)
+        known = {key: cw_ids.get(f"{key}_show") for key in ("imdb", "tvdb")}
+        tmdb_show = show_tmdb_id(cfg, known, hint)
+        if tmdb_show:
+            cw_ids["tmdb_show"] = tmdb_show
 
     return cw_ids
 
@@ -809,7 +766,7 @@ def _resolve_episode_by_showids(
         if not sid:
             continue
         try:
-            r = requests.get(
+            r = trakt_paced_request(requests.get, "GET",
                 f"{TRAKT_API}/shows/{sid}/seasons/{season}/episodes/{number}",
                 headers=_headers(cfg),
                 timeout=10,
@@ -869,7 +826,7 @@ def _build_primary_body(
         try:
             title = (md.get("SeriesName") or (root or {}).get("SeriesName") or (root or {}).get("SeriesTitle") or "").strip()
             if title:
-                r = requests.get(
+                r = trakt_paced_request(requests.get, "GET",
                     f"{TRAKT_API}/search/show",
                     params={"query": title, "limit": 1},
                     headers=_headers(cfg),
@@ -1012,7 +969,29 @@ def _make_session_id(payload: Mapping[str, Any], md: Mapping[str, Any], ids_all:
     return base + "|" + _session_media_key(md, ids_all, root=payload)
 
 
-def _archive(event_type: str, media_type: str, md: dict[str, Any], payload: dict[str, Any], ids: dict[str, Any], account: Any, prog: Any, reason: str | None = None) -> None:
+def _completion_session_token(payload: Mapping[str, Any]) -> str:
+    for key in ("PlaySessionId", "SessionId"):
+        val = str(payload.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _completion_replay_key(
+    provider_instance: str,
+    account: Any,
+    session_token: str,
+    media_key: str,
+) -> str:
+    session_token = str(session_token or "").strip()
+    media_key = str(media_key or "").strip()
+    if not (session_token and media_key):
+        return ""
+    acc_key = str(account or "").strip().lower() or "unknown"
+    return f"jellyfin:{provider_instance}|u:{acc_key}|s:{session_token}|m:{media_key}"
+
+
+def _archive(event_type: str, media_type: str, md: dict[str, Any], payload: dict[str, Any], ids: dict[str, Any], account: Any, prog: Any, reason: str | None = None, **kw: Any) -> None:
     try:
         from cw_platform.event_archive import record_webhook
 
@@ -1024,10 +1003,45 @@ def _archive(event_type: str, media_type: str, md: dict[str, Any], payload: dict
         record_webhook(
             event_type=event_type, source_provider="jellyfin", destination_provider="trakt",
             media_type=media_type, ids=ids, account=account, progress=prog, reason=reason,
-            title=title, year=md.get("ProductionYear"), season=season, episode=episode,
+            title=title, year=md.get("ProductionYear"), season=season, episode=episode, **kw,
         )
     except Exception:
         pass
+
+
+def _archive_scrobble_result(
+    intended: str,
+    status: int,
+    activity_recorded: bool,
+    sinks: set[str],
+    watched_at: float,
+    args: tuple[Any, ...],
+    *,
+    session_key: str,
+    provider_instance: str | None,
+    settings: dict[str, Any],
+) -> None:
+    if "trakt" not in sinks:
+        return
+    reason = None
+    if status >= 400:
+        if intended not in ("/scrobble/start", "/scrobble/stop"):
+            return
+        event_type = "scrobble_failed"
+        reason = str(status)
+    elif not activity_recorded:
+        return
+    elif intended == "/scrobble/start":
+        event_type = "scrobble_started"
+    elif intended == "/scrobble/stop" and args[-1] >= watched_at:
+        event_type = "scrobble_completed"
+    else:
+        return
+    _archive(
+        event_type, *args, reason=reason, session_key=session_key,
+        source_instance=provider_instance or "default",
+        destination_instance=webhook_sink_instance(settings, "trakt"),
+    )
 
 
 def process_webhook(
@@ -1145,6 +1159,12 @@ def process_webhook(
         st = _SCROBBLE_STATE.get(sess) or {}
         first_seen = float(st.get("first_seen") or now)
         st = {**st, "first_seen": first_seen}
+        completion_key = _completion_replay_key(
+            provider_instance,
+            acc_title,
+            _completion_session_token(payload),
+            item_key,
+        )
 
         ev_lc = (event or "").lower()
         paused_flag = _extract_paused(payload)
@@ -1153,6 +1173,7 @@ def process_webhook(
         if (
             st.get("last_event") == ev_lc
             and (now - float(st.get("ts", 0))) < 1.0
+            and not st.get("retry_completion")
             and not (paused_flag is not None and paused_flag != st.get("paused"))
         ):
             return {"ok": True, "dedup": True}
@@ -1368,7 +1389,7 @@ def process_webhook(
 
         if intended == "/scrobble/stop" and prog >= complete_at:
             fin = _LAST_FINISH_BY_ACC.get(acc_key) or {}
-            if fin.get("ik") == item_key and (now - float(fin.get("ts") or 0)) <= _DUP_FINISH_WINDOW_S:
+            if fin.get("ik") == item_key and fin.get("sess") == sess and (now - float(fin.get("ts") or 0)) <= _DUP_FINISH_WINDOW_S:
                 _emit(logger, "suppress duplicate finish (stop<->scrobble)", "DEBUG")
                 _SCROBBLE_STATE[sess] = {
                     **st,
@@ -1383,6 +1404,28 @@ def process_webhook(
                     "last_stop_ts": now,
                 }
                 return {"ok": True, "suppressed": True}
+        if (
+            intended == "/scrobble/stop"
+            and prog >= watched_at
+            and completion_key
+            and st.get("completion_key") == completion_key
+            and st.get("completion_done") is True
+        ):
+            _emit(logger, "suppress duplicate completion replay", "DEBUG")
+            _SCROBBLE_STATE[sess] = {
+                **st,
+                "ts": now,
+                "last_event": ev_lc,
+                "last_pause_ts": st.get("last_pause_ts", 0),
+                "prog": prog,
+                "sk": sk_current,
+                "finished": True,
+                **({"wl_removed": st.get("wl_removed")} if st.get("wl_removed") else {}),
+                "paused": False,
+                "last_stop_ts": now,
+                "retry_completion": False,
+            }
+            return {"ok": True, "suppressed": True, "dedup": True}
         if (
             ev_lc in ("playbackstop", "playbackstopped")
             and st.get("last_event") in ("playbackstop", "playbackstopped")
@@ -1496,11 +1539,18 @@ def process_webhook(
             f"webhook {intended} -> {r.status_code}",
             "DEBUG",
         )
+        activity_recorded = bool(rj.get("activity_recorded")) if isinstance(rj, dict) else False
+        _archive_scrobble_result(
+            intended, r.status_code, activity_recorded, sinks_cfg, watched_at,
+            (media_type, md, payload, cw_ids or ids_all, acc_title, prog),
+            session_key=sess, provider_instance=provider_instance, settings=wh,
+        )
 
         if r.status_code < 400:
-            if intended == "/scrobble/stop" and prog >= watched_at:
-                _LAST_FINISH_BY_ACC[acc_key] = {"ik": item_key, "ts": now}
-            if intended == "/scrobble/stop" and prog >= watched_at and not (st.get("wl_removed") is True):
+            completed_success = activity_recorded and intended == "/scrobble/stop" and prog >= watched_at
+            if activity_recorded and intended == "/scrobble/stop" and prog >= watched_at:
+                _LAST_FINISH_BY_ACC[acc_key] = {"ik": item_key, "sess": sess, "ts": now}
+            if activity_recorded and intended == "/scrobble/stop" and prog >= watched_at and not (st.get("wl_removed") is True):
                 try:
                     _call_remove_across(ids_all or {}, media_type, origin=f"jellyfin:{provider_instance}")
                     st = {**st, "wl_removed": True}
@@ -1512,10 +1562,13 @@ def process_webhook(
                 "last_pause_ts": (now if intended == "pause" else st.get("last_pause_ts", 0)),
                 "prog": prog,
                 "sk": sk_current,
-                "finished": (intended == "/scrobble/stop" and prog >= watched_at),
+                "finished": (activity_recorded and intended == "/scrobble/stop" and prog >= watched_at),
                 **({"wl_removed": st.get("wl_removed")} if st.get("wl_removed") else {}),
                 "paused": (intended == "pause"),
                 **({"last_stop_ts": now} if intended == "/scrobble/stop" else {}),
+                "completion_key": completion_key if completed_success and completion_key else "",
+                "completion_done": bool(completed_success and completion_key),
+                "retry_completion": False,
             }
 
             try:
@@ -1527,15 +1580,9 @@ def process_webhook(
             except Exception:
                 pass
 
-            if "trakt" in sinks_cfg and intended == "/scrobble/start":
-                _archive("scrobble_started", media_type, md, payload, ids_all, acc_title, prog)
-            elif "trakt" in sinks_cfg and intended == "/scrobble/stop" and prog >= watched_at:
-                _archive("scrobble_completed", media_type, md, payload, ids_all, acc_title, prog)
-            return {"ok": True, "status": 200, "action": intended, "trakt": rj}
+            return {"ok": True, "status": 200, "action": intended, "trakt": rj, "ignored": not activity_recorded}
 
         _emit(logger, f"{intended} {r.status_code} {(str(rj)[:180])}", "ERROR")
-        if "trakt" in sinks_cfg and intended in ("/scrobble/start", "/scrobble/stop"):
-            _archive("scrobble_failed", media_type, md, payload, ids_all, acc_title, prog, reason=str(r.status_code))
         _SCROBBLE_STATE[sess] = {**st,            "ts": now,
             "last_event": ev_lc,
             "last_pause_ts": st.get("last_pause_ts", 0),
@@ -1544,6 +1591,7 @@ def process_webhook(
             "finished": (prog >= complete_at),
             **({"wl_removed": st.get("wl_removed")} if st.get("wl_removed") else {}),
             "paused": st.get("paused") if paused_flag is None else paused_flag,
+            "retry_completion": bool(intended == "/scrobble/stop" and prog >= watched_at),
         }
         return {"ok": False, "status": r.status_code, "trakt": rj}
     except Exception as e:

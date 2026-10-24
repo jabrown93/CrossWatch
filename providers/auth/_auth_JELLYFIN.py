@@ -491,11 +491,12 @@ def html() -> str:
           </div>
 
           <div class="cw-subpanel" data-sub="whitelist">
-            <div style="max-width:980px">
+            <div style="width:100%;max-width:none">
               <div id="jfy_lib_matrix"></div>
               <select id="jfy_lib_history" data-cfg-path="jellyfin.history.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_history" class="lm-hidden" multiple></select>
               <select id="jfy_lib_ratings" data-cfg-path="jellyfin.ratings.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_ratings" class="lm-hidden" multiple></select>
               <select id="jfy_lib_progress" data-cfg-path="jellyfin.progress.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_progress" class="lm-hidden" multiple></select>
+              <select id="jfy_lib_collection" data-cfg-path="jellyfin.collection.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_collection" class="lm-hidden" multiple></select>
               <select id="jfy_lib_scrobble" data-cfg-path="jellyfin.scrobble.libraries" data-cfg-instance-root="jellyfin" name="jfy_lib_scrobble" class="lm-hidden" multiple></select>
             </div>
           </div>

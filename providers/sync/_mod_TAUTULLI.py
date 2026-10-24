@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.app_version import user_agent as http_user_agent
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -17,10 +18,19 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.0"
-os.environ.setdefault("CW_TAUTULLI_VERSION", __VERSION__)
-os.environ.setdefault("CW_TAUTULLI_UA", f"CrossWatch/{__VERSION__} (Tautulli)")
+__VERSION__ = "1.1"
+os.environ.setdefault("CW_TAUTULLI_UA", http_user_agent("Tautulli", override_env="CW_TAUTULLI_UA"))
 __all__ = ["get_manifest", "OPS"]
+
+_HISTORY_CAPABILITIES: dict[str, Any] = {
+    "read": True,
+    "write": False,
+    "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+    "index_semantics": "event",
+    "observed_deletes": False,
+    "event_history": True,
+    "rewatches": {"read": True, "write": False, "account_gate": False},
+}
 
 def _health(status: str, ok: bool, latency_ms: int) -> None:
     cw_log("TAUTULLI", "health", "info", "health", latency_ms=latency_ms, ok=ok, status=status)
@@ -63,6 +73,7 @@ def get_manifest() -> Mapping[str, Any]:
             "can_source": True,
             "can_target": False,
             "read_only": True,
+            "history": _HISTORY_CAPABILITIES,
         },
         "description": "Plex monitoring (history only).",
     }
@@ -110,7 +121,7 @@ class TAUTULLIClient:
         self.raw_cfg = raw_cfg
         self.session = build_session("TAUTULLI", ctx, feature_label=_label)
         try:
-            self.session.headers.setdefault("User-Agent", os.environ.get("CW_TAUTULLI_UA") or f"CrossWatch/{__VERSION__} (Tautulli)")
+            self.session.headers["User-Agent"] = os.environ.get("CW_TAUTULLI_UA") or http_user_agent("Tautulli", override_env="CW_TAUTULLI_UA")
             self.session.headers.setdefault("Accept", "application/json")
         except Exception:
             pass
@@ -238,6 +249,7 @@ class _TAUTULLIOPS:
             "can_source": True,
             "can_target": False,
             "read_only": True,
+            "history": _HISTORY_CAPABILITIES,
         }
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:

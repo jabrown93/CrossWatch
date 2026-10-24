@@ -206,7 +206,7 @@ def test_apply_remove_provider_down_skips_and_records_unresolved(monkeypatch):
     recorded: list[tuple[str, str, list, str]] = []
     monkeypatch.setattr(
         twoway, "record_unresolved",
-        lambda provider, feature, items, hint=None: recorded.append((provider, feature, list(items), hint)),
+        lambda provider, feature, items, hint=None, **_kw: recorded.append((provider, feature, list(items), hint)),
     )
     result, aops, bops, ctx = _run_two_way(
         monkeypatch,
@@ -271,7 +271,7 @@ def test_apply_update_provider_down_skips_and_records_unresolved(monkeypatch):
     recorded: list[tuple[str, str, list, str]] = []
     monkeypatch.setattr(
         twoway, "record_unresolved",
-        lambda provider, feature, items, hint=None: recorded.append((provider, feature, list(items), hint)),
+        lambda provider, feature, items, hint=None, **_kw: recorded.append((provider, feature, list(items), hint)),
     )
     result, aops, bops, ctx = _run_two_way(
         monkeypatch, feature="ratings", a_snap=a_snap, b_snap=b_snap,
@@ -334,7 +334,7 @@ def test_apply_add_verify_after_write_filters_keys_still_unresolved(monkeypatch)
     monkeypatch.setattr(twoway, "_apply_verify_after_write_supported", lambda _ops: True)
     calls = {"n": 0}
 
-    def _load_unresolved(provider, feature, cross_features=False):
+    def _load_unresolved(provider, feature, cross_features=False, **_kw):
         # 1st call = unresolved_before (empty); 2nd call = unresolved_after (empty);
         # 3rd call = the verify-after-write re-check, which reports it unresolved.
         calls["n"] += 1
@@ -355,7 +355,7 @@ def test_apply_add_provider_down_skips_and_records_unresolved(monkeypatch):
     recorded: list[tuple[str, str, list, str]] = []
     monkeypatch.setattr(
         twoway, "record_unresolved",
-        lambda provider, feature, items, hint=None: recorded.append((provider, feature, list(items), hint)),
+        lambda provider, feature, items, hint=None, **_kw: recorded.append((provider, feature, list(items), hint)),
     )
     result, aops, bops, ctx = _run_two_way(
         monkeypatch, feature="history", a_snap={"tmdb:900": NEW_ITEM}, b_snap={},

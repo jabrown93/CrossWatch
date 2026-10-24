@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -14,7 +15,7 @@ from typing import Any
 
 from cw_platform.config_base import load_config, save_config
 from cw_platform.id_map import canonical_key, ids_from, keys_for_item, minimal as id_minimal
-from cw_platform.provider_instances import ensure_instance_block, get_provider_block, normalize_instance_id
+from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
 from providers.auth._auth_KODI import KodiAuthError, jsonrpc_batch_call, jsonrpc_call, verify_connection
 from providers.sync._log import log as cw_log
 
@@ -23,11 +24,17 @@ EPISODE_BASE_PROPERTIES = ["uniqueid", "title", "showtitle", "season", "episode"
 MOVIE_PROPERTIES = [*MOVIE_BASE_PROPERTIES, "playcount", "lastplayed", "userrating", "resume"]
 EPISODE_PROPERTIES = [*EPISODE_BASE_PROPERTIES, "playcount", "lastplayed", "userrating", "resume"]
 SHOW_PROPERTIES = ["uniqueid", "title", "year"]
-WHITELIST_FEATURES = ("history", "ratings", "progress", "scrobble")
+WHITELIST_FEATURES = ("history", "ratings", "progress", "collection", "scrobble")
 
 
 def properties_for_feature(feature: str) -> tuple[list[str], list[str], list[str]]:
     name = str(feature or "").strip().lower()
+    if name == "collection":
+        return (
+            [*MOVIE_BASE_PROPERTIES, "dateadded"],
+            [*EPISODE_BASE_PROPERTIES, "dateadded"],
+            list(SHOW_PROPERTIES),
+        )
     if name == "history":
         return (
             [*MOVIE_BASE_PROPERTIES, "playcount", "lastplayed"],
@@ -63,7 +70,10 @@ def log(feature: str, level: str, event: str, **fields: Any) -> None:
     cw_log("KODI", feature, level, event, **fields)
 
 
-def pick_instance_id() -> str:
+def pick_instance_id(cfg: Mapping[str, Any] | None = None) -> str:
+    explicit_instance = (cfg or {}).get("_cw_provider_instance")
+    if explicit_instance is not None:
+        return normalize_instance_id(explicit_instance)
     for key in ("CW_SNAPSHOT_INSTANCE", "CW_INSTANCE_ID", "CW_PROVIDER_INSTANCE", "CW_INSTANCE"):
         value = str(os.getenv(key) or "").strip()
         if value:
@@ -77,7 +87,7 @@ def pick_instance_id() -> str:
 
 
 def configured_block(cfg: Mapping[str, Any] | None, instance_id: Any = "default") -> dict[str, Any]:
-    return get_provider_block(dict(cfg or {}), "kodi", normalize_instance_id(instance_id))
+    return resolve_provider_block(dict(cfg or {}), "kodi", normalize_instance_id(instance_id))
 
 
 def is_configured(cfg: Mapping[str, Any] | None, instance_id: Any = "default") -> bool:
@@ -221,20 +231,57 @@ def to_float(value: Any) -> float | None:
         return None
 
 
+EXTERNAL_ID_KEYS: tuple[str, ...] = ("tmdb", "imdb", "tvdb", "anidb", "anilist", "mal", "kitsu")
+
+UNIQUEID_NAMESPACES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("anidb", ("anidb",)),
+    ("anilist", ("anilist",)),
+    ("kitsu", ("kitsu",)),
+    ("mal", ("myanimelist", "mal")),
+    ("imdb", ("imdb",)),
+    ("tmdb", ("tmdb", "themoviedb")),
+    ("tvdb", ("tvdb", "thetvdb")),
+)
+
+
+def uniqueid_name(key: Any) -> str:
+    return "".join(ch for ch in str(key or "").strip().lower() if ch.isalnum())
+
+
+def uniqueid_namespace(name: str, text: str) -> str | None:
+    if text.lower().startswith("tt"):
+        return "imdb"
+    for namespace, needles in UNIQUEID_NAMESPACES:
+        if any(needle in name for needle in needles):
+            return namespace
+    return None
+
+
+PLACEHOLDER_IDS: frozenset[str] = frozenset({"none", "null", "nan", "unknown", "0", "-1"})
+
+_PATH_USERINFO = re.compile(r"^([a-z][a-z0-9+.\-]*://)[^/]*@", re.IGNORECASE)
+
+
+def is_placeholder_id(value: Any) -> bool:
+    text = str(value if value is not None else "").strip().lower()
+    return not text or text in PLACEHOLDER_IDS
+
+
+def strip_path_userinfo(path: Any) -> str:
+    text = str(path or "")
+    return _PATH_USERINFO.sub(r"\1", text, count=1)
+
+
 def normalize_uniqueids(uniqueid: Any) -> dict[str, str]:
     raw = uniqueid if isinstance(uniqueid, Mapping) else {}
     out: dict[str, str] = {}
     for key, value in raw.items():
         text = str(value or "").strip()
-        if not text:
+        if is_placeholder_id(text):
             continue
-        name = "".join(ch for ch in str(key or "").strip().lower() if ch.isalnum())
-        if "imdb" in name or text.lower().startswith("tt"):
-            out.setdefault("imdb", text)
-        elif "tmdb" in name or "themoviedb" in name:
-            out.setdefault("tmdb", text)
-        elif "tvdb" in name or "thetvdb" in name:
-            out.setdefault("tvdb", text)
+        namespace = uniqueid_namespace(uniqueid_name(key), text)
+        if namespace:
+            out.setdefault(namespace, text)
     return out
 
 
@@ -254,12 +301,25 @@ def resume_ms(row: Mapping[str, Any]) -> tuple[int | None, int | None, float | N
     return pos_ms, total_ms, pct
 
 
+def kodi_datetime_to_iso(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.startswith("0000-00-00"):
+        return None
+    try:
+        return _local_datetime(text).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return text if "T" in text else None
+
+
 def movie_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
     kid = kodi_item_id(row, "movie")
     if kid is None:
         return None
     ids = normalize_uniqueids(row.get("uniqueid"))
     item: dict[str, Any] = {"type": "movie", "ids": ids, "title": row.get("title"), "year": to_int(row.get("year")), "_kodi_id": kid, "_kodi_type": "movie"}
+    collected_at = kodi_datetime_to_iso(row.get("dateadded"))
+    if collected_at:
+        item["collected_at"] = collected_at
     item["_kodi_keys"] = sorted(keys_for_item(item))
     return item
 
@@ -283,6 +343,9 @@ def episode_item(row: Mapping[str, Any], show_ids_by_id: Mapping[int, Mapping[st
         "_kodi_id": kid,
         "_kodi_type": "episode",
     }
+    collected_at = kodi_datetime_to_iso(row.get("dateadded"))
+    if collected_at:
+        item["collected_at"] = collected_at
     item["_kodi_keys"] = sorted(keys_for_item(item))
     return item
 
@@ -298,7 +361,7 @@ def _has_external_identifiers(item: Mapping[str, Any]) -> bool:
     if isinstance(show_ids, Mapping):
         sources.append(show_ids)
     for src in sources:
-        if any(str(src.get(k) or "").strip() for k in ("tmdb", "imdb", "tvdb")):
+        if any(str(src.get(k) or "").strip() for k in EXTERNAL_ID_KEYS):
             return True
     return False
 
@@ -436,7 +499,9 @@ def _load_kodi_feature_baseline(adapter: Any, feature: str) -> Mapping[str, Mapp
         from cw_platform.config_base import CONFIG_BASE
         from cw_platform.orchestrator._state_store import StateStore
 
-        state = StateStore(Path(CONFIG_BASE())).load_state()
+        config = getattr(adapter, "config", None) or {}
+        scope = config.get("_cw_pair_scope") if isinstance(config, Mapping) else None
+        state = StateStore(Path(CONFIG_BASE()), pair_scope=scope).load_state_features({name})
         providers = state.get("providers") if isinstance(state, Mapping) else None
         providers = providers if isinstance(providers, Mapping) else {}
         kodi = providers.get("KODI") or providers.get("kodi")
@@ -449,7 +514,8 @@ def _load_kodi_feature_baseline(adapter: Any, feature: str) -> Mapping[str, Mapp
             inst_node = instances.get(instance_id) or instances.get(str(instance_id))
             if isinstance(inst_node, Mapping):
                 nodes.append(inst_node)
-        nodes.append(kodi)
+        if instance_id == "default":
+            nodes.append(kodi)
         for node in nodes:
             block = node.get(name)
             block = block if isinstance(block, Mapping) else {}
@@ -729,11 +795,13 @@ def library_index(adapter: Any, feature: str = "") -> LibraryIndex:
 
 
 def feature_index(adapter: Any, feature: str) -> dict[str, dict[str, Any]]:
+    from providers.sync._mod_common import observation_time
+
     idx = library_index(adapter, feature)
     out: dict[str, dict[str, Any]] = {}
     prior_ratings = _load_kodi_ratings_baseline(adapter) if feature == "ratings" else {}
     prior_progress = _load_kodi_progress_baseline(adapter) if feature == "progress" else {}
-    now_iso = _utc_now_iso() if feature in {"ratings", "progress"} else ""
+    now_iso = observation_time(adapter, _utc_now_iso) if feature in {"ratings", "progress"} else ""
     for base in idx.items:
         item = dict(base)
         raw_obj = item.get("_kodi_raw")
