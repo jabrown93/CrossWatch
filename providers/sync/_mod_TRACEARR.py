@@ -11,6 +11,8 @@ import os
 import threading
 import time
 
+from cw_platform.url_validation import assert_server_url_safe
+
 from ._log import log as cw_log
 from ._mod_common import SimpleRateLimiter, build_session, request_with_retries, safe_json
 
@@ -139,16 +141,24 @@ class TRACEARRClient:
 
     def get(self, path: str, **params: Any) -> Any:
         q = {k: v for k, v in (params or {}).items() if v is not None}
+        url = self._url(path)
+        # Fork: requests follows redirects without re-checking the target, so the configured
+        # server could bounce this credentialed request to a metadata or link-local address.
+        assert_server_url_safe(url, "tracearr.server_url")
         _LIMITER.wait("TRACEARR")
         r = request_with_retries(
             self.session,
             "GET",
-            self._url(path),
+            url,
             params=q,
             timeout=self.cfg.timeout,
             max_retries=self.cfg.max_retries,
             verify=self.cfg.verify_ssl,
+            allow_redirects=False,
         )
+        if getattr(r, "is_redirect", False):
+            _warn("http_failed", op=path, status=r.status_code, reason="redirect_refused")
+            raise RuntimeError(f"HTTP {r.status_code}: redirect refused")
         if r.status_code in (401, 403):
             _warn("http_failed", op=path, status=r.status_code, reason="invalid_api_key")
             raise RuntimeError("invalid_api_key")
