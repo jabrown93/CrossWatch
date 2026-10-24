@@ -17,6 +17,7 @@ import requests
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
 from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
+from cw_platform.url_validation import assert_server_url_safe, guarded_request
 from cw_platform.provider_instances import ensure_instance_block, get_provider_block, normalize_instance_id
 
 try:
@@ -191,6 +192,11 @@ def _discovered_backend_url(value: Any) -> str:
     parts = urlsplit(raw)
     if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
         raise NuvioDiscoveryError("missing_configuration")
+    # The remote document picks where OAuth credentials go next.
+    try:
+        assert_server_url_safe(raw, "nuvio.backend_url")
+    except ValueError as exc:
+        raise NuvioDiscoveryError("invalid_url") from exc
     return raw.rstrip("/")
 
 
@@ -225,9 +231,16 @@ def discover_server(value: Any, *, session: requests.Session | None = None, time
     url = discovery_url(value)
     if _same_host(url, API_BASE):
         raise NuvioDiscoveryError("official_server")
-    sess = session or requests.Session()
+    headers = {"Accept": "application/json", "User-Agent": UA}
     try:
-        resp = sess.get(url, headers={"Accept": "application/json", "User-Agent": UA}, timeout=timeout, stream=True)
+        assert_server_url_safe(url, "nuvio.base_url")
+        if session is None:
+            # Re-validates every redirect hop; the URL is admin-supplied.
+            resp = guarded_request("GET", url, field_name="nuvio.base_url", headers=headers, timeout=timeout, stream=True)
+        else:
+            resp = session.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=False)
+    except ValueError as exc:
+        raise NuvioDiscoveryError("invalid_url") from exc
     except requests.RequestException as exc:
         raise NuvioDiscoveryError("connection_failed") from exc
     try:

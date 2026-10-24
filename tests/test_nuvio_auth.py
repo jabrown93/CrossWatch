@@ -531,3 +531,28 @@ def test_config_normalization_keeps_publishable_key_only_for_self_hosted() -> No
     assert kid["server_mode"] == "self_hosted"
     assert kid["base_url"] == "https://nuvio.example.com"
     assert kid["publishable_key"] == "k"
+
+
+def test_discovery_refuses_metadata_destinations() -> None:
+    import responses
+
+    from providers.auth import _auth_NUVIO as common
+
+    direct = DiscoverySession(DiscoveryResponse(_discovery_doc()))
+    with pytest.raises(common.NuvioDiscoveryError, match="invalid_url"):
+        common.discover_server("http://169.254.169.254", session=direct)
+    assert direct.get_calls == []
+
+    with pytest.raises(common.NuvioDiscoveryError, match="invalid_url"):
+        common.parse_discovery(_discovery_doc(backend_url="http://169.254.169.254"))
+
+    with responses.RequestsMock() as mock:
+        mock.add(
+            responses.GET,
+            "http://192.168.1.10:8080/.well-known/nuvio",
+            status=302,
+            headers={"Location": "http://169.254.169.254/latest/meta-data/"},
+        )
+        with pytest.raises(common.NuvioDiscoveryError, match="invalid_url"):
+            common.discover_server("http://192.168.1.10:8080", timeout=1)
+        assert len(mock.calls) == 1
