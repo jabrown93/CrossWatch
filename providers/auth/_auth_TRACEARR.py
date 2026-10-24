@@ -12,6 +12,7 @@ from ._auth_base import AuthManifest, AuthProvider, AuthStatus
 from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
+from cw_platform.url_validation import guarded_request
 
 __VERSION__ = "0.1"
 UA = http_user_agent("TracearrAuth", override_env="CW_TRACEARR_UA")
@@ -42,8 +43,12 @@ def is_configured(block: Mapping[str, Any] | None) -> bool:
 
 
 def _get(server_url: str, api_key: str, path: str, params: Mapping[str, Any], *, timeout: float, verify_ssl: bool) -> requests.Response:
-    return requests.get(
+    # guarded_request re-validates every redirect hop; the URL is admin-supplied
+    # and the request carries the API key.
+    return guarded_request(
+        "GET",
         f"{normalize_server_url(server_url)}{API_PREFIX}{path}",
+        field_name="tracearr.server_url",
         params=dict(params),
         headers={"Accept": "application/json", "User-Agent": UA, "Authorization": f"Bearer {str(api_key or '').strip()}"},
         timeout=timeout,
@@ -66,6 +71,8 @@ def validate_credentials(server_url: str, api_key: str, *, timeout: float = 12.0
         return False, "api_key_required"
     try:
         r = _get(server_url, api_key, "/users", {"pageSize": 1}, timeout=timeout, verify_ssl=verify_ssl)
+    except ValueError:
+        return False, "blocked_url"
     except requests.Timeout:
         return False, "validation_timeout"
     except requests.RequestException:
@@ -90,6 +97,8 @@ def list_users(server_url: str, api_key: str, *, timeout: float = 12.0, verify_s
             params["cursor"] = cursor
         try:
             r = _get(server_url, api_key, "/users", params, timeout=timeout, verify_ssl=verify_ssl)
+        except ValueError:
+            return users, "blocked_url"
         except requests.Timeout:
             return users, "validation_timeout"
         except requests.RequestException:

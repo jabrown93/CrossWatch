@@ -121,3 +121,38 @@ def test_repeated_unavailable_warnings_are_rate_limited(database, monkeypatch, c
     with caplog.at_level("WARNING", logger="crosswatch.local_db"):
         assert db.get_conn() is None
     assert any("4 similar warnings suppressed" in r.getMessage() for r in caplog.records)
+
+
+def test_connect_overlapping_a_whole_suspension_is_not_cached(database, tmp_path, monkeypatch):
+    path = tmp_path / "crosswatch.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    seed = sqlite3.connect(replacement)
+    seed.execute("CREATE TABLE concurrency_test (value TEXT)")
+    seed.execute("INSERT INTO concurrency_test VALUES ('restored')")
+    seed.commit()
+    seed.close()
+    real_connect = db.connect
+    calls = []
+
+    def connect_then_restore(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if not calls:
+            # A restore finishes its whole suspended() block before this worker
+            # registers the handle it opened on the old inode.
+            with db.suspended():
+                for suffix in ("-wal", "-shm"):
+                    path.with_name(path.name + suffix).unlink(missing_ok=True)
+                replacement.replace(path)
+        calls.append(conn)
+        return conn
+
+    def worker():
+        monkeypatch.setattr(db, "connect", connect_then_restore)
+        conn = db.get_conn()
+        assert conn is not None
+        return conn.execute("SELECT value FROM concurrency_test").fetchall()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        rows = pool.submit(worker).result(timeout=10)
+    assert [tuple(r) for r in rows] == [("restored",)]
+    assert len(calls) == 2

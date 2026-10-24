@@ -264,11 +264,11 @@ def test_auth_validation_maps_status_codes(monkeypatch: pytest.MonkeyPatch, stat
 
     seen: dict[str, Any] = {}
 
-    def fake_get(url: str, **kwargs: Any) -> _Resp:
-        seen.update(url=url, **kwargs)
+    def fake_get(method: str, url: str, **kwargs: Any) -> _Resp:
+        seen.update(method=method, url=url, **kwargs)
         return _Resp(status, body)
 
-    monkeypatch.setattr(auth.requests, "get", fake_get)
+    monkeypatch.setattr(auth, "guarded_request", fake_get)
 
     assert auth.validate_credentials("tracearr:3000/", "trr_pub_x") == expected
     assert seen["url"] == "http://tracearr:3000/api/v2/public/users"
@@ -282,7 +282,7 @@ def test_auth_lists_users_across_pages(monkeypatch: pytest.MonkeyPatch) -> None:
         None: {"data": [{"id": "b", "username": "Zed", "accounts": [{"server_type": "plex"}]}], "meta": {"nextCursor": "c1"}},
         "c1": {"data": [{"id": "a", "username": "amy", "accounts": [{"server_type": "jellyfin"}, {"server_type": "plex"}]}], "meta": {"nextCursor": None}},
     }
-    monkeypatch.setattr(auth.requests, "get", lambda url, params, **_: _Resp(200, pages[params.get("cursor")]))
+    monkeypatch.setattr(auth, "guarded_request", lambda method, url, params, **_: _Resp(200, pages[params.get("cursor")]))
 
     users, reason = auth.list_users("http://t", "k")
 

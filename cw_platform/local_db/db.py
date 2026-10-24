@@ -28,6 +28,10 @@ _CONNECTIONS: dict[threading.Thread, tuple[str, sqlite3.Connection, tuple[int, i
 # Fork: count of active suspended() contexts; get_conn() hands out nothing while
 # nonzero. A boolean would let the first of two overlapping rebuilds lift it early.
 _SUSPEND_DEPTH = 0
+# Fork: bumped by close_conn() so a connect() that straddled a whole suspended()
+# block is discarded; its handle can point at the replaced inode yet still match
+# the new file id.
+_GENERATION = 0
 # Fork: serializes schema setup across per-thread connections. Concurrent
 # CREATE/ALTER on a fresh database fails the others with "database schema has
 # changed", which get_conn() reports as unavailable and recorders turn into a
@@ -267,26 +271,37 @@ def get_conn(base_path: str | os.PathLike[str] | None = None) -> sqlite3.Connect
             del _CONNECTIONS[worker]
             if path == want and current is None:
                 _LOG.warning("local database file missing; recreating %s", want)
+        generation = _GENERATION
     # Schema setup can wait for another worker's transaction. Do not hold the
     # registry lock while waiting: that worker may need get_conn() to finish.
-    try:
-        conn = connect(want, base_path=base_path)
+    for _ in range(3):
+        try:
+            conn = connect(want, base_path=base_path)
+        except Exception as exc:
+            note = _holder_note() if "locked" in str(exc) else ""
+            _warn(want, f"local database unavailable: {exc}{note}")
+            return None
         with _LOCK:
-            if _SUSPEND_DEPTH:
-                # suspended() began while this connect ran; the handle may point
-                # at an inode the rebuild is about to unlink.
-                conn.close()
-                return None
-            _CONNECTIONS[worker] = (want, conn, _file_id(want))
-        return conn
-    except Exception as exc:
-        note = _holder_note() if "locked" in str(exc) else ""
-        _warn(want, f"local database unavailable: {exc}{note}")
-        return None
+            if not _SUSPEND_DEPTH and _GENERATION == generation:
+                _CONNECTIONS[worker] = (want, conn, _file_id(want))
+                return conn
+            suspended_now = bool(_SUSPEND_DEPTH)
+            generation = _GENERATION
+        # A suspension overlapped this connect; the handle may point at an inode
+        # the rebuild unlinked or is about to unlink.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if suspended_now:
+            return None
+    return None
 
 
 def close_conn() -> None:
+    global _GENERATION
     with _LOCK:
+        _GENERATION += 1
         for _, conn, _ in _CONNECTIONS.values():
             try:
                 conn.close()
