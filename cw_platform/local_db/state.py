@@ -230,7 +230,7 @@ def _item_to_row(provider_state_id: int, key: str, item: Mapping[str, Any], ts: 
         _s(item.get("_cw_instance")),
         _s(item.get("provider_item_id")),
         _s(item.get("provider_event_id") or item.get("_simkl_rewatch_id") or item.get("rewatch_id") or item.get("_publicmetadb_history_id") or item.get("_wetrakr_history_id")),
-        json.dumps({k: item[k] for k in ("media_paths", "part") if k in item}, separators=(",", ":")) if item.get("media_paths") else None,
+        json.dumps({k: item[k] for k in ("media_paths", "part") if k in item}, separators=(",", ":")) if item.get("media_paths") or item.get("part") is not None else None,
         json.dumps({k: item[k] for k in ("format", "media_info") if item.get(k)}, separators=(",", ":"), sort_keys=True) if item.get("format") or item.get("media_info") else None,
         ts,
     )

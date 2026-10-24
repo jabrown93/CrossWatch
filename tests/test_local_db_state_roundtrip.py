@@ -351,3 +351,16 @@ def test_schema_upgrade_adds_media_json_to_existing_baseline_tables(tmp_path) ->
         conn.close()
 
     assert all("media_json" in columns for columns in tables.values())
+
+
+def test_state_database_preserves_movie_part_without_media_paths(tmp_path) -> None:
+    # SIMKL multipart anime movies carry `part` but no media paths; dropping it
+    # would collapse distinct parts onto one history identity.
+    item = {"type": "movie", "title": "Part Two", "year": 2020, "ids": {"simkl": "37137"}, "watched_at": "2026-01-02T03:04:05Z", "part": 2}
+    state = {"providers": {"SIMKL": {"history": {"baseline": {"items": {"simkl:37137#part:2": item}}}}}}
+
+    store = StateStore(tmp_path)
+    store.save_state(state)
+    items = store.load_state()["providers"]["SIMKL"]["history"]["baseline"]["items"]
+
+    assert items["simkl:37137#part:2"]["part"] == 2
