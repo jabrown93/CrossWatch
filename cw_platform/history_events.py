@@ -50,6 +50,7 @@ EVENT_ID_FIELDS = (
     "_simkl_rewatch_id",
     "_punchplay_history_id",
     "_scrob_history_id",
+    "_wetrakr_history_id",
     "rewatch_id",
 )
 
@@ -57,11 +58,22 @@ EVENT_META_FIELDS = (
     *EVENT_ID_FIELDS,
     "_punchplay_history_ids",
     "_scrob_media_id",
+    "_wetrakr_watched_at_unknown",
     "is_rewatch",
     "rewatch_status",
     "_cw_event_key",
     "_cw_rewatch_sync",
 )
+
+
+def has_history_watch(item: Any) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    return bool(item.get("watched_at") or item.get("last_watched_at")) or (
+        item.get("watched") is True
+        and item.get("type") in {"movie", "episode"}
+        and item.get("_cw_watched_state") is True
+    )
 
 
 def is_history_event_key(key: Any) -> bool:

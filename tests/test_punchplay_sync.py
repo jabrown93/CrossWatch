@@ -59,7 +59,7 @@ def test_module_is_registered_and_discoverable() -> None:
     assert ops.name() == "PUNCHPLAY"
     assert ops.label() == "PunchPlay"
     assert dict(ops.features()) == {
-        "watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False,
+        "watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False, "collection": True,
     }
     assert sync_provider_supports_feature("PUNCHPLAY", "history") is True
     assert sync_provider_supports_feature("PUNCHPLAY", "playlists") is False
@@ -78,15 +78,19 @@ def test_manifest_matches_validated_contract() -> None:
     assert man["experimental"] is True
     assert man["bidirectional"] is True
 
-    for feature in ("watchlist", "ratings", "history", "progress"):
+    for feature in ("watchlist", "ratings", "history", "progress", "collection"):
         assert caps[feature]["observed_deletes"] is True, feature
 
     assert caps["ratings"]["scale"] == "1-10"
     assert caps["history"]["rewatch"] is True
+    assert caps["history"]["event_history"] is True
+    assert caps["history"]["rewatches"] == {"read": True, "write": True, "account_gate": False}
     assert caps["history"]["requires_watched_at"] is True
     for feature in ("watchlist", "ratings", "history"):
         assert caps[feature]["batch_size"] == 100
         assert caps[feature]["accepted_ids"] == ["tmdb", "imdb", "tvdb", "mal"]
+    assert caps["collection"]["types"] == {"movies": True, "shows": True, "seasons": True, "episodes": False}
+    assert caps["collection"]["default_format"] == "digital"
 
 
 def test_ui_feature_flags_match_the_sync_manifest() -> None:
@@ -354,6 +358,144 @@ def test_watchlist_index_merges_sync_snapshot_list_items(monkeypatch: pytest.Mon
     assert http.calls[2]["params"]["resource"] == "list_item"
 
 
+# --- collection ---------------------------------------------------------------
+
+def test_collection_index_reads_paged_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _collection as co
+
+    http = FakeHTTP([
+        _Resp(200, {"items": [
+            {"id": 11, "kind": "movie", "sourceId": 550, "title": "Fight Club", "year": 1999, "format": "bluray"},
+            {"id": 12, "kind": "show", "sourceId": 1399, "title": "Game of Thrones", "year": 2011, "season": 1, "format": "digital"},
+        ], "nextCursor": "next"}),
+        _Resp(200, {"items": [
+            {"id": 13, "kind": "show", "sourceId": 1402, "title": "The Walking Dead", "year": 2010},
+        ], "nextCursor": None}),
+    ])
+    _patch(monkeypatch, co, http)
+
+    idx = co.build_index(Adapter())
+
+    assert idx["tmdb:550"]["_punchplay_collection_id"] == "11"
+    assert idx["tmdb:550"]["format"] == "bluray"
+    assert idx["tmdb:1399#season:1"]["type"] == "season"
+    assert idx["tmdb:1399#season:1"]["show_ids"] == {"tmdb": "1399"}
+    assert idx["tmdb:1402#show"]["type"] == "show"
+    assert http.calls[0]["params"] == {"limit": 200}
+    assert http.calls[1]["params"] == {"limit": 200, "cursor": "next"}
+
+
+def test_collection_index_reads_tmdb_id_for_tvdb_sourced_anime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _collection as co
+
+    def row(entry_id: int, season: int, **extra: Any) -> dict[str, Any]:
+        return {"id": entry_id, "tmdbId": 19849, "type": "anime", "kind": "show", "isAnime": True, "mediaSource": "tvdb",
+                "sourceId": 78960, "season": season, "title": "Blood+", "format": "digital", **extra}
+
+    http = FakeHTTP([_Resp(200, {"items": [
+        row(30607, 0),
+        row(30609, 3),
+        {"id": 30700, "kind": "show", "mediaSource": "tvdb", "sourceId": 78960, "season": 0, "title": "No tmdb"},
+    ], "nextCursor": None})])
+    _patch(monkeypatch, co, http)
+
+    idx = co.build_index(Adapter())
+
+    assert set(idx) == {"tmdb:19849#show", "tmdb:19849#season:3", "tvdb:78960"}
+    assert idx["tmdb:19849#show"]["ids"] == {"tmdb": "19849", "tvdb": "78960"}
+    assert idx["tmdb:19849#season:3"]["show_ids"] == {"tmdb": "19849", "tvdb": "78960"}
+    assert idx["tmdb:19849#show"]["_punchplay_collection_id"] == "30607"
+
+
+def test_collection_add_defaults_to_digital(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _collection as co
+
+    http = FakeHTTP([_Resp(200, {"id": 99})])
+    _patch(monkeypatch, co, http)
+
+    res = co.add(Adapter(), [{"type": "movie", "title": "Fight Club", "year": 1999, "ids": {"tmdb": "550"}}])
+
+    assert res["confirmed_keys"] == ["tmdb:550"]
+    assert http.calls[0]["method"] == "POST"
+    assert http.calls[0]["url"].endswith("/collection")
+    assert http.calls[0]["json"] == {"kind": "movie", "sourceId": 550, "format": "digital", "title": "Fight Club", "year": 1999}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("bluray", "bluray"),
+        ("Blu-ray", "bluray"),
+        ("BD", "bluray"),
+        ("4k_bluray", "4k_bluray"),
+        ("4K Ultra HD Blu-ray", "4k_bluray"),
+        ("UHD", "4k_bluray"),
+        ("hd_dvd", "hd_dvd"),
+        ("hddvd", "hd_dvd"),
+        ("HD-DVD", "hd_dvd"),
+        ("DVD", "dvd"),
+        ("Digital", "digital"),
+        ("vhs", "digital"),
+        ("", "digital"),
+    ],
+)
+def test_collection_format_normalizes_source_values(raw: str, expected: str) -> None:
+    from providers.sync.punchplay import _collection as co
+
+    assert co._format_value(Adapter(), {"format": raw}) == expected
+
+
+def test_collection_add_sends_normalized_source_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cw_platform.id_map import minimal
+    from providers.sync.punchplay import _collection as co
+
+    http = FakeHTTP([_Resp(200, {"id": 99})])
+    _patch(monkeypatch, co, http)
+
+    planned = minimal({"type": "movie", "title": "Fight Club", "year": 1999, "ids": {"tmdb": "550"}, "format": "Blu-ray", "_floppy_collection_id": "3"})
+    co.add(Adapter(), [planned])
+
+    assert http.calls[0]["json"]["format"] == "bluray"
+
+
+def test_collection_format_folds_bluray_with_4k_resolution() -> None:
+    from providers.sync.punchplay import _collection as co
+
+    assert co._format_value(Adapter(), {"format": "bluray", "media_info": {"resolution": "uhd_4k"}}) == "4k_bluray"
+    assert co._format_value(Adapter(), {"format": "bluray", "media_info": {"resolution": "hd_1080p"}}) == "bluray"
+
+
+def test_collection_add_supports_season_and_rejects_episode(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _collection as co
+
+    http = FakeHTTP([_Resp(200, {"id": 99})])
+    _patch(monkeypatch, co, http)
+
+    res = co.add(Adapter(), [
+        {"type": "season", "series_title": "Example", "show_ids": {"tmdb": "100"}, "season": 2},
+        {"type": "episode", "show_ids": {"tmdb": "100"}, "season": 2, "episode": 4},
+    ])
+
+    assert res["confirmed_keys"] == ["tmdb:100#season:2"]
+    assert res["unresolved_keys"] == ["tmdb:100#s02e04"]
+    assert http.calls[0]["json"]["kind"] == "show"
+    assert http.calls[0]["json"]["sourceId"] == 100
+    assert http.calls[0]["json"]["season"] == 2
+
+
+def test_collection_remove_uses_existing_collection_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _collection as co
+
+    http = FakeHTTP([_Resp(204)])
+    _patch(monkeypatch, co, http)
+
+    res = co.remove(Adapter(), [{"type": "movie", "ids": {"tmdb": "550"}, "_punchplay_collection_id": "77"}])
+
+    assert res["confirmed_keys"] == ["tmdb:550"]
+    assert http.calls[0]["method"] == "DELETE"
+    assert http.calls[0]["url"].endswith("/collection/77")
+
+
 # --- ratings ------------------------------------------------------------------
 
 def test_ratings_index_prefers_sync_snapshot_interaction(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -445,8 +587,62 @@ def test_history_index_prefers_sync_snapshot_history(monkeypatch: pytest.MonkeyP
     assert http.calls[0]["method"] == "GET"
     assert http.calls[0]["url"].endswith("/me/sync/snapshot")
     assert http.calls[0]["params"]["resource"] == "history"
-    assert http.calls[0]["params"]["limit"] == 100
+    assert http.calls[0]["params"]["limit"] == 500
     assert http.calls[0]["params"]["after"] == 0
+
+
+def test_history_snapshot_pages_independently_of_legacy_history_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    rows = [
+        {"id": i, "kind": "movie", "tmdb_id": i, "watched_at": "2026-01-01T20:00:00Z"}
+        for i in range(1, 502)
+    ]
+    http = FakeHTTP([
+        _Resp(200, {"items": rows[:500], "hasMore": True, "nextAfter": 500}),
+        _Resp(200, {"items": rows[500:], "hasMore": False, "nextAfter": None}),
+    ])
+    _patch(monkeypatch, hi, http)
+    adapter = Adapter()
+    adapter.config["punchplay"]["history_per_page"] = 100
+
+    idx = hi.build_index(adapter)
+
+    assert len(idx) == 501
+    assert "tmdb:501" in idx
+    assert [call["params"] for call in http.calls] == [
+        {"resource": "history", "after": 0, "limit": 500},
+        {"resource": "history", "after": 500, "limit": 500},
+    ]
+    assert all(call["url"].endswith("/me/sync/snapshot") for call in http.calls)
+
+
+@pytest.mark.parametrize("configured,expected", [(None, 100), (500, 100), (50, 50)])
+def test_history_fallback_keeps_its_own_page_limit(monkeypatch: pytest.MonkeyPatch, configured, expected) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    http = FakeHTTP([
+        _Resp(200, {"items": [], "hasMore": False}),
+        _Resp(200, {"items": [
+            {"id": 1, "kind": "movie", "tmdb_id": 550, "watched_at": "2026-01-01T20:00:00Z"},
+        ], "nextCursor": "next"}),
+        _Resp(200, {"items": [
+            {"id": 2, "kind": "movie", "tmdb_id": 551, "watched_at": "2026-01-02T20:00:00Z"},
+        ], "nextCursor": None}),
+    ])
+    _patch(monkeypatch, hi, http)
+    adapter = Adapter()
+    if configured is not None:
+        adapter.config["punchplay"]["history_per_page"] = configured
+
+    idx = hi.build_index(adapter)
+
+    assert set(idx) == {"tmdb:550", "tmdb:551"}
+    assert http.calls[0]["params"]["limit"] == 500
+    assert [call["params"] for call in http.calls[1:]] == [
+        {"limit": expected}, {"limit": expected, "cursor": "next"},
+    ]
+    assert all(call["url"].endswith("/me/history") for call in http.calls[1:])
 
 
 def test_history_index_reads_episode_from_sync_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -463,6 +659,113 @@ def test_history_index_reads_episode_from_sync_snapshot(monkeypatch: pytest.Monk
     assert idx["tmdb:46260#s01e49"]["show_ids"] == {"tmdb": "46260"}
     assert idx["tmdb:46260#s01e49"]["season"] == 1
     assert idx["tmdb:46260#s01e49"]["episode"] == 49
+
+
+def _renumbered_row(client_item_id: Any, **extra: Any) -> dict[str, Any]:
+    return {"id": 13295519, "type": "episode", "mediaSource": "tvdb", "sourceId": 78960, "showTmdbId": 19849,
+            "title": "Blood+", "season": 2, "episode": 1, "watchedAt": "2020-01-01T10:00:00.000Z",
+            "clientItemId": client_item_id, **extra}
+
+
+@pytest.mark.parametrize(
+    ("client_item_id", "expected"),
+    [
+        ("cw:history:tmdb:19849#s01e14:2020-01-01T10:00:00.000Z", "tmdb:19849#s01e14"),
+        ("cw:history:imdb:tt0482855#s01e14:2020-01-01T10:00:00.000Z", "tmdb:19849#s01e14"),
+        ("cw:history:tmdb:19849#s01e14@1577872800:2020-01-01T10:00:00.000Z", "tmdb:19849#s01e14"),
+        ("cw:history:tmdb:999#s01e14:2020-01-01T10:00:00.000Z", "tmdb:19849#s02e01"),
+        ("cw:history:tmdb:19849:2020-01-01T10:00:00.000Z", "tmdb:19849#s02e01"),
+        ("cw:0f3a9c", "tmdb:19849#s02e01"),
+        ("other-app:tmdb:19849#s01e14", "tmdb:19849#s02e01"),
+        (None, "tmdb:19849#s02e01"),
+    ],
+    ids=["written_key", "written_imdb_key", "written_event_key", "other_show", "no_episode", "hashed", "foreign_client", "missing"],
+)
+def test_history_index_restores_the_numbering_crosswatch_wrote(monkeypatch: pytest.MonkeyPatch, client_item_id: Any, expected: str) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    http = FakeHTTP([_Resp(200, {"items": [_renumbered_row(client_item_id)], "hasMore": False, "nextAfter": None})])
+    _patch(monkeypatch, hi, http)
+
+    idx = hi.build_index(Adapter())
+
+    assert list(idx) == [expected]
+    assert idx[expected]["show_ids"] == {"tmdb": "19849"}
+    assert idx[expected]["_punchplay_history_ids"] == ["13295519"]
+
+
+def test_history_written_play_reads_back_under_the_same_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    item = {"type": "episode", "show_ids": {"tmdb": "19849"}, "ids": {}, "season": 1, "episode": 14,
+            "series_title": "Blood+", "watched_at": "2020-01-01T10:00:00Z"}
+    write = FakeHTTP([_Resp(200, {"results": [{"index": 0, "status": "inserted", "id": 13295519, "resolved_tmdb_id": 19849,
+                                               "stored": {"season": 2, "episode": 1, "media_source": "tvdb", "source_id": 78960}}]})])
+    _patch(monkeypatch, hi, write)
+    res = hi.add(Adapter(), [item])
+    sent = write.calls[0]["json"]["items"][0]
+
+    read = FakeHTTP([_Resp(200, {"items": [_renumbered_row(sent["client_item_id"])], "hasMore": False, "nextAfter": None})])
+    _patch(monkeypatch, hi, read)
+
+    assert list(hi.build_index(Adapter())) == res["confirmed_keys"] == ["tmdb:19849#s01e14"]
+
+
+@pytest.mark.parametrize("endpoint", ["snapshot", "history"])
+@pytest.mark.parametrize(
+    ("source", "client_id", "expected"),
+    [
+        ({"sourceSeason": 1, "sourceEpisode": 14}, None, "s01e14"),
+        ({"sourceSeason": 1, "sourceEpisode": 14}, "other-app:play", "s01e14"),
+        ({"sourceSeason": 1, "sourceEpisode": 14}, "cw:history:tmdb:19849#s02e01:2020-01-01T10:00:00Z", "s01e14"),
+        ({"sourceSeason": 0, "sourceEpisode": 2}, None, "s00e02"),
+        ({"sourceSeason": None, "sourceEpisode": 14}, None, "s02e01"),
+        ({"sourceSeason": 1}, None, "s02e01"),
+        ({"sourceSeason": -1, "sourceEpisode": 14}, None, "s02e01"),
+        ({"sourceSeason": 1, "sourceEpisode": 0}, None, "s02e01"),
+        ({"sourceSeason": True, "sourceEpisode": 14}, None, "s02e01"),
+        ({"sourceSeason": "invalid", "sourceEpisode": 14}, "cw:history:tmdb:19849#s01e14:2020-01-01T10:00:00Z", "s01e14"),
+    ],
+)
+def test_history_reads_source_coordinates(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, source: dict[str, Any], client_id: str | None, expected: str,
+) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    responses = [_Resp(200, {"items": [_renumbered_row(client_id, **source)], "hasMore": False, "nextCursor": None})]
+    if endpoint == "history":
+        responses.insert(0, _Resp(200, {"items": [], "hasMore": False}))
+    http = FakeHTTP(responses)
+    _patch(monkeypatch, hi, http)
+
+    idx = hi.build_index(Adapter())
+
+    assert list(idx) == [f"tmdb:19849#{expected}"]
+    assert idx[f"tmdb:19849#{expected}"]["_punchplay_history_ids"] == ["13295519"]
+
+
+@pytest.mark.parametrize("event_mode", [False, True])
+def test_history_source_coordinates_preserve_plays_and_delete_ids(monkeypatch: pytest.MonkeyPatch, event_mode: bool) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    rows = [
+        _renumbered_row(None, sourceSeason=1, sourceEpisode=14),
+        {"id": 13295520, "data": _renumbered_row(None, id=13295520, sourceSeason=1, sourceEpisode=14,
+                                                 watchedAt="2020-02-01T10:00:00.000Z")},
+    ]
+    http = FakeHTTP([_Resp(200, {"items": rows, "hasMore": False}), _Resp(204), _Resp(204)])
+    _patch(monkeypatch, hi, http)
+    adapter = Adapter()
+    adapter.config["_cw_history_rewatches"] = event_mode
+
+    idx = hi.build_index(adapter)
+
+    assert len(idx) == (2 if event_mode else 1)
+    assert all(key.startswith("tmdb:19849#s01e14") for key in idx)
+    assert sorted(hid for item in idx.values() for hid in item["_punchplay_history_ids"]) == ["13295519", "13295520"]
+    result = hi.remove(adapter, idx.values())
+    assert result["ok"] is True
+    assert {call["url"].rsplit("/", 1)[-1] for call in http.calls if call["method"] == "DELETE"} == {"13295519", "13295520"}
 
 
 def test_history_client_item_id_is_per_play(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -531,6 +834,24 @@ def test_history_index_collects_entry_ids_for_rewatches(monkeypatch: pytest.Monk
     assert entry["watched_at"] == "2026-06-01T20:00:00.000Z"
 
 
+def test_history_rewatch_mode_indexes_each_play_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _history as hi
+
+    http = FakeHTTP([_Resp(200, {"items": [
+        {"id": 7, "kind": "movie", "tmdb_id": 550, "title": "Fight Club", "year": 1999, "watched_at": "2026-01-01T20:00:00.000Z"},
+        {"id": 9, "kind": "movie", "tmdb_id": 550, "title": "Fight Club", "year": 1999, "watched_at": "2026-06-01T20:00:00.000Z"},
+    ], "hasMore": False, "nextAfter": None})])
+    _patch(monkeypatch, hi, http)
+    adapter = Adapter()
+    adapter.config["_cw_history_rewatches"] = True
+
+    idx = hi.build_index(adapter)
+
+    assert len(idx) == 2
+    assert all(key.startswith("tmdb:550@") for key in idx)
+    assert all(entry["_cw_rewatch_sync"] is True for entry in idx.values())
+
+
 def test_history_remove_deletes_each_entry_id(monkeypatch: pytest.MonkeyPatch) -> None:
     from providers.sync.punchplay import _history as hi
 
@@ -576,6 +897,87 @@ def test_progress_index_uses_in_progress_endpoint(monkeypatch: pytest.MonkeyPatc
     assert idx["tmdb:550"]["_punchplay_progress_id"] == "4"
     assert http.calls[0]["method"] == "GET"
     assert http.calls[0]["url"].endswith("/playback/in-progress")
+
+
+def _renumbered_progress_row(**extra: Any) -> dict[str, Any]:
+    return {"id": 141085, "type": "episode", "tmdbId": 19849, "showTmdbId": 19849, "showTitle": "Blood+",
+            "season": 2, "episode": 7, "progressSeconds": 430, "durationSeconds": 1440, "progressPercent": 29.86,
+            "updatedAt": "2026-10-12T21:44:46.320Z", "mediaSource": "tvdb", "sourceId": 78960,
+            "progressKey": "tvdb:show:78960:S2:E7", **extra}
+
+
+@pytest.mark.parametrize(
+    ("in_progress", "snapshot", "expected"),
+    [
+        ({"sourceSeason": 1, "sourceEpisode": 20}, None, "tmdb:19849#s01e20"),
+        ({"sourceSeason": 1, "sourceEpisode": 20}, {}, "tmdb:19849#s01e20"),
+        ({}, {"sourceSeason": 1, "sourceEpisode": 20}, "tmdb:19849#s01e20"),
+        ({}, {}, "tmdb:19849#s02e07"),
+        ({"sourceSeason": None, "sourceEpisode": 20}, None, "tmdb:19849#s02e07"),
+        ({"sourceSeason": 1, "sourceEpisode": 0}, None, "tmdb:19849#s02e07"),
+    ],
+    ids=["source_numbering", "snapshot_row_follows_in_progress", "snapshot_corrects_numbering", "no_source_numbering", "partial_source", "invalid_source"],
+)
+def test_progress_index_reads_source_numbering(
+    monkeypatch: pytest.MonkeyPatch,
+    in_progress: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    expected: str,
+) -> None:
+    from providers.sync.punchplay import _progress as pr
+
+    snapshot_rows = [] if snapshot is None else [_renumbered_progress_row(**snapshot)]
+    http = FakeHTTP([
+        _Resp(200, [_renumbered_progress_row(**in_progress)]),
+        _Resp(200, {"items": snapshot_rows, "hasMore": False, "nextAfter": None}),
+    ])
+    _patch(monkeypatch, pr, http)
+
+    idx = pr.build_index(Adapter())
+
+    assert list(idx) == [expected]
+    assert idx[expected]["_punchplay_progress_id"] == "141085"
+    assert idx[expected]["progress_ms"] == 430000
+
+
+def test_progress_coordinate_correction_keeps_another_entry_at_the_old_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _progress as pr
+
+    http = FakeHTTP([
+        _Resp(200, [_renumbered_progress_row(), _renumbered_progress_row(id=141086)]),
+        _Resp(200, {"items": [_renumbered_progress_row(sourceSeason=1, sourceEpisode=20)], "hasMore": False}),
+    ])
+    _patch(monkeypatch, pr, http)
+
+    idx = pr.build_index(Adapter())
+
+    assert set(idx) == {"tmdb:19849#s02e07", "tmdb:19849#s01e20"}
+    assert idx["tmdb:19849#s02e07"]["_punchplay_progress_id"] == "141086"
+    assert idx["tmdb:19849#s01e20"]["_punchplay_progress_id"] == "141085"
+
+
+def test_progress_snapshot_source_coordinates_cover_items_missing_from_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _progress as pr
+
+    rows = [
+        _renumbered_progress_row(id=141100, season=1, episode=5, sourceSeason=1, sourceEpisode=5),
+        _renumbered_progress_row(id=141101, sourceSeason=1, sourceEpisode=20),
+        _renumbered_progress_row(id=141102, season=3, episode=5, sourceSeason=1, sourceEpisode=30),
+        _renumbered_progress_row(id=141103, season=4, episode=1, sourceSeason=1, sourceEpisode=39),
+    ]
+    http = FakeHTTP([
+        _Resp(200, [rows[0]]),
+        _Resp(200, {"items": rows[:2], "hasMore": True, "nextAfter": 141101}),
+        _Resp(200, {"items": rows[2:], "hasMore": False, "nextAfter": None}),
+    ])
+    _patch(monkeypatch, pr, http)
+
+    idx = pr.build_index(Adapter())
+
+    assert set(idx) == {f"tmdb:19849#s01e{episode:02d}" for episode in (5, 20, 30, 39)}
+    assert {item["_punchplay_progress_id"] for item in idx.values()} == {"141100", "141101", "141102", "141103"}
+    assert all(item["progress_ms"] == 430000 for item in idx.values())
+    assert http.calls[2]["params"]["after"] == 141101
 
 
 def test_progress_index_does_not_read_continue_watching(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -651,6 +1053,57 @@ def test_progress_write_uses_incomplete_stop_for_passive_sync(monkeypatch: pytes
     assert call["json"]["watched"] is False
     assert call["json"]["watched_threshold"] == 1.0
     assert res["confirmed_keys"] == ["tmdb:550"]
+
+
+@pytest.mark.parametrize("duration", [None, 0, -1, float("inf"), 0.0001])
+def test_progress_write_rejects_percentage_without_usable_duration(monkeypatch: pytest.MonkeyPatch, duration) -> None:
+    from providers.sync.punchplay import _progress as pr
+
+    http = FakeHTTP([])
+    _patch(monkeypatch, pr, http)
+
+    res = pr.add(Adapter(), [{
+        "type": "movie", "title": "Fight Club", "ids": {"tmdb": "550"},
+        "progress_percent": 25, "duration_seconds": duration,
+    }])
+
+    assert http.calls == []
+    assert res["confirmed_keys"] == []
+    assert res["unresolved_keys"] == ["tmdb:550"]
+    assert res["unresolved"][0]["status"] == "missing_supported_id_or_position"
+
+
+@pytest.mark.parametrize("position", [0, 120])
+def test_progress_write_accepts_position_without_duration(monkeypatch: pytest.MonkeyPatch, position) -> None:
+    from providers.sync.punchplay import _progress as pr
+
+    http = FakeHTTP([_Resp(200, {})])
+    _patch(monkeypatch, pr, http)
+
+    res = pr.add(Adapter(), [{
+        "type": "movie", "title": "Fight Club", "ids": {"tmdb": "550"},
+        "position_seconds": position,
+    }])
+
+    assert res["confirmed_keys"] == ["tmdb:550"]
+    assert http.calls[0]["json"]["position_seconds"] == position
+    assert "duration_seconds" not in http.calls[0]["json"]
+
+
+def test_progress_write_accepts_percentage_with_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync.punchplay import _progress as pr
+
+    http = FakeHTTP([_Resp(200, {})])
+    _patch(monkeypatch, pr, http)
+
+    res = pr.add(Adapter(), [{
+        "type": "movie", "title": "Fight Club", "ids": {"tmdb": "550"},
+        "progress_percent": 25, "duration_seconds": 8000,
+    }])
+
+    assert res["confirmed_keys"] == ["tmdb:550"]
+    assert http.calls[0]["json"]["progress"] == 0.25
+    assert http.calls[0]["json"]["duration_seconds"] == 8000
 
 
 def test_progress_write_uses_progress_action_for_now_playing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -944,6 +1397,37 @@ def test_governor_ignores_healthy_remaining_header() -> None:
     gov.observe("GET", url, {"X-RateLimit-Remaining": "250", "X-RateLimit-Reset": "99999999999"})
 
     assert gov.acquire("GET", url) == 0.0
+
+
+def test_session_rate_limit_activity_logs_periodic_summaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    from providers.sync import _mod_common as common
+
+    events: list[dict[str, Any]] = []
+    clock = {"t": 1000.0}
+    session = common.HitSession("PUNCHPLAY", lambda *_args: None)
+    session._rate_limiter_meta = {"get_per_sec": 2.0, "post_per_sec": 0.5}
+    session._rl_log_every_s = 60.0
+    session._rl_log_min_sleep_s = 0.5
+
+    def fake_log(provider: str, feature: str, level: str, msg: str, **fields: Any) -> None:
+        events.append({"provider": provider, "feature": feature, "level": level, "msg": msg, **fields})
+
+    monkeypatch.setattr(common.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(common, "cw_log", fake_log)
+
+    session._log_rate_limit_summary("POST", 1.7)
+    clock["t"] += 30.0
+    session._log_rate_limit_summary("POST", 1.7)
+    assert events == []
+
+    clock["t"] += 31.0
+    session._log_rate_limit_summary("POST", 1.7)
+
+    assert len(events) == 1
+    assert events[0]["msg"] == "client throttle activity"
+    assert events[0]["bucket"] == "POST"
+    assert events[0]["events"] == 3
+    assert events[0]["configured_rps"] == 0.5
 
 
 def test_budgets_are_configurable() -> None:

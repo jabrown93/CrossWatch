@@ -1,0 +1,70 @@
+/* assets/js/editor/mapping.js */
+/* CrossWatch - Shared mapping workspace with staged Editor corrections */
+/* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
+export async function openEditorMapping(row, ctx) {
+  const {state} = ctx;
+  const scope = state.mappingPair ? "pair" : "shared";
+  const direct = !state.hasChanges && typeof ctx.saveChanges === "function";
+  const original = structuredClone(row.raw || {});
+  original.type = row.type || original.type;
+  original.title = row.title || original.title;
+  original.ids = {...original.ids};
+  for (const key of ["imdb", "tmdb", "tvdb", "trakt", "simkl", "mal", "anilist"]) {
+    if (!(key in row)) continue;
+    if (String(row[key] || "").trim()) original.ids[key] = String(row[key]).trim();
+    else delete original.ids[key];
+  }
+  const reference = {provider:state.snapshot, instance:state.instance || "default", pair_id:state.mappingPair || "",
+    feature:state.kind, key:row.key, original};
+  const checkCurrentRow = () => {
+    if (state.snapshot !== reference.provider || (state.instance || "default") !== reference.instance
+        || (state.mappingPair || "") !== reference.pair_id || state.kind !== reference.feature || !state.rows.includes(row)) {
+      throw new Error("The Editor view changed. Reopen mapping for the current item.");
+    }
+  };
+  const request = (action, extra = {}, options = {}) => ctx.fetchJSON("/api/editor/mapping", {
+    ...options, method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({...reference, action, ...extra}),
+  });
+  const version = encodeURIComponent(window.APP_VERSION || "1");
+  if (!document.querySelector('link[href*="/assets/css/interactive-sync.css"]')) {
+    const style = document.createElement("link");
+    style.rel = "stylesheet";
+    style.href = `/assets/css/interactive-sync.css?v=${version}`;
+    document.head.append(style);
+  }
+  const {openMappingWorkspace} = await import(`/assets/js/interactive-sync-mapping.js?v=${version}`);
+  const context = await request("catalogs");
+  checkCurrentRow();
+  let groupsChanged = false;
+  const finish = () => {
+    state.mappingEditing = false;
+    if (groupsChanged) ctx.loadState?.();
+  };
+  return openMappingWorkspace({
+    rows:[context.row],
+    onEpisodeGroup:state.kind === "history" && original.type === "episode" && direct ? async trigger => {
+      const {openEpisodeGroups} = await import(`/assets/js/editor/episode-groups.js?v=${version}`);
+      await openEpisodeGroups(trigger, {pairId:reference.pair_id, original, provider:reference.provider,
+        returnToMapping:true,
+        instance:reference.instance, onSaved:() => { groupsChanged = true; }});
+    } : undefined,
+    total:1, standalone:true, staged:true, direct, scope,
+    scopes:[{id:scope, label:scope === "pair" ? "Only this sync pair" : "Every sync with this account"}],
+    onClose:finish, onSaved:finish,
+    mappingApi:{
+      catalogs:async () => context,
+      search:(_row, q, catalog, options) => request("search", {q, catalog}, options),
+      episodes:(edits, options) => request("episodes", {item:edits[0].item}, options),
+      parts:(_row, simklId, options) => request("parts", {simkl_id:simklId}, options),
+      save:async edits => {
+        const result = await request("prepare", {item:edits[0].item});
+        checkCurrentRow();
+        const error = ctx.commitReplacement(row, result.item, result.key, "Correction ready. Save changes to apply it.");
+        if (error) throw new Error(error);
+        if (direct) await ctx.saveChanges();
+        return result;
+      },
+    },
+  });
+}

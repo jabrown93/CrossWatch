@@ -26,6 +26,7 @@ class FakeOps:
             can_add=not smart,
             can_remove=not smart,
             can_reorder=bool(d.get("can_reorder", True)) and not smart,
+            extra=dict(d.get("extra") or {}),
         )
 
     def list_playlist_resources(self, cfg, *, instance=None):
@@ -134,6 +135,24 @@ def test_mirror_removes_extras(config_base):
     assert {canonical_key(m) for m in dst["T1"]["items"]} == {"tmdb:1", "tmdb:2"}
 
 
+def test_discovery_source_can_mirror_to_writable_target(config_base):
+    src = {
+        "D1": {
+            "name": "Trending",
+            "items": [_movie(2), _movie(1)],
+            "smart": True,
+            "extra": {"endpoint_type": "discovery", "source_kind": "discovery", "discovery": True, "virtual": True},
+        }
+    }
+    dst = {"T1": {"name": "dst", "items": [_movie(1), _movie(3)]}}
+    provs = _providers(src, dst)
+
+    res = R.run_mapping(_cfg(), _mapping(src_pl="D1", membership="mirror", order="preserve"), providers=provs)
+
+    assert res["added"] == 1 and res["removed"] == 1
+    assert [canonical_key(m) for m in dst["T1"]["items"]] == ["tmdb:2", "tmdb:1"]
+
+
 def test_multiple_mappings_isolated(config_base):
     src = {"L1": {"name": "s1", "items": [_movie(1)]}, "L2": {"name": "s2", "items": [_movie(9)]}}
     dst = {"T1": {"name": "d1", "items": []}, "T2": {"name": "d2", "items": []}}
@@ -190,3 +209,27 @@ def test_scope_key_isolates_by_mapping_and_endpoints():
     b = R.scope_key(_mapping("MAP-01", "L1", "T2"))
     c = R.scope_key(_mapping("MAP-02", "L1", "T1"))
     assert a != b and a != c
+
+
+def test_episode_own_id_does_not_match_movie_with_same_id(config_base):
+    episode = {"type": "episode", "title": "E", "show_ids": {"tmdb": "1399"}, "ids": {"tmdb": "1"}, "season": 1, "episode": 2}
+    src = {"L1": {"name": "src", "items": [episode, _movie(2)]}}
+    dst = {"T1": {"name": "dst", "items": [_movie(1), _movie(2)]}}
+    provs = _providers(src, dst)
+    res = R.run_mapping(_cfg(), _mapping(membership="mirror"), providers=provs)
+    assert res["added"] == 1 and res["removed"] == 1
+    assert {canonical_key(m) for m in dst["T1"]["items"]} == {"tmdb:1399#s01e02", "tmdb:2"}
+
+    dst["T1"]["items"] = [{"type": "episode", "title": "E", "ids": {"tmdb": "1"}}, _movie(2)]
+    provs = _providers(src, dst)
+    res = R.run_mapping(_cfg(), _mapping(membership="mirror"), providers=provs)
+    assert res["added"] == 0 and res["removed"] == 0
+
+
+def test_own_id_only_episode_does_not_match_movie_with_same_id(config_base):
+    episode = {"type": "episode", "title": "E", "ids": {"tmdb": "1"}}
+    src = {"L1": {"name": "src", "items": [episode]}}
+    dst = {"T1": {"name": "dst", "items": [_movie(1)]}}
+    provs = _providers(src, dst)
+    R.run_mapping(_cfg(), _mapping(membership="mirror"), providers=provs)
+    assert {call[0] for call in provs["PLEX"].calls} >= {"add", "remove"}

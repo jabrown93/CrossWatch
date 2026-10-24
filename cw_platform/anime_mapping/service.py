@@ -6,15 +6,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from cw_platform.history_events import split_history_event_key
 from cw_platform.id_map import canonical_key, ids_from, merge_ids, minimal
 
+from .coordinates import translate
 from .descriptors import descriptor_candidates_for_id, parse_descriptor
-from .overrides import find_identity_overrides
-from .storage import index_ready, query_edges, query_identity_natives
+from .overrides import EpisodeOverride, find_episode_overrides, find_identity_overrides
+from .storage import index_ready, query_edges, query_identity_natives, query_native_identity
 
-ANIME_NATIVE_PROVIDERS = {"anilist", "simkl"}
+ANIME_NATIVE_PROVIDERS = {"kitsu", "myanimelist", "anilist", "simkl", "crosswatch"}
 DEFAULT_FEATURES = {"watchlist", "ratings"}
-OPT_IN_FEATURES = {"history"}
+OPT_IN_FEATURES = {"history", "progress"}
 ANY_PAIR = "*"
 OUTPUT_KEYS = ("anilist", "mal", "anidb", "tmdb", "tvdb", "imdb")
 SEED_KEYS = frozenset(OUTPUT_KEYS)
@@ -122,6 +124,142 @@ def runtime_pair_feature_options(cfg: Mapping[str, Any], feature: Any = "watchli
     return opts
 
 
+ANIME_ONLY_TARGET_KEYS = {"anilist": ("anilist", "mal"), "kitsu": ("kitsu",), "myanimelist": ("mal",)}
+
+
+ANIME_ONLY_AIRED_KEYS = ("tvdb", "tmdb")
+
+
+def _clean_id_map(raw: Any) -> dict[str, str]:
+    return {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in dict(raw if isinstance(raw, Mapping) else {}).items()
+        if str(v or "").strip()
+    }
+
+
+def _anime_target_id(release_tag: str, namespace: str, ident: str, target: str) -> str:
+    if target == "myanimelist" and namespace == "mal":
+        return ident
+    if namespace == target:
+        return ident
+    if target == "kitsu" and namespace in ("anilist", "mal", "anidb"):
+        return str(query_native_identity(release_tag, namespace, ident).get(target) or "")
+    return ""
+
+
+def _show_has_anime_entry(release_tag: str, show_ids: Mapping[str, str], cache: dict[tuple[str, str], bool], target: str) -> bool:
+    if any(show_ids.get(key) for key in ANIME_ONLY_TARGET_KEYS[target]):
+        return True
+    if target == "kitsu" and any(_anime_target_id(release_tag, key, ident, target) for key, ident in show_ids.items()):
+        return True
+    for provider in ANIME_ONLY_AIRED_KEYS:
+        ident = show_ids.get(provider)
+        if not ident:
+            continue
+        hit = cache.get((provider, ident))
+        if hit is None:
+            try:
+                rows = query_edges(release_tag, provider, ident)
+            except Exception:
+                rows = []
+            hit = any(
+                str(row.get("source_kind") or "").strip().lower() == "show"
+                and _anime_target_id(release_tag, str(row.get("target_provider") or "").strip().lower(),
+                                     str(row.get("target_id") or "").strip(), target)
+                for row in rows
+            )
+            cache[(provider, ident)] = hit
+        if hit:
+            return True
+    return False
+
+
+def _override_reaches_anime_target(release_tag: str, ruled: EpisodeOverride, target: str) -> bool:
+    namespace = str(ruled.namespace or "").strip().lower()
+    if _anime_target_id(release_tag, namespace, str(ruled.target_id or "").strip(), target):
+        return True
+    if namespace not in ("mal", "anidb", "anilist"):
+        return False
+    try:
+        rows = query_edges(release_tag, namespace, str(ruled.target_id))
+    except Exception:
+        return False
+    hits: set[tuple[str, int]] = set()
+    for row in rows:
+        target_id = _anime_target_id(release_tag, str(row.get("target_provider") or "").strip().lower(),
+                                    str(row.get("target_id") or "").strip(), target)
+        if not target_id:
+            continue
+        if namespace == "anidb" and str(row.get("source_scope") or "").strip().upper() != "R":
+            continue
+        mapped = translate(row.get("source_range"), row.get("target_range"), ruled.absolute)
+        if mapped and target_id:
+            hits.add((target_id, int(mapped)))
+    return len(hits) == 1
+
+
+def _anime_only_keep(svc: "AnimeMappingService", row: Mapping[str, Any], history: bool,
+                     cache: dict[tuple[str, str], bool], target: str) -> bool:
+    media_type = str(row.get("type") or "").strip().lower()
+    mapping_enabled = bool((svc.cfg.get("anime_mapping") or {}).get("enabled", False))
+    if target in {"kitsu", "myanimelist"} and media_type not in ({"movie", "episode"} if history else {"movie", "show"}):
+        return False
+    if not history or media_type not in ("episode", "season"):
+        ids = ids_from(row)
+        if (history and target == "anilist") or (target in {"kitsu", "myanimelist"} and mapping_enabled):
+            try:
+                ids = svc.enrich_ids(ids, media_type=media_type or "movie").get("ids") or ids
+                if target == "kitsu" and not ids.get(target):
+                    ids = svc.enrich_ids(ids, media_type=media_type or "movie").get("ids") or ids
+            except Exception:
+                pass
+        return any(str(ids.get(key) or "").strip() for key in ANIME_ONLY_TARGET_KEYS[target])
+    if target in {"kitsu", "myanimelist"} and not mapping_enabled:
+        return False
+    try:
+        if int(str(row.get("season")).strip()) == 0:
+            return False
+    except Exception:
+        pass
+    show_ids = _clean_id_map(row.get("show_ids")) or _clean_id_map(row.get("ids"))
+    try:
+        ruled = find_episode_overrides(show_ids, row.get("season"), row.get("episode"))
+    except Exception:
+        ruled = []
+    if ruled:
+        return any(_override_reaches_anime_target(svc.release_tag, rule, target) for rule in ruled)
+    return _show_has_anime_entry(svc.release_tag, show_ids, cache, target)
+
+
+def anime_only_adds(
+    items: Any,
+    cfg: Mapping[str, Any] | None,
+    options: Mapping[str, Any] | None,
+    feature: Any = None,
+    *,
+    target: str = "anilist",
+) -> tuple[list[Any], int]:
+    rows = list(items or [])
+    target = _norm_provider(target)
+    history = str(feature or "").strip().lower() == "history"
+    if not rows or not (history or target in ANIME_ONLY_TARGET_KEYS or bool((options or {}).get("anime_only_sync"))):
+        return rows, 0
+    unavailable: tuple[list[Any], int] = ([], len(rows)) if history else (rows, 0)
+    block = cfg.get("anime_mapping") if isinstance(cfg, Mapping) else None
+    if target not in {"kitsu", "myanimelist"} and history and not bool((block if isinstance(block, Mapping) else {}).get("enabled", False)):
+        return unavailable
+    try:
+        svc = AnimeMappingService(cfg)
+        if target not in {"kitsu", "myanimelist"} and history and not svc.ready():
+            return unavailable
+    except Exception:
+        return unavailable
+    cache: dict[tuple[str, str], bool] = {}
+    kept = [row for row in rows if not isinstance(row, Mapping) or _anime_only_keep(svc, row, history, cache, target)]
+    return kept, len(rows) - len(kept)
+
+
 def mapped_media_type(item: Mapping[str, Any]) -> str | None:
     detail = item.get("detail") if isinstance(item.get("detail"), Mapping) else {}
     amap = detail.get("anime_mapping") if isinstance(detail, Mapping) else {}
@@ -215,6 +353,32 @@ class AnimeMappingService:
                 return natives
         return {}
 
+    def _identity_target_ids(self, ids: Mapping[str, Any], media_type: str | None = None) -> dict[str, str]:
+        if str(media_type or "").strip().lower() in IDENTITY_SEED_EXCLUDED_TYPES:
+            return {}
+        found: dict[str, str] = {}
+        conflicts: set[str] = set()
+        for key in ("anidb", "mal", "anilist"):
+            value = str(ids.get(key) or "").strip()
+            if not value:
+                continue
+            try:
+                targets = query_native_identity(self.release_tag, key, value)
+            except Exception:
+                continue
+            for target_key in IDENTITY_SEED_KEYS:
+                target_value = str(targets.get(target_key) or "").strip()
+                if not target_value:
+                    continue
+                current = found.get(target_key)
+                if current is None:
+                    found[target_key] = target_value
+                elif current != target_value:
+                    conflicts.add(target_key)
+        for key in conflicts:
+            found.pop(key, None)
+        return found
+
     def enrich_ids(self, ids: Mapping[str, Any] | None, *, media_type: str | None = None) -> dict[str, Any]:
         ids0 = {str(k).lower(): v for k, v in dict(ids or {}).items() if v not in (None, "")}
         if not ids0:
@@ -236,7 +400,8 @@ class AnimeMappingService:
             }
 
         identity_seeds = self._identity_seed_ids(ids0, media_type)
-        seed_ids: dict[str, Any] = {**identity_seeds, **ids0, **ruled}
+        identity_targets = self._identity_target_ids(ids0, media_type)
+        seed_ids: dict[str, Any] = {**identity_seeds, **identity_targets, **ids0, **ruled}
 
         seen_sources: set[tuple[str, str]] = set()
         rows: list[dict[str, Any]] = []
@@ -334,10 +499,11 @@ class AnimeMappingService:
                 "source_descriptors": sorted(set(source_descriptors)),
                 **({"overrides": dict(ruled)} if ruled else {}),
                 **({"identity_seeds": dict(identity_seeds)} if identity_seeds else {}),
+                **({"identity_targets": dict(identity_targets)} if identity_targets else {}),
                 **({"ambiguous": sorted(ambiguous)} if ambiguous else {}),
                 **details,
             }
-        } if (details or ruled or identity_seeds) else {}
+        } if (details or ruled or identity_seeds or identity_targets) else {}
         return {"ids": merged or dict(ids0), "detail": detail, "changed": bool(changed)}
 
     def enrich_item(self, item: Mapping[str, Any]) -> dict[str, Any]:
@@ -366,6 +532,28 @@ class AnimeMappingService:
 
 def enrich_item(item: Mapping[str, Any], cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return AnimeMappingService(cfg).enrich_item(item)
+
+
+ART_ID_KEYS = ("tmdb", "tvdb", "imdb")
+ART_SEED_KEYS = ("anidb", "mal", "anilist", "simkl", "kitsu")
+
+
+def artwork_ids(cfg: Mapping[str, Any] | None, ids: Mapping[str, Any] | None, *, media_type: str | None = None) -> dict[str, str]:
+    block = (cfg or {}).get("anime_mapping") if isinstance(cfg, Mapping) else {}
+    if not (isinstance(block, Mapping) and block.get("enabled")):
+        return {}
+    clean = {str(k).strip().lower(): str(v).strip() for k, v in dict(ids or {}).items() if str(v or "").strip()}
+    if clean.get("tmdb") or not any(clean.get(k) for k in ART_SEED_KEYS):
+        return {}
+    kind = "movie" if str(media_type or "").strip().lower() == "movie" else "show"
+    try:
+        svc = AnimeMappingService(cfg)
+        if not svc.ready():
+            return {}
+        found = svc.enrich_ids({k: clean[k] for k in ART_SEED_KEYS if clean.get(k)}, media_type=kind).get("ids") or {}
+    except Exception:
+        return {}
+    return {k: str(found[k]) for k in ART_ID_KEYS if str(found.get(k) or "").strip() and not clean.get(k)}
 
 
 def new_enrich_stats() -> dict[str, int]:
@@ -410,6 +598,9 @@ def enrich_index_for_pair(
             enriched = svc.enrich_item(value)
             mini = minimal(enriched)
             new_key = canonical_key(mini) or str(key)
+            event = split_history_event_key(key)
+            if event and new_key != str(key):
+                new_key = f"{new_key}@{event[1]}"
             if counts is not None:
                 seeded, dead_end = _seed_status(value, enriched)
                 if seeded:

@@ -3,8 +3,12 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import sqlite3
+
 from cw_platform.local_db import get_conn
 from cw_platform.local_db import state as sqlite_state
+from cw_platform.local_db import schema as sqlite_schema
+from cw_platform.local_db.db import connect
 from cw_platform.orchestrator._state_store import StateStore
 
 
@@ -84,6 +88,45 @@ def test_state_database_preserves_current_sync_item_fields(tmp_path) -> None:
     assert loaded_item == item
     assert loaded["providers"]["TRAKT"]["history"]["checkpoint"] == "checkpoint-1"
     assert loaded["last_sync_epoch"] == 123
+
+
+def test_schema_upgrade_adds_collected_at_to_existing_baseline_items(tmp_path) -> None:
+    db_path = tmp_path / "old-crosswatch.sqlite3"
+    old_schema = sqlite_schema._CREATE_BASELINE_ITEMS.replace("    collected_at             TEXT,\n", "")
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute(old_schema)
+        raw.commit()
+    finally:
+        raw.close()
+
+    conn = connect(db_path, base_path=tmp_path)
+    try:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(baseline_items)").fetchall()}
+    finally:
+        conn.close()
+
+    assert "collected_at" in columns
+
+
+def test_schema_upgrade_preserves_existing_manual_mappings(tmp_path) -> None:
+    db_path = tmp_path / "old-manual-policy.sqlite3"
+    old_schema = sqlite_schema._CREATE_MANUAL_POLICY_ADD_ITEMS.replace("    collected_at             TEXT,\n", "")
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute(sqlite_schema._CREATE_MANUAL_POLICY_FEATURES)
+        raw.execute(old_schema)
+        raw.execute("INSERT INTO manual_policy_features(id,provider,feature,updated_at) VALUES(1,'SRC','collection',0)")
+        raw.execute("INSERT INTO manual_policy_add_items(feature_id,item_key,title,updated_at) VALUES(1,'tmdb:1','Existing mapping',0)")
+        raw.commit()
+    finally:
+        raw.close()
+    conn = connect(db_path, base_path=tmp_path)
+    try:
+        row = conn.execute("SELECT item_key,title,collected_at FROM manual_policy_add_items").fetchone()
+        assert tuple(row) == ("tmdb:1", "Existing mapping", None)
+    finally:
+        conn.close()
 
 
 def _feature_row_ids(base_path) -> dict[tuple[str, str, str], int]:
@@ -269,3 +312,55 @@ def test_state_feature_read_helpers_load_only_requested_features(tmp_path) -> No
     assert counts["TRAKT"] == 1
     assert counts["SIMKL"] == 1
     assert watchlist["last_sync_epoch"] == 300
+
+
+def test_state_database_preserves_collection_media_info(tmp_path) -> None:
+    item = {
+        "type": "movie",
+        "title": "Dune: Part Two",
+        "year": 2024,
+        "ids": {"tmdb": "693134"},
+        "collected_at": "2026-01-02T03:04:05Z",
+        "format": "digital",
+        "media_info": {"resolution": "uhd_4k", "hdr": "dolby_vision", "audio": "dolby_atmos", "audio_channels": "7.1", "is_3d": True},
+    }
+    plain = {"type": "movie", "title": "Arrival", "year": 2016, "ids": {"tmdb": "329865"}}
+    state = {"providers": {"PLEX": {"collection": {"baseline": {"items": {"tmdb:693134": item, "tmdb:329865": plain}}}}}}
+
+    store = StateStore(tmp_path)
+    store.save_state(state)
+    items = store.load_state()["providers"]["PLEX"]["collection"]["baseline"]["items"]
+
+    assert items["tmdb:693134"] == item
+    assert items["tmdb:329865"] == plain
+
+
+def test_schema_upgrade_adds_media_json_to_existing_baseline_tables(tmp_path) -> None:
+    db_path = tmp_path / "old-crosswatch.sqlite3"
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute(sqlite_schema._CREATE_BASELINE_ITEMS)
+        raw.commit()
+    finally:
+        raw.close()
+
+    conn = connect(db_path, base_path=tmp_path)
+    try:
+        tables = {table: {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()} for table in ("baseline_items", "pair_baseline_items")}
+    finally:
+        conn.close()
+
+    assert all("media_json" in columns for columns in tables.values())
+
+
+def test_state_database_preserves_movie_part_without_media_paths(tmp_path) -> None:
+    # SIMKL multipart anime movies carry `part` but no media paths; dropping it
+    # would collapse distinct parts onto one history identity.
+    item = {"type": "movie", "title": "Part Two", "year": 2020, "ids": {"simkl": "37137"}, "watched_at": "2026-01-02T03:04:05Z", "part": 2}
+    state = {"providers": {"SIMKL": {"history": {"baseline": {"items": {"simkl:37137#part:2": item}}}}}}
+
+    store = StateStore(tmp_path)
+    store.save_state(state)
+    items = store.load_state()["providers"]["SIMKL"]["history"]["baseline"]["items"]
+
+    assert items["simkl:37137#part:2"]["part"] == 2

@@ -3,8 +3,10 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.interactive_reads import retained_read
+
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +40,7 @@ __all__ = [
     "content_id_key",
     "epoch_ms",
     "ids_for_content_id",
+    "enrich_external_ids",
     "is_configured",
     "iso_from_epoch_ms",
     "library_lock",
@@ -53,6 +56,7 @@ __all__ = [
     "resolve_episode",
     "rpc",
     "selected_profile_id",
+    "unresolved_result_keys",
     "to_int",
 ]
 
@@ -110,6 +114,11 @@ def positive_int(value: Any) -> int | None:
     return number if number is not None and number > 0 else None
 
 
+def season_int(value: Any) -> int | None:
+    number = to_int(value)
+    return number if number is not None and number >= 0 else None
+
+
 def epoch_ms(value: Any) -> int | None:
     number = to_int(value)
     if number is not None:
@@ -148,6 +157,61 @@ def ids_for_content_id(content_id: Any) -> dict[str, str] | None:
         if value.isdigit():
             return {"tmdb": value}
     return None
+
+
+def enrich_external_ids(adapter: Any, item: Mapping[str, Any], *, entity: str) -> dict[str, Any]:
+    out = dict(item or {})
+    content_ids = ids_for_content_id(out.get("_nuvio_content_id") or out.get("content_id"))
+    tmdb = str((content_ids or {}).get("tmdb") or "").strip()
+    if not tmdb:
+        ids_raw = out.get("show_ids") if str(entity or "").lower() == "tv" and isinstance(out.get("show_ids"), Mapping) else out.get("ids")
+        ids = ids_raw if isinstance(ids_raw, Mapping) else {}
+        tmdb = str(ids.get("tmdb") or "").strip()
+    if not tmdb.isdigit():
+        return out
+
+    cache = getattr(adapter, "_nuvio_external_ids_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(adapter, "_nuvio_external_ids_cache", cache)
+        except Exception:
+            pass
+
+    ent = "tv" if str(entity or "").strip().lower() in {"tv", "show", "series"} else "movie"
+    cache_key = (ent, tmdb)
+    ids_extra = cache.get(cache_key)
+    if ids_extra is None:
+        provider = _tmdb_metadata_provider(adapter)
+        if provider is None:
+            cache[cache_key] = {}
+            return out
+        try:
+            detail = provider.fetch(entity=ent, ids={"tmdb": tmdb}, need={"poster": False, "backdrop": False, "ids": True})
+        except Exception:
+            cache[cache_key] = {}
+            return out
+        raw = detail.get("ids") if isinstance(detail, Mapping) else None
+        ids_extra = merge_ids({"tmdb": tmdb}, raw if isinstance(raw, Mapping) else {})
+        cache[cache_key] = ids_extra
+
+    if not isinstance(ids_extra, Mapping) or not ids_extra:
+        return out
+
+    ids_cur = out.get("ids") if isinstance(out.get("ids"), Mapping) else {}
+    merged_ids = merge_ids(ids_cur, ids_extra)
+    if merged_ids:
+        out["ids"] = merged_ids
+
+    if str(out.get("type") or "").strip().lower() in {"episode", "season", "show"} or ent == "tv":
+        show_ids_cur = out.get("show_ids") if isinstance(out.get("show_ids"), Mapping) else {}
+        merged_show_ids = merge_ids(show_ids_cur, ids_extra)
+        if merged_show_ids:
+            out["show_ids"] = merged_show_ids
+            if str(out.get("type") or "").strip().lower() in {"episode", "season"}:
+                out["ids"] = merge_ids(out.get("ids") if isinstance(out.get("ids"), Mapping) else {}, merged_show_ids)
+
+    return out
 
 
 def content_id_for_item(item: Mapping[str, Any]) -> str | None:
@@ -269,9 +333,9 @@ def make_item(
     if not ids:
         return None
     ctype = str(content_type or "").strip().lower()
-    season_n = positive_int(season)
+    season_n = season_int(season)
     episode_n = positive_int(episode)
-    if ctype in {"series", "show", "tv"} and not (season_n and episode_n):
+    if ctype in {"series", "show", "tv"} and not (season_n is not None and episode_n):
         item = {"type": "show", "ids": dict(ids)}
         if title:
             item["title"] = str(title)
@@ -279,7 +343,7 @@ def make_item(
             item["year"] = year
         return item
 
-    if ctype in {"episode"} or (season_n and episode_n):
+    if ctype in {"episode"} or (season_n is not None and episode_n):
         if season_n is None or episode_n is None:
             return None
         item: dict[str, Any] = {
@@ -304,6 +368,29 @@ def canonical_item_key(item: Mapping[str, Any]) -> str:
     return canonical_key(id_minimal(item))
 
 
+def unresolved_result_keys(unresolved: Iterable[Mapping[str, Any]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in unresolved or []:
+        if not isinstance(row, Mapping):
+            continue
+        key = ""
+        for field in ("key", "_cw_key", "canonical_key"):
+            raw = str(row.get(field) or "").strip()
+            if raw:
+                key = raw
+                break
+        if not key:
+            item = row.get("item")
+            if isinstance(item, Mapping):
+                key = canonical_item_key(item)
+        if not key or key == "unknown:" or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def payload_item_key(payload: Mapping[str, Any]) -> str:
     return canonical_item_key(
         make_item(
@@ -320,9 +407,9 @@ def payload_item_key(payload: Mapping[str, Any]) -> str:
 
 def content_id_key(item: Mapping[str, Any]) -> str:
     content_id = content_id_for_item(item)
-    season = positive_int(item.get("season"))
+    season = season_int(item.get("season"))
     episode = positive_int(item.get("episode"))
-    if content_id and season and episode:
+    if content_id and season is not None and episode:
         return f"{content_id}:{season}:{episode}"
     return str(content_id or "")
 
@@ -334,20 +421,20 @@ def progress_key(item: Mapping[str, Any]) -> str | None:
     content_id = content_id_for_item(item)
     if not content_id:
         return None
-    season = positive_int(item.get("season"))
+    season = season_int(item.get("season"))
     episode = positive_int(item.get("episode"))
-    if season and episode:
+    if season is not None and episode:
         return f"{content_id}_s{season}e{episode}"
     return content_id
 
 
 def resolve_episode(adapter: Any, item: Mapping[str, Any], *, current_rows: Any = None) -> EpisodeMapResult:
     content_id = resolve_content_id_for_item(adapter, item)
-    season = positive_int(item.get("season"))
+    season = season_int(item.get("season"))
     episode = positive_int(item.get("episode"))
     if not content_id:
         return EpisodeMapResult(False, "nuvio_id_missing")
-    if not season or not episode:
+    if season is None or not episode:
         return EpisodeMapResult(False, "nuvio_episode_not_found", content_id=content_id)
 
     video_id = str(item.get("_nuvio_video_id") or item.get("video_id") or "").strip()
@@ -359,7 +446,7 @@ def resolve_episode(adapter: Any, item: Mapping[str, Any], *, current_rows: Any 
             continue
         if str(row.get("content_id") or "").strip() != content_id:
             continue
-        if positive_int(row.get("season")) != season or positive_int(row.get("episode")) != episode:
+        if season_int(row.get("season")) != season or positive_int(row.get("episode")) != episode:
             continue
         row_video = str(row.get("video_id") or "").strip()
         if row_video:
@@ -374,6 +461,7 @@ def _rows(data: Any, reason: str) -> list[Mapping[str, Any]]:
     return [row for row in data if isinstance(row, Mapping)]
 
 
+@retained_read
 def pull_watch_progress_rows(adapter: Any, *, limit: int = 1000, max_pages: int = 1000) -> list[Mapping[str, Any]]:
     pid = selected_profile_id(adapter)
     per_page = max(1, min(int(limit or 1000), 1000))
@@ -394,6 +482,7 @@ def pull_watch_progress_rows(adapter: Any, *, limit: int = 1000, max_pages: int 
     return out
 
 
+@retained_read
 def pull_watched_rows(adapter: Any, *, page_size: int = 900, max_pages: int = 1000) -> list[Mapping[str, Any]]:
     pid = selected_profile_id(adapter)
     size = max(1, min(int(page_size or 900), 1000))
@@ -407,6 +496,7 @@ def pull_watched_rows(adapter: Any, *, page_size: int = 900, max_pages: int = 10
     return out
 
 
+@retained_read
 def pull_library_rows(adapter: Any, *, limit: int = 500, max_pages: int = 1000) -> list[Mapping[str, Any]]:
     pid = selected_profile_id(adapter)
     size = max(1, min(int(limit or 500), 500))

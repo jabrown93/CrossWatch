@@ -3,14 +3,16 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.interactive_reads import accepted_result, replaying, replace_retained
+
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from cw_platform.id_map import canonical_key, ids_from, minimal as id_minimal
+from cw_platform.id_map import ids_from, minimal as id_minimal, unified_keys_from_ids
 
 from providers.sync._log import log as cw_log
 
-from ._common import canonical_item_key, epoch_ms, library_lock, make_item, payload_item_key, pull_library_rows, resolve_content_id_for_item, rpc, selected_profile_id
+from ._common import canonical_item_key, enrich_external_ids, epoch_ms, library_lock, make_item, payload_item_key, pull_library_rows, resolve_content_id_for_item, rpc, selected_profile_id, unresolved_result_keys
 
 _METADATA_FIELDS = (
     "name",
@@ -34,7 +36,7 @@ def _warn(event: str, **fields: Any) -> None:
     cw_log("NUVIO", "watchlist", "warn", event, **fields)
 
 
-def _item_from_row(row: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] | None, str | None]:
+def _item_from_row(adapter: Any, row: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] | None, str | None]:
     ctype = str(row.get("content_type") or "").strip().lower()
     if ctype not in {"movie", "series", "show"}:
         return None, None, "nuvio_id_missing"
@@ -52,6 +54,7 @@ def _item_from_row(row: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] |
     for field in _METADATA_FIELDS:
         if field in row:
             item[f"_nuvio_{field}"] = row.get(field)
+    item = enrich_external_ids(adapter, item, entity="tv" if item.get("type") == "show" else "movie")
     key = canonical_item_key(item)
     if not key or key == "unknown:":
         return None, None, "nuvio_id_missing"
@@ -216,7 +219,7 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     skipped = 0
     for row in rows:
-        key, item, reason = _item_from_row(row)
+        key, item, reason = _item_from_row(adapter, row)
         if not key or not item:
             if reason:
                 skipped += 1
@@ -232,7 +235,7 @@ def _pull_remote_by_key(adapter: Any) -> tuple[dict[str, dict[str, Any]], dict[s
     items: dict[str, dict[str, Any]] = {}
     remote: dict[str, dict[str, Any]] = {}
     for row in rows:
-        key, item, _reason = _item_from_row(row)
+        key, item, _reason = _item_from_row(adapter, row)
         if key and item:
             items[key] = item
             remote[key] = _remote_for_row(row)
@@ -263,7 +266,7 @@ def _result(ok: bool, count: int, attempted: int, confirmed: list[str], unresolv
         "attempted": int(attempted),
         "confirmed_keys": list(dict.fromkeys(k for k in confirmed if k)),
         "unresolved": unresolved,
-        "unresolved_keys": list(dict.fromkeys(canonical_key((u.get("item") or {}) if isinstance(u, Mapping) else {}) for u in unresolved)),
+        "unresolved_keys": unresolved_result_keys(unresolved),
         "results": results,
         "skipped": int(skipped),
         "errors": sum(1 for u in unresolved if str(u.get("status") or "") == "failed"),
@@ -283,12 +286,13 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
         pending_keys: list[str] = []
         verify_keys: list[str] = []
         pending_items: list[dict[str, Any]] = []
+        confirmed_destinations: dict[str, dict[str, Any]] = {}
 
         for item in src:
             key = canonical_item_key(item)
             payload, reason = _remote_for_item(adapter, item)
             if payload is None:
-                entry = {"status": "unresolved", "reason": reason or "nuvio_id_missing", "item": id_minimal(item)}
+                entry = {"status": "unresolved", "reason": reason or "nuvio_id_missing", "item": id_minimal(item), "key": key, "canonical_key": key}
                 unresolved.append(entry)
                 results.append(entry)
                 continue
@@ -311,42 +315,106 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
             try:
                 rpc(adapter, "sync_push_library", {"p_profile_id": selected_profile_id(adapter), "p_items": list(remote.values())})
             except Exception:
-                return _result(False, 0, attempted, [], [{"status": "failed", "reason": "nuvio_library_replace_failed"}], results, 0)
+                failed = [
+                    {"status": "failed", "reason": "nuvio_library_replace_failed", "item": id_minimal(item), "key": key, "canonical_key": key}
+                    for item, key in zip(pending_items, pending_keys)
+                ]
+                return _result(False, 0, attempted, [], failed or [{"status": "failed", "reason": "nuvio_library_replace_failed"}], results, 0)
+
+        if replaying():
+            replace_retained(pull_library_rows, list(remote.values()))
+            return accepted_result(_result(not unresolved, len(pending_keys), attempted, pending_keys, unresolved, results, 0), pending_keys)
 
         after = build_index(adapter)
-        confirmed = [key for key, verify_key in zip(pending_keys, verify_keys) if verify_key in after]
-        unresolved.extend({"status": "failed", "reason": "nuvio_library_verification_failed", "item": id_minimal(item), "canonical_key": key} for item, key, verify_key in zip(pending_items, pending_keys, verify_keys) if verify_key not in after)
+        confirmed = []
+        for key, verify_key in zip(pending_keys, verify_keys):
+            if verify_key in after:
+                confirmed.append(key)
+                confirmed_destinations[key] = {
+                    "key": verify_key,
+                    "item": dict(after.get(verify_key) or {}),
+                    "status": "added" if changed else "existing",
+                }
+        unresolved.extend({"status": "failed", "reason": "nuvio_library_verification_failed", "item": id_minimal(item), "key": key, "canonical_key": key} for item, key, verify_key in zip(pending_items, pending_keys, verify_keys) if verify_key not in after)
         ok = len(unresolved) == 0
         _info("write_done", op="add", ok=ok, attempted=attempted, confirmed=len(confirmed), unresolved=len(unresolved))
-        return _result(ok, len(confirmed), attempted, confirmed, unresolved, results, 0)
+        return _result(ok, len(confirmed), attempted, confirmed, unresolved, results, 0, confirmed_destinations=confirmed_destinations)
+
+
+def _library_row_identity(row: Mapping[str, Any]) -> tuple[str, str]:
+    return str(id_minimal({"type": row.get("content_type")})["type"]), str(row.get("content_id") or "").strip()
+
+
+def _removal_row_for_item(
+    adapter: Any,
+    item: Mapping[str, Any],
+    current: Mapping[int, Mapping[str, Any]],
+) -> tuple[int | None, str | None]:
+    typ = id_minimal(item)["type"]
+    wanted = unified_keys_from_ids(ids_from(item))
+    if typ not in {"movie", "show"} or not wanted:
+        return None, "nuvio_id_missing"
+    candidates = {index: row for index, row in current.items() if row.get("type") == typ}
+    native_id = str(item.get("_nuvio_content_id") or item.get("content_id") or "").strip()
+    if native_id:
+        native = [index for index, row in candidates.items() if row.get("_nuvio_content_id") == native_id]
+        if native:
+            return (native[0], None) if len(native) == 1 else (None, "nuvio_id_ambiguous")
+    tokens = {index: unified_keys_from_ids(ids_from(row)) for index, row in candidates.items()}
+    matches = [index for index, keys in tokens.items() if wanted & keys]
+    if not matches:
+        resolved = _verify_key_for_item(adapter, item)
+        matches = [index for index, keys in tokens.items() if resolved in keys]
+    if len(matches) > 1:
+        return None, "nuvio_id_ambiguous"
+    if not matches:
+        return None, None
+    matched = matches[0]
+    wanted_ids = dict(token.split(":", 1) for token in wanted)
+    matched_ids = dict(token.split(":", 1) for token in tokens[matched])
+    if any(wanted_ids[name] != matched_ids[name] for name in wanted_ids.keys() & matched_ids.keys()):
+        return None, "nuvio_id_conflict"
+    return matched, None
 
 
 def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
     src = [dict(x or {}) for x in items or [] if isinstance(x, Mapping)]
     with library_lock(adapter):
-        current, remote = _pull_remote_by_key(adapter)
+        rows = pull_library_rows(adapter)
+        current: dict[int, dict[str, Any]] = {}
+        remote = {index: _remote_for_row(row) for index, row in enumerate(rows)}
+        for index, row in enumerate(rows):
+            _, parsed, _ = _item_from_row(adapter, row)
+            if parsed:
+                current[index] = parsed
         unresolved: list[dict[str, Any]] = []
         results: list[dict[str, Any]] = []
         attempted = 0
         skipped = 0
         pending_keys: list[str] = []
-        verify_keys: list[str] = []
+        verify_keys: list[tuple[str, str]] = []
         pending_items: list[dict[str, Any]] = []
 
         for item in src:
             key = canonical_item_key(item)
-            verify_key = _verify_key_for_item(adapter, item)
             if not key or key == "unknown:":
-                entry = {"status": "unresolved", "reason": "nuvio_id_missing", "item": id_minimal(item)}
+                entry = {"status": "unresolved", "reason": "nuvio_id_missing", "item": id_minimal(item), "key": key, "canonical_key": key}
                 unresolved.append(entry)
                 results.append(entry)
                 continue
-            if verify_key not in remote:
+            row_index, reason = _removal_row_for_item(adapter, item, current)
+            if reason:
+                entry = {"status": "unresolved", "reason": reason, "item": id_minimal(item), "key": key, "canonical_key": key}
+                unresolved.append(entry)
+                results.append(entry)
+                continue
+            if row_index is None:
                 skipped += 1
                 results.append({"status": "skipped", "reason": "already_absent", "item": id_minimal(item), "canonical_key": key})
                 continue
             attempted += 1
-            remote.pop(verify_key, None)
+            verify_key = _library_row_identity(remote.pop(row_index))
+            current.pop(row_index, None)
             pending_keys.append(key)
             verify_keys.append(verify_key)
             pending_items.append(item)
@@ -358,15 +426,23 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = 
             try:
                 rpc(adapter, "sync_push_library", {"p_profile_id": selected_profile_id(adapter), "p_items": list(remote.values())})
             except Exception:
-                return _result(False, 0, attempted, [], [{"status": "failed", "reason": "nuvio_library_replace_failed"}], results, skipped)
+                failed = [
+                    {"status": "failed", "reason": "nuvio_library_replace_failed", "item": id_minimal(item), "key": key, "canonical_key": key}
+                    for item, key in zip(pending_items, pending_keys)
+                ]
+                return _result(False, 0, attempted, [], failed or [{"status": "failed", "reason": "nuvio_library_replace_failed"}], results, skipped)
 
-        after = build_index(adapter)
+        if replaying():
+            replace_retained(pull_library_rows, list(remote.values()))
+            return _result(not unresolved, len(pending_keys), attempted, pending_keys, unresolved, results, skipped)
+
+        after = {_library_row_identity(row) for row in pull_library_rows(adapter)}
         confirmed: list[str] = []
         for item, key, verify_key in zip(pending_items, pending_keys, verify_keys):
             if key and verify_key not in after:
                 confirmed.append(key)
-            elif verify_key in current:
-                unresolved.append({"status": "failed", "reason": "nuvio_library_verification_failed", "item": id_minimal(item), "canonical_key": key})
+            else:
+                unresolved.append({"status": "failed", "reason": "nuvio_library_verification_failed", "item": id_minimal(item), "key": key, "canonical_key": key})
         ok = len(unresolved) == 0
         _info("write_done", op="remove", ok=ok, attempted=attempted, confirmed=len(confirmed), skipped=skipped, unresolved=len(unresolved))
         return _result(ok, len(confirmed), attempted, confirmed, unresolved, results, skipped)

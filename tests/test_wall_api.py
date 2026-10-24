@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
+from pathlib import Path
 from typing import cast
 
 from api import wallAPI
@@ -55,6 +56,63 @@ def test_wall_cache_key_tracks_db_watchlist(monkeypatch, tmp_path):
     after = wallAPI._cache_key(both_only=False, active_only=False, limit=20)
 
     assert after != before
+
+
+def test_wall_endpoint_returns_not_modified_for_known_version(monkeypatch):
+    app = FastAPI()
+    wallAPI.register_wall(app)
+    wallAPI._WALL_CACHE.clear()
+    wallAPI._WALL_CACHE.update({"key": None, "data": None})
+
+    monkeypatch.setattr(wallAPI, "load_config", lambda: {"tmdb": {"api_key": "tmdb-key"}})
+    monkeypatch.setattr(wallAPI, "_load_state", lambda: {"last_sync_epoch": 123})
+    monkeypatch.setattr(wallAPI.sqlite_state, "fingerprint", lambda *_args, **_kwargs: ("state", 1))
+    monkeypatch.setattr(wallAPI.sqlite_manual_policy, "fingerprint", lambda *_args, **_kwargs: ("manual", 1))
+    monkeypatch.setattr(wallAPI.sqlite_watchlist_hide, "fingerprint", lambda *_args, **_kwargs: ("hidden", 1))
+    monkeypatch.setattr(wallAPI, "config_path", lambda: "config.json")
+    monkeypatch.setattr(wallAPI, "build_watchlist", lambda _state, tmdb_ok: [{"key": "one", "status": "both"}])
+
+    endpoint = next(cast(APIRoute, route).endpoint for route in app.routes if getattr(route, "path", "") == "/api/state/wall")
+    first = endpoint(both_only=False, active_only=False, limit=20)
+    monkeypatch.setattr(
+        wallAPI,
+        "build_watchlist",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wall should not rebuild")),
+    )
+
+    second = endpoint(both_only=False, active_only=False, limit=20, known_version=first["version"])
+
+    assert second == {"ok": True, "not_modified": True, "version": first["version"]}
+
+
+def test_watchlist_preview_uses_cached_wall_version() -> None:
+    js = Path("assets/helpers/watchlist-preview.js").read_text("utf-8")
+
+    assert "version" in js
+    assert "const WALL_PREVIEW_FETCH_TIMEOUT_MS = 30 * 1000;" in js
+    assert "window.CW.API.j(url, {}, WALL_PREVIEW_FETCH_TIMEOUT_MS)" in js
+    assert 'const controller = !opt?.signal && typeof AbortController === "function" ? new AbortController() : null;' in js
+    assert 'controller.abort("timeout")' in js
+    assert 'params.set("known_version", cached.version)' in js
+    assert "if (data?.not_modified && cached?.items?.length)" in js
+    assert "preserveIfSame: true" in js
+    assert "function clearWatchlistPreview()" in js
+    assert 'window.addEventListener("cw:sync-state-cleared", clearWatchlistPreview);' in js
+    assert "key.startsWith(`${WALL_PREVIEW_CACHE_KEY}.`)" in js
+
+
+def test_watchlist_preview_uses_shared_provider_branding() -> None:
+    js = Path("assets/helpers/watchlist-preview.js").read_text("utf-8")
+    css = Path("assets/crosswatch.css").read_text("utf-8")
+
+    assert "const providerBrandInfo = (value) =>" in js
+    assert "const info = meta.brandInfo?.(key);" in js
+    assert "const providerLogoPath = (name) => providerBrandInfo(name).icon || \"\";" in js
+    assert "PILL_CLASS_BY_PROVIDER" not in js
+    assert 'cls: "p-provider"' in js
+    assert "rgb: brand.tone?.rgb || \"\"" in js
+    assert "border:1px solid rgba(${rgb},.22)" in js
+    assert ".p-provider{color:rgb(var(--pill-rgb,208,217,255));" in css
 
 
 def test_wall_endpoint_filters_by_user_profile(monkeypatch):
@@ -126,3 +184,49 @@ def test_wall_endpoint_reads_db_watchlist(monkeypatch, tmp_path):
     assert data["total"] == 1
     assert data["items"][0]["tmdb"] == 550
     assert data["last_sync_epoch"] == 123
+
+
+def test_wall_endpoint_uses_watchlist_id_alias_merge(monkeypatch, tmp_path):
+    app = FastAPI()
+    wallAPI.register_wall(app)
+    wallAPI._WALL_CACHE.clear()
+    wallAPI._WALL_CACHE.update({"key": None, "data": None})
+
+    monkeypatch.setattr(wallAPI, "CONFIG", tmp_path)
+    monkeypatch.setattr(watchlist_service, "CONFIG", tmp_path)
+    monkeypatch.setattr(wallAPI, "load_config", lambda: {"tmdb": {"api_key": "tmdb-key"}})
+    monkeypatch.setattr(wallAPI, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(watchlist_service, "_registry_sync_providers", lambda: ["TRAKT", "STREMIO"])
+    StateStore(tmp_path).save_feature_baseline(
+        provider="TRAKT",
+        feature="watchlist",
+        items={
+            "tmdb:1662317": {
+                "type": "movie",
+                "title": "The Crash",
+                "year": 2026,
+                "ids": {"tmdb": "1662317", "imdb": "tt40792117"},
+            }
+        },
+        last_sync_epoch=123,
+    )
+    StateStore(tmp_path).save_feature_baseline(
+        provider="STREMIO",
+        feature="watchlist",
+        items={
+            "imdb:tt40792117": {
+                "type": "movie",
+                "title": "The Crash",
+                "ids": {"imdb": "tt40792117"},
+            }
+        },
+        last_sync_epoch=123,
+    )
+
+    endpoint = next(cast(APIRoute, route).endpoint for route in app.routes if getattr(route, "path", "") == "/api/state/wall")
+    data = endpoint(both_only=False, active_only=False, limit=20)
+
+    assert data["total"] == 1
+    assert data["items"][0]["key"] == "tmdb:1662317"
+    assert data["items"][0]["tmdb"] == 1662317
+    assert data["items"][0]["sources"] == ["stremio", "trakt"]

@@ -3,16 +3,16 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import os
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
 
-UA = os.environ.get("CW_EMBY_UA") or os.environ.get("CW_UA") or "CrossWatch"
+UA = http_user_agent("Emby", override_env="CW_EMBY_UA")
 
 
 def _clean(url: str) -> str:
@@ -27,7 +27,7 @@ def _clean(url: str) -> str:
 
 
 def _mb_auth(token: str | None, device_id: str) -> str:
-    version = os.environ.get("CW_EMBY_VERSION") or os.environ.get("CW_VERSION") or "unknown"
+    version = app_version()
     base = f'MediaBrowser Client="CrossWatch", Device="Web", DeviceId="{device_id}", Version="{version}"'
     return f'{base}, Token="{token}"' if token else base
 
@@ -67,6 +67,10 @@ def ensure_whitelist_defaults(cfg: dict[str, Any] | None = None, instance_id: An
         em.setdefault("ratings", {}).setdefault("libraries", [])
         changed = True
 
+    if "collection" not in em or "libraries" not in (em.get("collection") or {}):
+        em.setdefault("collection", {}).setdefault("libraries", [])
+        changed = True
+
     if "scrobble" not in em or "libraries" not in (em.get("scrobble") or {}):
         em.setdefault("scrobble", {}).setdefault("libraries", [])
         changed = True
@@ -99,8 +103,9 @@ def inspect_and_persist(cfg: dict[str, Any] | None = None, instance_id: Any = No
     changed = False
     if server and token:
         try:
+            selected_user_id = str(em.get("user_id") or "").strip()
             r = requests.get(
-                urljoin(server, "Users/Me"),
+                urljoin(server, f"Users/{selected_user_id}" if selected_user_id else "Users/Me"),
                 headers=_headers(token, devid),
                 timeout=timeout,
                 verify=verify,
@@ -108,10 +113,11 @@ def inspect_and_persist(cfg: dict[str, Any] | None = None, instance_id: Any = No
             if r.ok:
                 me = r.json() or {}
                 name = (me.get("Name") or out["username"] or "").strip()
-                uid = (me.get("Id") or out["user_id"] or "").strip()
+                uid = selected_user_id or (me.get("Id") or "").strip()
 
-                if name and em.get("user") != name:
+                if name and (em.get("user") != name or em.get("username") != name):
                     em["user"] = name
+                    em["username"] = name
                     changed = True
                 if uid and em.get("user_id") != uid:
                     em["user_id"] = uid

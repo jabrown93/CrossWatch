@@ -19,7 +19,6 @@ except Exception:  # pragma: no cover
 
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 
-from .._mod_common import _safe_scope
 
 _PAIR_SCOPE_ENV: tuple[str, ...] = ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR")
 
@@ -46,6 +45,14 @@ def _pair_scope() -> str | None:
         if v and str(v).strip():
             return str(v).strip()
     return "unscoped"
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def scope_safe() -> str:
@@ -129,22 +136,44 @@ def state_file_for_read(root: Path, stem: str, scoped: Path) -> Path:
     return scoped
 
 
-def latest_snapshot_file(root: Path, feature: str) -> Path | None:
-    snaps = root / "snapshots"
-    if not snaps.exists() or not snaps.is_dir():
-        return None
-
-    candidates: list[Path] = []
-    for p in snaps.rglob(f"*-{feature}.json"):
-        if p.is_file():
-            candidates.append(p)
-
+def _newest(candidates: list[Path]) -> Path | None:
     if not candidates:
         return None
     try:
         return max(candidates, key=lambda x: x.stat().st_mtime)
     except Exception:
         return candidates[-1]
+
+
+def latest_snapshot_file(root: Path, feature: str) -> Path | None:
+    snaps = root / "snapshots"
+    if not snaps.exists() or not snaps.is_dir():
+        return None
+    return _newest([p for p in snaps.rglob(f"*-{feature}.json") if p.is_file()])
+
+
+def chained_source() -> bool:
+    if not pair_scoped():
+        return True
+    return str(os.getenv("CW_PAIR_SRC") or "").strip().upper() == "CROSSWATCH"
+
+
+def fallback_state_file(root: Path, stem: str) -> Path | None:
+    return latest_state_file(root, stem) if chained_source() else None
+
+
+def fallback_snapshot_file(root: Path, feature: str) -> Path | None:
+    if chained_source():
+        return latest_snapshot_file(root, feature)
+
+    snaps = root / "snapshots"
+    candidates: list[Path] = []
+    if snaps.is_dir():
+        candidates += [p for p in snaps.glob(f"*-{feature}.json") if p.is_file()]
+    scoped = scoped_snapshots_dir(root)
+    if scoped != snaps and scoped.is_dir():
+        candidates += [p for p in scoped.rglob(f"*-{feature}.json") if p.is_file()]
+    return _newest(candidates)
 
 # Logging factory
 
@@ -162,6 +191,71 @@ def make_logger(feature: str):  # type: ignore[return]
         cw_log("CROSSWATCH", feature, "error", msg, **fields)
 
     return _dbg, _info, _warn, _error
+
+
+_IDENTITY_MAP_FIELDS: tuple[str, ...] = ("ids", "show_ids")
+_PASSTHROUGH_FIELDS: tuple[str, ...] = (
+    "_anime_absolute",
+    "_cw_anime_map",
+    "_simkl_episode_number",
+    "_trakt_number_abs",
+    "anime_type",
+    "simkl_bucket",
+)
+
+
+def _clean_identity_map(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        name = str(key or "").strip().lower()
+        if not name or item in (None, "") or isinstance(item, bool):
+            continue
+        if isinstance(item, (Mapping, list, tuple, set)):
+            continue
+        text = str(item).strip()
+        if text:
+            out[name] = text
+    return out
+
+
+def preserve_tracker_identity(base: Mapping[str, Any], source: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep CrossWatch useful as a chained provider by preserving source identity maps."""
+    out = dict(base or {})
+    for field in _IDENTITY_MAP_FIELDS:
+        raw = _clean_identity_map(source.get(field))
+        current = _clean_identity_map(out.get(field))
+        merged = dict(raw)
+        merged.update(current)
+        if merged:
+            out[field] = merged
+        else:
+            out.pop(field, None)
+    for field in _PASSTHROUGH_FIELDS:
+        value = source.get(field)
+        if value not in (None, ""):
+            out[field] = value
+    return out
+
+
+def tracker_minimal(item: Mapping[str, Any]) -> dict[str, Any]:
+    return preserve_tracker_identity(id_minimal(item), item)
+
+
+def merge_tracker_identity(existing: Mapping[str, Any] | None, incoming: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(existing, Mapping):
+        return dict(incoming or {})
+    out = dict(incoming or {})
+    for field in _IDENTITY_MAP_FIELDS:
+        merged = _clean_identity_map(existing.get(field))
+        merged.update(_clean_identity_map(out.get(field)))
+        if merged:
+            out[field] = merged
+    for field in _PASSTHROUGH_FIELDS:
+        if out.get(field) in (None, "") and existing.get(field) not in (None, ""):
+            out[field] = existing.get(field)
+    return out
 
 
 # Path helpers

@@ -9,6 +9,7 @@ from providers.metadata._meta_TMDB import TmdbProvider
 
 from services.playback_progress.service import (
     _combine_records,
+    _group_records,
     _overlay_live_streams,
     _progress_edit_max_exclusive,
     _profile_has_explicit_identity,
@@ -58,44 +59,20 @@ def _record(**overrides):
     return record
 
 
-def test_playback_bulk_footer_uses_wide_management_layout():
-    js = (ROOT / "assets" / "js" / "playback_progress.js").read_text(encoding="utf-8")
-    css = (ROOT / "assets" / "css" / "pages.css").read_text(encoding="utf-8")
-    shell = js[js.index("function shell()") : js.index('      <div class="pp-modal hidden" id="pp-progress-dialog"')]
-
-    assert 'class="pp-bulk-summary"' in shell
-    assert 'id="pp-selected-count" class="pp-selected-number">0</span>' in shell
-    assert 'class="pp-selected-copy"><strong>selected</strong><span>Select items to manage</span>' in shell
-    assert 'class="pp-btn pp-bulk-choice" id="pp-select-visible">${icon("visibility")}<span>Select Visible</span>' in shell
-    assert 'class="pp-btn pp-bulk-choice" id="pp-select-all">${icon("format_list_bulleted")}<span>Select All Filtered Results</span>' in shell
-    assert 'class="pp-btn pp-bulk-choice pp-bulk-clear" id="pp-clear-selection">${icon("cancel")}<span>Clear Selection</span>' in shell
-    assert 'class="pp-selected-pill"' not in shell
-    assert 'class="pp-bulk-divider"' not in shell
-    assert "#playback-progress-root .pp-bulk{position:sticky;bottom:12px;z-index:20;display:grid;grid-template-columns:minmax(220px,1fr)auto minmax(170px,1fr)" in css
-    assert "#playback-progress-root .pp-bulk-actions .pp-bulk-icon{width:48px;min-width:48px;height:48px;min-height:48px" in css
-    assert "#playback-progress-root .pp-bulk-actions #pp-bulk-edit{background:linear-gradient(180deg,rgba(63,126,255,0.56)" in css
-    assert "#playback-progress-root .pp-bulk-actions #pp-bulk-watch{background:linear-gradient(180deg,rgba(64,166,105,0.48)" in css
-    assert "#playback-progress-root .pp-bulk-actions #pp-bulk-remove{background:linear-gradient(180deg,rgba(181,48,68,0.58)" in css
-    assert "#playback-progress-root .pp-card.selected:before,#playback-progress-root .pp-card.selected:after{content:none !important;display:none !important}" in css
-
-
 def test_playback_progress_frontend_includes_kodi_provider_key():
-    js = (ROOT / "assets" / "js" / "playback_progress.js").read_text(encoding="utf-8")
+    js = (ROOT / "assets" / "js" / "profile-page.js").read_text(encoding="utf-8")
 
     keys = js.split("PLAYBACK_PROVIDER_KEYS")[1].split("]")[0]
-    for provider in ("crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy"):
+    for provider in ("crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "punchplay", "flicklist", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy"):
         assert f'"{provider}"' in keys, provider
 
 
 def test_playback_progress_frontend_is_readonly_for_managed_users():
-    js = (ROOT / "assets" / "js" / "playback_progress.js").read_text(encoding="utf-8")
+    js = (ROOT / "assets" / "js" / "profile-page.js").read_text(encoding="utf-8")
 
-    assert 'document.documentElement?.dataset?.cwRole === "user"' in js
-    assert "if (isReadOnly()) return;" in js
-    assert "user_profile" in js
-    assert "window.CW?.OverviewProfile?.id" in js
-    assert 'window.addEventListener("cw:overview-profile-changed"' in js
-    assert "CARD.cacheScope" not in js
+    assert 'const isManaged = () => doc?.dataset?.cwRole === "user";' in js
+    assert 'const canAct = () => !isManaged() || doc?.dataset?.cwPermWrite === "on";' in js
+    assert "if (!canAct() || !items.length) return;" in js
 
 
 def test_playback_progress_provider_instances_respect_user_filter():
@@ -275,6 +252,36 @@ def test_combined_record_uses_stable_artwork_source_instead_of_newest_record():
 
     assert forward["poster_url"] == older["poster_url"]
     assert reverse["poster_url"] == older["poster_url"]
+
+
+def test_playback_progress_groups_cross_provider_id_aliases():
+    trakt = _record(
+        provider="trakt",
+        provider_label="Trakt",
+        remote_id="trakt-1",
+        canonical_key="tmdb:1662317",
+        title="The Crash",
+        year=2026,
+        ids={"tmdb": "1662317", "imdb": "tt40792117"},
+        progress_percent=21.0,
+    )
+    stremio = _record(
+        provider="stremio",
+        provider_label="Stremio",
+        remote_id="stremio-1",
+        canonical_key="imdb:tt40792117",
+        title="The Crash",
+        year=None,
+        ids={"imdb": "tt40792117"},
+        progress_percent=21.5,
+    )
+
+    rows = _group_records([trakt, stremio])
+
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "combined"
+    assert rows[0]["provider_count"] == 2
+    assert rows[0]["ids"] == {"tmdb": "1662317", "imdb": "tt40792117"}
 
 
 def test_same_title_with_different_profile_progress_does_not_group():
@@ -635,7 +642,7 @@ def test_playback_progress_uses_crosswatch_profiles(monkeypatch, tmp_path):
 
 
 def test_playback_progress_settings_use_short_crosswatch_profile_ids() -> None:
-    js = (ROOT / "assets" / "js" / "playback_progress.js").read_text(encoding="utf-8")
+    js = (ROOT / "assets" / "js" / "profile-page.js").read_text(encoding="utf-8")
 
     assert 'String(p.provider || "").toLowerCase() === "crosswatch"' in js
     assert "/^CW-P\\d+$/i.test(id)" in js
@@ -1336,3 +1343,40 @@ def test_tmdb_cache_is_bounded(monkeypatch):
     assert "expired" not in provider._cache
     assert len(provider._cache) <= 10
     assert "fresh11" in provider._cache
+
+
+def test_profile_label_drops_the_separator_left_by_the_prefix() -> None:
+    js = Path("assets/js/profile-page.js").read_text("utf-8")
+    block = js.split("const profileLabel = (p) =>", 1)[1].split("const settingsLabel", 1)[0]
+
+    assert r'replace(/^[\s_-]+/, "")' in block
+
+
+def test_user_profile_filter_narrows_the_provider_instances() -> None:
+    from cw_platform.provider_instances import instances_for_user_profile
+    from services.playback_progress import get_service
+
+    cfg = {
+        "plex": {"instances": {"PLEX-P01": {"account_token": "t"}}},
+        "scrob": {"instances": {"SCROB-P01": {"server_url": "u", "api_key": "k", "username": "u", "password": "p"}}},
+        "user_profiles": {"up1": {"label": "Pazzie", "instances": {"PLEX": ["PLEX-P01"]}}},
+    }
+    service = get_service()
+
+    unscoped = {(s["provider"], s["instance_id"]) for s in service.provider_instances(cfg)}
+    scoped = {
+        (s["provider"], s["instance_id"])
+        for s in service.provider_instances(cfg, user_filter=instances_for_user_profile(cfg, "up1"))
+    }
+
+    assert ("plex", "PLEX-P01") in unscoped
+    assert ("scrob", "SCROB-P01") in unscoped
+    assert scoped == {("plex", "PLEX-P01")}
+
+
+def test_settings_modal_shows_profile_names_without_the_provider() -> None:
+    js = Path("assets/js/profile-page.js").read_text("utf-8")
+    block = js.split("const settingsLabel = (p) =>", 1)[1].split("const providerOrder", 1)[0]
+
+    assert "return profileLabel(p);" in block
+    assert 'if (id === "default") return "Default";' in block

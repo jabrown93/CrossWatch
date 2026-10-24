@@ -3,14 +3,225 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude
 from __future__ import annotations
 
-from typing import cast
+import copy
+import hashlib
+import json
+import threading
+import traceback
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Mapping, cast
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from services.dashboard_widgets import dashboard_widgets_payload
+from services.media_scope import MediaScope
+
+try:
+    from _logging import log as _base_log
+
+    LOG = _base_log.child("DASH")
+except Exception:  # pragma: no cover
+    LOG = None
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+_PAYLOAD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_PAYLOAD_CACHE_LOCK = threading.Lock()
+_PAYLOAD_CACHE_MAX = 8
+
+
+def _cached_widgets_payload(version: str) -> dict[str, Any] | None:
+    if not version:
+        return None
+    with _PAYLOAD_CACHE_LOCK:
+        payload = _PAYLOAD_CACHE.get(version)
+        if payload is None:
+            return None
+        _PAYLOAD_CACHE.move_to_end(version)
+        return copy.deepcopy(payload)
+
+
+def _store_widgets_payload(version: str, payload: Mapping[str, Any]) -> None:
+    if not version:
+        return
+    with _PAYLOAD_CACHE_LOCK:
+        _PAYLOAD_CACHE[version] = copy.deepcopy(dict(payload))
+        _PAYLOAD_CACHE.move_to_end(version)
+        while len(_PAYLOAD_CACHE) > _PAYLOAD_CACHE_MAX:
+            _PAYLOAD_CACHE.popitem(last=False)
+
+
+_PAYLOAD_INFLIGHT: dict[str, threading.Event] = {}
+_PAYLOAD_BUILD_WAIT_SECONDS = 55.0
+_STATE_RECENT_LIMIT = 400
+_COUNT_FEATURES = {
+    "history": "recent_history",
+    "ratings": "latest_ratings",
+    "progress": "recent_progress",
+}
+
+
+def _feature_library_totals(base_path: Any, requested: set[str], user_filter: Mapping[str, Any]) -> dict[str, int]:
+    wanted = requested & set(_COUNT_FEATURES)
+    if not wanted:
+        return {}
+    scoped = {str(provider or "").strip().upper() for provider in (user_filter or {})}
+    try:
+        from cw_platform.orchestrator._state_store import StateStore
+
+        store = StateStore(base_path)
+    except Exception:
+        return {}
+    totals: dict[str, int] = {}
+    for feature in sorted(wanted):
+        try:
+            counts = store.provider_feature_counts(feature) or {}
+        except Exception:
+            continue
+        values = [
+            int(value or 0)
+            for provider, value in counts.items()
+            if not scoped or str(provider or "").strip().upper() in scoped
+        ]
+        totals[feature] = max(values) if values else 0
+    return totals
+
+
+def _begin_widgets_build(version: str) -> tuple[threading.Event, bool]:
+    with _PAYLOAD_CACHE_LOCK:
+        event = _PAYLOAD_INFLIGHT.get(version)
+        if event is not None:
+            return event, False
+        event = threading.Event()
+        _PAYLOAD_INFLIGHT[version] = event
+        return event, True
+
+
+def _finish_widgets_build(version: str) -> None:
+    with _PAYLOAD_CACHE_LOCK:
+        event = _PAYLOAD_INFLIGHT.pop(version, None)
+    if event is not None:
+        event.set()
+
+
+def clear_dashboard_payload_cache() -> None:
+    with _PAYLOAD_CACHE_LOCK:
+        _PAYLOAD_CACHE.clear()
+        for event in _PAYLOAD_INFLIGHT.values():
+            event.set()
+        _PAYLOAD_INFLIGHT.clear()
+
+
+def _dashboard_alias_stamp(requested: set[str]) -> list[tuple[str, int, int]]:
+    if "history" not in requested:
+        return []
+    try:
+        from services.analyzer import CWS_DIR
+
+        if not CWS_DIR.is_dir():
+            return []
+        stamp: list[tuple[str, int, int]] = []
+        for path in sorted(CWS_DIR.glob("*history.pair_alias*.json")):
+            try:
+                st = path.stat()
+                stamp.append((path.name, int(st.st_mtime_ns), int(st.st_size)))
+            except OSError:
+                stamp.append((path.name, 0, 0))
+        return stamp
+    except Exception:
+        return []
+
+
+def _dashboard_activity_stamp(base_path: Any, requested: set[str]) -> tuple[Any, ...] | None:
+    if "scrobble" not in requested:
+        return None
+    try:
+        from cw_platform.local_db import activity as sqlite_activity
+
+        return sqlite_activity.fingerprint(base_path)
+    except Exception:
+        return None
+
+
+def _dashboard_config_stamp(base_path: Any) -> float:
+    try:
+        return round((Path(base_path) / "config.json").stat().st_mtime, 3)
+    except OSError:
+        return 0.0
+
+
+def _dashboard_tracker_stamp(
+    base_path: Any,
+    cfg: Mapping[str, Any],
+    requested: set[str],
+) -> list[tuple[str, int, int]]:
+    tracker_features = requested & {"history", "ratings", "progress"}
+    if not tracker_features:
+        return []
+    try:
+        from cw_platform.provider_instances import normalize_instance_id
+
+        node = cfg.get("crosswatch") if isinstance(cfg, Mapping) else {}
+        raw_root = str(node.get("root_dir") or "").strip() if isinstance(node, Mapping) else ""
+        root = Path(raw_root or ".cw_provider")
+        if not root.is_absolute():
+            root = Path(base_path) / root
+        roots: list[tuple[str, Path]] = [("default", root)]
+        instances = node.get("instances") if isinstance(node, Mapping) else {}
+        if isinstance(instances, Mapping):
+            for raw_id in instances.keys():
+                inst = normalize_instance_id(raw_id)
+                if inst != "default":
+                    roots.append((inst, root / "profiles" / inst))
+        stamp: list[tuple[str, int, int]] = []
+        for inst, base in roots:
+            for feature in sorted(tracker_features):
+                path = base / f"{feature}.json"
+                try:
+                    st = path.stat()
+                    stamp.append((f"{inst}:{feature}", int(st.st_mtime_ns), int(st.st_size)))
+                except OSError:
+                    stamp.append((f"{inst}:{feature}", 0, 0))
+        return stamp
+    except Exception:
+        return []
+
+
+def _dashboard_widgets_version(
+    base_path: Any,
+    *,
+    cfg: Mapping[str, Any],
+    requested: set[str],
+    state_features: set[str],
+    profile: str,
+    limits: dict[str, int],
+) -> str:
+    try:
+        from cw_platform.local_db import state as sqlite_state
+        from cw_platform.local_db import manual_policy as sqlite_manual_policy
+
+        state_fp = sqlite_state.fingerprint(base_path, state_features) if state_features else None
+        policy_fp = sqlite_manual_policy.fingerprint(base_path, state_features) if state_features else None
+    except Exception:
+        state_fp = None
+        policy_fp = None
+    source = {
+        "requested": sorted(requested),
+        "state_features": sorted(state_features),
+        "profile": str(profile or ""),
+        "limits": limits,
+        "state": state_fp,
+        "policy": policy_fp,
+        "activity": _dashboard_activity_stamp(base_path, requested),
+        "config": _dashboard_config_stamp(base_path),
+        "media_scope": MediaScope(cfg).fingerprint(),
+        "tracker": _dashboard_tracker_stamp(base_path, cfg, requested),
+        "alias": _dashboard_alias_stamp(requested),
+    }
+    blob = json.dumps(source, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 @router.get("/widgets")
@@ -23,37 +234,89 @@ def dashboard_widgets(
     playlists_limit: int = Query(8, ge=1, le=24),
     include: str = Query("history,ratings,scrobble,progress,playlists"),
     user_profile: str = Query("", alias="user_profile"),
+    known_version: str = Query("", alias="known_version"),
 ) -> JSONResponse:
     try:
         from cw_platform.config_base import CONFIG, load_config
         from cw_platform.orchestrator._state_store import StateStore
-        from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
+        from api.appAuthAPI import effective_request_profile_id
         from cw_platform.provider_instances import instances_for_user_profile
 
         requested = {part.strip() for part in include.split(",") if part.strip()}
         state_features = requested & {"history", "ratings", "progress"}
-        state = StateStore(CONFIG).load_state_features(state_features) if state_features else {}
         cfg = load_config() or {}
-        token = request.cookies.get(COOKIE_NAME) if request is not None else None
-        profile = effective_user_profile_id(cfg, token, user_profile)
-        scoped = bool(str(profile or "").strip())
-        user_filter = instances_for_user_profile(cfg, profile) if scoped else {}
-        if scoped and not user_filter:
-            user_filter = {"__NONE__": ["__NONE__"]}
-        payload = dashboard_widgets_payload(
-            state,
-            history_limit=history_limit,
-            ratings_limit=ratings_limit,
-            scrobble_limit=scrobble_limit,
-            progress_limit=progress_limit,
-            playlists_limit=playlists_limit,
-            include=requested,
-            user_filter=user_filter,
+        profile = effective_request_profile_id(cfg, request, user_profile)
+        limits = {
+            "history": history_limit,
+            "ratings": ratings_limit,
+            "scrobble": scrobble_limit,
+            "progress": progress_limit,
+            "playlists": playlists_limit,
+        }
+        version = _dashboard_widgets_version(
+            CONFIG,
+            cfg=cfg,
+            requested=requested,
+            state_features=state_features,
+            profile=str(profile or "").strip(),
+            limits=limits,
         )
+        if known_version and str(known_version).strip() == version:
+            return JSONResponse({"ok": True, "not_modified": True, "version": version}, headers={"Cache-Control": "no-store"})
+        scoped = bool(str(profile or "").strip())
+        payload = _cached_widgets_payload(version)
+        if payload is None:
+            build_event, build_owner = _begin_widgets_build(version)
+            try:
+                if not build_owner:
+                    build_event.wait(timeout=_PAYLOAD_BUILD_WAIT_SECONDS)
+                    payload = _cached_widgets_payload(version)
+                if payload is None:
+                    media_scope = MediaScope(cfg)
+                    scoped_features = {feature for feature in state_features if media_scope.active({feature})}
+                    state = (
+                        StateStore(CONFIG).load_state_features(state_features, recent_limit=None if scoped_features else _STATE_RECENT_LIMIT)
+                        if state_features
+                        else {}
+                    )
+                    user_filter = instances_for_user_profile(cfg, profile) if scoped else {}
+                    if scoped and not user_filter:
+                        user_filter = {"__NONE__": ["__NONE__"]}
+                    state = media_scope.state(state)
+                    payload = dashboard_widgets_payload(
+                        state,
+                        history_limit=history_limit,
+                        ratings_limit=ratings_limit,
+                        scrobble_limit=scrobble_limit,
+                        progress_limit=progress_limit,
+                        playlists_limit=playlists_limit,
+                        include=requested,
+                        user_filter=user_filter,
+                        media_scope=media_scope,
+                    )
+                    totals = _feature_library_totals(CONFIG, requested - scoped_features, user_filter)
+                    totals.update(media_scope.totals(state, scoped_features, user_filter))
+                    for feature, total in totals.items():
+                        block = payload.get(_COUNT_FEATURES[feature])
+                        if isinstance(block, dict):
+                            block["library_total"] = total
+                    _store_widgets_payload(version, payload)
+            finally:
+                if build_owner:
+                    _finish_widgets_build(version)
+        payload["version"] = version
         if scoped:
             payload["user_profile"] = str(profile or "").strip()
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
-    except Exception:
+    except Exception as exc:
+        try:
+            if LOG is not None:
+                LOG.error(
+                    "dashboard widgets payload failed",
+                    extra={"error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()},
+                )
+        except Exception:
+            pass
         return JSONResponse(
             {"ok": False, "error": "dashboard_widgets_failed"},
             status_code=200,

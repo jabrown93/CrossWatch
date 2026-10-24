@@ -9,17 +9,7 @@ ui_frontend.py:source-provider
 ui_frontend.py:target-provider
 
 # Filter and search controls over already-loaded data.
-assets/js/playback_progress.js:pp-search
-assets/js/playback_progress.js:pp-provider
-assets/js/playback_progress.js:pp-type
-assets/js/playback_progress.js:pp-progress
-assets/js/playback_progress.js:pp-progress-range
-assets/js/playback_progress.js:pp-progress-value
-assets/js/playback_progress.js:pp-age
-assets/js/playback_progress.js:pp-rating
-assets/js/playback_progress.js:pp-sort
 # Hidden per-row carrier for provider/instance attributes.
-assets/js/playback_progress.js:(no id)
 
 # Login credentials posted to a connect endpoint; never stored in config.
 providers/auth/_auth_EMBY.py:emby_pass
@@ -64,3 +54,47 @@ providers/auth/_auth_SCROB.py:scrob_totp
 # Login credentials posted to a connect endpoint; never stored in config.
 providers/auth/_auth_STREMIO.py:stremio_email
 providers/auth/_auth_STREMIO.py:stremio_password
+
+# Added by the 2026-10 upstream sync, not yet annotated (FORK.md decisions).
+providers/auth/_auth_BINGEBASE.py:bingebase_api_key
+providers/auth/_auth_BINGEBASE.py:bingebase_device_code
+providers/auth/_auth_BINGEBASE.py:bingebase_webhook_url
+providers/auth/_auth_CROSSWATCH.py:cw_tracker_restore_collection
+providers/auth/_auth_FLICKLIST.py:flicklist_api_key
+providers/auth/_auth_FLICKLIST.py:flicklist_auth_method
+providers/auth/_auth_FLICKLIST.py:flicklist_device_code
+providers/auth/_auth_KITSU.py:kitsu_password
+providers/auth/_auth_KITSU.py:kitsu_username
+providers/auth/_auth_NUVIO.py:nuvio_server_mode
+providers/auth/_auth_NUVIO.py:nuvio_server_url
+providers/auth/_auth_STREMIO.py:stremio_addon_url
+providers/auth/_auth_TMDB.py:tmdb_sync_read_token
+providers/auth/_auth_TRACEARR.py:tracearr_key
+providers/auth/_auth_TRACEARR.py:tracearr_server
+providers/auth/_auth_TRACEARR.py:tracearr_user_id
+providers/auth/_auth_TRAKT.py:trakt_auth_method
+providers/auth/_auth_WETRAKR.py:wetrakr_code
+ui_frontend.py:assistant_api_key
+ui_frontend.py:assistant_base_url
+ui_frontend.py:assistant_model
+ui_frontend.py:assistant_models_all
+ui_frontend.py:assistant_wiki_help
+ui_frontend.py:profile-2fa-confirm-password
+ui_frontend.py:profile-collection-page-size
+ui_frontend.py:profile-collection-provider
+ui_frontend.py:profile-collection-search
+ui_frontend.py:profile-collection-sort
+ui_frontend.py:profile-media-card
+ui_frontend.py:profile-playback-age
+ui_frontend.py:profile-playback-edit-range
+ui_frontend.py:profile-playback-edit-value
+ui_frontend.py:profile-playback-page-size
+ui_frontend.py:profile-playback-progress
+ui_frontend.py:profile-playback-provider
+ui_frontend.py:profile-playback-search
+ui_frontend.py:profile-playback-sort
+ui_frontend.py:profile-playback-timeout
+ui_frontend.py:profile-pref-time-format
+ui_frontend.py:profile-pref-timezone
+ui_frontend.py:profile-timezone-search
+ui_frontend.py:ui_media_card

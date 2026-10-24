@@ -6,11 +6,32 @@
   const providerMeta = () => w.CW?.ProviderMeta || {};
   const label = (v) => providerMeta().label?.(v) || String(v || "").toUpperCase();
   const logo = (v) => providerMeta().logoPath?.(v) || "";
-  const plexRatingSinks = ["crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay"];
+  const plexRatingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob"];
   const state = { root: null, overview: null, busy: false, panels: { watcherDefaults: false, ratings: false, webhookDefaults: false }, delBtn: null, delTimer: 0, regenBtn: null, regenTimer: 0, legacyConfirm: false, legacyTimer: 0, hybridDismissed: false };
 
+  async function authSetupBlocked() {
+    const boot = w.__cwAuthBootstrapState;
+    if (boot && typeof boot.blocked === "boolean") return boot.blocked;
+    const pending = w.__cwAuthBootstrapPromise;
+    if (pending && typeof pending.then === "function") {
+      const resolved = await pending.catch(() => null);
+      if (resolved && typeof resolved.blocked === "boolean") return resolved.blocked;
+    }
+    return w.cwIsAuthSetupPending?.() === true;
+  }
+
+  function authPendingError() {
+    const err = new Error("auth setup pending");
+    err.code = "auth_setup_pending";
+    return err;
+  }
+
+  function isAuthPendingError(err) {
+    return err?.code === "auth_setup_pending" || String(err?.message || "").includes("auth setup pending");
+  }
+
   async function j(url, options = {}) {
-    if (w.cwIsAuthSetupPending?.() === true) throw new Error("auth setup pending");
+    if (await authSetupBlocked()) throw authPendingError();
     const res = await fetch(url, { cache: "no-store", credentials: "same-origin", ...options });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data?.ok === false) {
@@ -80,11 +101,26 @@
     const users = Array.isArray(filters.username_whitelist) ? filters.username_whitelist : [];
     const allow = Array.isArray(filters.server_uuid_whitelist) ? filters.server_uuid_whitelist : [];
     const block = Array.isArray(filters.server_uuid_blacklist) ? filters.server_uuid_blacklist : [];
+    const paths = Array.isArray(filters.ignored_path_prefixes) ? filters.ignored_path_prefixes : [];
+    const patterns = Array.isArray(filters.ignored_filename_patterns) ? filters.ignored_filename_patterns : [];
+    const editions = Array.isArray(filters.ignored_editions) ? filters.ignored_editions : [];
     if (users.length) parts.push(`${users.length} user${users.length === 1 ? "" : "s"}`);
     if (allow.length || filters.server_uuid) parts.push(`${allow.length || 1} UUID allow`);
     if (block.length) parts.push(`${block.length} UUID block`);
+    if (filters.ignore_agregarr_trailers) parts.push("Agregarr ignored");
+    if (filters.ignore_specials) parts.push("Specials ignored");
+    if (paths.length) parts.push(`${paths.length} path ignored`);
+    if (patterns.length) parts.push(`${patterns.length} pattern ignored`);
+    if (editions.length) parts.push(`${editions.length} edition ignored`);
     if (filters.ignore_live_tv_dvr) parts.push("Live TV ignored");
     return parts.length ? parts.join(" - ") : "No filters";
+  }
+
+  function webhookFilterSummary(row = {}) {
+    const provider = String(row.provider || "").toLowerCase();
+    const key = provider === "plex" ? "filters_plex" : provider === "jellyfin" ? "filters_jellyfin" : "filters_emby";
+    const settings = row.effective_settings || {};
+    return routeFilterSummary(settings[key] || {});
   }
 
   function renderHeader(o) {
@@ -96,9 +132,10 @@
           <p>Receive real time scrobbles via Watcher routes or webhooks. <b>Watcher is recommended</b></p>
         </div>
         <div class="cw-settings-pane-head-actions">
-          <div class="cw-settings-jumpbar" aria-label="Scrobbler actions">
-            <button type="button" class="cw-settings-jump" data-action="add-webhook"><span class="material-symbols-rounded" aria-hidden="true">add</span>Add webhook</button>
-            <button type="button" class="cw-settings-jump" data-action="add-route"><span class="material-symbols-rounded" aria-hidden="true">add</span>Add watcher</button>
+          <div class="cw-conn-hero-summary" aria-label="Scrobbler actions">
+            <button type="button" class="cw-conn-seg" data-action="add-webhook"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>Add webhook</span></button>
+            <button type="button" class="cw-conn-seg" data-action="add-route"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>Add watcher</span></button>
+            <button type="button" class="cw-conn-refresh" data-action="refresh-scrobbler" title="Refresh webhooks and watcher" aria-label="Refresh webhooks and watcher"><span class="material-symbol" aria-hidden="true">refresh</span></button>
           </div>
         </div>
         <span class="material-symbols-rounded cw-settings-hero-shape" aria-hidden="true">sensors</span>
@@ -138,6 +175,7 @@
               <div class="sc2-route-meta">
                 <span class="sc2-route-type"><span class="material-symbols-rounded">webhook</span>Webhook</span>
                 <span class="sc2-route-id">${esc(text)}</span>
+                <span class="sc2-route-filters sc2-muted">${esc(webhookFilterSummary(x))}</span>
               </div>
               <div class="sc2-route-actions">
                 <button type="button" class="btn small sc2-round-action sc2-route-toggle ${x.enabled ? "is-on" : "is-off"}" data-action="toggle-webhook" data-provider="${esc(x.provider)}" data-instance="${esc(x.provider_instance)}" data-sink="${esc(x.sink)}" title="${esc(x.enabled ? "Disable source webhooks" : "Enable source webhooks")}" aria-label="${esc(x.enabled ? "Disable source webhooks" : "Enable source webhooks")}"><span class="material-symbols-rounded">power_settings_new</span><span>${x.enabled ? "On" : "Off"}</span></button>
@@ -190,7 +228,7 @@
             <span class="sc2-logo sc2-add-logo"><span class="material-symbols-rounded">add</span></span>
             <div class="sc2-route-add-copy">
               <strong>Add watcher route</strong>
-              <span>Create a new source to tracker route.</span>
+              <span>Create a new source to destination route.</span>
             </div>
             <span class="material-symbols-rounded sc2-route-add-arrow">arrow_forward</span>
           </button>
@@ -240,7 +278,7 @@
           <button type="button" class="sc2-setting-row ${autoOn ? "is-on" : "is-off"}" data-setting-toggle="auto-remove" title="${autoOn ? "Disable auto-remove" : "Enable auto-remove"}" aria-pressed="${autoOn ? "true" : "false"}"><span class="sc2-setting-ico material-symbols-rounded">bookmark_remove</span><span class="sc2-setting-copy"><strong>Auto-remove from Watchlists</strong><small>Remove watched items from watchlists automatically.</small></span><span class="sc2-setting-state">${autoOn ? "On" : "Off"}</span></button>
           <div class="sc2-inline-note"><span class="material-symbols-rounded">info</span><span>These settings apply to all routes unless overridden.<br><strong>Leave them at their defaults unless you know what you are doing.</strong></span></div>
           <div class="sc2-defaults-grid">
-            <label class="sc2-field"><span class="sc2-label-text">Watched threshold (%)${fieldHelp("Progress percentage that counts an item as watched for completion and auto-remove. Route options can override it.")}</span><input class="input" type="number" min="0" max="100" data-setting-num="watch_watched_at" value="${esc(wd.watched_at ?? "")}" placeholder="Default"></label>
+            <label class="sc2-field"><span class="sc2-label-text">Watched threshold (%)${fieldHelp("Progress percentage that counts an item as watched for completion and auto-remove. Route options can override it. SIMKL uses at least 50.")}</span><input class="input" type="number" min="0" max="100" data-setting-num="watch_watched_at" value="${esc(wd.watched_at ?? "")}" placeholder="Default"></label>
             <label class="sc2-field"><span class="sc2-label-text">Final-stop trust (%)${fieldHelp("At or above this progress, a final stop event is trusted even if the source is noisy near the end. Route options can override it.")}</span><input class="input" type="number" min="0" max="100" data-setting-num="watch_force_stop_at" value="${esc(wd.force_stop_at ?? "")}" placeholder="Default"></label>
             <label class="sc2-field"><span class="sc2-label-text">Progress step (%)${fieldHelp("Minimum progress change required before sending another watching update. Leave this at the default, as it significantly affects API usage.")}</span><input class="input" type="number" min="1" max="25" data-setting-num="watch_progress_step" value="${esc(wd.progress_step ?? "")}" placeholder="Default"></label>
             <label class="sc2-field"><span class="sc2-label-text">Pause debounce (s)${fieldHelp("Seconds to ignore tiny pause/start flaps just after playback starts.")}</span><input class="input" type="number" min="0" max="3600" data-setting-num="watch_pause_debounce_seconds" value="${esc(wd.pause_debounce_seconds ?? "")}" placeholder="Default"></label>
@@ -256,7 +294,12 @@
     const r = st.global_plex_ratings || {};
     const open = state.panels.ratings;
     const url = r.endpoint_url || "";
-    const on = plexRatingSinks.filter((k) => r[k]);
+    const configured = new Set((o.destination_availability || [])
+      .filter((g) => plexRatingSinks.includes(String(g?.provider || "").toLowerCase()))
+      .filter((g) => (g?.profiles || []).some((p) => p?.configured))
+      .map((g) => String(g.provider || "").toLowerCase()));
+    const visibleSinks = plexRatingSinks.filter((k) => configured.has(k) || r[k]);
+    const on = visibleSinks.filter((k) => r[k]);
     const summary = on.length ? `→ ${on.map(label).join(", ")}` : "No destinations selected";
     return `
       <section class="sc2-section sc2-collapse ${open ? "is-open" : ""}" id="sc-sec-ratings">
@@ -267,7 +310,7 @@
         </button>
         <div class="sc2-collapse-body">
           <div class="sc2-rating-targets">
-            ${plexRatingSinks.map((k) => `<button type="button" class="sc2-rating-pill provider-${k} ${r[k] ? "is-on" : ""}" data-rating-target="${k}"><span class="material-symbols-rounded">${r[k] ? "check_circle" : "radio_button_unchecked"}</span>${esc(label(k))}</button>`).join("")}
+            ${visibleSinks.map((k) => `<button type="button" class="sc2-rating-pill provider-${k} ${r[k] ? "is-on" : ""}" data-rating-target="${k}"><span class="material-symbols-rounded">${r[k] ? "check_circle" : "radio_button_unchecked"}</span>${esc(label(k))}</button>`).join("") || '<div class="sc2-muted">Configure a ratings destination first.</div>'}
           </div>
           <div class="sc2-endpoint">
             <code title="${esc(url)}">${esc(url || "Global Plex ratings URL is unavailable until a token exists")}</code>
@@ -331,9 +374,22 @@
     state.root.innerHTML = `<div class="sc2-page">${renderHeader(o)}${gate}${renderSummary(o)}${hybrid}${legacy}${renderRoutes(o)}${collapseRow}${renderRuntime(o)}${renderWebhooks(o)}${webhookDefaults}</div>`;
   }
 
+  function renderAuthPending() {
+    if (!state.root) return;
+    state.root.innerHTML = `<div class="sc2-page">${renderHeader(state.overview || {})}<div class="sc2-empty">Finish authentication setup to load Scrobbler.</div></div>`;
+  }
+
   async function loadOverview() {
-    state.overview = await j("/api/scrobbler/overview");
-    render();
+    try {
+      state.overview = await j("/api/scrobbler/overview");
+      render();
+    } catch (err) {
+      if (isAuthPendingError(err)) {
+        renderAuthPending();
+        return;
+      }
+      throw err;
+    }
   }
 
   function applyMutation(data) {
@@ -609,6 +665,13 @@
       const action = btn.getAttribute("data-action");
       if (action === "dismiss-hybrid-warning") { state.hybridDismissed = true; btn.closest(".sc2-dismissible-note")?.remove(); return; }
       if (action === "open-connections") { try { w.cwSettingsSelect?.("providers"); } catch {} return; }
+      if (action === "refresh-scrobbler") {
+        if (btn.classList.contains("loading")) return;
+        btn.classList.add("loading", "spin");
+        try { await refresh(); } catch {}
+        btn.classList.remove("loading", "spin");
+        return;
+      }
       if (action === "add-webhook") await openModal("webhook", { mode: "create", overview: state.overview, onSaved: applyMutation });
       if (action === "edit-webhook") await openModal("webhook", { mode: "edit", overview: state.overview, webhook: findWebhook(btn.dataset.provider, btn.dataset.instance, btn.dataset.sink), onSaved: applyMutation });
       if (action === "toggle-webhook") await webhookToggle(findWebhook(btn.dataset.provider, btn.dataset.instance, btn.dataset.sink), btn);

@@ -3,12 +3,15 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from .._path_matching import path_fallback
+
 from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Lock
 from typing import Any, Iterable, Mapping, cast
 
 from ._common import (
+    _fb_cache_flush,
     _as_base_url,
     _xml_to_container,
     active_pms_token,
@@ -32,6 +35,7 @@ from ._common import (
     plex_worker_count,
     season_rating_key_from_show,
     section_allowed,
+    native_item_matches,
     unresolved_home_scope_not_applied,
     emit,
     make_logger,
@@ -118,6 +122,7 @@ def _norm_rating(v: Any) -> int | None:
         i = 10
     return i
 
+@path_fallback("PLEX", "ratings")
 def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
     if not isinstance(it, Mapping):
         return None
@@ -159,10 +164,11 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
         return False
 
     rk = ids.get("plex")
+    allow = plex_feature_library_ids(adapter, "ratings")
     if rk:
         try:
             obj0 = srv.fetchItem(int(rk))
-            if obj0 and _accept_obj(obj0):
+            if obj0 and section_allowed(obj0, allow) and native_item_matches(obj0, {**it, "type": kind}):
                 return str(rk)
         except Exception:
             pass
@@ -175,8 +181,8 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
         return None
 
     year = it.get("year")
-    season = it.get("season") or it.get("season_number")
-    episode = it.get("episode") or it.get("episode_number")
+    season = it.get("season") if it.get("season") is not None else it.get("season_number")
+    episode = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
 
     allow = plex_feature_library_ids(adapter, "ratings")
     sec_types = ("show",) if (is_episode or is_season or is_show) else ("movie",)
@@ -192,7 +198,7 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
             rk_any = None
         if not rk_any and guids:
             try:
-                _hist_build_guid_index(adapter, allow)
+                _hist_build_guid_index(adapter, allow, feature="ratings")
                 rk_any = _hist_find_in_guid_index("movie" if is_movie else "show", guids)
             except Exception:
                 pass
@@ -200,7 +206,9 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
             try:
                 obj = srv.fetchItem(int(rk_any))
                 if obj and _accept_obj(obj):
-                    if section_allowed(obj, allow):
+                    identity_ok = (_otype(obj) not in {"episode", "season"}
+                                   or native_item_matches(obj, {**it, "type": kind}))
+                    if section_allowed(obj, allow) and identity_ok:
                         hits.append(obj)
             except Exception:
                 pass
@@ -330,7 +338,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                 reason="shared_user_ratings_unsupported",
                 selected=(sel_aid or sel_uname),
             )
-            return {}
+            raise RuntimeError("shared_user_ratings_unsupported")
 
         srv = getattr(getattr(adapter, "client", None), "server", None)
         if not srv:
@@ -339,9 +347,6 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
         prog_mk = getattr(adapter, "progress_factory", None)
         prog: Any = prog_mk("ratings") if callable(prog_mk) else None
     
-        if plex_cfg_get(adapter, "fallback_GUID", False) or plex_cfg_get(adapter, "fallback_guid", False):
-            _emit({"event": "debug", "msg": "fallback_guid.enabled", "provider": "PLEX", "feature": "ratings"})
-        fallback_guid = bool(plex_cfg_get(adapter, "fallback_GUID", False) or plex_cfg_get(adapter, "fallback_guid", False))
     
         base = _as_base_url(srv)
         if not base:
@@ -357,11 +362,8 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
             tok_source = "active_pms_token(srv)"
         if not tok:
             tok, tok_source = _preferred_pms_token(adapter)
-        configure_plex_context(baseurl=base, token=tok)
+        configure_plex_context(baseurl=base, token=tok, session=ses)
 
-        cli = getattr(adapter, "client", None)
-    
-    
         if not (base and tok and ses):
             raise RuntimeError(f"PLEX ratings fast query unavailable (base={bool(base)} tok={bool(tok)} ses={bool(ses)})")
     
@@ -451,7 +453,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
         except Exception:
             section_specs = []
 
-        def _iter_rating_rows(path: str, tnum: int) -> Iterable[Mapping[str, Any]]:
+        def _iter_rating_rows(path: str, tnum: int, library_id: str | None = None) -> Iterable[Mapping[str, Any]]:
             nonlocal total
             start = 0
             expected_total: int | None = None
@@ -477,7 +479,9 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                     head = (r.text or "")[:140].replace("\n", " ")
                     raise RuntimeError(f"PLEX ratings fast query parse failed (ct={(r.headers or {}).get('Content-Type')}; head={head!r})")
 
-                mc = cont.get("MediaContainer") or {}
+                mc = cont.get("MediaContainer")
+                if not isinstance(mc, Mapping):
+                    raise RuntimeError("plex_ratings_invalid_response")
                 try:
                     raw_total = mc.get("totalSize")
                     if raw_total is not None:
@@ -491,18 +495,26 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                         pass
                     _tick(force=True)
 
-                rows = mc.get("Metadata") or []
+                rows = mc.get("Metadata")
+                if rows is None and (mc.get("size") == 0 or mc.get("totalSize") == 0):
+                    rows = []
+                if not isinstance(rows, list) or any(not isinstance(row, Mapping) or not row.get("ratingKey") for row in rows):
+                    raise RuntimeError("plex_ratings_invalid_metadata")
                 if not rows:
+                    if expected_total is not None and start < expected_total:
+                        raise RuntimeError("plex_ratings_incomplete_page")
                     break
                 signature = tuple(str(row.get("ratingKey") or row.get("key") or "") for row in rows if isinstance(row, Mapping))
                 if signature in seen_pages:
-                    break
+                    raise RuntimeError("plex_ratings_repeated_page")
                 seen_pages.add(signature)
                 for row in rows:
                     if isinstance(row, Mapping):
+                        if library_id:
+                            row = {**row, "librarySectionID": library_id}
                         yield cast(Mapping[str, Any], row)
                 start += len(rows)
-                if len(rows) < page_size or (expected_total is not None and start >= expected_total):
+                if (len(rows) < page_size and expected_total is None) or (expected_total is not None and start >= expected_total):
                     break
 
         def _consume_rows(rows: list[Mapping[str, Any]], tnum: int) -> bool:
@@ -543,10 +555,10 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
 
                 fb_try_local = 0
                 fb_ok_local = 0
-                if fallback_guid and not has_external_ids(m.get("ids") or {}):
+                if not has_external_ids(m.get("ids") or {}):
                     fb_try_local += 1
                     try:
-                        fb = minimal_from_history_row(row, token=tok, allow_discover=True)
+                        fb = minimal_from_history_row(row, token=tok, allow_discover=False)
                     except Exception:
                         fb = None
                     if isinstance(fb, Mapping):
@@ -616,11 +628,22 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
             return False
 
         try:
-            for tnum in (1, 2, 3, 4):
-                rows = list(_iter_rating_rows(f"{base}/library/all", tnum))
-                if _consume_rows(rows, tnum):
-                    return out
+            if allow:
+                if not section_specs:
+                    raise RuntimeError("plex_ratings_no_accessible_selected_libraries")
+                for sid, tnums in section_specs:
+                    for tnum in tnums:
+                        rows = list(_iter_rating_rows(f"{base}/library/sections/{sid}/all", tnum, sid))
+                        if _consume_rows(rows, tnum):
+                            return out
+            else:
+                for tnum in (1, 2, 3, 4):
+                    rows = list(_iter_rating_rows(f"{base}/library/all", tnum))
+                    if _consume_rows(rows, tnum):
+                        return out
         except RuntimeError as e:
+            if allow:
+                raise
             if "status=401" not in str(e) and "status=403" not in str(e):
                 raise
             _warn("fast_query_fallback", mode="section_scan", reason=str(e))
@@ -635,7 +658,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
                     pass
             for sid, tnums in section_specs:
                 for tnum in tnums:
-                    rows = list(_iter_rating_rows(f"{base}/library/sections/{sid}/all", tnum))
+                    rows = list(_iter_rating_rows(f"{base}/library/sections/{sid}/all", tnum, sid))
                     if _consume_rows(rows, tnum):
                         return out
     
@@ -648,6 +671,7 @@ def build_index(adapter: Any, limit: int | None = None) -> dict[str, dict[str, A
         _info("index_done", count=len(out), added=added, scanned=scanned, fb_try=fb_try, fb_ok=fb_ok, workers=workers, account_id=account_id, token_source=tok_source)
         return out
     finally:
+        _fb_cache_flush()
         home_scope_exit(adapter, did_switch)
 
 def _get_existing_rating(srv: Any, rating_key: Any) -> int | None:

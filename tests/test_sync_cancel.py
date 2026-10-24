@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import threading
 import types
+import json
+import time
 from typing import Any
 
 import pytest
@@ -67,6 +69,98 @@ def test_apply_chunked_stops_after_current_chunk() -> None:
     assert seen == [2, 2]
     assert res["cancelled"] is True
     assert res["attempted"] == 4
+
+
+def test_apply_chunked_preserves_counts_when_cancel_raises_mid_batch() -> None:
+    calls = 0
+    events: list[str] = []
+
+    def call(chunk):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            run_control.request_cancel()
+            raise run_control.SyncCancelled("stop")
+        return {"ok": True, "count": len(chunk)}
+
+    res = _applier._apply_chunked(
+        "add",
+        dst="TRAKT",
+        feature="watchlist",
+        items=[{"n": i} for i in range(5)],
+        call=call,
+        emit=lambda event, **_k: events.append(event),
+        dbg=lambda *a, **k: None,
+        chunk_size=2,
+        chunk_pause_ms=0,
+    )
+
+    assert calls == 2
+    assert res["cancelled"] is True
+    assert res["attempted"] == 2
+    assert res["confirmed"] == 2
+    assert "add:cancelled" in events
+
+
+def test_apply_chunked_single_shot_returns_cancelled_when_call_raises() -> None:
+    def call(_items):
+        run_control.request_cancel()
+        raise run_control.SyncCancelled("stop")
+
+    res = _applier._apply_chunked(
+        "add",
+        dst="TRAKT",
+        feature="watchlist",
+        items=[{"n": 1}],
+        call=call,
+        emit=lambda *a, **k: None,
+        dbg=lambda *a, **k: None,
+        chunk_size=0,
+        chunk_pause_ms=0,
+    )
+
+    assert res["cancelled"] is True
+    assert res["attempted"] == 0
+
+
+def test_retry_does_not_retry_sync_cancelled() -> None:
+    calls = 0
+
+    def call():
+        nonlocal calls
+        calls += 1
+        raise run_control.SyncCancelled("stop")
+
+    with pytest.raises(run_control.SyncCancelled):
+        _applier._retry(call, attempts=3, base_sleep=0)
+
+    assert calls == 1
+
+
+def test_apply_chunked_skips_pause_after_cancel(monkeypatch) -> None:
+    slept: list[float] = []
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: slept.append(float(seconds)))
+
+    def call(chunk):
+        run_control.request_cancel()
+        return {"ok": True, "count": len(chunk)}
+
+    res = _applier._apply_chunked(
+        "add",
+        dst="TRAKT",
+        feature="watchlist",
+        items=[{"n": 1}, {"n": 2}],
+        call=call,
+        emit=lambda *a, **k: None,
+        dbg=lambda *a, **k: None,
+        chunk_size=1,
+        chunk_pause_ms=100,
+    )
+
+    assert slept == []
+    assert res["cancelled"] is True
+    assert res["attempted"] == 1
 
 
 def test_apply_chunked_completes_when_not_cancelled() -> None:
@@ -161,7 +255,13 @@ def _run_thread_harness(monkeypatch, tmp_path, run_result: dict[str, Any]) -> tu
             self.config = config
 
         def run_pairs(self, **kwargs: Any) -> dict[str, Any]:
-            return dict(run_result)
+            progress = kwargs.get("progress")
+            for event in run_result.get("_progress_events") or []:
+                if callable(progress):
+                    progress(json.dumps(event) if isinstance(event, dict) else str(event))
+            result = dict(run_result)
+            result.pop("_progress_events", None)
+            return result
 
     monkeypatch.setattr(
         sync.importlib,
@@ -239,6 +339,61 @@ def test_normal_run_is_not_marked_cancelled(monkeypatch, tmp_path) -> None:
     assert any("Done. Total added: 1" in line for line in log["SYNC"])
 
 
+def test_saved_run_keeps_feature_settings_from_start(monkeypatch, tmp_path) -> None:
+    from services import log_archive
+
+    sync, _events, _log = _run_thread_harness(monkeypatch, tmp_path, {"added": 1})
+    cfg = sync._env()[0]()
+    cfg["pairs"][0]["features"] = {"watchlist": {"enable": True}, "history": {"enable": False}}
+    store = log_archive.LogArchive(tmp_path / "features.db")
+    monkeypatch.setattr(log_archive, "archive", lambda: store)
+    try:
+        sync._run_pairs_thread("run-features", {"pair_id": "plex-trakt"})
+        cfg["pairs"][0]["features"]["watchlist"]["enable"] = False
+        saved = store.sessions("sync", run_id="run-features")
+        assert len(saved) == 1
+        assert json.loads(saved[0]["pairs"])[0]["features"] == {
+            "watchlist": {"enable": True}, "history": {"enable": False},
+        }
+    finally:
+        store.close()
+
+
+def test_final_unresolved_summary_uses_deduped_orchestrator_count(monkeypatch, tmp_path) -> None:
+    item = {
+        "type": "episode",
+        "series_title": "Pray, Obey, Kill",
+        "season": 1,
+        "episode": 1,
+        "ids": {"imdb": "tt13848098"},
+        "show_ids": {"imdb": "tt13848098"},
+    }
+    raw_unresolved = [
+        {"feature": "history", "provider": "SIMKL", "item": item, "reason": "simkl_not_found:shows"},
+        {"feature": "history", "provider": "SIMKL", "item": item, "reason": "simkl_not_found:episodes"},
+    ]
+    sync, _events, log = _run_thread_harness(
+        monkeypatch,
+        tmp_path,
+        {
+            "added": 0,
+            "unresolved": 1,
+            "cancelled": False,
+            "_progress_events": [
+                {"event": "apply:unresolved", "provider": "SIMKL", "feature": "history", "items": raw_unresolved},
+                {"event": "apply:add:done", "dst": "SIMKL", "feature": "history", "unresolved": 2, "added": 0},
+            ],
+        },
+    )
+
+    sync._run_pairs_thread("run-unresolved-1", {"source": "scheduler", "scheduler_mode": "standard"})
+
+    assert any("Total unresolved: 1" in line for line in log["SYNC"])
+    assert not any("Total unresolved: 2" in line for line in log["SYNC"])
+    unresolved_lines = [line for line in log["SYNC"] if "Pray, Obey, Kill - S01E01" in line]
+    assert unresolved_lines == ["[i] Pray, Obey, Kill - S01E01 | SIMKL episode not found"]
+
+
 def test_cancel_endpoint_requires_a_running_sync(monkeypatch, tmp_path) -> None:
     sync, _events, _log = _run_thread_harness(monkeypatch, tmp_path, {})
 
@@ -276,3 +431,29 @@ def test_manual_run_clears_a_stale_queue_stop(monkeypatch, tmp_path) -> None:
     sync.clear_queue_stop()
 
     assert run_control.queue_stopped() is False
+
+
+def test_request_with_retries_exits_during_retry_sleep(monkeypatch) -> None:
+    from providers.sync import _mod_common
+
+    class Session:
+        calls = 0
+
+        def request(self, *_args, **_kwargs):
+            self.calls += 1
+            return types.SimpleNamespace(status_code=503, headers={}, text="")
+
+    session = Session()
+    slept: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        slept.append(float(seconds))
+        run_control.request_cancel()
+
+    monkeypatch.setattr(_mod_common.time, "sleep", fake_sleep)
+
+    with pytest.raises(run_control.SyncCancelled):
+        _mod_common.request_with_retries(session, "GET", "https://example.test", max_retries=3)
+
+    assert session.calls == 1
+    assert slept == [0.25]

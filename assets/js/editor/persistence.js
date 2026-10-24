@@ -29,8 +29,9 @@
   function buildSaveData(ctx = {}) {
     const state = stateOf(ctx);
     const items = {};
-    const blocks = [];
-    const seenBlocks = new Set();
+    const blocks = ctx.isPolicySource?.() ? [...(state.preservedBlocks || [])] : [];
+    const originals = {};
+    const seenBlocks = new Set(blocks.map(key => key.toLowerCase()));
 
     for (const row of state.rows || []) {
       if (row.deleted) {
@@ -79,12 +80,15 @@
       raw.year = Number.isFinite(n) ? n : null;
 
       items[key] = raw;
+      originals[key] = String(row._replacedKey || key);
     }
 
     const payload = { kind: state.kind, source: state.source, items };
+    if (ctx.isPolicySource?.()) payload.mapping_originals = originals;
     if (ctx.isProviderPickerSource?.()) {
       payload.provider = state.snapshot;
       payload.provider_instance = state.instance || "default";
+      payload.pair_id = state.mappingPair || "";
       payload.blocks = blocks;
     }
     if (state.source === "playlist") {
@@ -116,7 +120,7 @@
     if (missing.length) {
       ctx.setTag?.("error", "Missing key");
       ctx.setStatus?.(
-        `Cannot save: ${missing.length} row${missing.length === 1 ? "" : "s"} have data but no Key. Fill the Key or remove the row.`
+        `Cannot save: ${missing.length} row${missing.length === 1 ? " has" : "s have"} data but no Key. Fill the Key or remove the row.`
       );
       if (window.cxToast) window.cxToast("Fill Key for all rows with data before saving");
       return;
@@ -155,12 +159,10 @@
         if (unresolved) parts.push(`${unresolved} unresolved`);
         ctx.setStatus?.(`Applied playlist changes: ${parts.join(", ")}`);
         await ctx.loadState?.();
-      } else if (ctx.isManualSource?.()) {
-        ctx.setStatus?.(`Saved ${res.count || Object.keys(items).length} overrides`);
-        await ctx.loadState?.();
       } else {
         ctx.setStatus?.(`Saved ${res.count || Object.keys(items).length} items`);
         await ctx.loadSnapshots?.();
+        await ctx.loadState?.();
       }
     } catch (e) {
       console.error(e);

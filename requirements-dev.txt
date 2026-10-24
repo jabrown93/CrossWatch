@@ -3,7 +3,9 @@
 annotated-doc==0.0.5 \
     --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101 \
     --hash=sha256:c7e58ce09192557605d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb
-    # via fastapi
+    # via
+    #   fastapi
+    #   typer
 annotated-types==0.8.0 \
     --hash=sha256:13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7 \
     --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
@@ -311,6 +313,7 @@ colorama==0.4.6 ; sys_platform == 'win32' \
     # via
     #   pytest
     #   qrcode
+    #   typer
 coverage==7.17.0 \
     --hash=sha256:032d4c2db4c677eb71d43f2f8b80bf64e9346f7a3f7b6ebb13f1782f3cc6c274 \
     --hash=sha256:03baf0688e14a5a44ffd1eefa8928dfc92b14565e521174e072b31b971aa1657 \
@@ -533,6 +536,14 @@ joserfc==1.7.7 \
     --hash=sha256:06979cfbab78bc802f14c0358f32969826cc26720e13cb38926ffdc86bc0cb2c \
     --hash=sha256:471d0fd12a5a0d1c0942de280f39efe6f597878315033270b504d4d006d25510
     # via authlib
+markdown-it-py==4.2.0 \
+    --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+    # via rich
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
+    --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
+    # via markdown-it-py
 opentelemetry-api==1.45.1 \
     --hash=sha256:aa38ed19bcc084ba42782a73255b3582283eced7ad6dddbd6695189e69adfb75 \
     --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb
@@ -705,7 +716,9 @@ pydantic-core==2.50.1 \
 pygments==2.21.0 \
     --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9 \
     --hash=sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c
-    # via pytest
+    # via
+    #   pytest
+    #   rich
 pytest==9.1.1 \
     --hash=sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313 \
     --hash=sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c
@@ -810,10 +823,24 @@ responses==0.26.3 \
     --hash=sha256:74474f799334ac4f37d93b6437ecc3bb1bb5c77a8d31780a338643be2dce0af8 \
     --hash=sha256:b0c11ca8131b8b227b8d5108e6ed39772222bd5aab030ed430e8f99057c4c409
     # via -r requirements-dev.in
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb \
+    --hash=sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36
+    # via
+    #   -r requirements.in
+    #   typer
+shellingham==1.5.4 \
+    --hash=sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686 \
+    --hash=sha256:8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de
+    # via typer
 starlette==1.9.0 \
     --hash=sha256:3d931de246ed870e35ce605974440816ef895e592f255d1396cfdf191d4c4318 \
     --hash=sha256:fd3f159936e882d06c1108f84688f7cda2cf85fc6a592a50edbd175e882c2ddc
     # via fastapi
+typer==0.27.3 \
+    --hash=sha256:d0396f770a560ab1b0a8504e13b5f254b728cedb05c61cf0359e944e50ce8901 \
+    --hash=sha256:e50022f28b82a86313e54501317a1db64bf8f8d036ff8cfe5ca7e47675454aff
+    # via -r requirements.in
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5

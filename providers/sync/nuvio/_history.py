@@ -3,27 +3,32 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.interactive_reads import accepted_result, replaying, replace_retained
+
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.id_map import minimal as id_minimal
 
 from providers.sync._log import log as cw_log
 
 from ._common import (
     canonical_item_key,
+    enrich_external_ids,
     epoch_ms,
     iso_from_epoch_ms,
     make_item,
     metadata_title_for_content_id,
     payload_item_key,
     positive_int,
+    season_int,
     pull_watched_rows,
     resolve_content_id_for_item,
     resolve_episode,
     rpc,
     selected_profile_id,
+    unresolved_result_keys,
 )
 
 
@@ -45,7 +50,7 @@ def _series_title_from_episode_label(value: Any) -> str:
 
 
 def _episode_title(item: Mapping[str, Any], season: Any, episode: Any) -> str:
-    code = f"S{int(season):02d}E{int(episode):02d}" if positive_int(season) and positive_int(episode) else ""
+    code = f"S{int(season):02d}E{int(episode):02d}" if season_int(season) is not None and positive_int(episode) else ""
     series = str(item.get("series_title") or item.get("show_title") or "").strip()
     title = str(item.get("title") or "").strip()
     if series:
@@ -73,6 +78,7 @@ def _item_from_row(adapter: Any, row: Mapping[str, Any]) -> tuple[str | None, di
     item["watched_at"] = watched_at
     item["_nuvio_content_id"] = str(row.get("content_id") or "").strip()
     item["_nuvio_profile_id"] = row.get("profile_id")
+    item = enrich_external_ids(adapter, item, entity="tv" if ctype in {"series", "show"} else "movie")
     key = canonical_item_key(item)
     if not key or key == "unknown:":
         return None, None, "nuvio_id_missing"
@@ -133,16 +139,20 @@ def _delete_key_for_item(adapter: Any, item: Mapping[str, Any]) -> dict[str, Any
     if not content_id:
         return None
     key: dict[str, Any] = {"content_id": content_id}
-    season = positive_int(item.get("season"))
+    season = season_int(item.get("season"))
     episode = positive_int(item.get("episode"))
-    if season and episode:
+    if season is not None and episode:
         key["season"] = season
         key["episode"] = episode
     return key
 
 
-def _unresolved(item: Mapping[str, Any], reason: str) -> dict[str, Any]:
-    return {"status": "unresolved", "reason": reason, "item": id_minimal(item)}
+def _unresolved(item: Mapping[str, Any], reason: str, key: str | None = None) -> dict[str, Any]:
+    out = {"status": "unresolved", "reason": reason, "item": id_minimal(item)}
+    if key:
+        out["key"] = key
+        out["canonical_key"] = key
+    return out
 
 
 def _result(ok: bool, count: int, attempted: int, confirmed: list[str], unresolved: list[dict[str, Any]], results: list[dict[str, Any]], skipped: int, **extra: Any) -> dict[str, Any]:
@@ -152,7 +162,7 @@ def _result(ok: bool, count: int, attempted: int, confirmed: list[str], unresolv
         "attempted": int(attempted),
         "confirmed_keys": list(dict.fromkeys(k for k in confirmed if k)),
         "unresolved": unresolved,
-        "unresolved_keys": list(dict.fromkeys(canonical_key((u.get("item") or {}) if isinstance(u, Mapping) else {}) for u in unresolved)),
+        "unresolved_keys": unresolved_result_keys(unresolved),
         "results": results,
         "skipped": int(skipped),
         "errors": sum(1 for u in unresolved if str(u.get("status") or "") == "failed"),
@@ -171,20 +181,27 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
     keys: list[str] = []
     verify_keys: list[str] = []
     pending_items: list[dict[str, Any]] = []
+    skipped_keys: list[str] = []
+    presence_confirmed_keys: list[str] = []
+    confirmed_destinations: dict[str, dict[str, Any]] = {}
     skipped = 0
 
     for item in src:
         key = canonical_item_key(item)
         payload, reason = _payload_for_item(adapter, item, current_rows=rows)
         if payload is None:
-            entry = _unresolved(item, reason or "nuvio_history_write_failed")
+            entry = _unresolved(item, reason or "nuvio_history_write_failed", key)
             unresolved.append(entry)
             results.append(entry)
             continue
         verify_key = payload_item_key(payload) or key
         target = current.get(verify_key) or current.get(key)
         if target and (epoch_ms(target.get("watched_at")) or 0) >= int(payload.get("watched_at") or 0):
+            dest_key = verify_key if verify_key in current else key
             skipped += 1
+            skipped_keys.append(key)
+            presence_confirmed_keys.append(key)
+            confirmed_destinations[key] = {"key": dest_key, "item": dict(target), "status": "existing"}
             results.append({"status": "skipped", "reason": "history_unchanged", "item": id_minimal(item), "canonical_key": key})
             continue
         payloads.append(payload)
@@ -194,7 +211,19 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
         results.append({"status": "pending" if not dry_run else "dry_run", "item": id_minimal(item), "canonical_key": key})
 
     if dry_run:
-        return _result(len(unresolved) == 0, len(payloads), len(payloads), [], unresolved, results, skipped, dry_run=True)
+        return _result(
+            len(unresolved) == 0,
+            len(payloads),
+            len(payloads),
+            [],
+            unresolved,
+            results,
+            skipped,
+            skipped_keys=skipped_keys,
+            presence_confirmed_keys=presence_confirmed_keys,
+            confirmed_destinations=confirmed_destinations,
+            dry_run=True,
+        )
 
     failed = False
     if payloads:
@@ -203,19 +232,43 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
         except Exception:
             failed = True
             for item, key in zip(pending_items, keys):
-                unresolved.append({"status": "failed", "reason": "nuvio_history_write_failed", "item": id_minimal(item), "canonical_key": key})
+                unresolved.append({"status": "failed", "reason": "nuvio_history_write_failed", "item": id_minimal(item), "key": key, "canonical_key": key})
+
+    if replaying():
+        accepted = []
+        retained = {payload_item_key(row): dict(row) for row in rows}
+        for key, verify_key, payload in zip(keys, verify_keys, payloads):
+            if not failed:
+                accepted.append(key)
+                retained[verify_key] = dict(payload)
+        replace_retained(pull_watched_rows, list(retained.values()))
+        return accepted_result(_result(not unresolved, len(accepted), len(payloads), accepted, unresolved, results, skipped,
+                                       skipped_keys=skipped_keys, presence_confirmed_keys=presence_confirmed_keys,
+                                       confirmed_destinations=confirmed_destinations), accepted)
 
     after = build_index(adapter) if payloads and not failed else current
     confirmed: list[str] = []
-    for key, verify_key in ([] if failed else zip(keys, verify_keys)):
+    for item, key, verify_key in ([] if failed else zip(pending_items, keys, verify_keys)):
         if verify_key in after:
             confirmed.append(key)
+            confirmed_destinations[key] = {"key": verify_key, "item": dict(after.get(verify_key) or {}), "status": "added"}
         else:
-            unresolved.append({"status": "failed", "reason": "nuvio_history_verification_failed", "canonical_key": key})
+            unresolved.append({"status": "failed", "reason": "nuvio_history_verification_failed", "item": id_minimal(item), "key": key, "canonical_key": key})
 
     ok = len(unresolved) == 0
     _info("write_done", op="add", ok=ok, attempted=len(payloads), confirmed=len(confirmed), skipped=skipped, unresolved=len(unresolved))
-    return _result(ok, len(confirmed), len(payloads), confirmed, unresolved, results, skipped)
+    return _result(
+        ok,
+        len(confirmed),
+        len(payloads),
+        confirmed,
+        unresolved,
+        results,
+        skipped,
+        skipped_keys=skipped_keys,
+        presence_confirmed_keys=presence_confirmed_keys,
+        confirmed_destinations=confirmed_destinations,
+    )
 
 
 def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
@@ -233,7 +286,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = 
         item_key = canonical_item_key(item)
         payload = _delete_key_for_item(adapter, current.get(item_key) or item)
         if not payload:
-            entry = _unresolved(item, "nuvio_id_missing")
+            entry = _unresolved(item, "nuvio_id_missing", item_key)
             unresolved.append(entry)
             results.append(entry)
             continue
@@ -258,15 +311,22 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = 
         except Exception:
             failed = True
             for item, key in zip(pending_items, item_keys):
-                unresolved.append({"status": "failed", "reason": "nuvio_history_write_failed", "item": id_minimal(item), "canonical_key": key})
+                unresolved.append({"status": "failed", "reason": "nuvio_history_write_failed", "item": id_minimal(item), "key": key, "canonical_key": key})
+
+    if replaying():
+        accepted = [] if failed else list(item_keys)
+        removed = set() if failed else set(verify_keys)
+        retained = [row for row in pull_watched_rows(adapter) if payload_item_key(row) not in removed]
+        replace_retained(pull_watched_rows, retained)
+        return _result(not unresolved, len(accepted), len(keys_payload), accepted, unresolved, results, skipped)
 
     after = build_index(adapter) if keys_payload and not failed else current
     confirmed: list[str] = []
-    for key, verify_key in ([] if failed else zip(item_keys, verify_keys)):
+    for item, key, verify_key in ([] if failed else zip(pending_items, item_keys, verify_keys)):
         if key and verify_key not in after:
             confirmed.append(key)
         elif key:
-            unresolved.append({"status": "failed", "reason": "nuvio_history_verification_failed", "canonical_key": key})
+            unresolved.append({"status": "failed", "reason": "nuvio_history_verification_failed", "item": id_minimal(item), "key": key, "canonical_key": key})
 
     ok = len(unresolved) == 0
     _info("write_done", op="remove", ok=ok, attempted=len(keys_payload), confirmed=len(confirmed), skipped=skipped, unresolved=len(unresolved))

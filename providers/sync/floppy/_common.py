@@ -6,7 +6,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from cw_platform.id_map import canonical_key, ids_from, minimal as id_minimal
+from cw_platform.anime_mapping.storage import query_edges
+from cw_platform.app_version import user_agent as http_user_agent
+from cw_platform.id_map import canonical_key, coalesce_ids, ids_from, merge_ids, minimal as id_minimal
 from providers.auth._auth_FLOPPY import FloppyAuthError, is_configured as auth_is_configured, provider_block
 from providers.sync._mod_common import safe_json
 
@@ -18,6 +20,10 @@ MAX_PAGES = 200
 MAX_ROWS = 200_000
 MAX_SEASONS = 60
 MAX_EMPTY_SEASONS = 2
+ANIME_BUCKET = "anime"
+TV_BUCKET = "tv"
+ANIME_ID_KEYS = ("mal", "anilist", "kitsu", "anidb")
+ANIME_LOOKUP_KEYS = ("tmdb", "tvdb", "imdb")
 
 _LAYOUT_CACHE: dict[str, list[tuple[int, int]]] = {}
 
@@ -52,11 +58,145 @@ def watchlist_name(adapter: Any) -> str:
     return str(pair.get("watchlist_name") or block.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
 
 
+def anime_library_enabled(adapter: Any) -> bool:
+    pair = pair_provider_block(adapter)
+    if "anime_library" in pair:
+        return bool(pair.get("anime_library"))
+    block = configured_block(getattr(adapter, "config", None), getattr(adapter, "instance_id", "default"))
+    return bool(block.get("anime_library"))
+
+
+def _anime_mapping_release(adapter: Any) -> str | None:
+    cfg = getattr(adapter, "config", None)
+    block = cfg.get("anime_mapping") if isinstance(cfg, Mapping) else None
+    if not isinstance(block, Mapping) or not block.get("enabled"):
+        return None
+    return str(block.get("release_tag") or "").strip() or "v3"
+
+
+def _show_id_map(item: Mapping[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    typ = str(item.get("type") or "").strip().lower()
+    sources = (item.get("show_ids"),) if typ in {"episode", "season"} and isinstance(item.get("show_ids"), Mapping) else (item.get("ids"), item.get("show_ids"))
+    for raw in sources:
+        if not isinstance(raw, Mapping):
+            continue
+        for key, value in raw.items():
+            text = str(value or "").strip()
+            if text:
+                out.setdefault(str(key).strip().lower(), text)
+    return out
+
+
+def is_anime_item(adapter: Any, item: Mapping[str, Any]) -> bool:
+    if str(item.get("type") or "").strip().lower() == "anime":
+        return True
+    ids = _show_id_map(item)
+    if any(ids.get(key) for key in ANIME_ID_KEYS):
+        return True
+    amap = item.get("_cw_anime_map")
+    if isinstance(amap, Mapping) and str(amap.get("namespace") or "").strip().lower() in ANIME_ID_KEYS and str(amap.get("target_id") or "").strip():
+        return True
+    release = _anime_mapping_release(adapter)
+    if not release:
+        return False
+    cache = getattr(adapter, "_floppy_anime_lookup", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(adapter, "_floppy_anime_lookup", cache)
+        except Exception:
+            pass
+    for provider in ANIME_LOOKUP_KEYS:
+        ident = ids.get(provider)
+        if not ident:
+            continue
+        hit = cache.get((provider, ident))
+        if hit is None:
+            try:
+                rows = query_edges(release, provider, ident)
+            except Exception:
+                rows = []
+            hit = any(
+                str(row.get("source_kind") or "").strip().lower() == "show"
+                and str(row.get("target_provider") or "").strip().lower() in ANIME_ID_KEYS
+                for row in rows
+            )
+            cache[(provider, ident)] = hit
+        if hit:
+            return True
+    return False
+
+
+def _load_show_buckets(adapter: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for media_type in ("tv", "anime"):
+        try:
+            rows = paged(adapter, f"media/{media_type}")
+        except FloppyAuthError as exc:
+            if getattr(exc, "status_code", None) not in ({400, 404} if media_type == "tv" else {400, 403, 404}):
+                raise
+            rows = []
+        for row in rows:
+            inner_raw = row.get("item")
+            inner: Mapping[str, Any] = inner_raw if isinstance(inner_raw, Mapping) else {}
+            typ, source, media_id, _, _ = media_parts_from_item_id(row.get("item_id"))
+            source = str(inner.get("source") or source or "").strip()
+            media_id = str(inner.get("media_id") or media_id or "").strip()
+            if source != "tmdb" or not media_id or str(inner.get("media_type") or typ or "").strip().lower() != "tv":
+                continue
+            bucket = ANIME_BUCKET if str(inner.get("library_media_type") or "").strip().lower() == ANIME_BUCKET else TV_BUCKET
+            if out.get(media_id) != ANIME_BUCKET:
+                out[media_id] = bucket
+    return out
+
+
+def show_buckets(adapter: Any) -> dict[str, str]:
+    cached = getattr(adapter, "_floppy_show_buckets", None)
+    if isinstance(cached, dict):
+        return cached
+    loaded = _load_show_buckets(adapter)
+    try:
+        setattr(adapter, "_floppy_show_buckets", loaded)
+    except Exception:
+        pass
+    return loaded
+
+
+def show_bucket(adapter: Any, tmdb_id: Any) -> str | None:
+    key = str(tmdb_id or "").strip()
+    return show_buckets(adapter).get(key) if key else None
+
+
+def write_bucket(adapter: Any, tmdb_id: Any, item: Mapping[str, Any] | None = None) -> str:
+    key = str(tmdb_id or "").strip()
+    if not key:
+        return ""
+    buckets = show_buckets(adapter)
+    existing = buckets.get(key)
+    if existing is None:
+        existing = ANIME_BUCKET if anime_library_enabled(adapter) and isinstance(item, Mapping) and is_anime_item(adapter, item) else TV_BUCKET
+        buckets[key] = existing
+    return ANIME_BUCKET if existing == ANIME_BUCKET else ""
+
+
+def bucket_params(bucket: str | None) -> dict[str, str] | None:
+    return {"library_media_type": bucket} if bucket else None
+
+
+def bucket_body(bucket: str | None) -> dict[str, str]:
+    return {"library_media_type": bucket} if bucket else {}
+
+
+def show_path(tmdb_id: Any, bucket: str | None = None) -> str:
+    return f"media/{ANIME_BUCKET if bucket == ANIME_BUCKET else 'tv'}/tmdb/{tmdb_id}"
+
+
 def api_request(adapter: Any, method: str, path: str, *, ok: tuple[int, ...] = (200,), **kwargs: Any) -> Any:
     client = adapter.client
     url = f"{client.api_base}/{str(path or '').strip('/')}"
     headers = dict(kwargs.pop("headers", {}) or {})
-    headers.update({"Accept": "application/json", "Authorization": f"Bearer {client.api_token}", "User-Agent": "CrossWatch/1.0"})
+    headers.update({"Accept": "application/json", "Authorization": f"Bearer {client.api_token}", "User-Agent": http_user_agent(override_env="CW_FLOPPY_UA")})
     if method.upper() in {"POST", "PUT", "PATCH"}:
         headers.setdefault("Content-Type", "application/json")
     resp = client.session.request(method.upper(), url, headers=headers, timeout=client.timeout, verify=client.verify_ssl, **kwargs)
@@ -109,15 +249,27 @@ def _page_signature(rows: list[Any]) -> str:
     return "\n".join(parts)
 
 
-def paged(adapter: Any, path: str, *, params: Mapping[str, Any] | None = None, max_pages: int = MAX_PAGES) -> list[Mapping[str, Any]]:
+def _total_of(data: Mapping[str, Any]) -> int | None:
+    pagination = data.get("pagination")
+    raw = data.get("count") if data.get("count") is not None else (pagination.get("total") if isinstance(pagination, Mapping) else None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def paged(adapter: Any, path: str, *, params: Mapping[str, Any] | None = None, max_pages: int = MAX_PAGES, require_total: bool = False) -> list[Mapping[str, Any]]:
     out: list[Mapping[str, Any]] = []
     base = dict(params or {})
     limit = max(1, min(PAGE_SIZE, int(base.pop("limit", PAGE_SIZE) or PAGE_SIZE)))
     offset = max(0, int(base.pop("offset", 0) or 0))
     previous: str | None = None
+    total: int | None = None
     for _ in range(max(1, int(max_pages or 1))):
         data = api_get(adapter, path, params={**base, "limit": limit, "offset": offset})
         enveloped = isinstance(data, Mapping)
+        if enveloped and total is None:
+            total = _total_of(data)
         rows = data.get("results") if enveloped else data
         if not isinstance(rows, list) or not rows:
             break
@@ -130,18 +282,15 @@ def paged(adapter: Any, path: str, *, params: Mapping[str, Any] | None = None, m
             del out[before:]
             break
         previous = signature
-        count = data.get("count")
         offset += len(rows)
         if len(rows) < limit:
             break
-        if count is not None:
-            try:
-                if offset >= int(count):
-                    break
-            except Exception:
-                pass
+        if total is not None and offset >= total:
+            break
         if len(out) >= MAX_ROWS:
             break
+    if require_total and total is not None and len(out) < total:
+        raise RuntimeError(f"floppy_incomplete_read:{path}:{len(out)}/{total}")
     return out
 
 
@@ -235,6 +384,89 @@ def tmdb_id_for_item(item: Mapping[str, Any], *, episode_show: bool = False) -> 
     return val or None
 
 
+def _tmdb_metadata_provider(adapter: Any) -> Any | None:
+    cached = getattr(adapter, "_floppy_tmdb_provider", None)
+    if cached is not None:
+        return cached
+    cfg = getattr(adapter, "config", None) or getattr(adapter, "raw_cfg", None) or {}
+    if not isinstance(cfg, Mapping):
+        return None
+    tmdb_raw = cfg.get("tmdb")
+    metadata_raw = cfg.get("metadata")
+    tmdb: Mapping[str, Any] = tmdb_raw if isinstance(tmdb_raw, Mapping) else {}
+    metadata: Mapping[str, Any] = metadata_raw if isinstance(metadata_raw, Mapping) else {}
+    if not str(tmdb.get("api_key") or metadata.get("tmdb_api_key") or "").strip():
+        return None
+    try:
+        from providers.metadata._meta_TMDB import TmdbProvider
+
+        provider = TmdbProvider(lambda: dict(cfg), lambda _cfg: None)
+        setattr(adapter, "_floppy_tmdb_provider", provider)
+        return provider
+    except Exception:
+        return None
+
+
+def _metadata_lookup_ids(item: Mapping[str, Any], *, episode_show: bool = False) -> dict[str, str]:
+    show_ids = item.get("show_ids")
+    if episode_show and isinstance(show_ids, Mapping):
+        source = merge_ids({str(k): v for k, v in show_ids.items()}, {})
+    else:
+        source = merge_ids(ids_from(item), ids_from(id_minimal(item)))
+        if isinstance(show_ids, Mapping):
+            source = merge_ids(source, {str(k): v for k, v in show_ids.items()})
+    return {key: str(source.get(key) or "").strip() for key in ("tmdb", "imdb", "tvdb") if str(source.get(key) or "").strip()}
+
+
+def resolved_tmdb_id_for_item(adapter: Any, item: Mapping[str, Any], *, episode_show: bool = False) -> str | None:
+    direct = tmdb_id_for_item(item, episode_show=episode_show)
+    if direct:
+        return direct
+    lookup_ids = _metadata_lookup_ids(item, episode_show=episode_show)
+    if not lookup_ids:
+        return None
+    provider = _tmdb_metadata_provider(adapter)
+    if provider is None:
+        return None
+    typ = str(item.get("type") or id_minimal(item).get("type") or "").strip().lower()
+    entity = "tv" if episode_show or typ in {"episode", "episodes", "season", "seasons", "show", "series", "tv"} else "movie"
+    try:
+        detail = provider.fetch(entity=entity, ids=lookup_ids, need={"poster": False, "backdrop": False, "ids": True})
+    except Exception:
+        return None
+    if not isinstance(detail, Mapping):
+        return None
+    detail_ids = detail.get("ids")
+    if not isinstance(detail_ids, Mapping):
+        return None
+    tmdb = str(detail_ids.get("tmdb") or "").strip()
+    return tmdb if tmdb.isdigit() else None
+
+
+def tmdb_enriched_item(adapter: Any, item: Mapping[str, Any], *, episode_show: bool = False) -> dict[str, Any]:
+    out = dict(item)
+    tmdb_id = resolved_tmdb_id_for_item(adapter, out, episode_show=episode_show)
+    if not tmdb_id:
+        return out
+    if episode_show:
+        show_ids_raw = out.get("show_ids")
+        show_ids: Mapping[str, Any] = show_ids_raw if isinstance(show_ids_raw, Mapping) else {}
+        merged = dict(show_ids)
+        merged["tmdb"] = tmdb_id
+        out["show_ids"] = merged
+        return out
+    ids_raw = out.get("ids")
+    ids: Mapping[str, Any] = ids_raw if isinstance(ids_raw, Mapping) else {}
+    merged = dict(ids)
+    merged["tmdb"] = tmdb_id
+    out["ids"] = merged
+    return out
+
+
+def confirmed_destination(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {"key": canonical_item_key(item), "item": id_minimal(item)}
+
+
 def canonical_item_key(item: Mapping[str, Any]) -> str:
     return canonical_key(id_minimal(item))
 
@@ -244,19 +476,21 @@ def item_from_row(row: Mapping[str, Any], *, force_type: str | None = None) -> d
     typ, source, media_id, season, episode = media_parts_from_item_id(item_id)
     inner_raw = row.get("item")
     inner: Mapping[str, Any] = inner_raw if isinstance(inner_raw, Mapping) else {}
-    source = str(row.get("source") or source or inner.get("source") or "").strip()
+    source = str(source or inner.get("source") or row.get("source") or "").strip()
     media_id = str(row.get("media_id") or media_id or inner.get("media_id") or "").strip()
     typ = str(force_type or row.get("media_type") or typ or inner.get("media_type") or "").strip().lower()
     if source != "tmdb" or not media_id:
         return None
+    inner_ids_raw = inner.get("ids")
+    inner_ids = coalesce_ids(inner_ids_raw) if isinstance(inner_ids_raw, Mapping) else {}
     if typ == "episode" or (season is not None and episode is not None):
         if season is None or episode is None:
             return None
         out = {"type": "episode", "show_ids": {"tmdb": media_id}, "season": season, "episode": episode}
     elif typ in {"tv", "show", "series"}:
-        out: dict[str, Any] = {"type": "show", "ids": {"tmdb": media_id}}
+        out: dict[str, Any] = {"type": "show", "ids": {**inner_ids, "tmdb": media_id}}
     elif typ == "movie":
-        out = {"type": "movie", "ids": {"tmdb": media_id}}
+        out = {"type": "movie", "ids": {**inner_ids, "tmdb": media_id}}
     else:
         return None
     title = str(row.get("title") or inner.get("title") or "").strip()
@@ -268,13 +502,16 @@ def item_from_row(row: Mapping[str, Any], *, force_type: str | None = None) -> d
     return out
 
 
-def ensure_media(adapter: Any, media_type: str, tmdb_id: str, *, payload: Mapping[str, Any] | None = None) -> None:
-    track_media(adapter, media_type, tmdb_id, payload=payload)
+def ensure_media(adapter: Any, media_type: str, tmdb_id: str, *, payload: Mapping[str, Any] | None = None, bucket: str | None = None) -> None:
+    track_media(adapter, media_type, tmdb_id, payload=payload, bucket=bucket)
 
 
-def track_media(adapter: Any, media_type: str, tmdb_id: str, *, payload: Mapping[str, Any] | None = None, patch_payload: Mapping[str, Any] | None = None) -> None:
+def track_media(adapter: Any, media_type: str, tmdb_id: str, *, payload: Mapping[str, Any] | None = None, patch_payload: Mapping[str, Any] | None = None, bucket: str | None = None) -> None:
     body = {"source": "tmdb", "media_id": str(tmdb_id)}
     body.update({k: v for k, v in dict(payload or {}).items() if v is not None})
+    anime = media_type == "tv" and bucket == ANIME_BUCKET
+    if anime:
+        body.update(bucket_body(bucket))
     try:
         api_post(adapter, f"media/{media_type}", json=body)
         return
@@ -284,7 +521,8 @@ def track_media(adapter: Any, media_type: str, tmdb_id: str, *, payload: Mapping
         post_exc = exc
     try:
         patch_body = payload if patch_payload is None else patch_payload
-        api_patch(adapter, f"media/{media_type}/tmdb/{tmdb_id}", json={k: v for k, v in dict(patch_body or {}).items() if v is not None})
+        patch_path = show_path(tmdb_id, bucket) if anime else f"media/{media_type}/tmdb/{tmdb_id}"
+        api_patch(adapter, patch_path, json={k: v for k, v in dict(patch_body or {}).items() if v is not None})
     except FloppyAuthError as exc:
         if getattr(exc, "status_code", None) == 404:
             raise post_exc

@@ -14,20 +14,29 @@
 
   function profileOption(value, option) {
     const label = labelOf(value, option) || "Default";
+    return { label, icons: [{ symbol: "badge" }], note: text(option?.dataset?.note), showNote: false };
+  }
+
+  function userProfileOption(value, option) {
+    const label = labelOf(value, option) || "Default";
     return { label, icons: [{ symbol: "account_circle" }], note: text(option?.dataset?.note), showNote: false };
   }
 
   function enhanceProvider(select, cfg = {}) {
-    return CW.IconSelect?.enhance?.(select, { ...cfg, className: `cw-profile-select cw-provider-select ${text(cfg.className)}`.trim(), getOptionData: cfg.getOptionData || providerOption });
+    return CW.IconSelect?.enhance?.(select, { sortAlphabetically: true, ...cfg, className: `cw-profile-select cw-provider-select ${text(cfg.className)}`.trim(), getOptionData: cfg.getOptionData || providerOption });
   }
 
   function enhanceProfile(select, cfg = {}) {
-    return CW.IconSelect?.enhance?.(select, { ...cfg, className: `cw-profile-select cw-profile-instance-select ${text(cfg.className)}`.trim(), getOptionData: cfg.getOptionData || profileOption });
+    return CW.IconSelect?.enhance?.(select, { sortAlphabetically: true, ...cfg, className: `cw-profile-select cw-profile-instance-select ${text(cfg.className)}`.trim(), getOptionData: cfg.getOptionData || profileOption });
+  }
+
+  function enhanceUserProfile(select, cfg = {}) {
+    return CW.IconSelect?.enhance?.(select, { sortAlphabetically: true, ...cfg, className: `cw-profile-select cw-user-profile-select ${text(cfg.className)}`.trim(), getOptionData: cfg.getOptionData || userProfileOption });
   }
 
   function enhancePair(providerSelect, profileSelect, cfg = {}) {
     return { provider: enhanceProvider(providerSelect, cfg.provider || {}), profile: enhanceProfile(profileSelect, cfg.profile || {}) };
   }
 
-  CW.ProfileSelect = { enhanceProvider, enhanceProfile, enhancePair, providerOption, profileOption };
+  CW.ProfileSelect = { enhanceProvider, enhanceProfile, enhanceUserProfile, enhancePair, providerOption, profileOption, userProfileOption };
 })();

@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from datetime import datetime, timezone, date
@@ -12,15 +12,17 @@ from contextlib import contextmanager
 import dataclasses as _dc, importlib, inspect, json, os, re, shlex, shutil, threading, time, uuid
 import asyncio
 
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from cw_platform.modules_registry import get_sync_module_path_by_name, sync_provider_names, sync_provider_supports_feature
 from cw_platform.access_policy import filter_pairs_for_user, managed_profile_id, managed_profile_instances, pair_ids_for_user, request_user, user_can_access_pair
 from cw_platform.provider_instances import list_user_profiles, normalize_user_profile_id
 from cw_platform.local_db.legacy_files import LAST_SYNC_JSON
+from cw_platform.memory_release import clear_caches, release_memory
 from cw_platform.reason_labels import friendly_reason
 from cw_platform.run_control import (
+    SyncCancelled,
     cancel_requested,
     cancel_state,
     clear_cancel,
@@ -62,9 +64,10 @@ def _rt():
     )
 
 
-FEATURE_KEYS = ["watchlist", "ratings", "history", "playlists", "progress"]
+FEATURE_KEYS = ["watchlist", "ratings", "history", "playlists", "progress", "collection"]
 _ALLOWED_RATING_TYPES: tuple[str, ...] = ("movies", "shows", "seasons", "episodes")
 _ALLOWED_RATING_MODES: tuple[str, ...] = ("only_new", "from_date", "all")
+_ALLOWED_COLLECTION_TYPES: tuple[str, ...] = ("movies", "shows", "seasons", "episodes")
 
 def _normalize_progress_block(v: dict | bool | None) -> dict:
     if isinstance(v, bool):
@@ -159,12 +162,44 @@ def _normalize_ratings_block(v: dict | bool | None) -> dict:
 
     return d
 
+def _normalize_collection_block(v: dict | bool | None) -> dict:
+    if isinstance(v, bool):
+        return {
+            "enable": coerce_bool(v), "add": coerce_bool(v), "remove": False,
+            "types": ["movies"],
+        }
+
+    d = dict(v or {})
+    d["enable"] = coerce_bool(d.get("enable", d.get("enabled", False)))
+    d["add"] = coerce_bool(d.get("add", True), True)
+    d["remove"] = coerce_bool(d.get("remove", False))
+
+    t = d.get("types", [])
+    if isinstance(t, str):
+        t = [t]
+    t_norm = [str(x).strip().lower() for x in t if isinstance(x, str)]
+    if "all" in t_norm:
+        d["types"] = list(_ALLOWED_COLLECTION_TYPES)
+    else:
+        keep = [x for x in _ALLOWED_COLLECTION_TYPES if x in t_norm]
+        d["types"] = keep or ["movies"]
+
+    return d
+
+def _normalize_remove_mode(raw: Any) -> str | None:
+    mode = str(raw or "").strip().lower()
+    if not mode:
+        return None
+    return "mirror" if mode == "mirror" else "source_deletes"
+
 def _normalize_features(f: dict | None) -> dict:
     f = dict(f or {})
     for k in FEATURE_KEYS:
         v = f.get(k)
         if k == "ratings":
             f[k] = _normalize_ratings_block(v)
+        elif k == "collection":
+            f[k] = _normalize_collection_block(v)
         elif k == "progress":
             if isinstance(v, (bool, dict)):
                 f[k] = _normalize_progress_block(v)
@@ -176,13 +211,33 @@ def _normalize_features(f: dict | None) -> dict:
             v["remove"] = coerce_bool(v.get("remove", False))
         if k == "history" and isinstance(f.get(k), dict):
             f[k]["rewatches"] = coerce_bool(f[k].get("rewatches", False))
+            if "use_source_status" in f[k]:
+                f[k]["use_source_status"] = coerce_bool(f[k].get("use_source_status", False))
+        if k in ("history", "ratings", "progress", "watchlist") and isinstance(f.get(k), dict) and "library_only" in f[k]:
+            f[k]["library_only"] = coerce_bool(f[k].get("library_only", False))
+        if k in ("history", "progress", "ratings") and isinstance(f.get(k), dict):
+            f[k]["include_specials"] = coerce_bool(f[k].get("include_specials", True), True)
+        if isinstance(f.get(k), dict) and "remove_mode" in f[k]:
+            mode = _normalize_remove_mode(f[k].get("remove_mode"))
+            if mode is None:
+                f[k].pop("remove_mode", None)
+            else:
+                f[k]["remove_mode"] = mode
         if isinstance(f.get(k), dict) and ("use_anime_mapping" in f[k] or "anime_only_sync" in f[k]):
             use_map = coerce_bool(f[k].get("use_anime_mapping", False))
             f[k]["use_anime_mapping"] = use_map
             f[k]["anime_only_sync"] = coerce_bool(f[k].get("anime_only_sync", False)) if use_map else False
     return f
 
+def _playlist_managed_pair(pair: Mapping[str, Any] | None) -> bool:
+    feats = pair.get("features") if isinstance(pair, Mapping) else None
+    pl = feats.get("playlists") if isinstance(feats, Mapping) else None
+    return str(pl.get("managed_by") if isinstance(pl, Mapping) else "").strip().lower() == "playlists"
+
 def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
+    from cw_platform.path_matching import pair_enabled
+
+    pair["path_matching"] = pair_enabled(pair)
     src = str(pair.get("source") or "").strip().upper()
     dst = str(pair.get("target") or "").strip().upper()
     feats = pair.get("features")
@@ -194,6 +249,14 @@ def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
         feats.pop("progress", None)
     if not sync_provider_supports_feature(src, "ratings") or not sync_provider_supports_feature(dst, "ratings"):
         feats.pop("ratings", None)
+    if "collection" in feats:
+        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
+        collection_targets = {"TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
+        if src not in collection_sources or dst not in collection_targets or str(pair.get("mode") or "").strip().lower().startswith("two"):
+            feats.pop("collection", None)
+
+_DROPPED_SHOW_PROVIDERS = frozenset({"trakt", "mdblist", "simkl", "wetrakr", "flicklist"})
+
 
 def _normalize_pair_providers(p: Any) -> dict[str, Any]:
     if not isinstance(p, dict):
@@ -211,17 +274,22 @@ def _normalize_pair_providers(p: Any) -> dict[str, Any]:
         blk: dict[str, Any] = {}
         if "strict_id_matching" in v:
             blk["strict_id_matching"] = coerce_bool(v.get("strict_id_matching"))
-        if key == "trakt":
+        if key == "jellyfin" and "targeted_lookup" in v:
+            blk["targeted_lookup"] = coerce_bool(v.get("targeted_lookup"), True)
+        if key in _DROPPED_SHOW_PROVIDERS:
             if "history_ignore_dropped_shows" in v:
                 blk["history_ignore_dropped_shows"] = coerce_bool(v.get("history_ignore_dropped_shows"))
-        if key == "mdblist":
-            if "history_ignore_dropped_shows" in v:
-                blk["history_ignore_dropped_shows"] = coerce_bool(v.get("history_ignore_dropped_shows"))
-        if key == "simkl":
-            if "history_ignore_dropped_shows" in v:
-                blk["history_ignore_dropped_shows"] = coerce_bool(v.get("history_ignore_dropped_shows"))
+            mode = str(v.get("history_dropped_mode") or "").strip().lower()
+            if mode in {"sync", "ignore", "tag"}:
+                blk["history_dropped_mode"] = mode
+        if key == "floppy" and "anime_library" in v:
+            blk["anime_library"] = coerce_bool(v.get("anime_library"))
         for kk, vv in v.items():
-            if kk in {"strict_id_matching", "history_ignore_dropped_shows"}:
+            if kk in {"strict_id_matching", "history_ignore_dropped_shows", "history_dropped_mode"}:
+                continue
+            if key == "floppy" and kk == "anime_library":
+                continue
+            if key == "jellyfin" and kk == "targeted_lookup":
                 continue
             blk[str(kk)] = vv
         if blk:
@@ -302,6 +370,145 @@ def _summary_set_timeline(flag: str, value: bool = True) -> None:
 def _summary_snapshot() -> dict[str, Any]:
     with SUMMARY_LOCK:
         return dict(SUMMARY)
+
+def _epoch_seconds(v: Any) -> int | None:
+    if v in (None, ""):
+        return None
+    try:
+        n = float(v)
+        if n > 0:
+            return int(n / 1000) if n > 1e12 else int(n)
+    except Exception:
+        pass
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+def _summary_has_run(snap: Mapping[str, Any]) -> bool:
+    if snap.get("running") or snap.get("run_id") or snap.get("raw_started_ts"):
+        return True
+    if snap.get("started_at") or snap.get("finished_at") or snap.get("exit_code") is not None:
+        return True
+    tl = snap.get("timeline")
+    return isinstance(tl, Mapping) and any(bool(v) for v in tl.values())
+
+def _final_timeline(timeline: Any, *, finished: bool) -> dict[str, bool]:
+    raw = timeline if isinstance(timeline, Mapping) else {}
+    out = {
+        "start": bool(raw.get("start") or raw.get("started")),
+        "pre": bool(raw.get("pre") or raw.get("discovery") or raw.get("discovering")),
+        "post": bool(raw.get("post") or raw.get("syncing") or raw.get("apply")),
+        "done": bool(raw.get("done") or raw.get("finished") or raw.get("complete")),
+    }
+    if finished or out["done"]:
+        out.update({"start": True, "pre": True, "post": True, "done": True})
+    return out
+
+def _final_phase(features: Any) -> dict[str, dict[str, Any]]:
+    total = 0
+    if isinstance(features, Mapping):
+        for lane in features.values():
+            if not isinstance(lane, Mapping):
+                continue
+            try:
+                total += int(lane.get("added") or 0) + int(lane.get("removed") or 0) + int(lane.get("updated") or 0)
+            except Exception:
+                pass
+    return {
+        "snapshot": {"total": 1, "done": 1, "final": True},
+        "apply": {"total": total, "done": total, "final": True},
+    }
+
+def _latest_report_summary() -> dict[str, Any] | None:
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.local_db.sync_reports import list_reports
+
+        rows = list_reports(CONFIG, limit=1, feature_keys=FEATURE_KEYS)
+    except Exception:
+        rows = []
+    if not rows:
+        return None
+    row = dict(rows[0])
+    finished = bool(row.get("finished_at") or row.get("exit_code") is not None)
+    row["running"] = False
+    if finished and row.get("exit_code") is None:
+        row["exit_code"] = 0
+    row["timeline"] = _final_timeline(row.get("timeline"), finished=finished)
+    row["_phase"] = _final_phase(row.get("features"))
+    return row
+
+def _last_sync_summary() -> dict[str, Any] | None:
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.local_db import last_sync as sqlite_last_sync
+
+        last = sqlite_last_sync.load_last_sync(CONFIG)
+    except Exception:
+        last = {}
+    if not isinstance(last, Mapping) or not last:
+        return None
+
+    started = _epoch_seconds(last.get("started_at"))
+    finished = _epoch_seconds(last.get("finished_at"))
+    if not (started or finished):
+        return None
+    raw_result = last.get("result")
+    result: Mapping[str, Any] = raw_result if isinstance(raw_result, Mapping) else {}
+    exit_code = last.get("exit_code")
+    if exit_code is None and finished:
+        exit_code = 0
+    out: dict[str, Any] = {
+        "running": False,
+        "run_id": str(last.get("run_id") or f"last-sync-{finished or started}"),
+        "raw_started_ts": started,
+        "started_at": started,
+        "finished_at": finished,
+        "duration_sec": last.get("duration_sec"),
+        "result": raw_result or "",
+        "exit_code": exit_code,
+        "timeline": _final_timeline(last.get("timeline"), finished=bool(finished)),
+        "features": {},
+        "enabled": _lanes_enabled_defaults(),
+        "_phase": _final_phase({}),
+    }
+    for key in ("added", "removed", "updated", "skipped", "unresolved", "errors", "blocked"):
+        if key in result:
+            out[f"{key}_last" if key in {"added", "removed", "updated"} else key] = result.get(key)
+    return out
+
+def _load_persisted_summary() -> dict[str, Any] | None:
+    return _latest_report_summary() or _last_sync_summary()
+
+def _summary_snapshot_for_response() -> dict[str, Any]:
+    snap = _summary_snapshot()
+    if _summary_has_run(snap):
+        return snap
+    persisted = _load_persisted_summary()
+    if not persisted:
+        return snap
+    with SUMMARY_LOCK:
+        if not _summary_has_run(SUMMARY):
+            SUMMARY.clear()
+            SUMMARY.update(persisted)
+        return dict(SUMMARY)
+
+def _summary_stream_replay_start_index(buf: Sequence[Any], snap: Mapping[str, Any], *, log_visible: bool = True) -> int:
+    if not log_visible:
+        return len(buf or [])
+    tl = snap.get("timeline") if isinstance(snap, Mapping) else {}
+    running = bool(snap.get("running")) or str(snap.get("state") or "").lower() == "running"
+    finished = bool(snap.get("exit_code") is not None or (isinstance(tl, Mapping) and tl.get("done")))
+    return 0 if running and not finished else len(buf or [])
 
 # Provider counts (pre/post) seeding for UI/report parity
 def _seed_summary_provider_counts(phase: str) -> None:
@@ -481,6 +688,61 @@ def _format_unresolved_line(it: Mapping[str, Any]) -> str:
         head = f"{head} - {code}"
     return f"{head} | {reason}"
 
+def _unresolved_display_item(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    item = row.get("item")
+    return item if isinstance(item, Mapping) else row
+
+def _unresolved_display_key(row: Mapping[str, Any]) -> str:
+    feature = str(row.get("feature") or "").strip().lower()
+    item = _unresolved_display_item(row)
+    if feature == "history":
+        try:
+            from cw_platform.history_events import history_sync_key
+
+            key = str(history_sync_key(item, row.get("_cw_event_key") or row.get("key"), event_mode=False) or "").strip()
+            if key:
+                return key
+        except Exception:
+            pass
+    try:
+        from cw_platform.id_map import canonical_key
+
+        key = str(canonical_key(item) or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    line = _format_unresolved_line(row).rsplit("|", 1)[0].strip().lower()
+    return line or repr(sorted((str(k), repr(v)) for k, v in item.items()))
+
+def _unresolved_display_score(row: Mapping[str, Any]) -> int:
+    item = _unresolved_display_item(row)
+    typ = str(item.get("type") or "").strip().lower()
+    reason = str(row.get("reason") or row.get("hint") or row.get("error") or "").strip().lower()
+    if typ == "episode" and ("episode" in reason or "episodes" in reason):
+        return 4
+    if typ == "episode" and ("show" in reason or "shows" in reason):
+        return 3
+    if typ and typ in reason:
+        return 3
+    if reason:
+        return 2
+    return 1
+
+def _dedupe_unresolved_for_display(items: Sequence[Any]) -> list[dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    scores: dict[str, int] = {}
+    for raw in items or []:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        key = _unresolved_display_key(row)
+        score = _unresolved_display_score(row)
+        if key not in out or score >= scores.get(key, 0):
+            out[key] = row
+            scores[key] = score
+    return list(out.values())
+
 def _emit_unresolved_details(total_unresolved: int | None = None) -> None:
     with SUMMARY_LOCK:
         items = list(SUMMARY.get("unresolved_items") or [])
@@ -492,6 +754,7 @@ def _emit_unresolved_details(total_unresolved: int | None = None) -> None:
             items = []
     if not items:
         return
+    items = _dedupe_unresolved_for_display(items)
     seen: set[str] = set()
     lines: list[str] = []
     for it in items:
@@ -522,7 +785,14 @@ def _emit_unresolved_details(total_unresolved: int | None = None) -> None:
         for line in shown:
             _sync_progress_ui(f"[i] {line}")
 
-def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
+def _run_pairs_thread_entry(run_id: str, overrides: dict | None = None, *, interactive: Any = None) -> None:
+    try:
+        _run_pairs_thread(run_id, overrides, interactive=interactive)
+    finally:
+        clear_caches()
+        release_memory()
+
+def _run_pairs_thread(run_id: str, overrides: dict | None = None, *, interactive: Any = None) -> None:
     rt = _rt()
     LOG_BUFFERS, RUNNING_PROCS, _append_log, strip_ansi = rt[0], rt[1], rt[8], rt[7]
     overrides = overrides or {}
@@ -531,6 +801,22 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
     scheduler_webhook_cfg: dict[str, Any] | None = None
     scheduler_start_sent = False
     was_cancelled = False
+    from cw_platform.log_context import log_run_id
+    log_token = log_run_id.set(str(run_id))
+    archived_run = None
+    try:
+        from services.log_archive import archive
+        log_cfg = _env()[0]()
+        requested = str(overrides.get("pair_id") or overrides.get("pair_scope") or "").strip()
+        raw_log_scope = overrides.get("pair_scope_ids")
+        scope = {str(value or '').strip() for value in raw_log_scope if str(value or '').strip()} if isinstance(raw_log_scope, list) else set()
+        log_pairs = [{key: p.get(key) for key in ("id", "source", "source_instance", "src_instance", "target", "target_instance", "dst_instance", "mode", "features")}
+                     for p in log_cfg.get("pairs", []) if isinstance(p, dict) and coerce_bool(p.get("enabled", True), True)
+                     and (not requested or str(p.get("id")) == requested)
+                     and (not scope or str(p.get("id") or '').strip() in scope)]
+        archived_run = archive().start(str(run_id), log_pairs)
+    except Exception:
+        pass
     clear_cancel()
     _summary_reset()
     _summary_set("run_id", str(run_id))
@@ -631,6 +917,11 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
     try:
         load_config, _save = _env()
         cfg = load_config()
+        if interactive is not None:
+            from cw_platform.orchestrator._interactive import fingerprint
+
+            if fingerprint(cfg) != interactive.config_hash:
+                return
         scheduler_webhook_cfg = cfg if isinstance(cfg, dict) else {}
 
         try:
@@ -657,19 +948,22 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
         except Exception:
             req_pair_ids = set()
 
+        pair_scope_ids: set[str] = set(req_pair_ids)
+
         if req_pair_ids:
             _summary_set("pair_scope_ids", sorted(req_pair_ids))
-            cfg = dict(cfg)
-            cfg["pairs"] = [p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") in req_pair_ids]
 
         if req_pair_id:
+            if req_pair_ids and req_pair_id not in req_pair_ids:
+                _sync_progress_ui(f"[!] Pair not found or disabled: {req_pair_id}")
+                _sync_progress_ui("[SYNC] exit code: 1")
+                return
             pair = next((p for p in (cfg.get("pairs") or []) if str(p.get("id") or "") == req_pair_id), None)
             if not pair or not coerce_bool(pair.get("enabled", True), True):
                 _sync_progress_ui(f"[!] Pair not found or disabled: {req_pair_id}")
                 _sync_progress_ui("[SYNC] exit code: 1")
                 return
-            cfg = dict(cfg)
-            cfg["pairs"] = [pair]
+            pair_scope_ids = {req_pair_id}
             pair_scope = req_pair_id
             pair_src = str(pair.get("source") or pair_src)
             pair_dst = str(pair.get("target") or pair_dst)
@@ -695,7 +989,13 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                         return True
                 return False
 
-            for pair in (cfg.get("pairs") or []):
+            pairs_for_run = [
+                p for p in (cfg.get("pairs") or [])
+                if isinstance(p, dict)
+                and (not pair_scope_ids or str(p.get("id") or "") in pair_scope_ids)
+            ]
+
+            for pair in pairs_for_run:
                 if not coerce_bool(pair.get("enabled", True), True):
                     continue
                 if "features" in pair and not _pair_has_enabled_features(pair):
@@ -707,6 +1007,8 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                     )
 
             mgr = OrchestratorClass(config=cfg)
+            if interactive is not None:
+                mgr.interactive = interactive
             dry = coerce_bool((cfg.get("sync") or {}).get("dry_run", False)) or coerce_bool((overrides or {}).get("dry_run"))
             runtime_cfg = cfg.get("runtime") or {}
             sync_cfg = cfg.get("sync") or {}
@@ -714,12 +1016,20 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                 sync_cfg.get("write_state_json", runtime_cfg.get("write_state_json", True)),
                 True,
             )
+            def report_progress(line):
+                _sync_progress_ui(line)
+                if interactive is not None and interactive.on_progress is not None:
+                    interactive.on_progress(line)
+
             result = mgr.run_pairs(
                 dry_run=dry,
-                progress=_sync_progress_ui,
+                progress=report_progress,
+                pair_scope_ids=sorted(pair_scope_ids),
                 write_state_json=write_state_json,
                 use_snapshot=True,
             )
+            if interactive is not None:
+                interactive.result = result
 
         if coerce_bool(result.get("cancelled")) or cancel_requested(run_id):
             was_cancelled = True
@@ -758,11 +1068,24 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
             v_log = int(totals.get(key) or 0)
             return max(v_result, v_log)
 
+        def _merge_unresolved_total() -> int:
+            if "unresolved" in result:
+                try:
+                    return int(result.get("unresolved") or 0)
+                except Exception:
+                    return 0
+            with SUMMARY_LOCK:
+                items = list(SUMMARY.get("unresolved_items") or [])
+            deduped = _dedupe_unresolved_for_display(items)
+            if deduped:
+                return len(deduped)
+            return int(totals.get("unresolved") or 0)
+
         added = _merge_total("added")
         removed = _merge_total("removed")
         updated = _merge_total("updated")
         skipped = _merge_total("skipped")
-        unresolved = _merge_total("unresolved")
+        unresolved = _merge_unresolved_total()
         errors = _merge_total("errors")
         blocked = _merge_total("blocked")
         for key, value in (("skipped", skipped), ("unresolved", unresolved), ("errors", errors), ("blocked", blocked)):
@@ -778,6 +1101,11 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
                 _emit_unresolved_details(unresolved)
             except Exception:
                 pass
+        _sync_progress_ui("[SYNC] exit code: 0")
+    except SyncCancelled:
+        was_cancelled = True
+        _summary_set("cancelled", True)
+        _sync_progress_ui("[!] Sync cancelled - already applied changes were kept.")
         _sync_progress_ui("[SYNC] exit code: 0")
     except Exception as e:
         _sync_progress_ui(f"[!] Sync error: {e}")
@@ -817,10 +1145,18 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None) -> None:
         except Exception:
             pass
         clear_cancel()
+        if archived_run:
+            try:
+                snap = _summary_snapshot()
+                outcome = "cancelled" if was_cancelled else "failed" if snap.get("exit_code") not in (0, "0") or snap.get("errors") else "issues" if snap.get("unresolved") or snap.get("blocked") else "completed"
+                archive().finish(archived_run, outcome)
+            except Exception:
+                pass
         RUNNING_PROCS.pop("SYNC", None)
+        log_run_id.reset(log_token)
 
 def _lanes_enabled_defaults() -> dict[str, bool]:
-    return {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": True}
+    return {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": True, "collection": True}
 
 def _parse_sync_line(line: str) -> None:
     s = _rt()[7](line).strip()
@@ -852,6 +1188,11 @@ def _parse_sync_line(line: str) -> None:
                 _summary_set("_phase", phase)
                 return
 
+            if ev == "history:episode_identity":
+                with SUMMARY_LOCK:
+                    SUMMARY.setdefault("notices", []).append(str(o.get("reason") or ""))
+                return
+
             if ev == "apply:unresolved":
                 raw_items = o.get("items")
                 if isinstance(raw_items, list) and raw_items:
@@ -865,10 +1206,11 @@ def _parse_sync_line(line: str) -> None:
                                 rec.setdefault("feature", feat_u)
                                 rec.setdefault("provider", prov_u)
                                 bucket.append(rec)
+                        SUMMARY["unresolved_items"] = _dedupe_unresolved_for_display(bucket)
                 return
 
             feat = str(o.get("feature") or "").lower()
-            if feat in ("watchlist", "history", "ratings", "progress", "playlists"):
+            if feat in ("watchlist", "history", "ratings", "progress", "playlists", "collection"):
                 F = SUMMARY.setdefault("features", {})
                 if feat not in F:
                     F[feat] = {
@@ -1151,40 +1493,6 @@ def _load_state() -> dict[str, Any]:
         _STATE_CACHE["data"] = data
         _STATE_CACHE["checked_ts"] = now
     return data
-def _iter_feature_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
-    """Collect a provider's `feat` node from its state entry, plus the same feature
-    node under each of its `instances` sub-entries. Shared by _show_title_maps_from_state
-    and _episode_code_map_from_state."""
-    out: list[dict[str, Any]] = []
-    node = pdata.get(feat)
-    if isinstance(node, dict):
-        out.append(node)
-    insts = pdata.get("instances")
-    if isinstance(insts, dict):
-        for _iid, idata in insts.items():
-            if not isinstance(idata, dict):
-                continue
-            node2 = idata.get(feat)
-            if isinstance(node2, dict):
-                out.append(node2)
-    return out
-
-
-def _iter_baseline_items(node: dict[str, Any]) -> Iterator[tuple[Any, dict[str, Any]]]:
-    """Yield (key, item) pairs from a feature node's baseline.items, accepting either the
-    dict-of-items or list-of-items shape. Shared by _show_title_maps_from_state and
-    _episode_code_map_from_state."""
-    baseline = node.get("baseline")
-    base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
-    items = base.get("items")
-    if isinstance(items, dict):
-        for k, it in items.items():
-            if isinstance(it, dict):
-                yield k, it
-    elif isinstance(items, list):
-        for it in items:
-            if isinstance(it, dict):
-                yield it.get("key"), it
 
 
 def _load_state_features(features: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
@@ -1217,13 +1525,42 @@ def _show_title_maps_from_state(state: dict[str, Any]) -> tuple[dict[str, str], 
         if k0 not in d:
             d[k0] = v0
 
+    def _iter_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        node = pdata.get(feat)
+        if isinstance(node, dict):
+            out.append(node)
+        insts = pdata.get("instances")
+        if isinstance(insts, dict):
+            for _iid, idata in insts.items():
+                if not isinstance(idata, dict):
+                    continue
+                node2 = idata.get(feat)
+                if isinstance(node2, dict):
+                    out.append(node2)
+        return out
+
     for _, pdata in provs.items():
         if not isinstance(pdata, dict):
             continue
 
-        for feat in ("history", "ratings", "watchlist", "playlists"):
-            for node in _iter_feature_nodes(pdata, feat):
-                for k, it in _iter_baseline_items(node):
+        for feat in ("history", "ratings", "watchlist", "playlists", "collection"):
+            for node in _iter_nodes(pdata, feat):
+                baseline = node.get("baseline")
+                base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
+                items = base.get("items")
+
+                if isinstance(items, dict):
+                    iters = items.items()
+                elif isinstance(items, list):
+                    iters = ((it.get("key"), it) for it in items if isinstance(it, dict))
+                else:
+                    continue
+
+                for k, it in iters:
+                    if not isinstance(it, dict):
+                        continue
+
                     typ = str(it.get("type") or "").lower()
                     is_show = typ in ("show", "series", "anime")
 
@@ -1292,12 +1629,38 @@ def _episode_code_map_from_state(state: dict[str, Any]) -> dict[str, tuple[int, 
         if len(parts) >= 3:
             out.setdefault(f"{parts[0]}:{parts[-1]}", (s, e))
 
+    def _iter_nodes(pdata: dict[str, Any], feat: str) -> list[dict[str, Any]]:
+        out_nodes: list[dict[str, Any]] = []
+        node = pdata.get(feat)
+        if isinstance(node, dict):
+            out_nodes.append(node)
+        insts = pdata.get("instances")
+        if isinstance(insts, dict):
+            for _iid, idata in insts.items():
+                if not isinstance(idata, dict):
+                    continue
+                node2 = idata.get(feat)
+                if isinstance(node2, dict):
+                    out_nodes.append(node2)
+        return out_nodes
+
     for _, pdata in provs.items():
         if not isinstance(pdata, dict):
             continue
-        for feat in ("history", "ratings", "watchlist", "playlists"):
-            for node in _iter_feature_nodes(pdata, feat):
-                for k, it in _iter_baseline_items(node):
+        for feat in ("history", "ratings", "watchlist", "playlists", "collection"):
+            for node in _iter_nodes(pdata, feat):
+                baseline = node.get("baseline")
+                base: dict[str, Any] = baseline if isinstance(baseline, dict) else node
+                items = base.get("items")
+                if isinstance(items, dict):
+                    iters = items.items()
+                elif isinstance(items, list):
+                    iters = ((it.get("key"), it) for it in items if isinstance(it, dict))
+                else:
+                    continue
+                for k, it in iters:
+                    if not isinstance(it, dict):
+                        continue
                     typ = str(it.get("type") or "").strip().lower()
                     if typ != "episode":
                         continue
@@ -1322,7 +1685,7 @@ def _get_episode_code_map() -> dict[str, tuple[int, int]]:
             cm = _EP_META_CACHE.get("code_map")
             if isinstance(cm, dict):
                 return cast(dict[str, tuple[int, int]], cm)
-    state = _load_state_features({"history", "ratings", "watchlist", "playlists"})
+    state = _load_state_features({"history", "ratings", "watchlist", "playlists", "collection"})
     cm2 = _episode_code_map_from_state(state or {})
     with _EP_META_CACHE_LOCK:
         _EP_META_CACHE["key"] = skey
@@ -1337,7 +1700,7 @@ def _get_title_maps() -> tuple[dict[str, str], dict[str, str]]:
             im = _TITLE_MAP_CACHE.get("id_map")
             if isinstance(km, dict) and isinstance(im, dict):
                 return cast(dict[str, str], km), cast(dict[str, str], im)
-    state = _load_state_features({"history", "ratings", "watchlist", "playlists"})
+    state = _load_state_features({"history", "ratings", "watchlist", "playlists", "collection"})
     km2, im2 = _show_title_maps_from_state(state or {})
     with _TITLE_MAP_CACHE_LOCK:
         _TITLE_MAP_CACHE["key"] = skey
@@ -1508,7 +1871,7 @@ def _hydrate_summary_spotlights_from_log(summary_obj: dict[str, Any], *, max_lin
         if ev not in ("apply:add:done", "apply:remove:done", "apply:update:done"):
             continue
         feat = str(obj.get("feature") or "").lower()
-        if feat not in ("watchlist", "history", "ratings", "progress", "playlists"):
+        if feat not in ("watchlist", "history", "ratings", "progress", "playlists", "collection"):
             continue
 
         lane = feats.get(feat)
@@ -1600,7 +1963,7 @@ def _finalize_spotlight_item(it: dict[str, Any]) -> None:
             return False
         if key and s == key.lower():
             return True
-        return bool(re.match(r"^(tmdb|imdb|tvdb|trakt|slug|mdblist|kitsu):", s))
+        return bool(re.match(r"^(tmdb|imdb|tvdb|trakt|slug|mdblist|mal|anilist|kitsu):", s))
 
     def _to_int(v: Any) -> int | None:
         if isinstance(v, int):
@@ -1696,7 +2059,7 @@ def _is_sync_running() -> bool:
 @router.get("/sync/providers")
 def api_sync_providers(request: Request = cast(Request, None)) -> JSONResponse:
     HIDDEN = {"BASE"}
-    FEATURE_KEYS = ("watchlist", "ratings", "history", "playlists", "progress")
+    FEATURE_KEYS = ("watchlist", "ratings", "history", "playlists", "progress", "collection")
     try:
         from cw_platform.config_base import load_config
         from cw_platform.provider_instances import build_provider_config_view, list_instance_ids
@@ -1749,6 +2112,8 @@ def api_sync_providers(request: Request = cast(Request, None)) -> JSONResponse:
     def _norm_caps(caps: dict | None) -> dict:
         caps = dict(caps or {})
         out: dict[str, Any] = {"bidirectional": bool(caps.get("bidirectional", False))}
+        if caps.get("can_target") is False:
+            out["can_target"] = False
         progress = _norm_progress_caps(caps.get("progress"))
         if progress:
             out["progress"] = progress
@@ -1765,6 +2130,9 @@ def api_sync_providers(request: Request = cast(Request, None)) -> JSONResponse:
                 out["history"] = {"rewatches": clean}
             elif isinstance(rewatches, bool):
                 out["history"] = {"rewatches": {"read": rewatches, "write": rewatches}}
+        presence = caps.get("library_presence")
+        if isinstance(presence, Mapping):
+            out["library_presence"] = {"features": [str(x) for x in (presence.get("features") or [])]}
         return out
 
     def _configured_state(mod, provider_name: str) -> bool:
@@ -1896,6 +2264,7 @@ class PairIn(BaseModel):
     target_instance: str | None = None
     mode: str | None = None
     enabled: bool | None = None
+    path_matching: bool | None = None
     providers: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     profile_id: str | None = None
@@ -1907,9 +2276,86 @@ class PairPatch(BaseModel):
     target_instance: str | None = None
     mode: str | None = None
     enabled: bool | None = None
+    path_matching: bool | None = None
     providers: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     profile_id: str | None = None
+
+
+class TopologyBaselineIn(BaseModel):
+    version: Literal[1]
+    pairs: list[dict[str, Any]]
+    findings: list[dict[str, Any]]
+    unsupportedPairs: int = 0
+
+
+def _topology_pairs(cfg: dict[str, Any], profile_id: str) -> list[dict[str, Any]]:
+    profile = next((row for row in list_user_profiles(cfg) if row["id"] == profile_id), None)
+    if profile_id and profile is None:
+        raise HTTPException(404, "Topology profile no longer exists.")
+    pairs = []
+    for pair in _cfg_pairs(cfg):
+        if pair.get("enabled") is False:
+            continue
+        if profile:
+            assigned = pair.get("profile_id")
+            if assigned and assigned != profile_id:
+                continue
+            if not assigned and not all(
+                _norm_instance_id(pair.get(f"{side}_instance")) in profile["instances"].get(str(pair.get(side) or "").strip().upper(), [])
+                for side in ("source", "target")
+            ):
+                continue
+        pairs.append({
+            "id": str(pair.get("id") or ""),
+            "source": str(pair.get("source") or "").strip().upper(),
+            "target": str(pair.get("target") or "").strip().upper(),
+            "source_instance": _norm_instance_id(pair.get("source_instance")),
+            "target_instance": _norm_instance_id(pair.get("target_instance")),
+            "mode": "two-way" if str(pair.get("mode") or "one-way").lower().startswith("two") else "one-way",
+            "features": pair.get("features") or {},
+        })
+    return sorted(pairs, key=lambda pair: pair["id"])
+
+
+@router.get("/sync/topology/baseline")
+def api_topology_baseline(profile_id: str = "") -> JSONResponse:
+    cfg = _env()[0]()
+    _topology_pairs(cfg, profile_id)
+    return JSONResponse({"baseline": (cfg.get("topology_baselines") or {}).get(profile_id or "all")}, headers={"Cache-Control": "no-store"})
+
+
+@router.put("/sync/topology/baseline")
+def api_topology_acknowledge(payload: TopologyBaselineIn, profile_id: str = "") -> dict[str, Any]:
+    from cw_platform.config_base import update_config
+
+    def mutate(cfg: dict[str, Any]) -> dict[str, Any]:
+        if payload.pairs != _topology_pairs(cfg, profile_id):
+            raise HTTPException(409, "Topology changed. Reload the sync configuration and review it again.")
+        baseline = {**payload.model_dump(), "accepted_at": datetime.now(timezone.utc).isoformat()}
+        cfg.setdefault("topology_baselines", {})[profile_id or "all"] = baseline
+        return baseline
+
+    return {"baseline": update_config(mutate)[1]}
+
+
+@router.delete("/sync/topology/baseline")
+def api_topology_reset(profile_id: str = "") -> dict[str, Any]:
+    from cw_platform.config_base import update_config
+
+    def mutate(cfg: dict[str, Any]) -> None:
+        _topology_pairs(cfg, profile_id)
+        cfg.setdefault("topology_baselines", {}).pop(profile_id or "all", None)
+
+    update_config(mutate)
+    return {"baseline": None}
+
+
+def _same_pair_endpoint(pair: Mapping[str, Any]) -> bool:
+    source = str(pair.get("source") or "").strip().upper()
+    target = str(pair.get("target") or "").strip().upper()
+    return bool(source and source == target and _norm_instance_id(pair.get("source_instance")) == _norm_instance_id(pair.get("target_instance")))
+
 
 def _request_user(request: Request | None) -> dict[str, Any] | None:
     try:
@@ -1985,7 +2431,7 @@ def api_pairs_list(request: Request = cast(Request, None)) -> JSONResponse:
                 it.pop("profile_id", None)
                 dirty = True
         user = _request_user(request)
-        if dirty and not (user and not user.get("is_admin")):
+        if dirty and not (user and (not user.get("is_admin") or user.get("monitor_view"))):
             save_config(cfg)
         return JSONResponse(filter_pairs_for_user(cfg, user, arr))
     except Exception as e:
@@ -1994,6 +2440,25 @@ def api_pairs_list(request: Request = cast(Request, None)) -> JSONResponse:
         except Exception:
             pass
         return JSONResponse({"ok": False, "error": _public_error("pairs_list_failed")}, status_code=500)
+
+def _default_pair_anime_mapping(cfg: Mapping[str, Any], item: dict[str, Any]) -> None:
+    source = str(item.get("source") or "").strip().lower()
+    target = str(item.get("target") or "").strip().lower()
+    anime_pair = bool({source, target} & {"simkl", "myanimelist", "kitsu", "anilist", "crosswatch"})
+    enabled = bool((cfg.get("anime_mapping") or {}).get("enabled")) and anime_pair
+    tmdb_ready = bool(str((cfg.get("tmdb") or {}).get("api_key") or (cfg.get("metadata") or {}).get("tmdb_api_key") or "").strip())
+    two_way = str(item.get("mode") or "").lower().startswith("two")
+    for feature in ("watchlist", "ratings", "history", "progress"):
+        block = (item.get("features") or {}).get(feature)
+        if not isinstance(block, dict):
+            continue
+        eligible = enabled
+        if feature == "history":
+            eligible = eligible and tmdb_ready
+        elif feature == "progress":
+            eligible = eligible and (target == "simkl" or (two_way and source == "simkl"))
+        block.setdefault("use_anime_mapping", eligible)
+
 
 @router.post("/pairs")
 def api_pairs_add(payload: PairIn = Body(...), request: Request = cast(Request, None)) -> dict[str, Any]:
@@ -2006,9 +2471,12 @@ def api_pairs_add(payload: PairIn = Body(...), request: Request = cast(Request, 
         item.setdefault("mode", "one-way")
         item["source_instance"] = _norm_instance_id(item.get("source_instance"))
         item["target_instance"] = _norm_instance_id(item.get("target_instance"))
+        if _same_pair_endpoint(item):
+            return {"ok": False, "error": "same_provider_instance"}
         item["enabled"] = coerce_bool(item.get("enabled", False))
         item["features"] = _normalize_features(item.get("features") or {"watchlist": True})
         _apply_pair_profile_scope(cfg, request, item)
+        _default_pair_anime_mapping(cfg, item)
         _enforce_pair_feature_constraints(item)
         if _managed_pair_blocked(cfg, request, item):
             return {"ok": False, "error": "profile_scope_denied"}
@@ -2088,6 +2556,10 @@ def api_pairs_update(pair_id: str, payload: PairPatch = Body(...), request: Requ
             if str(it.get("id")) == str(pair_id):
                 if _managed_pair_blocked(cfg, request, it):
                     return {"ok": False, "error": "profile_scope_denied"}
+                if _playlist_managed_pair(it):
+                    return {"ok": False, "error": "playlist_managed_pair"}
+                if _same_pair_endpoint({**it, **upd}):
+                    return {"ok": False, "error": "same_provider_instance"}
                 if "features" in upd:
                     it["features"] = _normalize_features(upd.pop("features"))
                 if "providers" in upd:
@@ -2124,15 +2596,28 @@ def _cw_state_dir() -> Path:
         p = Path('/config/.cw_state')
         return p if p.exists() else Path('.cw_state')
 
-def _purge_pair_state(pair_id: str) -> dict[str, Any]:
+def _purge_pair_state(pair_id: str, scopes: Sequence[str] = ()) -> dict[str, Any]:
     state_dir = _cw_state_dir()
     token = str(pair_id or '').strip()
-    if not token or not state_dir.exists():
-        return {'removed': [], 'errors': []}
-
-    paths: list[Path] = []
     removed: list[str] = []
     errors: list[str] = []
+
+    if scopes:
+        try:
+            from cw_platform.config_base import CONFIG
+            from services.pair_state import clear_pair_state
+
+            scoped = clear_pair_state(CONFIG, state_dir, scopes)
+            removed.extend(scoped.get('files') or [])
+            errors.extend(scoped.get('errors') or [])
+            clear_caches()
+        except Exception as e:
+            errors.append(f'pair_state: {e}')
+
+    if not token or not state_dir.exists():
+        return {'removed': removed, 'errors': errors}
+
+    paths: list[Path] = []
 
     try:
         for p in state_dir.rglob('*'):
@@ -2142,7 +2627,7 @@ def _purge_pair_state(pair_id: str) -> dict[str, Any]:
             except Exception:
                 continue
     except Exception as e:
-        return {'removed': [], 'errors': [f'scan_failed: {e}']}
+        return {'removed': removed, 'errors': [*errors, f'scan_failed: {e}']}
 
     paths.sort(key=lambda x: len(x.parts), reverse=True)
 
@@ -2172,16 +2657,38 @@ def api_pairs_delete(pair_id: str, purge_state: bool = True, request: Request = 
         pair = next((it for it in arr if str(it.get("id")) == str(pair_id)), None)
         if pair is not None and _managed_pair_blocked(cfg, request, pair):
             return {"ok": False, "error": "profile_scope_denied"}
+        if pair is not None and _playlist_managed_pair(pair):
+            return {"ok": False, "error": "playlist_managed_pair"}
+        scopes: list[str] = []
+        if purge_state and pair is not None:
+            try:
+                from services.pair_state import pair_scopes
+
+                scopes = list((pair_scopes(cfg, pair_id) or {}).values())
+            except Exception:
+                scopes = []
         before = len(arr)
         arr[:] = [it for it in arr if str(it.get("id")) != str(pair_id)]
         deleted = before - len(arr)
         if deleted:
             save_config(cfg)
         if purge_state:
-            state = _purge_pair_state(pair_id)
+            state = _purge_pair_state(pair_id, scopes if deleted else ())
+        inventory_removed = 0
+        if purge_state and deleted and pair is not None:
+            try:
+                from cw_platform.config_base import CONFIG
+                from services.pair_state import clear_uncovered_inventory
+
+                inventory_removed = int(clear_uncovered_inventory(CONFIG, cfg, pair).get("baselines") or 0)
+                if inventory_removed:
+                    clear_caches()
+            except Exception as e:
+                state.setdefault("errors", []).append(f"inventory: {e}")
         return {
             "ok": True,
             "deleted": deleted,
+            "inventory_removed": inventory_removed,
             "state_removed": len(state.get("removed") or []),
             "state_errors": len(state.get("errors") or []),
             "state_removed_preview": (state.get("removed") or [])[:25],
@@ -2284,7 +2791,7 @@ def _provider_counts_from_db() -> dict[str, int] | None:
     except Exception:
         return None
     if not counts:
-        return None
+        return {}
     out = _provider_count_defaults(counts)
     for key, value in counts.items():
         name = str(key or "").strip().upper()
@@ -2296,7 +2803,7 @@ def _provider_counts_from_db() -> dict[str, int] | None:
 
 def _provider_counts_current() -> dict[str, int]:
     counts = _provider_counts_from_db()
-    if counts is not None:
+    if counts:
         return counts
     cached = _PROVIDER_COUNTS_CACHE.get("data")
     return dict(cached) if isinstance(cached, dict) else _provider_count_defaults()
@@ -2341,7 +2848,7 @@ def _provider_counts_fast(*, max_age: int = 30, force: bool = False) -> dict:
     ):
         return dict(_PROVIDER_COUNTS_CACHE["data"])
     counts = _provider_counts_from_db()
-    if counts is None:
+    if not counts:
         counts = dict(_PROVIDER_COUNTS_CACHE.get("data") or _provider_count_defaults())
     _PROVIDER_COUNTS_CACHE["ts"] = now
     _PROVIDER_COUNTS_CACHE["data"] = counts
@@ -2464,7 +2971,7 @@ def api_run_sync(payload: dict | None = Body(None), request: Request = cast(Requ
         if user and not user.get("is_admin"):
             overrides["pair_scope_ids"] = [str(pair.get("id") or "") for pair in pairs if str(pair.get("id") or "")]
         th = threading.Thread(
-            target=_run_pairs_thread,
+            target=_run_pairs_thread_entry,
             args=(run_id,),
             kwargs={"overrides": overrides},
             daemon=True,
@@ -2506,7 +3013,7 @@ def api_cancel_sync(request: Request = cast(Request, None)) -> Any:
     run_id = str(_summary_snapshot().get("run_id") or "")
     state = request_cancel(run_id, reason="user")
     _summary_set("cancel_requested", True)
-    _rt()[8]("SYNC", "[!] Cancel requested; finishing the current step and stopping.")
+    _rt()[8]("SYNC", "[!] Cancel requested; stopping after the current batch.")
     return {"ok": True, "running": True, "run_id": state.get("run_id"), "requested_at": state.get("requested_at")}
 
 
@@ -2529,7 +3036,7 @@ def api_run_summary(request: Request = cast(Request, None)) -> JSONResponse:
     except Exception:
         cfg = {}
     user = _request_user(request)
-    snap0 = _summary_snapshot()
+    snap0 = _summary_snapshot_for_response()
     snap = dict(snap0 or {})
     snap.setdefault("features", {})
     snap.setdefault("enabled", _lanes_enabled_defaults())
@@ -2606,7 +3113,7 @@ def api_run_summary_file(request: Request = cast(Request, None)) -> Response:
     except Exception:
         cfg = {}
     user = _request_user(request)
-    snap0 = _summary_snapshot()
+    snap0 = _summary_snapshot_for_response()
     snap = dict(snap0 or {})
     snap.setdefault("features", {})
     snap.setdefault("enabled", _lanes_enabled_defaults())
@@ -2730,6 +3237,20 @@ async def api_run_summary_stream(request: Request, since: str = "") -> Streaming
         last_hydrate_sig = None
         last_emit = time.monotonic()
         LOG_BUFFERS = _rt()[0]
+        # Fork: a resumed client continues from its cursor; a fresh one starts at
+        # upstream's replay index instead of the whole buffer.
+        if not last_seq:
+            try:
+                initial_buf = LOG_BUFFERS.get("SYNC") or []
+                initial_log_visible = (not managed_scope) or run_log_visible_to_user(cfg_for_scope, user_for_scope)
+                last_idx = _summary_stream_replay_start_index(
+                    initial_buf,
+                    _summary_snapshot_for_response(),
+                    log_visible=initial_log_visible,
+                )
+                last_seq = _sync_log_base_seq() + last_idx - 1
+            except Exception:
+                last_seq = 0
 
         while True:
             if await request.is_disconnected():
@@ -2779,7 +3300,7 @@ async def api_run_summary_stream(request: Request, since: str = "") -> Streaming
             except Exception:
                 pass
 
-            snap = dict(_summary_snapshot() or {})
+            snap = dict(_summary_snapshot_for_response() or {})
             snap.setdefault("features", {})
             snap.setdefault("enabled", _lanes_enabled_defaults())
             hydrate_sig = (buf_len, (snap.get("timeline", {}) or {}).get("done"))

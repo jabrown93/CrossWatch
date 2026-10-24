@@ -145,16 +145,48 @@ def test_editor_ui_exposes_playlist_source() -> None:
     persistence_js = (root / "assets" / "js" / "editor" / "persistence.js").read_text(encoding="utf-8")
     assert 'sourceSelect.querySelector(\'option[value="playlist"]\')?.remove();' in chrome_js
     assert 'option[value="manual"]' in chrome_js
-    assert "Manual Overrides" in chrome_js
+    assert "Manual Overrides" not in chrome_js
     assert "/api/editor/playlists/endpoints" in sources_js
     assert "function hasPlaylistEndpoints(state)" in sources_js
     assert "state.playlistEndpointsLoaded = true;" in sources_js
     assert "if (showPlaylist && !sourceSel.querySelector('option[value=\"playlist\"]'))" in sources_js
     assert "payload.endpoint = state.snapshot" in persistence_js
     assert "state.playlistOriginalKeys" in load_js
-    assert 'const SOURCES = ["state", "manual", "playlist"];' in sources_js
+    assert 'const SOURCES = ["state", "playlist"];' in sources_js
     assert "/api/editor/tracker/workspaces" not in sources_js
     assert "state.source = ctx.normalizeSource(state.source);" in load_js
+
+
+def test_editor_ui_has_no_mojibake_markers() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
+    for marker in ("\u00c2", "\u00c3", "\u00e2", "\ufffd"):
+        assert marker not in js
+
+
+def test_editor_playlist_endpoint_picker_uses_styled_single_select() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
+    sources_js = (root / "assets" / "js" / "editor" / "sources.js").read_text(encoding="utf-8")
+    css = (root / "assets" / "css" / "pages.css").read_text(encoding="utf-8")
+    assert "function syncPlaylistEndpointIconSelect(selectEl, show)" in js
+    assert 'className: "cw-editor-icon-select"' in js
+    assert 'menuClassName: "cw-editor-icon-select-menu"' in js
+    assert "selectedShowNote: false" in js
+    assert 'menuClassName: "pl-endpoint-select-menu cw-editor-endpoint-select-menu"' not in js
+    assert 'badges: [type].filter(Boolean)' not in js
+    assert "function playlistEndpointType" not in js
+    assert "ctx.syncPlaylistEndpointIconSelect?.(snapSel, true);" in sources_js
+    assert "ctx.syncProviderIconSelect?.(snapSel, false);" not in sources_js
+    assert "#page-editor .cw-editor-endpoint-select" not in css
+    assert ".cw-editor-endpoint-select-menu" not in css
+    assert ".cw-editor-icon-select .cw-icon-select-btn" in css
+    assert "#page-editor .cw-editor-icon-select .cw-icon-select-btn{justify-content:flex-start}" in css
+    assert "#page-editor .cw-editor-icon-select .cw-icon-select-caret{margin-left:auto}" in css
 
 
 def test_editor_ui_allows_extra_policy_corrections() -> None:
@@ -261,7 +293,7 @@ def test_editor_filter_supports_season_episode_queries() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     search_js = (root / "assets" / "js" / "editor" / "search.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-search", "/assets/js/editor/search.js", "CrossWatchEditorSearch");' in core_js
+    assert 'ensurePageModule("editor-search", "/assets/js/editor/search.js", "CrossWatchEditorSearch")' in core_js
     assert 'filterInput.placeholder = "Filter by title / S01 / S01E02 / id...";' in js
     assert 'const editorSearch = requireEditorModule("Search");' in js
     assert "function parseSeasonEpisodeText(value)" in search_js
@@ -282,7 +314,7 @@ def test_editor_send_button_opens_visible_modal() -> None:
     send_js = (root / "assets" / "js" / "editor" / "send-modal.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
     css = (root / "assets" / "css" / "pages.css").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-send-modal", "/assets/js/editor/send-modal.js", "CrossWatchEditorSendModal");' in core_js
+    assert 'ensurePageModule("editor-send-modal", "/assets/js/editor/send-modal.js", "CrossWatchEditorSendModal")' in core_js
     assert 'const editorSendModal = requireEditorModule("SendModal");' in js
     assert "return editorSendModal.open({" in js
     assert 'shell.className = "cw-editor-send-overlay";' in send_js
@@ -348,6 +380,57 @@ def test_editor_send_failure_does_not_expose_exception_detail(monkeypatch) -> No
     assert "super-secret" not in str(res)
 
 
+def test_editor_send_collection_preserves_collected_at(monkeypatch) -> None:
+    class Ops:
+        pass
+
+    sent: dict[str, Any] = {}
+    merged: dict[str, Any] = {}
+
+    monkeypatch.setattr(api, "load_config", lambda: {})
+    monkeypatch.setattr(
+        api,
+        "_editor_send_targets",
+        lambda cfg, feature: [
+            {
+                "provider": "MDBLIST",
+                "instance": "default",
+                "collection_enabled": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(api, "load_sync_ops", lambda provider: Ops())
+    monkeypatch.setattr(api, "build_provider_config_view", lambda cfg, provider, instance: {})
+
+    def fake_apply_add(**kwargs):
+        sent.update(kwargs)
+        return {"ok": True, "confirmed": 1, "confirmed_keys": ["tmdb:949"]}
+
+    def fake_merge(provider, instance, feature, items):
+        merged.update(provider=provider, instance=instance, feature=feature, items=items)
+
+    monkeypatch.setattr(api, "apply_add", fake_apply_add)
+    monkeypatch.setattr(api, "_merge_sent_items_into_state", fake_merge)
+
+    item = {
+        "type": "movie",
+        "title": "Heat",
+        "ids": {"tmdb": "949"},
+        "collected_at": "2026-01-01T00:00:00Z",
+    }
+    res = api.api_editor_send(
+        {
+            "kind": "collection",
+            "providers": [{"provider": "MDBLIST", "instance": "default"}],
+            "items": [item],
+        }
+    )
+
+    assert res["ok"] is True
+    assert sent["items"][0]["collected_at"] == "2026-01-01T00:00:00Z"
+    assert merged["items"][0]["collected_at"] == "2026-01-01T00:00:00Z"
+
+
 def test_editor_bulk_action_buttons_use_playback_action_colors() -> None:
     from pathlib import Path
 
@@ -369,8 +452,8 @@ def test_editor_datetime_fields_use_utc() -> None:
     datetime_js = (root / "assets" / "js" / "editor" / "datetime.js").read_text(encoding="utf-8")
     extra_js = (root / "assets" / "js" / "editor" / "extra-editors.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-datetime", "/assets/js/editor/datetime.js", "CrossWatchEditorDateTime");' in core_js
-    assert 'await ensurePageModule("editor-extra-editors", "/assets/js/editor/extra-editors.js", "CrossWatchEditorExtraEditors");' in core_js
+    assert 'ensurePageModule("editor-datetime", "/assets/js/editor/datetime.js", "CrossWatchEditorDateTime")' in core_js
+    assert 'ensurePageModule("editor-extra-editors", "/assets/js/editor/extra-editors.js", "CrossWatchEditorExtraEditors")' in core_js
     assert 'const editorDateTime = requireEditorModule("DateTime");' in js
     assert 'const editorExtraEditors = requireEditorModule("ExtraEditors");' in js
     assert "editorExtraEditors.openHistoryEditor" in js
@@ -391,18 +474,27 @@ def test_editor_metadata_replacer_is_extracted() -> None:
     root = Path(__file__).resolve().parents[1]
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     meta_js = (root / "assets" / "js" / "editor" / "metadata-replacer.js").read_text(encoding="utf-8")
+    css = (root / "assets" / "css" / "pages.css").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-metadata-replacer", "/assets/js/editor/metadata-replacer.js", "CrossWatchEditorMetadataReplacer");' in core_js
+    assert 'ensurePageModule("editor-metadata-replacer", "/assets/js/editor/metadata-replacer.js", "CrossWatchEditorMetadataReplacer")' in core_js
     assert "function metadataReplacerContext()" in js
     assert 'const editorMetadataReplacer = requireEditorModule("MetadataReplacer");' in js
     assert "editorMetadataReplacer.openItemReplacer" in js
     assert "editorMetadataReplacer.openTitleSearchEditor" in js
     assert "function openTitleSearchEditor(row, anchor, refs, ctx = {})" in meta_js
-    assert "function openMetadataReplacer(row, anchor, ctx = {})" in meta_js
-    assert "function openEpisodeReplacer(row, anchor, ctx = {})" in meta_js
-    assert "function coordinateKeyFor(row, season, episode)" in meta_js
     assert "Search metadata" in meta_js
-    assert "Replace episode" in meta_js
+    assert 'pop.classList.add("cw-metadata-search-pop");' in meta_js
+    assert "cw-meta-search-head" in meta_js
+    assert "cw-meta-type-segment" in meta_js
+    assert "}, { closeOnOutside: false, trackAnchorOnScroll: true });" in meta_js
+    assert '[["all", "All"], ["movie", "Movie"], ["show", "TV Show"]]' in meta_js
+    assert 'document.createElement("select")' not in meta_js
+    assert 'searchBtn.innerHTML = \'<span class="material-symbols-rounded" aria-hidden="true">search</span><span>Search</span>\';' in meta_js
+    assert ".cw-pop.cw-metadata-search-pop{width:min(480px" in css
+    assert ".cw-pop.cw-metadata-search-pop .cw-search-results{max-height:220px" in css
+    assert ".cw-metadata-search-pop .cw-search-bar{display:grid;grid-template-columns:minmax(0,1fr)minmax(0,1.5fr)" in css
+    assert ".cw-metadata-search-pop .cw-meta-type-option.active" in css
+    assert "html[data-cw-theme]:not([data-cw-theme=\"flat-light\"]) body .cw-pop.cw-metadata-search-pop .cw-search-bar{background:transparent!important" in css
     assert "function correctedEpisodeItem" not in js
     assert "const EPISODE_ID_FIELDS" not in js
 
@@ -414,10 +506,9 @@ def test_editor_row_building_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     rows_js = (root / "assets" / "js" / "editor" / "rows.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-rows", "/assets/js/editor/rows.js", "CrossWatchEditorRows");' in core_js
+    assert 'ensurePageModule("editor-rows", "/assets/js/editor/rows.js", "CrossWatchEditorRows")' in core_js
     assert 'const editorRows = requireEditorModule("Rows");' in js
     assert "function buildRows(items, options = {})" in rows_js
-    assert "function buildManualOverrideRows(items, blocks, options = {})" in rows_js
     assert "function applyManualRow(row, item, key)" in rows_js
     assert "function imdbFromKey(key)" in rows_js
     assert "JSON.parse(JSON.stringify(raw))" not in js
@@ -432,8 +523,8 @@ def test_editor_table_row_rendering_is_extracted() -> None:
     table_js = (root / "assets" / "js" / "editor" / "table.js").read_text(encoding="utf-8")
     table_controller_js = (root / "assets" / "js" / "editor" / "table-controller.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-table", "/assets/js/editor/table.js", "CrossWatchEditorTable");' in core_js
-    assert 'await ensurePageModule("editor-table-controller", "/assets/js/editor/table-controller.js", "CrossWatchEditorTableController");' in core_js
+    assert 'ensurePageModule("editor-table", "/assets/js/editor/table.js", "CrossWatchEditorTable")' in core_js
+    assert 'ensurePageModule("editor-table-controller", "/assets/js/editor/table-controller.js", "CrossWatchEditorTableController")' in core_js
     assert 'const editorTable = requireEditorModule("Table");' in js
     assert 'const editorTableController = requireEditorModule("TableController");' in js
     assert "function tableControllerContext()" in js
@@ -459,7 +550,7 @@ def test_editor_row_editor_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     row_editor_js = (root / "assets" / "js" / "editor" / "row-editor.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-row-editor", "/assets/js/editor/row-editor.js", "CrossWatchEditorRowEditor");' in core_js
+    assert 'ensurePageModule("editor-row-editor", "/assets/js/editor/row-editor.js", "CrossWatchEditorRowEditor")' in core_js
     assert 'const editorRowEditor = requireEditorModule("RowEditor");' in js
     assert "function rowEditorContext()" in js
     assert "return editorRowEditor.updateTypeDisplay(row, el);" in js
@@ -479,7 +570,7 @@ def test_editor_file_utils_are_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     files_js = (root / "assets" / "js" / "editor" / "file-utils.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-file-utils", "/assets/js/editor/file-utils.js", "CrossWatchEditorFileUtils");' in core_js
+    assert 'ensurePageModule("editor-file-utils", "/assets/js/editor/file-utils.js", "CrossWatchEditorFileUtils")' in core_js
     assert 'const editorFileUtils = requireEditorModule("FileUtils");' in js
     assert "return editorFileUtils.fetchJSON(url, opts);" in js
     assert "return editorFileUtils.downloadFile(url, filename, toast, { setTag, setStatus });" in js
@@ -499,7 +590,7 @@ def test_editor_load_controller_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     load_js = (root / "assets" / "js" / "editor" / "load-controller.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-load-controller", "/assets/js/editor/load-controller.js", "CrossWatchEditorLoadController");' in core_js
+    assert 'ensurePageModule("editor-load-controller", "/assets/js/editor/load-controller.js", "CrossWatchEditorLoadController")' in core_js
     assert 'const editorLoadController = requireEditorModule("LoadController");' in js
     assert "function loadControllerContext()" in js
     assert "return editorLoadController.loadState(loadControllerContext());" in js
@@ -519,7 +610,7 @@ def test_editor_chrome_decoration_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     chrome_js = (root / "assets" / "js" / "editor" / "chrome.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-chrome", "/assets/js/editor/chrome.js", "CrossWatchEditorChrome");' in core_js
+    assert 'ensurePageModule("editor-chrome", "/assets/js/editor/chrome.js", "CrossWatchEditorChrome")' in core_js
     assert 'const editorChrome = requireEditorModule("Chrome");' in js
     assert "editorChrome.wireStaticLabels(host);" in js
     assert "editorChrome.decorateImportPanel({" in js
@@ -544,7 +635,7 @@ def test_editor_source_loading_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     sources_js = (root / "assets" / "js" / "editor" / "sources.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-sources", "/assets/js/editor/sources.js", "CrossWatchEditorSources");' in core_js
+    assert 'ensurePageModule("editor-sources", "/assets/js/editor/sources.js", "CrossWatchEditorSources")' in core_js
     assert 'const editorSources = requireEditorModule("Sources");' in js
     assert "function sourceContext()" in js
     assert "return editorSources.syncSourceUI(sourceContext());" in js
@@ -564,7 +655,7 @@ def test_editor_import_panel_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     importers_js = (root / "assets" / "js" / "editor" / "importers.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-importers", "/assets/js/editor/importers.js", "CrossWatchEditorImporters");' in core_js
+    assert 'ensurePageModule("editor-importers", "/assets/js/editor/importers.js", "CrossWatchEditorImporters")' in core_js
     assert 'const editorImporters = requireEditorModule("Importers");' in js
     assert "function importContext()" in js
     assert "return editorImporters.syncImportUI(importContext());" in js
@@ -586,7 +677,7 @@ def test_editor_persistence_is_extracted() -> None:
     js = (root / "assets" / "js" / "editor.js").read_text(encoding="utf-8")
     persistence_js = (root / "assets" / "js" / "editor" / "persistence.js").read_text(encoding="utf-8")
     core_js = (root / "assets" / "helpers" / "core.js").read_text(encoding="utf-8")
-    assert 'await ensurePageModule("editor-persistence", "/assets/js/editor/persistence.js", "CrossWatchEditorPersistence");' in core_js
+    assert 'ensurePageModule("editor-persistence", "/assets/js/editor/persistence.js", "CrossWatchEditorPersistence")' in core_js
     assert 'const editorPersistence = requireEditorModule("Persistence");' in js
     assert "function persistenceContext()" in js
     assert "return editorPersistence.findRowsMissingKey(state);" in js
@@ -612,6 +703,16 @@ def test_editor_uses_page_scroll_for_table() -> None:
     assert '#page-editor .cw-table-scroll{position:static!important;inset:auto!important;overflow:visible!important;border-radius:22px!important}' in css
     assert "cw-table-overflow-x" in css
     assert ".cw-pop.cw-columns-pop{width:min(370px" not in css
+    popup_pos = js[js.index("function positionPopup(pop, anchor)"):js.index("function openPopup(anchor, builder, opts = {})")]
+    assert "let left = rect.left;" in popup_pos
+    assert "let top = rect.bottom + margin;" in popup_pos
+    assert "window.scrollX" not in popup_pos
+    assert "window.scrollY" not in popup_pos
+    popup_open = js[js.index("function openPopup(anchor, builder, opts = {})"):js.index("function formatHistoryLabel(iso)")]
+    assert "if (opts.closeOnOutside !== false) document.addEventListener(\"mousedown\", onDoc);" in popup_open
+    assert "opts.trackAnchorOnScroll === true" in popup_open
+    assert "document.addEventListener(\"scroll\", popupState.onScroll, true);" in popup_open
+    assert "window.addEventListener(\"resize\", popupState.onResize);" in popup_open
     assert "columnOrder: state.columnOrder" in js
     assert "columnWidths: state.columnWidths" in js
     assert "wideView: state.wideView" in js

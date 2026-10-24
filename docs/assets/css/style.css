@@ -356,6 +356,10 @@ a[href="#content"],
   background: var(--cw-violet);
 }
 
+.cw-provider-card.is-kitsu {
+  border-color: rgba(253, 117, 92, .28);
+}
+
 .cw-provider-card.is-plex,
 .cw-provider-card.is-mdblist,
 .cw-provider-card.is-tmdb {
@@ -364,15 +368,19 @@ a[href="#content"],
 
 .cw-provider-card.is-jellyfin,
 .cw-provider-card.is-publicmetadb,
-.cw-provider-card.is-tautulli {
+.cw-provider-card.is-tautulli,
+.cw-provider-card.is-tracearr {
   border-color: rgba(98, 220, 198, .28);
 }
 
 .cw-provider-card.is-emby,
 .cw-provider-card.is-trakt,
+.cw-provider-card.is-wetrakr,
 .cw-provider-card.is-simkl,
 .cw-provider-card.is-floppy,
+.cw-provider-card.is-flicklist,
 .cw-provider-card.is-punchplay,
+.cw-provider-card.is-bingebase,
 .cw-provider-card.is-scrob,
 .cw-provider-card.is-crosswatch,
 .cw-provider-card.is-anilist,
@@ -402,7 +410,16 @@ a[href="#content"],
   opacity: .18;
 }
 
+.cw-provider-card.is-flicklist .cw-provider-mark {
+  width: 190px;
+  height: 190px;
+  right: -28px;
+  bottom: -46px;
+  opacity: .2;
+}
+
 .cw-provider-card.is-punchplay .cw-provider-mark,
+.cw-provider-card.is-bingebase .cw-provider-mark,
 .cw-provider-card.is-scrob .cw-provider-mark {
   width: 190px;
   height: 190px;

@@ -3,10 +3,11 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
+from collections import deque
 from collections.abc import AsyncIterator
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, quote
@@ -21,6 +22,7 @@ import threading
 import time
 import uvicorn
 import asyncio
+import logging
 
 # Mute Unverified HTTPS request warnings from requests/urllib3
 import urllib3
@@ -36,7 +38,6 @@ from api import (
 
 from api.appAuthAPI import (
     COOKIE_NAME as APP_AUTH_COOKIE,
-    api_key_authenticated as app_api_key_authenticated,
     auth_required as app_auth_required,
     current_user as app_current_user,
     is_authenticated as app_is_authenticated,
@@ -46,7 +47,13 @@ from api.appAuthAPI import (
     setup_lock_required as app_auth_setup_lock_required,
     register_app_auth,
 )
-from cw_platform.access_policy import clean_managed_permissions
+from api.apiTokensAPI import (
+    extract_api_token as app_extract_api_token,
+    resolve_api_token as app_resolve_api_token,
+    touch_api_token as app_touch_api_token,
+    register_api_tokens,
+)
+from cw_platform.access_policy import clean_managed_permissions, is_monitor_user, monitor_api_allowed, monitor_identity
 from cw_platform.event_archive.audit import record_audit
 
 from _logging import log as LOG, BLUE, GREEN, DIM, RED, YELLOW, RESET  # type: ignore
@@ -145,6 +152,9 @@ def _is_http_debug_enabled() -> bool:
 def _is_debug_enabled() -> bool:
     return _cached_runtime_flag(_DEBUG_CACHE, "debug")
 
+def _is_any_runtime_debug_enabled() -> bool:
+    return _is_debug_enabled() or _is_mods_debug_enabled()
+
 
 def _resolve_config_scoped_path(raw_path: str) -> Path:
     raw = str(raw_path or "").strip()
@@ -165,6 +175,40 @@ def _resolve_config_scoped_path(raw_path: str) -> Path:
 
 def _env_truthy(name: str) -> bool:
     return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_WEBUI_PATHS = {
+    "/",
+    "/profile",
+    "/login",
+    "/logout",
+    "/favicon.ico",
+    "/favicon.svg",
+    "/favicon.png",
+    "/manifest.webmanifest",
+    "/sw.js",
+}
+
+
+def _cli_only_mode() -> bool:
+    return _env_truthy("CW_CLI_ONLY")
+
+
+def _webui_disabled_path(path: str) -> bool:
+    path = str(path or "/")
+    if path.startswith(("/api/", "/webhook/", "/published/")):
+        return False
+    if path == "/callback" or path.startswith("/callback/"):
+        return False
+    return path in _WEBUI_PATHS or path.startswith("/assets/")
+
+
+def _webui_disabled_response() -> PlainTextResponse:
+    return PlainTextResponse(
+        "CrossWatch web UI is disabled. Use the cw CLI or /api endpoints.",
+        status_code=404,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _apply_auth_reset_env_once() -> None:
@@ -206,6 +250,7 @@ def _apply_auth_reset_env_once() -> None:
         sess["token_hash"] = ""
         sess["expires_at"] = 0
         a["sessions"] = []
+        a["api_tokens"] = []
         a["last_login_at"] = 0
         save_config(cfg)
         # Write a fresh token unconditionally rather than unlinking the old one and
@@ -276,9 +321,12 @@ _APP_AUTH_SETUP_ALLOWED_PATHS = {
     "/login",
     "/logout",
     "/api/health",
+    "/api/status",
+    "/api/version",
     "/api/config/meta",
     "/api/app-auth/status",
     "/api/app-auth/credentials",
+    "/api/app-auth/tokens/whoami",
 }
 
 _PUBLIC_HEALTH_PATHS = {
@@ -306,7 +354,7 @@ def _redact_query_string(query: str) -> str:
         return ""
 
 _SECRET_KV_RE = re.compile(
-    r"(?i)(\b(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token|password)\b\s*[=:]\s*)([^\s,;&]+)"
+    r"(?i)(\b(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|token_digest|x-plex-token|password)\b\s*[=:]\s*)([^\s,;&]+)"
 )
 _URL_QS_RE = re.compile(
     r"(?i)([?&](?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token)=)([^&\s]+)"
@@ -314,10 +362,10 @@ _URL_QS_RE = re.compile(
 _AUTH_BEARER_RE = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+([^\s,;]+)")
 _JSON_DQ_RE = re.compile(
-    r'(?i)("(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token|password|hash|salt)"\s*:\s*")([^"]*)(")'
+    r'(?i)("(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|token_digest|x-plex-token|password|hash|salt)"\s*:\s*")([^"]*)(")'
 )
 _JSON_SQ_RE = re.compile(
-    r"(?i)('(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|x-plex-token|password|hash|salt)'\s*:\s*')([^']*)(')"
+    r"(?i)('(?:api_key|apikey|access_token|refresh_token|client_secret|session_id|token|token_digest|x-plex-token|password|hash|salt)'\s*:\s*')([^']*)(')"
 )
 
 def _redact_secrets_in_text(s: str) -> str:
@@ -440,9 +488,13 @@ def _non_admin_permission_allowed(user: dict, path: str, method: str = "GET") ->
         return bool(perms.get("dashboard"))
     if path.startswith("/api/dashboard/") or path.startswith("/api/state/wall") or path.startswith("/api/activity/") or path == "/api/watch/currently_watching":
         return bool(perms.get("dashboard"))
+    if path == "/api/events/feed":
+        return bool(perms.get("dashboard"))
     if path in {"/api/status", "/api/sync/providers", "/api/sync/providers/counts"}:
         return bool(perms.get("dashboard"))
     if path == "/api/logs/stream":
+        return write
+    if path == "/api/logs/archive" or path.startswith("/api/logs/archive/"):
         return write
     if path == "/api/logs/watcher":
         return False
@@ -456,12 +508,22 @@ def _non_admin_permission_allowed(user: dict, path: str, method: str = "GET") ->
         "/api/export",
         "/api/import",
         "/api/editor",
+        "/api/interactive-sync",
         "/api/playlists",
         "/api/snapshots",
         "/api/manual",
     ):
         if path == prefix or path.startswith(prefix + "/"):
             return write
+    return True
+
+def _apply_monitor_view(request: Request, user: dict, path: str) -> bool:
+    if not monitor_api_allowed(user, path, request.method):
+        return False
+    try:
+        request.state.cw_user = monitor_identity(user)
+    except Exception:
+        return False
     return True
 
 def _unsafe_api_origin_blocked(cfg: dict, request: Request, token: str | None) -> bool:
@@ -571,7 +633,9 @@ async def conditional_access_logger(request: Request, call_next):
                 if should_log:
                     dt_ms = int((time.time() - t0) * 1000)
                     host = f"{client.host}:{client.port}" if client else "-"
-                    if path.startswith("/webhook/"):
+                    if path.startswith("/webhook/stremio/"):
+                        path_qs = "/webhook/stremio/***" + "".join(f"/{part}" for part in path.split("/")[4:])
+                    elif path.startswith(("/webhook/", "/published/")):
                         path_qs = path
                     else:
                         qs = _redact_query_string(request.url.query)
@@ -595,6 +659,9 @@ async def app_auth_gate(request: Request, call_next):
         return PlainTextResponse("Service unavailable", status_code=503, headers={"Cache-Control": "no-store"})
 
     path = request.url.path or "/"
+    if _cli_only_mode() and _webui_disabled_path(path):
+        return _webui_disabled_response()
+
     if path.startswith("/assets/"):
         return await call_next(request)
     
@@ -608,7 +675,7 @@ async def app_auth_gate(request: Request, call_next):
         return await call_next(request)
     
     # exclude webhooks from auth
-    if path.startswith("/webhook/"):
+    if path.startswith(("/webhook/", "/published/")):
         return await call_next(request)
 
     if app_auth_setup_lock_required(cfg):
@@ -631,6 +698,27 @@ async def app_auth_gate(request: Request, call_next):
 
     if not app_auth_required(cfg):
         return await call_next(request)
+
+    api_token = app_extract_api_token(request)
+    if api_token:
+        api_user = app_resolve_api_token(cfg, api_token)
+        if api_user is None:
+            if path.startswith("/api/"):
+                return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
+            return PlainTextResponse("Unauthorized", status_code=401, headers={"Cache-Control": "no-store"})
+        try:
+            request.state.cw_user = api_user
+        except Exception:
+            pass
+        if not api_user.get("is_admin"):
+            if _apply_monitor_view(request, api_user, path):
+                pass
+            elif is_monitor_user(api_user) or not app_non_admin_api_allowed(path, request.method) or not _non_admin_permission_allowed(api_user, path, request.method):
+                return JSONResponse({"ok": False, "error": "Administrator access required"}, status_code=403, headers={"Cache-Control": "no-store"})
+        app_touch_api_token(str(api_user.get("api_token_id") or ""))
+        response = await call_next(request)
+        _audit_api_action(request, response, api_user)
+        return response
 
     token = request.cookies.get(APP_AUTH_COOKIE)
     if app_is_authenticated(cfg, token):
@@ -656,23 +744,17 @@ async def app_auth_gate(request: Request, call_next):
         _audit_api_action(request, response, user)
         return response
 
-    if app_api_key_authenticated(cfg, request):
-        # The key is unrestricted admin, so its mutations have to land in the
-        # audit log too — otherwise a leaked key edits config and deletes pairs
-        # with no forensic trail, unlike the cookie branch above.
-        response = await call_next(request)
-        _audit_api_action(request, response, {"username": "api-key", "is_admin": True})
-        return response
-
     if path.startswith("/api/"):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
     next_url = (request.url.path or "/") + (("?" + request.url.query) if request.url.query else "")
     return RedirectResponse(url="/login?next=" + quote(next_url), status_code=302)
 
 # Static files
-register_assets_and_favicons(app, ROOT)
-register_ui_root(app)
+if not _cli_only_mode():
+    register_assets_and_favicons(app, ROOT)
+    register_ui_root(app)
 register_app_auth(app)
+register_api_tokens(app)
 
 # Misc utilities
 def get_primary_ip() -> str:
@@ -699,9 +781,18 @@ WATCH_LOG_TAGS = {
     "JELLYFIN-WATCH",
     "EMBY-WATCH",
     "KODI-WATCH",
-    "TRAKT-SCROBBLE",
-    "SIMKL-SCROBBLE",
-    "MDBLIST-SCROBBLE",
+    "SCROB-WATCH",
+    "STREMIO-WATCH",
+    "ANIME-WATCH",
+    "TRAKT-SINK",
+    "SIMKL-SINK",
+    "MDBLIST-SINK",
+    "FLOPPY-SINK",
+    "CROSSWATCH-SINK",
+    "FLICKLIST-SINK",
+    "BINGEBASE-SINK",
+    "PUNCHPLAY-SINK",
+    "SCROB-SINK",
 }
 WATCH_LOG_DEFAULT_TAGS = [
     "WATCH",
@@ -712,10 +803,22 @@ WATCH_LOG_DEFAULT_TAGS = [
     "JELLYFIN-WATCH",
     "EMBY-WATCH",
     "KODI-WATCH",
-    "TRAKT-SCROBBLE",
-    "SIMKL-SCROBBLE",
-    "MDBLIST-SCROBBLE",
+    "SCROB-WATCH",
+    "STREMIO-WATCH",
+    "ANIME-WATCH",
+    "TRAKT-SINK",
+    "SIMKL-SINK",
+    "MDBLIST-SINK",
+    "FLOPPY-SINK",
+    "CROSSWATCH-SINK",
+    "FLICKLIST-SINK",
+    "BINGEBASE-SINK",
+    "PUNCHPLAY-SINK",
+    "SCROB-SINK",
 ]
+WATCH_LOG_BUFFER: deque[tuple[int, str, str]] = deque(maxlen=MAX_LOG_LINES * len(WATCH_LOG_TAGS))
+WATCH_LOG_LOCK = threading.Lock()
+WATCH_LOG_NEXT_SEQ = 1
 
 ANSI_RE    = re.compile(r"\x1b\[([0-9;]*)m")
 ANSI_STRIP = re.compile(r"\x1b\[[0-9;]*m")
@@ -850,9 +953,18 @@ def ansi_to_html(line: str) -> str:
     return "".join(out)
 
 def _append_log_to_buffer(tag: str, raw_line: str) -> None:
+    global WATCH_LOG_NEXT_SEQ
     t = _norm_log_tag(tag)
     safe_line = _redact_secrets_in_text(raw_line)
+    if t in {"SYNC", DIAG_LOG_TAG} or t in WATCH_LOG_TAGS:
+        from services.log_archive import capture
+        capture(t, safe_line, watcher=t in WATCH_LOG_TAGS)
     html = ansi_to_html(safe_line.rstrip("\n"))
+    if t in WATCH_LOG_TAGS:
+        with WATCH_LOG_LOCK:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            WATCH_LOG_BUFFER.append((WATCH_LOG_NEXT_SEQ, t, f"[{stamp}] {html}"))
+            WATCH_LOG_NEXT_SEQ += 1
     buf = _get_log_buf(t)
     buf.append(html)
     LOG_NEXT_SEQ[t] = int(LOG_NEXT_SEQ.get(t, 1)) + 1
@@ -1014,6 +1126,15 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         except Exception:
             pass
     try:
+        from cw_platform.event_archive.retention import start_worker as _start_event_retention
+
+        _start_event_retention()
+    except Exception as e:
+        try:
+            _UIHostLogger("SYNC")(f"event retention startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
         from cw_platform.anime_mapping.auto_update import refresh_from_config as _anime_mapping_refresh_auto_update
 
         _anime_mapping_refresh_auto_update(load_config)
@@ -1023,8 +1144,32 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         except Exception:
             pass
     try:
+        from cw_platform.token_refresh import start_worker as _start_token_refresh
+
+        _start_token_refresh()
+    except Exception as e:
+        try:
+            _UIHostLogger("AUTH")(f"token refresh worker startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
+        from services.health_alerts import start_worker as _start_health_alerts
+
+        _start_health_alerts(app, load_config, log_fn=lambda msg: _UIHostLogger("SYNC", "SCHED")(msg, level="INFO"))
+    except Exception as e:
+        try:
+            _UIHostLogger("SYNC")(f"health alerts worker startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
         yield
     finally:
+        try:
+            from services.health_alerts import stop_worker as _stop_health_alerts
+
+            _stop_health_alerts()
+        except Exception:
+            pass
         try:
             from cw_platform.anime_mapping.auto_update import stop as _anime_mapping_stop_auto_update
 
@@ -1034,6 +1179,12 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         try:
             from providers.scrobble.watch_manager import stop_all as _wm_stop
             _wm_stop(app)
+        except Exception:
+            pass
+        try:
+            from services.log_archive import archive as _log_archive
+
+            _log_archive().flush()
         except Exception:
             pass
 
@@ -1115,6 +1266,8 @@ async def api_logs_stream_initial(
     managed = isinstance(user, dict) and not user.get("is_admin")
     if managed and tag != "SYNC":
         return JSONResponse({"ok": False, "error": "Administrator access required"}, status_code=403, headers={"Cache-Control": "no-store"})
+    if tag == DIAG_LOG_TAG and not _is_any_runtime_debug_enabled():
+        return JSONResponse({"ok": False, "error": "Debug logging is disabled"}, status_code=403, headers={"Cache-Control": "no-store"})
 
     def _run_visible() -> bool:
         if not managed:
@@ -1193,6 +1346,24 @@ async def api_logs_stream_initial(
         },
     )
 
+def _watch_log_snapshot(tags: List[str], after: int, limit: int | None) -> tuple[int, list[tuple[int, str, str]]]:
+    with WATCH_LOG_LOCK:
+        latest = WATCH_LOG_NEXT_SEQ - 1
+        rows = list(WATCH_LOG_BUFFER)
+    selected: list[tuple[int, str, str]] = []
+    counts: dict[str, int] = {}
+    for row in reversed(rows):
+        seq, tag, _line = row
+        if seq <= after:
+            break
+        if tag not in tags or (limit and counts.get(tag, 0) >= limit):
+            continue
+        counts[tag] = counts.get(tag, 0) + 1
+        selected.append(row)
+    selected.reverse()
+    return latest, selected
+
+
 @app.get("/api/logs/watcher", tags=["logging"])
 async def api_logs_watcher(
     request: Request,
@@ -1211,45 +1382,22 @@ async def api_logs_watcher(
     tags_sel = _watch_log_selection(tags)
 
     async def agen():
-        last_seq: Dict[str, int] = {}
-
-        for t in tags_sel:
-            buf = _get_log_buf(t, create=False)
-            if not skip_backlog:
-                start = max(0, len(buf) - int(tail))
-                for line in buf[start:]:
-                    safe = _log_stream_text(line, plain)
-                    yield f"event: {t}\ndata: {safe}\n\n"
-            base = int(LOG_BASE_SEQ.get(t, int(LOG_NEXT_SEQ.get(t, 1))))
-            last_seq[t] = base + len(buf) - 1
+        last_seq, rows = _watch_log_snapshot(tags_sel, 0, int(tail))
+        if not skip_backlog:
+            for _seq, tag, line in rows:
+                safe = _log_stream_text(line, plain)
+                yield f"event: {tag}\ndata: {safe}\n\n"
 
         last = time.time()
         while True:
             if await request.is_disconnected():
                 break
 
-            for t in tags_sel:
-                buf = _get_log_buf(t, create=False)
-                base = int(LOG_BASE_SEQ.get(t, int(LOG_NEXT_SEQ.get(t, 1))))
-                seen = int(last_seq.get(t, base - 1))
-                if seen < base - 1:
-                    seen = base - 1
-                start_seq = max(seen + 1, base)
-                start_idx = int(start_seq - base)
-                if start_idx < 0:
-                    start_idx = 0
-                if max_backlog:
-                    backlog = len(buf) - start_idx
-                    if backlog > max_backlog:
-                        start_idx = max(0, len(buf) - int(max_backlog))
-                        seen = base + start_idx - 1
-                for i in range(start_idx, len(buf)):
-                    line = buf[i]
-                    safe = _log_stream_text(line, plain)
-                    yield f"event: {t}\ndata: {safe}\n\n"
-                    last = time.time()
-                    seen = base + i
-                last_seq[t] = seen
+            last_seq, rows = _watch_log_snapshot(tags_sel, last_seq, max_backlog)
+            for _seq, tag, line in rows:
+                safe = _log_stream_text(line, plain)
+                yield f"event: {tag}\ndata: {safe}\n\n"
+                last = time.time()
 
             if time.time() - last > 15:
                 yield "event: ping\ndata: 1\n\n"
@@ -1482,6 +1630,7 @@ def main(host: str = "0.0.0.0", port: int = 8787) -> None:
     boot.info(f"  {_c('Local:', DIM)}   {_c(f'{protocol}://127.0.0.1:{port}', GREEN)}")
     boot.info(f"  {_c('Docker:', DIM)}  {_c(f'{protocol}://{ip}:{port}', GREEN)}")
     boot.info(f"  {_c('Bind:', DIM)}    {_c(f'{host}:{port}', GREEN)}")
+    boot.info(f"  {_c('Mode:', DIM)}    {'CLI/API only' if _cli_only_mode() else 'Web UI + CLI/API'}")
     boot.info("")
     boot.info(f"  {_c('Cache:', DIM)}      {CACHE_DIR}")
     boot.info(f"  {_c('CW_STATE:', DIM)}   {CW_STATE_DIR}")
@@ -1566,6 +1715,7 @@ def main(host: str = "0.0.0.0", port: int = 8787) -> None:
         "port": port,
         "log_level": ("debug" if debug else "warning"),
         "access_log": debug_http,
+        "timeout_graceful_shutdown": 5,
     }
 
     if protocol == "https":
@@ -1601,7 +1751,14 @@ def main(host: str = "0.0.0.0", port: int = 8787) -> None:
         uv_args["ssl_certfile"] = str(cert_path)
         uv_args["ssl_keyfile"] = str(key_path)
 
+    logging.getLogger("uvicorn.error").addFilter(_ShutdownCancelFilter())
     uvicorn.run(app, **uv_args)
+
+
+class _ShutdownCancelFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        return not (isinstance(exc, asyncio.CancelledError) and str(record.msg).startswith("Exception in ASGI application"))
 
 
 if __name__ == "__main__":

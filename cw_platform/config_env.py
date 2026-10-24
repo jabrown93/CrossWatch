@@ -20,7 +20,6 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "CW_OIDC_SCOPES": ("app_auth", "oidc", "scopes"),
     "CW_OIDC_GROUPS_CLAIM": ("app_auth", "oidc", "groups_claim"),
     "CW_OIDC_ALLOWED_GROUPS": ("app_auth", "oidc", "allowed_groups"),
-    "CW_API_KEY": ("security", "api_key"),
 }
 
 _PATH_TO_ALIAS: dict[tuple[str, ...], str] = {path: name for name, path in ALIASES.items()}

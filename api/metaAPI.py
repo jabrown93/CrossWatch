@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -369,6 +370,37 @@ def _ensure_under_root(root: Path, p: Path) -> Path:
     return p_r
 
 
+def _safe_tmdb_art_response_path(cache_dir: Path | str, path: Path | str) -> str:
+    cache_root = os.path.realpath(os.fspath(_cache_subdir(cache_dir, "art")))
+    candidate = os.path.realpath(os.fspath(path))
+    placeholder = os.path.realpath(os.fspath(_placeholder_poster()))
+
+    root_prefix = cache_root.rstrip(os.sep) + os.sep
+    allowed = candidate == placeholder
+    if not allowed and candidate.startswith(root_prefix):
+        try:
+            allowed = os.path.commonpath([cache_root, candidate]) == cache_root
+        except ValueError:
+            allowed = False
+
+    root_cmp = os.path.normcase(cache_root)
+    candidate_cmp = os.path.normcase(candidate)
+    placeholder_cmp = os.path.normcase(placeholder)
+    root_prefix_cmp = root_cmp.rstrip(os.sep) + os.sep
+    if not allowed and (
+        candidate_cmp == placeholder_cmp or candidate_cmp.startswith(root_prefix_cmp)
+    ):
+        try:
+            allowed = candidate_cmp == placeholder_cmp or os.path.commonpath(
+                [root_cmp, candidate_cmp]
+            ) == root_cmp
+        except ValueError:
+            allowed = False
+    if not allowed:
+        raise ValueError("Invalid art path")
+    return candidate
+
+
 def _cache_subdir(cache_dir: Path | str, name: str) -> Path:
     base = Path(cache_dir).resolve()
     base.mkdir(parents=True, exist_ok=True)
@@ -473,6 +505,12 @@ def _need_satisfied(meta: dict[str, Any], need: dict[str, Any] | None) -> bool:
             )
         if k == "videos":
             return "videos" in meta
+        if k in {"credits", "recommendations"}:
+            return k in meta
+        if k == "collection":
+            return "belongs_to_collection" in det or str(meta.get("type") or "").lower() in {"tv", "show"}
+        if k == "seasons":
+            return "seasons" in det or str(meta.get("type") or "").lower() == "movie"
         if k == "vote_count":
             return "vote_count" in meta or "vote_count" in det
         if k == "series_info":
@@ -556,6 +594,10 @@ def _entity_from_kind(kind: Any) -> str:
 
 
 _RESOLVED_ENTITY_MEMO: dict[str, str] = {}
+
+
+class _NoMetadataResult(RuntimeError):
+    pass
 
 
 def _resolve_entity(
@@ -663,20 +705,20 @@ def _resolve_tmdb_cached(
 ) -> dict[str, Any]:
     _METADATA, _, _ = _env()
     if _METADATA is None:
-        return {}
+        raise _NoMetadataResult("MetadataManager not available")
     need = {k: True for k in need_key} if need_key else None
-    try:
-        return (
-            _METADATA.resolve(
-                entity=entity,
-                ids={"tmdb": tmdb_id},
-                locale=locale,
-                need=need,
-            )
-            or {}
+    result = (
+        _METADATA.resolve(
+            entity=entity,
+            ids={"tmdb": tmdb_id},
+            locale=locale,
+            need=need,
         )
-    except Exception:
-        return {}
+        or {}
+    )
+    if not isinstance(result, dict) or not result:
+        raise _NoMetadataResult("empty metadata result")
+    return result
 
 
 def get_meta(
@@ -725,9 +767,21 @@ def get_meta(
         )
 
     ttl_key = _ttl_bucket(_cfg_meta_ttl_secs())
-    res = _resolve_tmdb_cached(
-        ttl_key, entity, str(tmdb_id), eff_locale, need_key
-    ) or {}
+    try:
+        res = _resolve_tmdb_cached(
+            ttl_key, entity, str(tmdb_id), eff_locale, need_key
+        ) or {}
+    except _NoMetadataResult:
+        res = {}
+    except Exception as e:
+        _meta_debug(
+            "metadata_resolve_failed",
+            type=entity,
+            tmdb_id=tmdb_id,
+            locale=eff_locale or "en-US",
+            error=e.__class__.__name__,
+        )
+        res = {}
 
     if res and _meta_cache_enabled():
         try:
@@ -810,50 +864,6 @@ def _art_candidates(
     return []
 
 
-def _cached_art_lookup(cache_root: Path, base: Path) -> tuple[str, str] | None:
-    """Return (path, mime) if `base`'s cache entry (sidecar meta json plus its matching
-    art file) is already fully cached, else None. Shared by get_art_file / get_episode_still_file."""
-    meta_path = base.with_suffix(".json")
-    if not (meta_path.exists() and _read_json(meta_path).get("url")):
-        return None
-    for f in _cache_matches(cache_root, base.name):
-        if f.suffix.lower() != ".json" and f.exists():
-            ext = f.suffix.lower()
-            mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
-            return str(f), mime
-    return None
-
-
-def _store_art(
-    cache_root: Path,
-    base: Path,
-    meta_path: Path,
-    dest: Path,
-    src_url: str,
-    *,
-    debug_fields: dict[str, Any],
-) -> tuple[str, str]:
-    """Purge any stale cached file(s) for `base` whose recorded url no longer matches
-    `src_url`, log an art_cache_hit/miss debug event, then download (or reuse) `dest` and
-    refresh its sidecar meta json. Shared tail of get_art_file / get_episode_still_file —
-    callers must have already validated `meta_path`/`dest` via _ensure_under_root."""
-    prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
-    if (prev_url and prev_url != src_url) or (not meta_path.exists()):
-        for f in _cache_matches(cache_root, base.name):
-            if f.name != meta_path.name:
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
-
-    art_hit = bool(dest.exists() and prev_url == src_url)
-    _meta_debug("art_cache_hit" if art_hit else "art_cache_miss", **debug_fields)
-
-    path, mime = _cache_download(src_url, dest)
-    _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
-    return str(path), mime
-
-
 def get_art_file(
     api_key: str,
     typ: str,
@@ -894,16 +904,25 @@ def get_art_file(
     safe_typ = _safe_cache_part(typ, default="media")
     safe_tmdb_id = _safe_cache_part(tmdb_id)
     safe_kind = _safe_cache_part(art_kind, default="poster")
+    # Fork: an invalid size falls back to the default instead of raising into the route.
     try:
         raw_size = _sanitize_tmdb_size(size)
     except ValueError:
         raw_size = "w342"
     safe_size = _safe_cache_part(raw_size, default="w342")
-    base = cache_root / f"{safe_typ}_{safe_tmdb_id}_{safe_kind}_{loc_tag}_{safe_size}"
+    cache_stem = _safe_cache_digest_stem("tmdb_art", safe_typ, safe_tmdb_id, safe_kind, loc_tag, safe_size)
+    base = _cache_base_path(cache_root, cache_stem)
     meta_path = base.with_suffix(".json")
 
-    cached = _cached_art_lookup(cache_root, base)
-    if cached:
+    cached_art = None
+    if meta_path.exists() and _read_json(meta_path).get("url"):
+        for f in _cache_matches(cache_root, cache_stem):
+            if f.suffix.lower() != ".json" and f.exists():
+                cached_art = f
+                break
+    if cached_art:
+        ext = cached_art.suffix.lower()
+        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
         _meta_debug(
             "art_cache_hit",
             type=typ,
@@ -912,7 +931,7 @@ def get_art_file(
             size=safe_size,
             locale=eff_locale or "any",
         )
-        return cached
+        return str(cached_art), mime
 
     meta = get_meta(
         api_key,
@@ -943,6 +962,9 @@ def get_art_file(
     if not src_url:
         return str(_placeholder_poster()), "image/svg+xml"
 
+    base = _cache_base_path(cache_root, cache_stem)
+    meta_path = base.with_suffix(".json")
+
     ext = Path(src_url.split("?", 1)[0]).suffix.lower() or ".jpg"
     if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
         ext = ".jpg"
@@ -952,10 +974,28 @@ def get_art_file(
     _ensure_under_root(cache_root, meta_path)
     _ensure_under_root(cache_root, dest)
 
-    return _store_art(
-        cache_root, base, meta_path, dest, src_url,
-        debug_fields=dict(type=typ, tmdb_id=tmdb_id, kind=art_kind, size=size_tag, locale=eff_locale or "any"),
+    prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
+    if (prev_url and prev_url != src_url) or (not meta_path.exists()):
+        for f in _cache_matches(cache_root, cache_stem):
+            if f.name != meta_path.name:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+    art_hit = bool(dest.exists() and prev_url == src_url)
+    _meta_debug(
+        "art_cache_hit" if art_hit else "art_cache_miss",
+        type=typ,
+        tmdb_id=tmdb_id,
+        kind=art_kind,
+        size=size_tag,
+        locale=eff_locale or "any",
     )
+
+    path, mime = _cache_download(src_url, dest)
+    _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
+    return str(path), mime
 
 
 def get_episode_still_file(
@@ -974,8 +1014,15 @@ def get_episode_still_file(
     base = _cache_base_path(cache_root, cache_stem)
     meta_path = base.with_suffix(".json")
 
-    cached = _cached_art_lookup(cache_root, base)
-    if cached:
+    cached_art = None
+    if meta_path.exists() and _read_json(meta_path).get("url"):
+        for f in _cache_matches(cache_root, cache_stem):
+            if f.suffix.lower() != ".json" and f.exists():
+                cached_art = f
+                break
+    if cached_art:
+        ext = cached_art.suffix.lower()
+        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png" if ext == ".png" else "application/octet-stream"
         _meta_debug(
             "art_cache_hit",
             type="tv",
@@ -985,7 +1032,7 @@ def get_episode_still_file(
             episode=episode,
             size=safe_size,
         )
-        return cached
+        return str(cached_art), mime
 
     def show_art_fallback() -> tuple[str, str]:
         last: tuple[str, str] | None = None
@@ -1020,11 +1067,40 @@ def get_episode_still_file(
     meta_path = _ensure_under_root(cache_root, meta_path)
     dest = _ensure_under_root(cache_root, dest)
 
-    return _store_art(
-        cache_root, base, meta_path, dest, src_url,
-        debug_fields=dict(type="tv", tmdb_id=show_tmdb_id, kind="still", season=season, episode=episode, size=safe_size),
+    prev_url = _read_json(meta_path).get("url") if meta_path.exists() else None
+    if (prev_url and prev_url != src_url) or (not meta_path.exists()):
+        for f in _cache_matches(cache_root, cache_stem):
+            if f.name != meta_path.name:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+    art_hit = bool(dest.exists() and prev_url == src_url)
+    _meta_debug(
+        "art_cache_hit" if art_hit else "art_cache_miss",
+        type="tv",
+        tmdb_id=show_tmdb_id,
+        kind="still",
+        season=season,
+        episode=episode,
+        size=safe_size,
     )
 
+    path, mime = _cache_download(src_url, dest)
+    _write_json(meta_path, {"url": src_url, "ts": int(time.time())})
+    return str(path), mime
+
+
+def get_poster_file(
+    api_key: str,
+    typ: str,
+    tmdb_id: str | int,
+    size: str,
+    cache_dir: Path | str,
+    locale: str | None = None,
+) -> tuple[str, str]:
+    return get_art_file(api_key, typ, tmdb_id, size, cache_dir, locale=locale, kind="poster")
 
 def _tmdb_external_ids(entity: str, tmdb_id: str | int) -> dict[str, str]:
     try:
@@ -1129,16 +1205,162 @@ def api_tmdb_art(
                 title=title,
                 year=year,
             )
+        safe_path = _safe_tmdb_art_response_path(base, local_path)
         return FileResponse(
-            str(local_path),
+            safe_path,
             media_type=mime,
             headers={
-                "Cache-Control": "public, max-age=86400, stale-while-revalidate=86400"
+                "Cache-Control": "public, max-age=31536000, immutable"
             },
         )
     except Exception as e:
         LOG.exception("TMDb art fetch failed")
         return PlainTextResponse("Art not available", status_code=404)
+
+
+_TMDB_IMAGE_PATH_RE = re.compile(r"^/[A-Za-z0-9_-]{4,64}\.(jpg|jpeg|png)$", re.IGNORECASE)
+
+
+def get_tmdb_image_file(path: str, size: str, cache_dir: Path | str) -> tuple[str, str]:
+    raw = str(path or "").strip()
+    match = _TMDB_IMAGE_PATH_RE.fullmatch(raw)
+    if not match:
+        raise ValueError("Invalid image path")
+    extension = ".png" if match.group(1).lower() == "png" else ".jpg"
+    size_tag = _sanitize_tmdb_size(size, default="w185")
+    cache_root = _cache_subdir(cache_dir, "art")
+    base = _cache_base_path(cache_root, _safe_cache_digest_stem("tmdb_path", raw, size_tag))
+    dest = _ensure_under_root(cache_root, base.with_suffix(extension))
+    local, mime = _cache_download(f"https://image.tmdb.org/t/p/{size_tag}{raw}", dest)
+    return str(local), mime
+
+
+@router.get("/art/tmdb/image", tags=["metadata"])
+def api_tmdb_image(
+    path: str = Query(..., max_length=80),
+    size: str = Query("w185"),
+):
+    cfg = load_config() or {}
+    if not str(((cfg.get("tmdb") or {}).get("api_key") or "")).strip():
+        return PlainTextResponse("TMDb key missing", status_code=404)
+    try:
+        _, base, _ = _env()
+        local_path, mime = get_tmdb_image_file(path, size, base)
+        cache_root = os.path.realpath(os.fspath(_cache_subdir(base, "art")))
+        safe_path = os.path.realpath(local_path)
+        if not safe_path.startswith(cache_root + os.sep):
+            raise ValueError("Invalid image path")
+        return FileResponse(
+            safe_path,
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+    except ValueError:
+        return PlainTextResponse("Invalid image", status_code=400)
+    except Exception:
+        LOG.warning("TMDb image fetch failed")
+        return PlainTextResponse("Image not available", status_code=404)
+
+
+@router.get("/api/metadata/tmdb/season", tags=["metadata"])
+def api_tmdb_season(
+    tmdb: int = Query(..., ge=1),
+    season: int = Query(..., ge=0),
+    locale: str | None = Query(None),
+) -> JSONResponse:
+    provider = _tmdb_provider()
+    if provider is None:
+        return JSONResponse({"ok": False, "error": "metadata_unavailable"})
+    eff_locale = locale or _cfg_ui_locale() or "en-US"
+    try:
+        data = provider._get(
+            f"https://api.themoviedb.org/3/tv/{tmdb}/season/{season}",
+            {"language": eff_locale},
+            quiet_404=True,
+        ) or {}
+    except Exception:
+        return JSONResponse({"ok": False, "error": "season_unavailable"})
+    episodes = [
+        {
+            "episode": row.get("episode_number"),
+            "name": row.get("name") or "",
+            "air_date": row.get("air_date") or "",
+            "runtime": row.get("runtime"),
+            "overview": row.get("overview") or "",
+            "vote_average": row.get("vote_average"),
+            "has_still": bool(row.get("still_path")),
+            "guest_stars": [
+                {"id": person.get("id"), "name": person.get("name"),
+                 "character": person.get("character") or "", "profile_path": person.get("profile_path") or ""}
+                for person in row.get("guest_stars") or []
+                if isinstance(person, dict) and person.get("name")
+            ],
+            "crew": [
+                {"id": person.get("id"), "name": person.get("name"), "job": person.get("job") or ""}
+                for person in row.get("crew") or []
+                if isinstance(person, dict) and person.get("name")
+                and (person.get("job") == "Director" or person.get("department") == "Writing"
+                     or person.get("job") in {"Writer", "Screenplay", "Story", "Teleplay"})
+            ],
+        }
+        for row in data.get("episodes") or []
+        if isinstance(row, dict) and row.get("episode_number") is not None
+    ]
+    return JSONResponse(
+        {
+            "ok": True,
+            "tmdb": tmdb,
+            "season": season,
+            "name": data.get("name") or "",
+            "air_date": data.get("air_date") or "",
+            "overview": _shorten(data.get("overview") or "", 400),
+            "episodes": episodes,
+        },
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+
+@router.get("/api/metadata/tmdb/collection", tags=["metadata"])
+def api_tmdb_collection(collection: int = Query(..., ge=1), locale: str | None = Query(None)) -> JSONResponse:
+    provider = _tmdb_provider()
+    if provider is None:
+        return JSONResponse({"ok": False, "error": "metadata_unavailable"})
+    try:
+        data = provider._get(f"https://api.themoviedb.org/3/collection/{collection}", {"language": locale or _cfg_ui_locale() or "en-US"}, quiet_404=True) or {}
+        if not data.get("id"):
+            return JSONResponse({"ok": False, "error": "collection_unavailable"})
+        parts = [
+            {"id": row["id"], "title": row.get("title") or "", "release_date": row.get("release_date") or "", "poster_path": row.get("poster_path") or ""}
+            for row in data.get("parts") or [] if isinstance(row, dict) and row.get("id")
+        ]
+        parts.sort(key=lambda row: (row["release_date"] or "9999", row["id"]))
+        return JSONResponse({"ok": True, "id": data["id"], "name": data.get("name") or "", "parts": parts[:100]}, headers={"Cache-Control": "private, max-age=3600"})
+    except Exception:
+        return JSONResponse({"ok": False, "error": "collection_unavailable"})
+
+
+@router.get("/api/metadata/tmdb/person", tags=["metadata"])
+def api_tmdb_person(person: int = Query(..., ge=1), locale: str | None = Query(None)) -> JSONResponse:
+    provider = _tmdb_provider()
+    if provider is None:
+        return JSONResponse({"ok": False, "error": "metadata_unavailable"})
+    try:
+        data = provider._get(f"https://api.themoviedb.org/3/person/{person}", {"language": locale or _cfg_ui_locale() or "en-US", "append_to_response": "combined_credits"}, quiet_404=True) or {}
+        if not data.get("id"):
+            return JSONResponse({"ok": False, "error": "person_unavailable"})
+        credits = []
+        seen = set()
+        for row in sorted((row for row in (data.get("combined_credits") or {}).get("cast") or [] if isinstance(row, dict)), key=lambda row: float(row.get("popularity") or 0), reverse=True):
+            kind = row.get("media_type")
+            key = (kind, row.get("id"))
+            if kind not in {"movie", "tv"} or not row.get("id") or key in seen or row.get("adult"):
+                continue
+            seen.add(key)
+            credits.append({"id": row["id"], "type": "movie" if kind == "movie" else "show", "title": row.get("title") or row.get("name") or "", "date": row.get("release_date") or row.get("first_air_date") or "", "character": row.get("character") or "", "poster_path": row.get("poster_path") or ""})
+        return JSONResponse({"ok": True, "id": data["id"], "name": data.get("name") or "", "biography": data.get("biography") or "", "profile_path": data.get("profile_path") or "", "credits": credits[:24]}, headers={"Cache-Control": "private, max-age=3600"})
+    except Exception:
+        return JSONResponse({"ok": False, "error": "person_unavailable"})
 
 
 class MetadataResolveIn(BaseModel):
@@ -1402,6 +1624,8 @@ def api_metadata_bulk(
             "certification",
             "release",
             "detail",
+            "credits",
+            "recommendations",
         }
         out: dict[str, Any] = {"type": meta.get("type") or typ}
         for k in keep:

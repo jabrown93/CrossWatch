@@ -1,22 +1,24 @@
 /* assets/js/insights.js */
-/* CrossWatch - Insight Module for watchlist, ratings, history, progress, playlists */
+/* CrossWatch - Insight Module for watchlist, ratings, history, progress, playlists, collections */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
 (function (w, d) {
   const authSetupPending = () => w.cwIsAuthSetupPending?.() === true;
   const featureMeta = w.CW?.FeatureMeta || {};
   const providerMeta = w.CW?.ProviderMeta || {};
-  const FEAT_LABEL = featureMeta.labels || { watchlist:"Watchlist", ratings:"Ratings", history:"History", progress:"Progress", playlists:"Playlists" };
-const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", progress:"timelapse", playlists:"queue_music" };
+  const FEAT_LABEL = featureMeta.labels || { watchlist:"Watchlist", ratings:"Ratings", history:"History", progress:"Progress", playlists:"Playlists", collection:"Collections" };
+const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", progress:"timelapse", playlists:"queue_music", collection:"inventory_2" };
   const FEATS = featureMeta.order || Object.keys(FEAT_LABEL);
   const DEFAULT_RECENT_SYNCS_LIMIT = 3;
   const PREF_KEY = "insights.settings.v1";
+  const TILES_KEY = "insights.tiles.v1";
   const CW_SNAPSHOT_PROFILE_KEY = "insights.crosswatch.snapshotProfile";
   const $ = (s, r = d) => r.querySelector(s), $$ = (s, r = d) => [...r.querySelectorAll(s)], lc = s => String(s || "").toLowerCase();
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
   const featureLabel = v => featureMeta.label?.(v) || FEAT_LABEL[lc(v)] || String(v || "");
   const providerLabel = v => providerMeta.label?.(v) || String(v || "");
   const providerLogo = v => providerMeta.logoPath?.(v) || "";
+  const providerOnSyncSurface = v => typeof providerMeta.syncSurfaceProvider === "function" ? providerMeta.syncSurfaceProvider(v) : true;
   const overviewProfile = () => w.CW?.OverviewProfile || null;
   const overviewProfileId = () => String(overviewProfile()?.id || "").trim();
   const overviewFilter = () => overviewProfile()?.filter || {};
@@ -55,7 +57,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
 
   function normalizePrefs(p, instancesByProvider = {}) {
     const out = clone(p), f = out.features && typeof out.features === "object" ? out.features : {};
-    out.features = { watchlist: f.watchlist !== false, ratings: f.ratings !== false, history: f.history !== false, progress: f.progress !== false, playlists: f.playlists !== false };
+    out.features = { watchlist: f.watchlist !== false, ratings: f.ratings !== false, history: f.history !== false, progress: f.progress !== false, playlists: f.playlists !== false, collection: f.collection !== false };
     out.instances = out.instances && typeof out.instances === "object" ? out.instances : {};
     out.known_instances = out.known_instances && typeof out.known_instances === "object" ? out.known_instances : {};
     for (const [prov, list] of Object.entries(instancesByProvider || {})) {
@@ -109,7 +111,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
   let _prefs = loadPrefs(), _visibleFeats = visibleFeatures(_prefs);
   const clampFeature = name => _visibleFeats.includes(String(name)) ? name : (_visibleFeats[0] || "watchlist");
   let _feature = clampFeature(localStorage.getItem("insights.feature"));
-  let _lastStatsFetch = 0, _cwSnapModal = null, _lastInsightsData = null, _fullInsightsTimer = 0, _configuredProvidersCache = null, _tilesFeature = null;
+  let _lastStatsFetch = 0, _cwSnapModal = null, _lastInsightsData = null, _fullInsightsTimer = 0, _configuredProvidersCache = null, _tilesFeature = null, _tileShellFeature = null, _bootScheduled = false, _tilesPainted = false;
 
   function syncPrefs(instancesByProvider = {}) {
     const next = normalizePrefs(_prefs, instancesByProvider), changed = JSON.stringify(next) !== JSON.stringify(_prefs);
@@ -184,7 +186,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     if (!hasOverviewFilter && (!selectionDiffers(_prefs, instancesByProvider) || !instCounts || typeof instCounts !== "object")) {
       return { providers: block.providers || {}, mse: raw.providers_mse || null, now: block.now };
     }
-    const out = {}, outMse = {}, selected = _prefs?.instances || {}, zero = () => ({ movies:0, shows:0, anime:0, episodes:0 });
+    const out = {}, outMse = {}, selected = _prefs?.instances || {}, zero = () => ({ movies:0, shows:0, seasons:0, anime:0, episodes:0 });
     for (const [prov, byInst] of Object.entries(instCounts || {})) {
       const key = lc(prov), map = byInst && typeof byInst === "object" ? byInst : {}, keys = Object.keys(map), want = Array.isArray(selected[key]) ? selected[key].map(String) : selected[key] === undefined ? keys : [];
       const overviewWant = activeOverviewFilter[String(prov || "").toUpperCase()] || activeOverviewFilter[String(prov || "").toLowerCase()];
@@ -194,7 +196,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
       for (const id of finalWant) {
         const part = mseMap[id];
         if (!part || typeof part !== "object") continue;
-        agg.movies += part.movies | 0; agg.shows += part.shows | 0; agg.anime += part.anime | 0; agg.episodes += part.episodes | 0;
+        agg.movies += part.movies | 0; agg.shows += part.shows | 0; agg.seasons += part.seasons | 0; agg.anime += part.anime | 0; agg.episodes += part.episodes | 0;
       }
       outMse[key] = agg;
     }
@@ -219,8 +221,8 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     }, { A: 0, R: 0, S: 0 });
     const ms = Date.now();
     if (!Number.isFinite(+now)) now = rows.length ? totalsFor(feat, rows.at(-1).r).sum : 0;
-    if (!Number.isFinite(+week)) week = sumSince(ms - 7 * 86400000).S;
-    if (!Number.isFinite(+month)) month = sumSince(ms - 30 * 86400000).S;
+    if (!Number.isFinite(+week)) week = sumSince(ms - 7 * 86400000).A;
+    if (!Number.isFinite(+month)) month = sumSince(ms - 30 * 86400000).A;
     if (!Number.isFinite(+added) || !Number.isFinite(+removed)) {
       const m = sumSince(ms - 30 * 86400000);
       if (!Number.isFinite(+added)) added = m.A;
@@ -231,6 +233,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
       providers: raw.providers || {},
       active: raw.providers_active || data?.providers_active || {},
       now: asNum(now), week: asNum(week), month: asNum(month), added: asNum(added), removed: asNum(removed),
+      weekRemoved: asNum(raw.week_removed), monthRemoved: asNum(raw.month_removed),
       raw
     };
   }
@@ -330,6 +333,8 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
   }
 
   function markActiveSwitcher() {
+    const mobileSelect = $("#insights-mobile-feature");
+    if (mobileSelect) mobileSelect.value = _feature;
     $$("#insights-switch .seg-btn").forEach(btn => {
       const on = btn.dataset.key === _feature;
       btn.classList.toggle("active", on);
@@ -354,29 +359,31 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
       host = d.createElement("div");
       host.id = "insights-switch";
       host.className = "ins-switch";
-      host.innerHTML = '<div class="seg" role="tablist" aria-label="Insights features"></div>';
+      host.innerHTML = '<div class="ins-mobile-feature"><select id="insights-mobile-feature" aria-label="Provider statistics feature"></select><button type="button" class="ins-mobile-settings" aria-label="Insight settings"><span class="material-symbols-rounded" aria-hidden="true">settings</span></button></div><div class="seg" role="tablist" aria-label="Insights features"></div>';
       wrap.appendChild(host);
     } else if (host.parentNode !== wrap) wrap.appendChild(host);
     if (!host.dataset.bound) {
       host.addEventListener("click", ev => {
         const btn = ev.target.closest(".seg-btn");
         if (btn) return switchFeature(btn.dataset.key);
-        if (ev.target.closest(".ins-gear")) openInsightSettingsModal();
+        if (ev.target.closest(".ins-gear, .ins-mobile-settings")) openInsightSettingsModal();
       });
+      host.querySelector("#insights-mobile-feature").addEventListener("change", event => switchFeature(event.target.value));
       host.dataset.bound = "1";
     }
     const seg = $(".seg", host), sig = _visibleFeats.join(",");
     const featCount = Math.max(1, _visibleFeats.length);
     host.style.setProperty("--ins-feat-count", String(featCount));
     host.dataset.labels = featCount >= 4 ? "icon" : "text";
-    if (seg) seg.dataset.count = String(featCount);
+    if (seg) seg.dataset.count = String(Math.max(1, _visibleFeats.length));
     host.querySelector(":scope > .ins-gear")?.remove();
     const needsGear = seg && !seg.querySelector(".ins-gear");
     if (host.dataset.feats !== sig || host.dataset.cur !== _feature || needsGear) {
       const settingsButton = '<button class="ins-gear" type="button" title="Insight settings" aria-label="Insight settings"><span class="material-symbols-rounded" aria-hidden="true">settings</span></button>';
-      seg.innerHTML = _visibleFeats.map(f => `<button class="seg-btn${_feature === f ? " active" : ""}" data-key="${f}" role="tab" aria-selected="${_feature === f}" title="${featureLabel(f)}" aria-label="${featureLabel(f)}"><span class="material-symbols-rounded" aria-hidden="true">${FEAT_ICON[lc(f)] || "insights"}</span><span>${featureLabel(f)}</span></button>`).join("") + settingsButton;
+      seg.innerHTML = _visibleFeats.map(f => `<button class="seg-btn${_feature === f ? " active" : ""}" data-key="${esc(f)}" role="tab" aria-selected="${_feature === f}" title="${esc(featureLabel(f))}" aria-label="${esc(featureLabel(f))}"><span class="material-symbols-rounded" aria-hidden="true">${FEAT_ICON[lc(f)] || "insights"}</span><span>${esc(featureLabel(f))}</span></button>`).join("") + settingsButton;
       host.dataset.feats = sig;
       host.dataset.cur = _feature;
+      host.querySelector("#insights-mobile-feature").innerHTML = _visibleFeats.map(f => `<option value="${esc(f)}">${esc(featureLabel(f))}</option>`).join("");
     }
     placeSwitchBeforeTiles();
     markActiveSwitcher();
@@ -420,11 +427,12 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     const conf = new Set([...configuredSet].map(canonical));
     const keys = [...new Set([...Object.keys(totals), ...Object.keys(active), ...conf])]
       .filter(k => conf.has(canonical(k)) && providerSelected(k, instancesByProvider))
-      .sort((a, b) => a === "crosswatch" ? -1 : b === "crosswatch" ? 1 : a.localeCompare(b));
+      .filter(k => providerOnSyncSurface(k))
+      .sort((a, b) => String(providerLabel(a) || a).localeCompare(String(providerLabel(b) || b), undefined, { sensitivity: "base", numeric: true }));
 
     if (!keys.length) {
       host.hidden = true;
-      return;
+      return keys;
     }
 
     host.hidden = false;
@@ -454,7 +462,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
       animateNumber($(".n", tile), total, 650, animate);
 
       const info = $(".mse", tile);
-      if (!per || prov === "crosswatch" || _feature === "playlists") {
+      if (!per || prov === "crosswatch" || _feature === "playlists" || _feature === "collection") {
         info.textContent = "";
         info.style.display = "none";
         tile.title = prov === "crosswatch" ? `${label} • ${total} • Click to switch snapshot` : `${label} • ${total}`;
@@ -479,6 +487,52 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
 
     [...host.querySelectorAll(".tile")].forEach(tile => !seen.has(tile.id) && tile.remove());
     placeSwitchBeforeTiles();
+    return keys;
+  }
+
+  function saveTilesCache(feature, keys, totals, active, mse) {
+    if (!Array.isArray(keys) || !keys.length) return;
+    try {
+      const all = readJSON(TILES_KEY, {});
+      all[feature] = { keys, totals: totals || {}, active: active || {}, mse: mse || {} };
+      localStorage.setItem(TILES_KEY, JSON.stringify(all));
+    } catch {}
+  }
+
+  function paintCachedTiles() {
+    if (_tilesPainted) return false;
+    if (!$("#stats-card")) return false;
+    if (authSetupPending()) return false;
+    const cached = readJSON(TILES_KEY, {})[_feature];
+    if (!cached || !Array.isArray(cached.keys) || !cached.keys.length) return false;
+    _tilesPainted = true;
+    _tilesFeature = _feature;
+    footWrap();
+    ensureSwitch();
+    renderProviderStats(cached.totals, cached.active, new Set(cached.keys), cached.mse, {}, false);
+    return true;
+  }
+
+  function visibleStatusProviderKeys() {
+    return [...new Set($$("#conn-badges [data-provider-key], #conn-badges [data-prov]")
+      .map(node => String(node.dataset.providerKey || node.dataset.prov || "").trim())
+      .filter(Boolean))];
+  }
+
+  function paintTileShell() {
+    if (_tilesPainted || _tileShellFeature === _feature || authSetupPending() || !$("#stats-card")) return false;
+    footWrap();
+    ensureSwitch();
+    let keys = visibleStatusProviderKeys();
+    if (!keys.length) keys = [...configuredProvidersSnapshot({})];
+    keys = keys.filter(k => providerOnSyncSurface(k));
+    if (!keys.length) return false;
+    _tileShellFeature = _feature;
+    _tilesFeature = _feature;
+    const totals = Object.fromEntries(keys.map(k => [k, 0]));
+    const active = Object.fromEntries(keys.map(k => [k, false]));
+    renderProviderStats(totals, active, new Set(keys), {}, {}, false);
+    return true;
   }
 
   function crosswatchSnapshotProfiles(cwSnapshots) {
@@ -538,11 +592,11 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     if (!rows.length) return void (list.innerHTML = `<div class="history-item"><div class="history-meta muted">${display.mode === "hours" ? `No runs in the last ${display.hours} hours` : "No runs for this feature"}</div></div>`);
     list.innerHTML = rows.map(row => {
       const t = totalsFor(_feature, row), cls = typeof row?.exit_code === "number" && row.exit_code !== 0 ? "err" : String(row?.result || "").toUpperCase() === "EQUAL" || t.sum === 0 ? "ok" : "warn";
-      return `<div class="history-item ${cls}"><div class="history-main"><div class="history-meta"><span class="history-time">${fmtWhen(row)}</span><span class="badge ${cls}">${row?.result || "—"}${typeof row?.exit_code === "number" ? ` · ${row.exit_code}` : ""}</span></div><div class="history-sub">${featureLabel(_feature)} • ${fmtDur(row?.duration_sec)}</div></div><div class="history-badges"><span class="badge add">+${t.a}</span><span class="badge del">-${t.r}</span>${t.u ? `<span class="badge micro">~${t.u}</span>` : ""}</div></div>`;
+      return `<div class="history-item ${cls}"><div class="history-main"><div class="history-meta"><span class="history-time">${esc(fmtWhen(row))}</span><span class="badge ${cls}">${esc(row?.result || "—")}${typeof row?.exit_code === "number" ? ` · ${row.exit_code}` : ""}</span></div><div class="history-sub">${esc(featureLabel(_feature))} • ${esc(fmtDur(row?.duration_sec))}</div></div><div class="history-badges"><span class="badge add">+${t.a}</span><span class="badge del">-${t.r}</span>${t.u ? `<span class="badge micro">~${t.u}</span>` : ""}</div></div>`;
     }).join("");
   }
 
-  function renderTopStats({ now = 0, week = 0, month = 0, added = 0, removed = 0 }) {
+  function renderTopStats({ now = 0, week = 0, month = 0, added = 0, removed = 0, weekRemoved = 0 }) {
     [["#stat-now", now], ["#stat-week", week], ["#stat-month", month], ["#stat-added", added], ["#stat-removed", removed]].forEach(([sel, val]) => animateNumber($(sel), val | 0));
     const fill = $("#stat-fill"), max = Math.max(1, now, week, month);
     if (fill) fill.style.width = `${Math.round(now / max * 100)}%`;
@@ -551,12 +605,12 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     if (lab) lab.textContent = featureLabel(_feature);
     const chip = $("#trend-week") || $("#stat-delta-chip");
     if (chip) {
-      const diff = (now | 0) - (week | 0);
-      chip.textContent = diff === 0 ? "no change" : `${diff > 0 ? "+" : ""}${diff} vs last week`;
+      const diff = (week | 0) - (weekRemoved | 0);
+      chip.textContent = diff === 0 ? "no change" : `${diff > 0 ? "+" : ""}${diff} this week`;
       chip.classList.remove("up", "down", "flat", "muted");
       chip.classList.add(diff > 0 ? "up" : diff < 0 ? "down" : "flat");
       chip.classList.toggle("muted", diff === 0);
-      chip.title = diff === 0 ? "No change versus last week" : `${Math.abs(diff)} ${diff > 0 ? "more" : "fewer"} than last week`;
+      chip.title = diff === 0 ? "No change in the last 7 days" : `${week | 0} added, ${weekRemoved | 0} removed in the last 7 days`;
     }
     $("#stat-breakdown")?.remove();
   }
@@ -585,20 +639,21 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     renderCrossWatchSnapshotHint(data?.crosswatch_snapshots || null);
     getConfiguredProviders(forceConfigured)
       .then((configured) => {
-        renderProviderStats(blk.providers, blk.active, configured, blk.raw?.providers_mse || null, data?.instances_by_provider || {}, animateTiles);
+        const painted = renderProviderStats(blk.providers, blk.active, configured, blk.raw?.providers_mse || null, data?.instances_by_provider || {}, animateTiles);
         renderCrossWatchSnapshotHint(data?.crosswatch_snapshots || null);
+        _tilesPainted = true;
+        saveTilesCache(_feature, painted, blk.providers, blk.active, blk.raw?.providers_mse || null);
       })
       .catch((e) => console.error("[Insights] Failed to resolve configured providers", e));
   }
 
   async function refreshInsights(force = false) {
     if (authSetupPending()) return;
+    clearTimeout(_fullInsightsTimer);
+    _fullInsightsTimer = 0;
     try {
       const profileParam = overviewProfileId() ? `&user_profile=${encodeURIComponent(overviewProfileId())}` : "";
-      const [data] = await Promise.all([
-        fetchJSON(`/api/insights?limit_samples=60&history=60${profileParam}${force ? `&t=${Date.now()}` : ""}`),
-        getConfiguredProviders(force).catch(() => null),
-      ]);
+      const data = await fetchJSON(`/api/insights?limit_samples=60&history=60${profileParam}${force ? `&t=${Date.now()}` : ""}`);
       await renderFromData(data, false, force);
     }
     catch (e) {
@@ -610,14 +665,11 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
   async function refreshStats(force = false) {
     if (authSetupPending()) return;
     const now = Date.now();
-    if (!force && now - _lastStatsFetch < 900) return;
+    if (now - _lastStatsFetch < (force ? 250 : 900)) return;
     _lastStatsFetch = now;
     try {
       const profileParam = overviewProfileId() ? `&user_profile=${encodeURIComponent(overviewProfileId())}` : "";
-      const [data] = await Promise.all([
-        fetchJSON(`/api/insights?limit_samples=0&history=0&include_events=0${profileParam}${force ? `&t=${Date.now()}` : ""}`),
-        getConfiguredProviders(force).catch(() => null),
-      ]);
+      const data = await fetchJSON(`/api/insights?limit_samples=0&history=0&include_events=0${profileParam}${force ? `&t=${Date.now()}` : ""}`);
       await renderFromData(data, true, force);
     }
     catch (e) {
@@ -636,12 +688,30 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     }, 180);
   }
 
+  function clearInsightsState() {
+    try { localStorage.removeItem(TILES_KEY); } catch {}
+    clearTimeout(_fullInsightsTimer);
+    _fullInsightsTimer = 0;
+    _lastInsightsData = {};
+    _tilesPainted = false;
+    _tilesFeature = "";
+    _tileShellFeature = null;
+    renderTopStats({});
+    renderHistoryTabs([]);
+    const providers = $("#stat-providers");
+    if (providers) {
+      providers.replaceChildren();
+      providers.hidden = true;
+    }
+  }
+
   w.addEventListener("insights:settings-changed", () => { _prefs = loadPrefs(); _visibleFeats = visibleFeatures(_prefs); _feature = clampFeature(_feature); localStorage.setItem("insights.feature", _feature); refreshInsightsFastThenFull(true); });
   w.addEventListener("cw:overview-profile-changed", () => refreshInsightsFastThenFull(true));
+  w.addEventListener("cw:sync-state-cleared", clearInsightsState);
 
   w.Insights = Object.assign(w.Insights || {}, {
     renderSparkline, refreshInsights, refreshStats, fetchJSON, animateNumber, animateChart, titleOf, subtitleOf,
-    switchFeature, refreshInsightsFastThenFull, get feature() { return _feature; }
+    switchFeature, refreshInsightsFastThenFull, clearState: clearInsightsState, get feature() { return _feature; }
   });
   w.renderSparkline = renderSparkline;
   w.refreshInsights = refreshInsights;
@@ -652,19 +722,32 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
   w.subtitleOf = subtitleOf;
   w.scheduleInsights = function scheduleInsights(max) {
     if (authSetupPending()) return;
+    if (_bootScheduled) return;
+    _bootScheduled = true;
     let tries = 0, limit = max || 20;
     (function tick() {
-      if (authSetupPending()) return;
-      if ($("#sync-history") || $("#stat-now") || $("#sparkline")) return refreshInsightsFastThenFull();
+      if (authSetupPending()) return void (_bootScheduled = false);
+      if ($("#sync-history") || $("#stat-now") || $("#sparkline")) { if (!paintCachedTiles()) paintTileShell(); return refreshInsightsFastThenFull(); }
       if (++tries < limit) setTimeout(tick, 250);
+      else _bootScheduled = false;
     })();
   };
 
-  d.addEventListener("DOMContentLoaded", () => { if (!authSetupPending()) w.scheduleInsights(); });
-  d.addEventListener("tab-changed", ev => {
-    if (authSetupPending()) return;
-    const tab = String(ev?.detail?.id || ev?.detail?.tab || "").toLowerCase();
-    if (tab === "main") refreshInsightsFastThenFull(true);
+  d.addEventListener("DOMContentLoaded", () => {
+    const badges = $("#conn-badges");
+    if (badges && !badges.dataset.insightsShellWatch) {
+      badges.dataset.insightsShellWatch = "1";
+      new MutationObserver(() => { if (!paintCachedTiles()) paintTileShell(); }).observe(badges, { childList: true, subtree: true });
+    }
+    if (!authSetupPending()) {
+      if (!paintCachedTiles()) paintTileShell();
+      w.scheduleInsights();
+    }
+  });
+  w.addEventListener("cw-auth-setup-pending", (ev) => {
+    if (ev?.detail?.pending !== false) return;
+    if (!paintCachedTiles()) paintTileShell();
+    w.scheduleInsights();
   });
 
   const snapLabel = name => {
@@ -678,7 +761,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     modal.className = "cw-snap-picker cw-snap-hidden";
     modal.innerHTML = '<div class="cw-snap-dialog" role="dialog" aria-modal="true" aria-labelledby="cw-snap-title"><div class="cw-snap-head"><div class="cw-snap-title-wrap"><div class="cw-snap-kicker">Snapshot selector</div><div class="cw-snap-title" id="cw-snap-title">Select snapshot for <span class="hl"></span></div></div><button class="snap-icon-close" type="button" aria-label="Close snapshot selector">×</button></div><div class="cw-snap-body"></div><div class="cw-snap-foot"><button class="snap-close" type="button">Cancel</button></div></div>';
     modal.addEventListener("click", async ev => {
-      const close = ev.target === modal || ev.target.closest(".snap-close,.snap-icon-close");
+      const close = ev.target.closest(".snap-close,.snap-icon-close");
       if (close) modal.classList.add("cw-snap-hidden");
       const btn = ev.target.closest(".snap-btn");
       if (!btn) return;
@@ -715,7 +798,7 @@ const FEAT_ICON = { watchlist:"movie", ratings:"star", history:"play_arrow", pro
     try { localStorage.setItem(CW_SNAPSHOT_PROFILE_KEY, inst); } catch {}
 
     body.innerHTML = `${profiles.length > 1
-      ? `<label class="cw-snap-profile"><span>Profile</span><select class="cw-snap-profile-select">${profiles.map(p => `<option value="${esc(p.id || "default")}"${String(p.id || "default") === inst ? " selected" : ""}>${esc(p.label || p.id || "Default")}</option>`).join("")}</select></label>`
+      ? `<label class="cw-snap-profile"><span>Profile</span><select class="cw-snap-profile-select" data-cw-sort="alphabetical">${profiles.map(p => `<option value="${esc(p.id || "default")}"${String(p.id || "default") === inst ? " selected" : ""}>${esc(p.label || p.id || "Default")}</option>`).join("")}</select></label>`
       : `<div class="cw-snap-profile is-single"><span>Profile</span><strong>${esc(profile.label || inst)}</strong></div>`}<div class="cw-snap-list"><div class="cw-snap-empty muted">Loading snapshots...</div></div>`;
     const list = $(".cw-snap-list", body);
 

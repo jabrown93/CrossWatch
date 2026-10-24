@@ -102,8 +102,12 @@ def test_crosswatch_watcher_sink_writes_progress_and_history(monkeypatch, tmp_pa
     sink = CrossWatchSink(cfg_provider=lambda: cfg, instance_id="CW-P01")
 
     sink.send(_episode_event("start", 12.0))
+    assert sink.send(_episode_event("start", 13.0)) == {
+        "ok": True, "log_status": "skipped", "reason": "progress_step", "previous_progress": 12.0, "progress_step": 5.0}
+    assert len(ops.added) == 1
     sink.send(_episode_event("pause", 20.0))
     sink.send(_episode_event("stop", 92.0))
+    assert sink.send(_episode_event("stop", 92.0))["reason"] == "session_completed"
 
     expected_root = str(root / "profiles" / "CW-P01").replace("\\", "/")
 
@@ -114,6 +118,8 @@ def test_crosswatch_watcher_sink_writes_progress_and_history(monkeypatch, tmp_pa
     history_item = ops.added[-1]["items"][0]
     assert progress_item["type"] == "episode"
     assert progress_item["show_ids"] == {"tmdb": "124800"}
+    assert progress_item["ids"] == {"tvdb": "9621656"}
+    assert history_item["ids"] == {"tvdb": "9621656"}
     assert progress_item["season"] == 1
     assert progress_item["episode"] == 7
     assert progress_item["progress_percent"] == 12.0

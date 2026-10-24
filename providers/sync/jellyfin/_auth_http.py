@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import os
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 import re
 import secrets
 from typing import Any
@@ -14,8 +14,8 @@ from requests import exceptions as rx
 
 from cw_platform.url_validation import guarded_request
 
-UA = os.environ.get("CW_JELLYFIN_UA") or os.environ.get("CW_UA") or "CrossWatch"
-CLIENT_VERSION = os.environ.get("CW_JELLYFIN_VERSION") or os.environ.get("CW_VERSION") or "1.0"
+UA = http_user_agent("Jellyfin", override_env="CW_JELLYFIN_UA")
+CLIENT_VERSION = app_version()
 CLIENT_NAME = "CrossWatch"
 DEVICE_NAME = "CrossWatch"
 

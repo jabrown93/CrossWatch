@@ -247,7 +247,7 @@ def test_pause_and_resume_detection(monkeypatch):
     script = RpcScript(
         **{
             "Player.GetActivePlayers": [active(), active(), active()],
-            "Player.GetItem": [{"item": movie_item()}],
+            "Player.GetItem": [{"item": movie_item()}, {"item": movie_item()}, {"item": movie_item()}],
             "Player.GetProperties": [props(1, 10), props(0, 11), props(1, 12)],
             "Profiles.GetCurrentProfile": [profile()],
         }
@@ -266,7 +266,7 @@ def test_progress_update_detection(monkeypatch):
     script = RpcScript(
         **{
             "Player.GetActivePlayers": [active(), active(), active()],
-            "Player.GetItem": [{"item": movie_item()}],
+            "Player.GetItem": [{"item": movie_item()}, {"item": movie_item()}, {"item": movie_item()}],
             "Player.GetProperties": [props(1, 10), props(1, 12), props(1, 16)],
             "Profiles.GetCurrentProfile": [profile()],
         }
@@ -373,7 +373,7 @@ def test_offline_reconnect_resets_backoff_and_logs_once(monkeypatch):
     assert service._offline_retry == 30.0
     assert disp.events[-1].action == "start"
     assert int(disp.events[-1].progress) == 33
-    lifecycle_logs = [row for row in logs if row[0] in {"WARNING", "INFO"}]
+    lifecycle_logs = [row for row in logs if row[0] in {"WARNING", "INFO"} and not row[1].startswith("event ")]
     assert lifecycle_logs == [
         ("WARNING", "Kodi watcher offline: Kodi server is unreachable: timeout; retrying with backoff"),
         ("INFO", "Kodi watcher reconnected"),
@@ -443,3 +443,115 @@ def test_scrobble_source_whitelist_ignores_unselected_paths(monkeypatch):
     assert logs[-1][0] == "DEBUG"
     assert "event filtered by scrobble whitelist" in logs[-1][1]
     assert "allowed=['/movies']" in logs[-1][1]
+
+
+def test_watcher_normalizes_native_anime_uniqueids():
+    got = kodi_watch._normalize_uniqueids(
+        {"anidb": "17969", "tvshow.anidb": "17969", "tvdb": "9515852", "tvshow.tvdb": "393478"},
+        "episode",
+    )
+
+    assert got == {
+        "anidb_episode": "17969",
+        "anidb_show": "17969",
+        "tvdb_episode": "9515852",
+        "tvdb_show": "393478",
+    }
+    assert kodi_watch._has_show_ids(got) is True
+
+
+def test_watcher_show_ids_carry_native_anime_namespaces():
+    got = kodi_watch._show_ids_from_uniqueids({"anidb": "17969", "tvdb": "393478", "MyAnimeList": "54918"})
+
+    assert got == {"anidb_show": "17969", "tvdb_show": "393478", "mal_show": "54918"}
+    assert kodi_watch._has_show_ids({"anidb_show": "17969"}) is False
+    assert kodi_watch._has_show_ids({"tvdb_show": "393478"}) is True
+
+
+def test_anidb_scraped_episode_scrobbles_as_anime(monkeypatch):
+    monkeypatch.setattr(kodi_watch, "_cw_update", lambda *a, **k: None)
+    script = RpcScript(
+        **{
+            "Player.GetActivePlayers": [active()],
+            "Player.GetItem": [
+                {
+                    "item": episode_item(
+                        title="Episode 5",
+                        showtitle="Tokyo Revengers: Tenjiku Hen",
+                        season=1,
+                        episode=5,
+                        uniqueid={"tvdb": "9515852", "tvshow.anidb": "17969", "tvshow.tvdb": "393478"},
+                    )
+                }
+            ],
+            "Player.GetProperties": [props(1, 12)],
+            "Profiles.GetCurrentProfile": [profile("Cinema")],
+        }
+    )
+    service, disp = svc(script)
+
+    assert service._tick() is True
+
+    ev = disp.events[-1]
+    assert ev.ids["anidb_show"] == "17969"
+    assert ev.ids["tvdb_show"] == "393478"
+    assert simkl_sink._show_ids(ev)["anidb"] == "17969"
+
+
+def test_poll_interval_follows_config():
+    state: dict[str, Any] = {"poll": 45}
+
+    def provider() -> dict[str, Any]:
+        out = cfg()
+        if state["poll"] is not None:
+            out["scrobble"]["watch"]["poll_seconds"] = state["poll"]
+        return out
+
+    service = KodiWatchService(dispatcher=FakeDispatcher(), cfg_provider=provider, instance_id="living-room", quiet_startup=True)
+    service._rpc = RpcScript(**{"Player.GetActivePlayers": [[], []]})  # type: ignore[method-assign]
+
+    service._tick()
+    assert service._base_poll == 45.0
+    state["poll"] = None
+    service._tick()
+    assert service._base_poll == kodi_watch.BASE_POLL_SECONDS
+
+
+def test_item_change_on_same_player_closes_previous_item(monkeypatch):
+    monkeypatch.setattr(kodi_watch, "_cw_update", lambda *a, **k: None)
+    monkeypatch.setattr(kodi_watch, "_cw_update_payload", lambda *a, **k: None)
+    monkeypatch.setattr(kodi_watch, "show_tmdb_id", lambda *a, **k: None)
+    script = RpcScript(
+        **{
+            "Player.GetActivePlayers": [active(), active(), active()],
+            "Player.GetItem": [{"item": episode_item()}, {"item": episode_item()}, {"item": episode_item(id=78, episode=2, title="The Big Empty")}],
+            "Player.GetProperties": [props(1, 50), props(1, 97), props(1, 2)],
+            "Profiles.GetCurrentProfile": [profile(), profile()],
+        }
+    )
+    service, disp = svc(script)
+
+    service._tick()
+    service._tick()
+    service._tick()
+
+    assert [(e.action, e.number, int(e.progress)) for e in disp.events] == [("start", 1, 50), ("start", 1, 97), ("stop", 1, 97), ("start", 2, 2)]
+    assert len(service._sessions) == 1
+
+
+def test_item_lookup_failure_keeps_current_session(monkeypatch):
+    monkeypatch.setattr(kodi_watch, "_cw_update", lambda *a, **k: None)
+    script = RpcScript(
+        **{
+            "Player.GetActivePlayers": [active(), active()],
+            "Player.GetItem": [{"item": movie_item()}, KodiAuthError("boom", reason="invalid_response")],
+            "Player.GetProperties": [props(1, 10), props(1, 40)],
+            "Profiles.GetCurrentProfile": [profile()],
+        }
+    )
+    service, disp = svc(script)
+
+    service._tick()
+    service._tick()
+
+    assert [(e.action, int(e.progress)) for e in disp.events] == [("start", 10), ("start", 40)]

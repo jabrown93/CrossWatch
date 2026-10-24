@@ -41,7 +41,7 @@ def _canon_feature(name: Any) -> str:
         return "progress"
     if s in ("wl", "watchlist"):
         return "watchlist"
-    return s if s in ("watchlist", "ratings", "history", "progress", "playlists") else "watchlist"
+    return s if s in ("watchlist", "ratings", "history", "progress", "playlists", "collection") else "watchlist"
 
 
 class Stats:
@@ -477,7 +477,114 @@ class Stats:
             prev_wl = {k: dict(v) for k, v in (self.data.get("current") or {}).items()}
             cur_wl = self._build_union_map(state, "watchlist")
 
-            added_keys, removed_keys = _emit_lane_events(ev, "watchlist", prev_wl, cur_wl, now_epoch)
+            def _norm_title(s: str) -> str:
+                s = unicodedata.normalize("NFKD", s or "")
+                s = "".join(ch for ch in s if not unicodedata.combining(ch)).casefold()
+                s = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", s)
+                s = s.replace("&", " and ")
+                s = re.sub(r"[^a-z0-9]+", " ", s)
+                s = re.sub(r"\s+", " ", s).strip()
+                toks = s.split()
+                if toks and toks[0] in {"the", "a", "an"}:
+                    s = " ".join(toks[1:])
+                return s
+
+            def _title_key(m: dict[str, Any]) -> str:
+                return _norm_title((m.get("title") or "").strip())
+
+            def _similar(a: str, b: str) -> bool:
+                if not a or not b:
+                    return False
+                if a == b:
+                    return True
+                ta, tb = set(a.split()), set(b.split())
+                if ta and (len(ta & tb) / len(ta | tb)) >= 0.85:
+                    return True
+                return difflib.SequenceMatcher(None, a, b).ratio() >= 0.92
+
+            def _titles_match_loose(rm: dict[str, Any], am: dict[str, Any]) -> bool:
+                ra, aa = _title_key(rm), _title_key(am)
+                if not ra or not aa:
+                    return False
+                ry, ay = self._year_of(rm), self._year_of(am)
+                if isinstance(ry, int) and isinstance(ay, int) and ry != ay:
+                    return False
+                return ra == aa or _similar(ra, aa)
+
+            def _provset(m: dict[str, Any]) -> set[str]:
+                provs = {str(p).lower() for p in (m.get("providers") or [])}
+                if not provs:
+                    s = str(m.get("src") or "").lower()
+                    if s and s != "both":
+                        provs = {s}
+                return provs
+
+            _IDCORE = re.compile(
+                r"^(?P<p>[a-z0-9]+):(?:(?:movie|tv|show):)?(?P<i>[^:]+)$",
+                re.I,
+            )
+
+            def _idcore(k: str) -> tuple[str | None, str | None]:
+                m = _IDCORE.match(str(k) or "")
+                return (m.group("p"), m.group("i")) if m else (None, None)
+
+            pk, ck = set(prev_wl), set(cur_wl)
+            added_keys, removed_keys = sorted(ck - pk), sorted(pk - ck)
+
+            for rk in list(removed_keys):
+                rm = prev_wl.get(rk) or {}
+                rp = _provset(rm)
+                rp_name, rp_id = _idcore(rk)
+                for ak in list(added_keys):
+                    am = cur_wl.get(ak) or {}
+                    ap = _provset(am)
+                    ap_name, ap_id = _idcore(ak)
+                    same_title = _titles_match_loose(rm, am)
+                    same_idcore = (
+                        rp_name == ap_name and rp_id and ap_id and rp_id == ap_id
+                    )
+                    if (same_title or same_idcore) and (rp & ap or same_idcore):
+                        removed_keys.remove(rk)
+                        added_keys.remove(ak)
+                        ev.append(
+                            {
+                                "ts": now_epoch,
+                                "action": "update",
+                                "feature": "watchlist",
+                                "key": ak,
+                                "source": am.get("src", ""),
+                                "title": am.get("title", ""),
+                                "type": am.get("type", ""),
+                            }
+                        )
+                        break
+
+            for k in added_keys:
+                m = cur_wl.get(k) or {}
+                ev.append(
+                    {
+                        "ts": now_epoch,
+                        "action": "add",
+                        "feature": "watchlist",
+                        "key": k,
+                        "source": m.get("src", ""),
+                        "title": m.get("title", ""),
+                        "type": m.get("type", ""),
+                    }
+                )
+            for k in removed_keys:
+                m = prev_wl.get(k) or {}
+                ev.append(
+                    {
+                        "ts": now_epoch,
+                        "action": "remove",
+                        "feature": "watchlist",
+                        "key": k,
+                        "source": m.get("src", ""),
+                        "title": m.get("title", ""),
+                        "type": m.get("type", ""),
+                    }
+                )
 
             self.data["current"] = cur_wl
             counters = self._ensure_counters()
@@ -502,7 +609,63 @@ class Stats:
                 if not prev_map and not cur_map:
                     cur_by[feat] = {}
                     continue
-                _emit_lane_events(ev, feat, prev_map, cur_map, now_epoch)
+                ap, rp = set(cur_map), set(prev_map)
+                adds, rems = sorted(ap - rp), sorted(rp - ap)
+
+                for rk in list(rems):
+                    rm = prev_map.get(rk) or {}
+                    rp = _provset(rm)
+                    rp_name, rp_id = _idcore(rk)
+                    for ak in list(adds):
+                        am = cur_map.get(ak) or {}
+                        ap = _provset(am)
+                        ap_name, ap_id = _idcore(ak)
+                        same_title = _titles_match_loose(rm, am)
+                        same_idcore = (
+                            rp_name == ap_name and rp_id and ap_id and rp_id == ap_id
+                        )
+                        if (same_title or same_idcore) and (rp & ap or same_idcore):
+                            rems.remove(rk)
+                            adds.remove(ak)
+                            ev.append(
+                                {
+                                    "ts": now_epoch,
+                                    "action": "update",
+                                    "feature": feat,
+                                    "key": ak,
+                                    "source": am.get("src", ""),
+                                    "title": am.get("title", ""),
+                                    "type": am.get("type", ""),
+                                }
+                            )
+                            break
+
+                for k in adds:
+                    m = cur_map.get(k) or {}
+                    ev.append(
+                        {
+                            "ts": now_epoch,
+                            "action": "add",
+                            "feature": feat,
+                            "key": k,
+                            "source": m.get("src", ""),
+                            "title": m.get("title", ""),
+                            "type": m.get("type", ""),
+                        }
+                    )
+                for k in rems:
+                    m = prev_map.get(k) or {}
+                    ev.append(
+                        {
+                            "ts": now_epoch,
+                            "action": "remove",
+                            "feature": feat,
+                            "key": k,
+                            "source": m.get("src", ""),
+                            "title": m.get("title", ""),
+                            "type": m.get("type", ""),
+                        }
+                    )
                 cur_by[feat] = cur_map
 
             self.data["current_by_feature"] = cur_by

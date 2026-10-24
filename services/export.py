@@ -10,16 +10,18 @@ import time
 from collections.abc import Mapping
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Callable, Iterable, cast
+from typing import Any, Callable, Iterable, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from cw_platform.access_policy import managed_profile_instances, request_user, user_can_access_instance
 from cw_platform.config_base import CONFIG as CONFIG_DIR, load_config
 from cw_platform.history_events import base_key_from_history_event, history_epoch_from_key, is_history_event_key
 from cw_platform.modules_registry import load_sync_ops
 from cw_platform.provider_instances import sanitize_instance_label
+from services import export_trakt
 
 router = APIRouter(prefix="/api", tags=["export"])
 
@@ -64,15 +66,17 @@ def _allowed_provider_map(cfg: Mapping[str, Any], request: Request | None) -> di
     return managed_profile_instances(cfg, user)
 
 
-def _export_instance_for_request(cfg: Mapping[str, Any], request: Request | None, provider: str, provider_instance: str) -> str:
+def _export_instance_for_request(cfg: Mapping[str, Any], request: Request | None, provider: str, provider_instance: str) -> str | tuple[str, ...]:
     inst = str(provider_instance or "all").strip() or "all"
     user = request_user(request)
     if not user or bool(user.get("is_admin")):
         return inst
     allowed = managed_profile_instances(cfg, user).get(str(provider or "").strip().upper()) or []
     if inst.lower() in {"all", "any", "*"}:
-        if allowed:
+        if len(allowed) == 1:
             return allowed[0]
+        if allowed:
+            return tuple(allowed)
         raise HTTPException(403, "profile_scope_denied")
     if not user_can_access_instance(cfg, user, provider, inst):
         raise HTTPException(403, "profile_scope_denied")
@@ -108,6 +112,7 @@ def _configured_instance_label(cfg: dict[str, Any], provider: str, instance_id: 
 
 
 _DEFAULT_INSTANCE = "default"
+_InstanceScope = str | tuple[str, ...] | None
 _MEDIA_TYPES = ("movie", "show", "season", "episode")
 _MEDIA_TYPE_ALIASES = {
     "movies": "movie",
@@ -166,12 +171,15 @@ def _merge_best(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
         out["ids"] = ids
     return out
 
-def _items_bucket(s: dict[str, Any], provider: str, feature: str, instance_id: str | None = None) -> dict[str, Any]:
-    inst = str(instance_id or "").strip()
+def _items_bucket(s: dict[str, Any], provider: str, feature: str, instance_id: _InstanceScope = None) -> dict[str, Any]:
+    scope = {str(value).strip() for value in instance_id} if isinstance(instance_id, tuple) else None
+    inst = "all" if scope is not None else str(instance_id or "").strip()
     inst_lc = inst.lower()
     if not inst or inst_lc in {"all", "any", "*"}:
         merged: dict[str, Any] = {}
-        for _iid, blk in _iter_provider_instance_blocks(s, provider):
+        for iid, blk in _iter_provider_instance_blocks(s, provider):
+            if scope is not None and iid not in scope:
+                continue
             items = _feature_items(blk, feature)
             if not items:
                 continue
@@ -229,7 +237,7 @@ def _collapse_history_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
 def _history_items_bucket(
     s: dict[str, Any],
     provider: str,
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> dict[str, Any]:
@@ -242,13 +250,16 @@ def _history_items_bucket(
 def _combined_items_bucket(
     s: dict[str, Any],
     provider: str,
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> dict[str, Any]:
     history = _history_items_bucket(s, provider, instance_id=instance_id, include_rewatches=include_rewatches)
     ratings = _items_bucket(s, provider, "ratings", instance_id=instance_id)
-    merged: dict[str, dict[str, Any]] = {str(k): dict(v or {}) for k, v in history.items()}
+    merged: dict[str, dict[str, Any]] = {
+        str(k): {**dict(v or {}), "_cw_export_history": True, "_cw_export_watched_at": _actual_watched_at(v or {}) or "unknown"}
+        for k, v in history.items()
+    }
     ratings_by_base = {base_key_from_history_event(str(k)): dict(v or {}) for k, v in ratings.items()}
     if include_rewatches and _provider_rewatch_read_supported(provider):
         for key, history_item in list(merged.items()):
@@ -291,7 +302,7 @@ def _feature_bucket(
     s: dict[str, Any],
     provider: str,
     feature: str,
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> dict[str, Any]:
@@ -305,7 +316,7 @@ def _iter_items(
     s: dict[str, Any],
     provider: str,
     feature: str,
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Iterable[tuple[str, dict[str, Any]]]:
@@ -323,7 +334,7 @@ def _norm_ids(ids: dict[str, Any]) -> dict[str, str]:
         m = re.search(r"(\d+)", str(v))
         if m:
             out["imdb"] = f"tt{m.group(1)}"
-    for ns in ("tmdb", "tvdb", "trakt", "simkl", "mdblist"):
+    for ns in ("tmdb", "tvdb", "trakt", "simkl", "mdblist", "wetrakr"):
         v = ids.get(ns)
         if v is None:
             continue
@@ -405,7 +416,7 @@ def _filter_keys(
     provider: str,
     feature: str,
     q: str,
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> list[str]:
@@ -426,7 +437,7 @@ def _filter_keys_with_media(
     feature: str,
     q: str,
     media_types: tuple[str, ...],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> list[str]:
@@ -607,6 +618,11 @@ def _csv_bytes(header: list[str] | None, rows: Iterable[list[str]]) -> int:
 
 def _target_caps(fmt: str) -> dict[str, Any]:
     caps: dict[str, dict[str, Any]] = {
+        "trakt": {
+            "features": {"watchlist", "history", "ratings", "combined"},
+            "media_types": set(_MEDIA_TYPES),
+            "label": "Trakt CSV",
+        },
         "letterboxd": {
             "features": {"watchlist", "history", "ratings", "combined"},
             "media_types": {"movie"},
@@ -643,6 +659,8 @@ def _validate_items(
     *,
     include_watched_date: bool = True,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[str], dict[str, int]]:
+    if fmt == "trakt":
+        return export_trakt.validate_items(feature, items)
     caps = _target_caps(fmt)
     warnings: list[str] = []
     stats = {
@@ -694,7 +712,7 @@ def _build_letterboxd(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_watched_date: bool = True,
     include_rewatches: bool = True,
@@ -714,7 +732,7 @@ def _build_imdb(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -737,7 +755,7 @@ def _build_justwatch(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -757,7 +775,7 @@ def _build_yamtrack(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -791,8 +809,8 @@ def _build_yamtrack(
         media_type = _yamtrack_media_type(t)
         native_title = _yamtrack_title(it, t) or title
         score = "" if t == "episode" else _rating_1_10(it.get("rating") or it.get("user_rating") or "")
-        season_number = str(it.get("season") or "")
-        episode_number = str(it.get("episode") or "")
+        season_number = "" if it.get("season") is None else str(it.get("season"))
+        episode_number = "" if it.get("episode") is None else str(it.get("episode"))
         end_date = actual_watched if feature in {"history", "combined"} else ""
         progressed_at = actual_watched if feature in {"history", "combined"} else ""
         rows.append(
@@ -821,7 +839,7 @@ def _tmdb_build_imdb_v3(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -932,7 +950,7 @@ def _tmdb_build_trakt_v2(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -1002,7 +1020,7 @@ def _tmdb_build_simkl_v1(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -1052,7 +1070,7 @@ def _build_tmdb(
     feature: str,
     s: dict[str, Any],
     keys: list[str],
-    instance_id: str | None = None,
+    instance_id: _InstanceScope = None,
     *,
     include_rewatches: bool = True,
 ) -> Response:
@@ -1064,7 +1082,23 @@ def _build_tmdb(
     return _tmdb_build_imdb_v3(provider, feature, s, keys, instance_id=instance_id, include_rewatches=include_rewatches)
 
 
+def _build_trakt(
+    provider: str,
+    feature: str,
+    s: dict[str, Any],
+    keys: list[str],
+    instance_id: _InstanceScope = None,
+    *,
+    include_rewatches: bool = True,
+) -> Response:
+    bucket = _feature_bucket(s, provider, feature, instance_id=instance_id, include_rewatches=include_rewatches)
+    items = [(key, bucket[key]) for key in dict.fromkeys(keys) if key in bucket]
+    exportable, _warnings, _stats = export_trakt.validate_items(feature, items)
+    return export_trakt.build_export(provider, feature, exportable)
+
+
 _BUILDERS: dict[str, Callable[..., Response]] = {
+    "trakt": _build_trakt,
     "letterboxd": _build_letterboxd,
     "imdb": _build_imdb,
     "justwatch": _build_justwatch,
@@ -1111,12 +1145,13 @@ def api_export_options(request: Request = cast(Request, None)) -> dict[str, Any]
             counts_instances[p][iid] = {f: len(_feature_bucket(s, p, f, instance_id=iid) or {}) for f in features}
 
     formats = {
-        "watchlist": ["letterboxd", "imdb", "justwatch", "yamtrack", "tmdb"],
-        "history": ["letterboxd", "justwatch", "yamtrack"],
-        "ratings": ["letterboxd", "tmdb"],
-        "combined": ["letterboxd", "yamtrack"],
+        "watchlist": ["letterboxd", "imdb", "justwatch", "yamtrack", "tmdb", "trakt"],
+        "history": ["letterboxd", "justwatch", "yamtrack", "trakt"],
+        "ratings": ["letterboxd", "tmdb", "trakt"],
+        "combined": ["letterboxd", "yamtrack", "trakt"],
     }
     labels = {
+        "trakt": "Trakt CSV",
         "letterboxd": "Letterboxd",
         "imdb": "IMDb (list)",
         "justwatch": "JustWatch",
@@ -1150,17 +1185,19 @@ def api_export_sample(
     provider: str = Query("", description="TRAKT|PLEX|EMBY|JELLYFIN|SIMKL|MDBLIST|CROSSWATCH"),
     provider_instance: str = Query("all", description="default|all|<instance_id>"),
     feature: str = Query("watchlist", pattern="^(watchlist|history|ratings|combined)$"),
-    format: str = Query("letterboxd", pattern="^(letterboxd|imdb|justwatch|yamtrack|tmdb)$"),
+    format: str = Query("letterboxd", pattern="^(letterboxd|imdb|justwatch|yamtrack|tmdb|trakt)$"),
     media_types: str = Query("movie", description="CSV of movie,show,season,episode"),
     include_watched_date: bool = Query(True, description="Letterboxd only: include WatchedDate for history exports"),
     include_rewatches: bool = Query(True, description="Keep separate history events when supported by the source provider"),
     limit: int = Query(25, ge=1, le=250),
     q: str = Query("", description="case-insensitive multi-token contains"),
+    offset: int = Query(0, ge=0),
     request: Request = cast(Request, None),
 ) -> dict[str, Any]:
     feature = feature.lower().strip()
     q = q if isinstance(q, str) else ""
-    limit = limit if isinstance(limit, int) else 25
+    limit = max(1, min(limit, 250)) if isinstance(limit, int) else 25
+    offset = max(0, offset) if isinstance(offset, int) else 0
     s = _load_state(_state_features_for_export(feature))
     provider = (provider or "").upper().strip()
     cfg = _load_config_safe()
@@ -1198,8 +1235,10 @@ def api_export_sample(
         }
 
     items: list[dict[str, Any]] = []
-    for i, (k, it) in enumerate(exportable):
+    for k, it in exportable[offset : offset + limit]:
         t, title, year, watched, ids = _row_base(it)
+        if fmt == "trakt":
+            watched = it["_cw_trakt_row"]["watched_at"]
         items.append(
             {
                 "key": k,
@@ -1211,13 +1250,13 @@ def api_export_sample(
                 "rating": it.get("rating") or it.get("user_rating"),
             }
         )
-        if i + 1 >= limit:
-            break
     return {
         "items": items,
         "total": len(exportable),
+        "offset": offset,
+        "limit": limit,
         "matched_total": validation["matched_total"],
-        "dropped_total": validation["unsupported_media_total"] + validation["missing_identity_total"],
+        "dropped_total": validation["unsupported_media_total"] + validation["missing_identity_total"] + validation.get("invalid_data_total", 0),
         "warnings": warnings,
         "validation": validation,
         "media_types": list(media),
@@ -1231,7 +1270,7 @@ def api_export_file(
     provider: str = Query("", description="TRAKT|PLEX|EMBY|JELLYFIN|SIMKL|MDBLIST|CROSSWATCH"),
     provider_instance: str = Query("all", description="default|all|<instance_id>"),
     feature: str = Query("watchlist", pattern="^(watchlist|history|ratings|combined)$"),
-    format: str = Query("letterboxd", pattern="^(letterboxd|imdb|justwatch|yamtrack|tmdb)$"),
+    format: str = Query("letterboxd", pattern="^(letterboxd|imdb|justwatch|yamtrack|tmdb|trakt)$"),
     media_types: str = Query("movie", description="CSV of movie,show,season,episode"),
     include_watched_date: bool = Query(True, description="Letterboxd only: include WatchedDate for history exports"),
     include_rewatches: bool = Query(True, description="Keep separate history events when supported by the source provider"),
@@ -1239,6 +1278,14 @@ def api_export_file(
     ids: str = Query("", description="optional CSV of keys to include (overrides q)"),
     request: Request = cast(Request, None),
 ) -> Response:
+    return _export_file(provider, provider_instance, feature, format, media_types,
+                        include_watched_date, include_rewatches, q, ids, request)
+
+
+def _export_file(provider: str, provider_instance: str, feature: str, format: str,
+                 media_types: str, include_watched_date: bool, include_rewatches: bool,
+                 q: str, ids: str, request: Request, *,
+                 selected: list[str] | None = None, excluded: set[str] | None = None) -> Response:
     provider_in = (provider or "").upper().strip()
     provider_eff = provider_in or "TRAKT"
     feature = feature.lower().strip()
@@ -1257,8 +1304,9 @@ def api_export_file(
     if feature not in _target_caps(fmt)["features"]:
         raise HTTPException(400, f"{_target_caps(fmt)['label']} does not support {feature} exports")
 
-    if ids.strip():
-        requested_keys = [k.strip() for k in ids.split(",") if k.strip()]
+    ids = ids if isinstance(ids, str) else ""
+    if selected is not None or ids.strip():
+        requested_keys = selected if selected is not None else [k.strip() for k in ids.split(",") if k.strip()]
         bucket = _feature_bucket(s, provider_eff, feature, instance_id=inst, include_rewatches=rewatch_mode)
         items = [
             (k, bucket.get(k, {}))
@@ -1282,6 +1330,9 @@ def api_export_file(
         bucket = _feature_bucket(s, provider_eff, feature, instance_id=inst, include_rewatches=rewatch_mode)
         items = [(k, bucket.get(k, {})) for k in requested_keys]
 
+    if excluded:
+        items = [(key, item) for key, item in items if key not in excluded]
+
     exportable, _warnings, _validation = _validate_items(
         fmt,
         feature,
@@ -1300,3 +1351,30 @@ def api_export_file(
             include_rewatches=rewatch_mode,
         )
     return _BUILDERS[fmt](provider_eff, feature, s, keys, inst, include_rewatches=rewatch_mode)
+
+
+class ExportFileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    provider_instance: str = "all"
+    feature: Literal["watchlist", "history", "ratings", "combined"] = "watchlist"
+    format: Literal["letterboxd", "imdb", "justwatch", "yamtrack", "tmdb", "trakt"] = "letterboxd"
+    media_types: str = "movie"
+    include_watched_date: bool = True
+    include_rewatches: bool = True
+    q: str = Field(default="", max_length=1000)
+    mode: Literal["all", "selected"] = "all"
+    row_ids: list[str] = Field(default_factory=list)
+    excluded_row_ids: list[str] = Field(default_factory=list)
+
+
+@router.post("/export/file")
+def api_export_file_selected(payload: ExportFileRequest, request: Request = cast(Request, None)) -> Response:
+    return _export_file(
+        payload.provider, payload.provider_instance, payload.feature, payload.format,
+        payload.media_types, payload.include_watched_date, payload.include_rewatches,
+        payload.q, "", request,
+        selected=payload.row_ids if payload.mode == "selected" else None,
+        excluded=set(payload.excluded_row_ids),
+    )

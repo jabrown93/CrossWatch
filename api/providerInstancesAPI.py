@@ -3,10 +3,11 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from typing import Any, cast
 import copy
 import re
+from collections.abc import Mapping
 from functools import lru_cache
+from typing import Any, cast
 
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
@@ -50,7 +51,22 @@ _CFG_KEY_ALIAS = {
     "cw": "crosswatch",
     "crosswatch": "crosswatch",
 }
-_MAX_GENERATED_PROFILES = 9
+_DEFAULT_MAX_PROFILES = 10
+
+
+def _max_profiles_per_provider(cfg: Mapping[str, Any] | None = None) -> int:
+    try:
+        src = cfg if isinstance(cfg, Mapping) else (load_config() or {})
+        rt = src.get("runtime")
+        raw = rt.get("max_profiles_per_provider") if isinstance(rt, Mapping) else None
+        total = _DEFAULT_MAX_PROFILES if raw is None else int(raw)
+    except Exception:
+        total = _DEFAULT_MAX_PROFILES
+    return max(1, min(100, total))
+
+
+def _max_generated_profiles(cfg: Mapping[str, Any] | None = None) -> int:
+    return _max_profiles_per_provider(cfg) - 1
 
 
 def _cfg_key(provider: str) -> str:
@@ -87,7 +103,7 @@ def _prov_prefix(provider: str) -> str:
     return str(provider or "").strip().upper()
 
 
-def _canonical_profile_id(provider: str, instance_id: Any) -> str | None:
+def _canonical_profile_id(provider: str, instance_id: Any, cfg: Mapping[str, Any] | None = None) -> str | None:
     inst = normalize_instance_id(instance_id)
     if inst == "default":
         return None
@@ -99,15 +115,15 @@ def _canonical_profile_id(provider: str, instance_id: Any) -> str | None:
         num = int(m.group(1))
     except Exception:
         return ""
-    if num < 1 or num > _MAX_GENERATED_PROFILES:
+    if num < 1 or num > _max_generated_profiles(cfg):
         return ""
     return f"{prov}-P{num:02d}"
 
 
-def _next_profile_id(provider: str, insts: dict[str, Any]) -> str:
+def _next_profile_id(provider: str, insts: dict[str, Any], cfg: Mapping[str, Any] | None = None) -> str:
     prov = _prov_prefix(provider)
     existing = {str(k).strip().upper() for k in (insts or {}).keys()}
-    for n in range(1, _MAX_GENERATED_PROFILES + 1):
+    for n in range(1, _max_generated_profiles(cfg) + 1):
         cand = f"{prov}-P{n:02d}"
         if cand not in existing:
             return cand
@@ -218,16 +234,38 @@ def _profile_scope_provider_key(provider: Any) -> str:
     return "TMDB" if key == "tmdb" else key.upper()
 
 
-def _managed_user_instance_scope(cfg: dict[str, Any], request: Request | None) -> dict[str, set[str]] | None:
+def _authenticated_request_user(cfg: dict[str, Any], request: Request | None) -> Mapping[str, Any] | None:
     if request is None:
         return None
+    try:
+        state = getattr(request, "state", None)
+        user = getattr(state, "cw_user", None) or getattr(state, "user", None)
+        if isinstance(user, Mapping):
+            return user
+    except Exception:
+        pass
+    try:
+        from api.apiTokensAPI import extract_api_token, resolve_api_token
+
+        user = resolve_api_token(cfg, extract_api_token(request))
+        if isinstance(user, Mapping):
+            return user
+    except Exception:
+        pass
     try:
         from api.appAuthAPI import COOKIE_NAME, current_user
 
         user = current_user(cfg, request.cookies.get(COOKIE_NAME))
+        if isinstance(user, Mapping):
+            return user
     except Exception:
-        return None
-    if not isinstance(user, dict) or user.get("is_admin"):
+        pass
+    return None
+
+
+def _managed_user_instance_scope(cfg: dict[str, Any], request: Request | None) -> dict[str, set[str]] | None:
+    user = _authenticated_request_user(cfg, request)
+    if not isinstance(user, Mapping) or user.get("is_admin"):
         return None
     pid = normalize_user_profile_id(user.get("profile_id"))
     if not pid:
@@ -275,7 +313,19 @@ def _admin_required_response(request: Request | None, cfg: dict[str, Any]) -> JS
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
     if request is None:
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
+    if _admin_api_token_request(request, cfg):
+        return None
     return _admin_required(request, cfg)
+
+
+def _admin_api_token_request(request: Request, cfg: dict[str, Any]) -> bool:
+    try:
+        from api.apiTokensAPI import extract_api_token, resolve_api_token
+
+        user = resolve_api_token(cfg, extract_api_token(request))
+    except Exception:
+        return False
+    return isinstance(user, Mapping) and bool(user.get("is_admin"))
 
 
 def _profile_value_error(exc: ValueError) -> str:
@@ -333,9 +383,9 @@ def api_provider_instances_create_next(provider: str, payload: dict[str, Any] = 
         insts = {}
         blk["instances"] = insts
 
-    inst = _next_profile_id(provider, insts)
+    inst = _next_profile_id(provider, insts, cfg)
     if not inst:
-        return {"ok": False, "error": "profile_limit_reached"}
+        return {"ok": False, "error": "profile_limit_reached", "limit": _max_profiles_per_provider(cfg)}
 
     if inst in insts and isinstance(insts.get(inst), dict):
         uid = provider_instance_uid_for(cfg, provider, inst, create=True)
@@ -350,14 +400,14 @@ def api_provider_instances_create_next(provider: str, payload: dict[str, Any] = 
 
 @router.post("/provider-instances/{provider}/{instance_id}")
 def api_provider_instances_create(provider: str, instance_id: str, payload: dict[str, Any] = Body(default_factory=dict), request: Request = cast(Request, None)) -> Any:
-    canon = _canonical_profile_id(provider, instance_id)
+    cfg = dict(load_config() or {})
+    canon = _canonical_profile_id(provider, instance_id, cfg)
     if canon is None:
         return {"ok": False, "error": "reserved_instance_id"}
     if not canon:
         return {"ok": False, "error": "invalid_instance_id"}
     inst = canon
 
-    cfg = dict(load_config() or {})
     blocked = _admin_required_response(request, cfg)
     if blocked is not None:
         return blocked
@@ -437,6 +487,12 @@ def api_provider_instances_delete(provider: str, instance_id: str, request: Requ
         if cleanup.get("ok") is False:
             return cleanup
 
+    if _cfg_key(provider) == "stremio":
+        from providers.scrobble.stremio import addon as stremio_addon
+
+        stremio_addon.set_instance_enabled(cfg, inst, False)
+        stremio_addon.forget_instance(inst)
+
     insts.pop(inst, None)
     remove_instance_from_user_profiles(cfg, provider, inst)
     remove_provider_instance_uid(cfg, provider, inst)
@@ -450,17 +506,11 @@ def api_user_profiles_all(request: Request = cast(Request, None)) -> JSONRespons
     cfg = dict(load_config() or {})
     rows = list_user_profiles(cfg)
     include_resources = True
-    try:
-        from api.appAuthAPI import COOKIE_NAME, current_user
-
-        token = request.cookies.get(COOKIE_NAME) if request is not None else None
-        user = current_user(cfg, token)
-        if user and not user.get("is_admin"):
-            pid = normalize_user_profile_id(user.get("profile_id"))
-            rows = [row for row in rows if row.get("id") == pid]
-            include_resources = False
-    except Exception:
-        pass
+    user = _authenticated_request_user(cfg, request)
+    if user and not user.get("is_admin"):
+        pid = normalize_user_profile_id(user.get("profile_id"))
+        rows = [row for row in rows if row.get("id") == pid]
+        include_resources = False
     payload: dict[str, Any] = {"ok": True, "items": _decorate_user_profile_rows(cfg, rows)}
     if include_resources:
         payload["resources"] = profile_resource_summary(cfg)
@@ -471,22 +521,27 @@ def api_user_profiles_all(request: Request = cast(Request, None)) -> JSONRespons
 def api_user_profiles_get(profile_id: str, request: Request = cast(Request, None)) -> JSONResponse:
     cfg = dict(load_config() or {})
     pid = normalize_user_profile_id(profile_id)
+    include_resources = True
     try:
-        from api.appAuthAPI import COOKIE_NAME, auth_required, current_user
+        from api.appAuthAPI import auth_required
 
         if request is not None and auth_required(cfg):
-            token = request.cookies.get(COOKIE_NAME)
-            user = current_user(cfg, token)
+            user = _authenticated_request_user(cfg, request)
             if user is None:
                 return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
-            if not user.get("is_admin") and normalize_user_profile_id(user.get("profile_id")) != pid:
-                return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+            if not user.get("is_admin"):
+                if normalize_user_profile_id(user.get("profile_id")) != pid:
+                    return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+                include_resources = False
     except Exception:
         if request is not None:
             return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     for row in list_user_profiles(cfg):
         if row.get("id") == pid:
-            return JSONResponse({"ok": True, "profile": _decorate_user_profile_rows(cfg, [row])[0], "resources": profile_resource_summary(cfg)})
+            payload: dict[str, Any] = {"ok": True, "profile": _decorate_user_profile_rows(cfg, [row])[0]}
+            if include_resources:
+                payload["resources"] = profile_resource_summary(cfg)
+            return JSONResponse(payload)
     return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
 
 

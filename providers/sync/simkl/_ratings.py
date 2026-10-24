@@ -7,10 +7,10 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, cast
 
-from cw_platform.id_map import minimal as id_minimal
+from cw_platform.id_map import migrate_media_key, minimal as id_minimal
+from providers.sync._mod_common import observation_time
 
 from .._log import log as cw_log
-from .._mod_common import _chunk_items
 from ._common import (
     SIMKLFetchError,
     adapter_headers,
@@ -164,6 +164,11 @@ def _rshadow_load() -> dict[str, Any]:
     store = sh.get("items")
     if not isinstance(store, dict):
         store = {}
+    store = {
+        migrate_media_key(str(k), rec["item"]) if isinstance(rec, Mapping) and isinstance(rec.get("item"), Mapping) else k: rec
+        for k, rec in store.items()
+    }
+    sh["items"] = store
     cleaned = False
     for k in list(store.keys()):
         if _is_unknown_key(k):
@@ -232,9 +237,12 @@ def _rshadow_put_all(items: Iterable[Mapping[str, Any]]) -> None:
     _rshadow_save(sh)
 
 
-def _rshadow_replace_all(items: Iterable[Mapping[str, Any]]) -> None:
+def _rshadow_replace_all(
+    items: Iterable[Mapping[str, Any]], *, activities: Mapping[str, Any] | None = None,
+) -> None:
     sh = _rshadow_load()
     sh["items"] = _rshadow_items_from(items)
+    sh["activities"] = dict(activities) if activities is not None else None
     _rshadow_save(sh)
 
 
@@ -551,9 +559,13 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
 
     out: dict[str, dict[str, Any]] = {}
     thaw: set[str] = set()
-    shadow_has_data = bool((_rshadow_load().get("items") or {}))
+    shadow = _rshadow_load()
+    shadow_items = shadow.get("items") or {}
+    shadow_has_data = bool(shadow_items)
+    observed_at = observation_time(adapter)
 
     act_latest: str | None = None
+    activity_stamps: dict[str, Any] | None = None
 
     acts, _rate = fetch_activities(sess, _headers(adapter, force_refresh=True), timeout=tmo)
     if isinstance(acts, Mapping):
@@ -561,10 +573,14 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
         lm = extract_latest_ts(acts, (("movies", "rated_at"),))
         ls = extract_latest_ts(acts, (("tv_shows", "rated_at"), ("shows", "rated_at")))
         la = extract_latest_ts(acts, (("anime", "rated_at"),))
+        buckets = (acts.get("movies"), acts.get("tv_shows", acts.get("shows")), acts.get("anime"))
+        if all(isinstance(bucket, Mapping) and "rated_at" in bucket for bucket in buckets):
+            activity_stamps = {"movies": lm, "shows": ls, "anime": la}
         candidates = [x for x in (lm, ls, la) if x]
         act_latest = max(candidates) if candidates else None
         unchanged = bool(wm) and (lm is None or lm <= wm) and (ls is None or ls <= wm) and (la is None or la <= wm)
-        if unchanged and shadow_has_data:
+        snapshot_unchanged = activity_stamps is not None and shadow.get("activities") == activity_stamps
+        if (unchanged and shadow_has_data) or snapshot_unchanged:
             _dbg("index_cache_hit", source="shadow", reason="activities_unchanged", movies=lm or "", shows=ls or "", anime=la or "")
             _rshadow_merge_into(out, thaw)
             _dedupe_prefer_plex_id(out)
@@ -703,10 +719,15 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
                         pass
                 continue
 
+            ts = _as_epoch(m.get("rated_at"))
+            if observed_at and not m.get("rated_at"):
+                previous_raw = shadow_items.get(k)
+                previous = previous_raw if isinstance(previous_raw, Mapping) else {}
+                previous_date = previous.get("rated_at") if _norm_rating(previous.get("rating")) == rt else None
+                m["rated_at"] = previous_date or observed_at
             out[k] = m
             thaw.add(k)
 
-            ts = _as_epoch(m.get("rated_at"))
             if ts is not None:
                 latest = max(latest or 0, ts)
 
@@ -747,7 +768,7 @@ def build_index(adapter: Any, *, since_iso: str | None = None) -> dict[str, dict
         update_watermark_if_new("ratings", _as_iso(latest_any))
 
     try:
-        _rshadow_replace_all(out.values())
+        _rshadow_replace_all(out.values(), activities=activity_stamps if since_iso is None else None)
     except Exception as exc:
         _warn("cache_save_failed", cache="shadow", op="index", source="live", error=str(exc))
 
@@ -802,6 +823,11 @@ def _write_group(item: Mapping[str, Any]) -> str:
     typ = str(item.get("type") or "").strip().lower()
     return "movies" if typ == "movie" else "shows"
 
+
+def _chunk_items(seq: list[Mapping[str, Any]], n: int) -> Iterable[list[Mapping[str, Any]]]:
+    size = max(1, int(n or 1))
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
 
 def _id_tokens(value: Any) -> set[str]:

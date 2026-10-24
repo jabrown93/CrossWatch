@@ -2,14 +2,42 @@
 # Pairs blocklist handling for the orchestrator.
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 from ..history_events import history_sync_key
-from ..id_map import canonical_key, ID_KEYS
-from ._tombstones import keys_for_feature, filter_with
+from ..id_map import canonical_key, ID_KEYS, _norm_type
+from ._tombstones import keys_for_feature, filter_with, media_tombstone_tokens
 
-from ._unresolved import load_unresolved_keys  # type: ignore
-from ._blackbox import load_blackbox_keys  # type: ignore
+try:
+    from ._unresolved import load_unresolved_keys  # type: ignore
+except Exception:  # pragma: no cover
+    def load_unresolved_keys(
+        dst: str,
+        feature: str | None = None,
+        *,
+        cross_features: bool = True,
+        instance: str | None = None,
+    ) -> set[str]:
+        return set()
+
+try:
+    from ._blackbox import load_blackbox_keys  # type: ignore
+except Exception:  # pragma: no cover
+    def load_blackbox_keys(
+        dst: str,
+        feature: str,
+        pair: str | None = None,
+        instance: str | None = None,
+    ) -> set[str]:
+        return set()
+
+_BARE_TMDB_KEY = re.compile(r"tmdb:\d+", re.IGNORECASE)
+
+
+def _typed_item_keys(keys: Iterable[str]) -> set[str]:
+    return {f"{key}#movie" if _BARE_TMDB_KEY.fullmatch(str(key)) else str(key) for key in keys or []}
+
 
 def _breakdown(
     state_store,
@@ -18,6 +46,7 @@ def _breakdown(
     *,
     pair_key: str | None,
     cross_feature_unresolved: bool,
+    instance: str | None = None,
 ) -> tuple[set[str], set[str], set[str], set[str]]:
     global_tomb: set[str] = set()
 
@@ -28,12 +57,12 @@ def _breakdown(
         pair_tomb = set()
 
     try:
-        unresolved = set(load_unresolved_keys(dst, feature, cross_features=cross_feature_unresolved) or [])
+        unresolved = set(load_unresolved_keys(dst, feature, cross_features=cross_feature_unresolved, instance=instance) or [])
     except Exception:
         unresolved = set()
 
     try:
-        blackbox = set(load_blackbox_keys(dst, feature, pair=pair_key) or [])
+        blackbox = _typed_item_keys(load_blackbox_keys(dst, feature, pair=pair_key, instance=instance) or [])
     except Exception:
         blackbox = set()
 
@@ -46,11 +75,12 @@ def blocked_keys_for_destination(
     *,
     pair_key: str | None = None,
     cross_feature_unresolved: bool = True,
+    instance: str | None = None,
 ) -> set[str]:
     g_tomb, p_tomb, _unr, bb = _breakdown(
         state_store, dst, feature,
         pair_key=pair_key,
-        cross_feature_unresolved=cross_feature_unresolved,
+        cross_feature_unresolved=cross_feature_unresolved, instance=instance,
     )
     return g_tomb | p_tomb | bb
 
@@ -79,7 +109,7 @@ def _ts_epoch(v: Any) -> int | None:
 def _history_is_blocked_by_tomb(item: dict[str, Any], tomb_ts: Mapping[str, int]) -> bool:
     # Allow re-add if the item has a newer watched_at than the tombstone timestamp.
     watched_ts = _ts_epoch(item.get("watched_at"))
-    tokens: list[str] = []
+    tokens: list[str] = list(media_tombstone_tokens(item))
     try:
         ck = canonical_key(item)
         if ck:
@@ -88,7 +118,7 @@ def _history_is_blocked_by_tomb(item: dict[str, Any], tomb_ts: Mapping[str, int]
         pass
 
     ids = item.get("ids") or {}
-    if isinstance(ids, Mapping):
+    if isinstance(ids, Mapping) and _norm_type(item.get("type")) != "episode":
         for k in ID_KEYS:
             v = ids.get(k)
             if v is None or str(v).strip() == "":
@@ -120,7 +150,7 @@ def _history_is_blocked_by_tomb(item: dict[str, Any], tomb_ts: Mapping[str, int]
 def _ratings_is_blocked_by_tomb(item: dict[str, Any], tomb_ts: Mapping[str, int]) -> bool:
     # Allow re-add if the item has a newer rated_at than the tombstone timestamp.
     rated_ts = _ts_epoch(item.get("rated_at"))
-    tokens: list[str] = []
+    tokens: list[str] = list(media_tombstone_tokens(item))
     try:
         ck = canonical_key(item)
         if ck:
@@ -129,7 +159,7 @@ def _ratings_is_blocked_by_tomb(item: dict[str, Any], tomb_ts: Mapping[str, int]
         pass
 
     ids = item.get("ids") or {}
-    if isinstance(ids, Mapping):
+    if isinstance(ids, Mapping) and _norm_type(item.get("type")) != "episode":
         for k in ID_KEYS:
             v = ids.get(k)
             if v is None or str(v).strip() == "":
@@ -166,25 +196,31 @@ def apply_blocklist(
     pair_key: str | None = None,
     cross_feature_unresolved: bool = True,
     ignore_pair_tomb: bool = False,
+    tomb_ttl_seconds: int | None = None,
+    now: int | None = None,
+    observed_tombstones: Mapping[str, int] | None = None,
     emit=None,
+    instance: str | None = None,
 ) -> list[dict[str, Any]]:
     global_tomb: set[str] = set()
 
     try:
-        pmap_raw = keys_for_feature(state_store, feature, pair=pair_key) or {}
+        pmap_raw = keys_for_feature(state_store, feature, pair=pair_key, ttl_seconds=tomb_ttl_seconds, now=now) or {}
         pmap: dict[str, int] = {str(k): int(v) for k, v in (pmap_raw or {}).items()} if isinstance(pmap_raw, Mapping) else {}
+        for key, timestamp in (observed_tombstones or {}).items():
+            pmap.setdefault(key, timestamp)
         pair_tomb: set[str] = set(pmap.keys())
     except Exception:
         pmap = {}
         pair_tomb = set()
 
     try:
-        unresolved = set(load_unresolved_keys(dst, feature, cross_features=cross_feature_unresolved) or [])
+        unresolved = set(load_unresolved_keys(dst, feature, cross_features=cross_feature_unresolved, instance=instance) or [])
     except Exception:
         unresolved = set()
 
     try:
-        blackbox = set(load_blackbox_keys(dst, feature, pair=pair_key) or [])
+        blackbox = _typed_item_keys(load_blackbox_keys(dst, feature, pair=pair_key, instance=instance) or [])
     except Exception:
         blackbox = set()
 
@@ -229,6 +265,7 @@ def apply_blocklist(
             emit(
                 "debug",
                 msg="blocked.counts",
+                destination_instance=instance,
                 feature=feature,
                 dst=dst,
                 pair=pair_key,

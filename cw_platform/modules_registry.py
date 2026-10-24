@@ -20,12 +20,18 @@ MODULES: dict[str, dict[str, str]] = {
         "_auth_MDBLIST":  "providers.auth._auth_MDBLIST",
         "_auth_PUBLICMETADB": "providers.auth._auth_PUBLICMETADB",
         "_auth_TAUTULLI": "providers.auth._auth_TAUTULLI",
+        "_auth_TRACEARR": "providers.auth._auth_TRACEARR",
         "_auth_NUVIO":    "providers.auth._auth_NUVIO",
         "_auth_STREMIO":  "providers.auth._auth_STREMIO",
         "_auth_FLOPPY":   "providers.auth._auth_FLOPPY",
+        "_auth_KITSU":    "providers.auth._auth_KITSU",
+        "_auth_MYANIMELIST": "providers.auth._auth_MYANIMELIST",
         "_auth_ANILIST":  "providers.auth._auth_ANILIST",
         "_auth_TMDB":     "providers.auth._auth_TMDB",
+        "_auth_WETRAKR": "providers.auth._auth_WETRAKR",
         "_auth_PUNCHPLAY": "providers.auth._auth_PUNCHPLAY",
+        "_auth_BINGEBASE": "providers.auth._auth_BINGEBASE",
+        "_auth_FLICKLIST": "providers.auth._auth_FLICKLIST",
         "_auth_SCROB":    "providers.auth._auth_SCROB",
     },
     "SYNC": {
@@ -42,17 +48,61 @@ MODULES: dict[str, dict[str, str]] = {
         "_mod_FLOPPY":     "providers.sync._mod_FLOPPY",
         "_mod_CROSSWATCH": "providers.sync._mod_CROSSWATCH",
         "_mod_TAUTULLI":   "providers.sync._mod_TAUTULLI",
+        "_mod_TRACEARR":   "providers.sync._mod_TRACEARR",
+        "_mod_MYANIMELIST": "providers.sync._mod_MYANIMELIST",
+        "_mod_KITSU":      "providers.sync._mod_KITSU",
         "_mod_ANILIST":    "providers.sync._mod_ANILIST",
         "_mod_TMDB":       "providers.sync._mod_TMDB",
         "_mod_PUNCHPLAY":  "providers.sync._mod_PUNCHPLAY",
+        "_mod_FLICKLIST":  "providers.sync._mod_FLICKLIST",
         "_mod_SCROB":      "providers.sync._mod_SCROB",
+        "_mod_WETRAKR":    "providers.sync._mod_WETRAKR",
     },
+}
+
+
+PROVIDER_CONNECTION_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "myanimelist": (("access_token",),),
+    "anilist": (("access_token", "token"),),
+    "kitsu": (("access_token",),),
+    "bingebase": (("access_token",), ("webhook_url",), ("api_key",)),
+    "crosswatch": (("root_dir",), ("profile_id",), ("enabled",), ("connected",)),
+    "emby": (("server",), ("access_token", "token", "api_key"), ("user_id",), ("verify_ssl",)),
+    "flicklist": (("api_key",), ("access_token", "token"), ("auth_method",)),
+    "floppy": (("server_url", "server"), ("api_token", "token"), ("verify_ssl",)),
+    "jellyfin": (("server",), ("access_token", "token"), ("user_id",), ("verify_ssl",)),
+    "kodi": (("server",), ("username",), ("password",), ("verify_ssl",), ("connection_verified",)),
+    "mdblist": (("api_key", "key"), ("access_token",), ("auth_method",)),
+    "nuvio": (("base_url",), ("server_mode",), ("publishable_key",), ("access_token",), ("profile_id",), ("auth_method",)),
+    "plex": (("account_token",), ("pms_token",), ("server_url", "server"), ("user_id",), ("verify_ssl",)),
+    "publicmetadb": (("base_url",), ("api_key",)),
+    "wetrakr": (("access_token",),),
+    "punchplay": (("access_token",),),
+    "scrob": (("server_url",), ("api_prefix",), ("api_key",), ("access_token",), ("username",), ("password",), ("verify_ssl",)),
+    "simkl": (("client_id", "api_key"), ("access_token", "token")),
+    "stremio": (("auth_key", "authKey"), ("stremio_profile_id",)),
+    "tautulli": (("server_url",), ("api_key",), ("verify_ssl",)),
+    "tmdb": (("api_key",), ("session_id",)),
+    "tracearr": (("server_url",), ("api_key",), ("verify_ssl",)),
+    "trakt": (("client_id",), ("access_token", "token")),
 }
 
 
 def get_sync_module_path_by_name(name: str) -> str | None:
     key = f"_mod_{(name or '').strip().upper()}"
     return MODULES["SYNC"].get(key)
+
+
+def provider_names(*, upper: bool = True) -> list[str]:
+    names: set[str] = set()
+    for group, prefix in (("AUTH", "_auth_"), ("SYNC", "_mod_")):
+        for key in (MODULES.get(group) or {}):
+            if not key.startswith(prefix):
+                continue
+            name = key[len(prefix):]
+            if name and name.lower() != "base":
+                names.add(name.upper() if upper else name.lower())
+    return sorted(names)
 
 
 def sync_provider_names(*, upper: bool = True) -> list[str]:
@@ -78,6 +128,26 @@ def load_sync_ops(name: str) -> Any | None:
         return None
     mod = import_module(path)
     return getattr(mod, "OPS", None)
+
+
+def provider_display_label(name: str) -> str:
+    key = str(name or "").strip().upper()
+    try:
+        ops = load_sync_ops(key)
+        label = str(ops.label() or "").strip() if ops is not None else ""
+        if label:
+            return label
+    except Exception:
+        pass
+    try:
+        from providers.auth.registry import auth_provider_manifest
+
+        label = str(auth_provider_manifest(key).get("label") or "").strip()
+        if label:
+            return label
+    except Exception:
+        pass
+    return key or "provider"
 
 
 def sync_provider_supports_feature(name: str, feature: str) -> bool:

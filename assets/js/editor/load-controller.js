@@ -5,6 +5,46 @@
   const Editor = (NS.Editor ||= {});
   let deferredRefreshTimer = null;
 
+  function renderMappingScope(ctx, data) {
+    const parent = ctx.instanceSel?.parentElement;
+    if (!parent) return;
+    let label = document.getElementById("cw-mapping-scope-label");
+    if (!label) {
+      label = document.createElement("label");
+      label.id = "cw-mapping-scope-label";
+      label.className = "cw-advanced-only";
+      label.htmlFor = "cw-mapping-scope";
+      label.textContent = "Fixes for";
+      label.title = "Which syncs use the fixes you make here";
+      const created = document.createElement("select");
+      created.id = "cw-mapping-scope";
+      created.name = "cw-mapping-scope";
+      created.className = "cw-select cw-advanced-only";
+      parent.append(label, created);
+    }
+    const select = document.getElementById("cw-mapping-scope");
+    const pairs = data.mapping_scopes || [];
+    const hide = !ctx.isPolicySource() || !!ctx.isMergedView?.() || !pairs.length;
+    label.hidden = select.hidden = hide;
+    select.replaceChildren(new Option("Every sync with this account", ""),
+      ...pairs.map(pair => new Option(`Only ${pair.label}`, pair.id)));
+    select.value = ctx.state.mappingPair || "";
+    window.CW?.IconSelect?.enhance(select, {className:"cw-plain-select",sortAlphabetically:true});
+    const wrap = select.nextElementSibling?.classList?.contains("cw-icon-select") ? select.nextElementSibling : null;
+    if (wrap) {
+      wrap.classList.add("cw-advanced-only");
+      wrap.style.display = hide ? "none" : "";
+    }
+    select.onchange = async () => {
+      if (ctx.state.loading || ctx.state.saving || (ctx.state.hasChanges && !window.confirm("Discard unsaved Editor changes and switch mapping scope?"))) {
+        select.value = ctx.state.mappingPair || "";
+        return;
+      }
+      ctx.state.mappingPair = select.value;
+      await loadState(ctx);
+    };
+  }
+
   function renderInstanceSharingNote(sharing) {
     const el = document.getElementById("cw-instance-shared");
     if (!el) return;
@@ -40,20 +80,6 @@
     }
   }
 
-  async function settleStateView(ctx = {}, maxAttempts = 3, delayMs = 300) {
-    const state = ctx.state;
-    if (state.source !== "state") return;
-    for (let i = 0; i < maxAttempts; i += 1) {
-      const missingProvider = !String(state.snapshot || "").trim();
-      const hasRows = Array.isArray(state.rows) && state.rows.length > 0;
-      const hasSnapshots = Array.isArray(state.snapshots) && state.snapshots.length > 0;
-      if (!missingProvider && (hasRows || !hasSnapshots)) return;
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-      await ctx.loadSnapshots();
-      await loadState(ctx);
-    }
-  }
-
   async function loadState(ctx = {}) {
     const state = ctx.state;
     if (state.source === "playlist") {
@@ -79,17 +105,29 @@
     }
     state.source = ctx.normalizeSource(state.source);
     state.loading = true;
+    state.loadError = null;
+    ctx.host?.setAttribute("aria-busy", "true");
+    ctx.syncActionButtons();
+    if (!(state.rows || []).length) ctx.renderRows();
     ctx.setTag("warn", "Loading");
     try {
       const params = new URLSearchParams({ kind: state.kind, source: state.source });
       if (ctx.isProviderPickerSource() && state.snapshot) {
         params.set("provider", state.snapshot);
         params.set("provider_instance", state.instance || "default");
+        if (state.mappingPair) params.set("pair_id", state.mappingPair);
       }
       if (state.source === "playlist" && state.snapshot) params.set("endpoint", state.snapshot);
 
-      const data = await ctx.fetchJSON(`/api/editor?${params.toString()}`);
+      const merged = !!ctx.isMergedView?.();
+      if (merged) {
+        ["source", "provider", "provider_instance", "pair_id"].forEach(name => params.delete(name));
+        const profile = ctx.mergedProfile();
+        if (profile) params.set("user_profile", profile);
+      }
+      const data = await ctx.fetchJSON(`/api/editor${merged ? "/merged" : ""}?${params.toString()}`);
       if (data && data.ok === false) throw new Error(data.error || data.detail || "Load failed");
+      renderMappingScope(ctx, data);
 
       if (state.source === "playlist") {
         state.playlistResource = data.resource || null;
@@ -100,6 +138,22 @@
         state.pageRids = [];
         state.ridSeq = 1;
         state.rows = ctx.buildRows(state.items);
+      } else if (merged) {
+        ctx.syncMergedScope(data);
+        renderInstanceSharingNote(null);
+        state.baselineItems = data.items || {};
+        state.manualAdds = {};
+        state.manualBlocks = [];
+        state.preservedBlocks = [];
+        state.selected = new Set();
+        state.pageRids = [];
+        state.ridSeq = 1;
+        state.items = state.baselineItems;
+        state.rows = ctx.buildRows(state.items);
+        for (const row of state.rows) {
+          row._origin = "baseline";
+          row.presence = (data.presence && data.presence[row.key]) || [];
+        }
       } else if (ctx.isPolicySource()) {
         if (ctx.isProviderPickerSource() && data && typeof data.provider === "string" && data.provider.trim()) {
           state.snapshot = data.provider.trim();
@@ -111,6 +165,7 @@
         state.baselineItems = data.items || {};
         state.manualAdds = data.manual_adds || {};
         state.manualBlocks = Array.isArray(data.manual_blocks) ? data.manual_blocks : [];
+        state.preservedBlocks = Array.isArray(data.preserved_blocks) ? data.preserved_blocks : [];
 
         if (ctx.isPolicySource() && data && typeof data.provider_instance === "string") {
           state.instance = data.provider_instance;
@@ -125,47 +180,46 @@
         state.selected = new Set();
         state.pageRids = [];
         state.ridSeq = 1;
-        if (ctx.isManualSource()) {
-          state.items = Object.assign({}, state.manualAdds || {});
-          state.rows = ctx.buildManualOverrideRows(state.items, state.manualBlocks || []);
-        } else {
-          const merged = Object.assign({}, state.baselineItems || {});
-          const manualKeys = new Set();
-          for (const [k, v] of Object.entries(state.manualAdds || {})) {
-            const key = String(k || "").trim();
-            if (!key) continue;
-            const existingKey = Object.keys(merged).find(x => String(x || "").toLowerCase() === key.toLowerCase());
-            const finalKey = existingKey || key;
-            merged[finalKey] = v;
-            manualKeys.add(finalKey.toLowerCase());
-          }
+        const merged = Object.assign({}, state.baselineItems || {});
+        const manualKeys = new Set();
+        for (const [k, v] of Object.entries(state.manualAdds || {})) {
+          const key = String(k || "").trim();
+          if (!key) continue;
+          const existingKey = Object.keys(merged).find(x => String(x || "").toLowerCase() === key.toLowerCase());
+          const finalKey = existingKey || key;
+          merged[finalKey] = v;
+          manualKeys.add(finalKey.toLowerCase());
+        }
 
-          state.items = merged;
-          state.rows = ctx.buildRows(state.items);
+        state.items = merged;
+        state.rows = ctx.buildRows(state.items);
 
-          const baselineKeys = new Set(Object.keys(state.baselineItems || {}));
-          const blocked = new Set(
-            (state.manualBlocks || []).map(x => String(x || "").trim()).filter(Boolean)
-          );
+        const baselineKeys = new Set(Object.keys(state.baselineItems || {}));
+        const blocked = new Set(
+          (state.manualBlocks || []).map(x => String(x || "").trim()).filter(Boolean)
+        );
 
-          for (const row of state.rows) {
-            const rowKey = String(row.key || "").toLowerCase();
-            row._origin = manualKeys.has(rowKey) ? "manual" : baselineKeys.has(row.key) ? "baseline" : "manual";
-            if (row._origin === "baseline") row.deleted = blocked.has(row.key);
-          }
+        for (const row of state.rows) {
+          const rowKey = String(row.key || "").toLowerCase();
+          row._origin = manualKeys.has(rowKey) ? "manual" : baselineKeys.has(row.key) ? "baseline" : "manual";
+          if (row._origin === "baseline") row.deleted = blocked.has(row.key);
         }
       }
 
+      for (const row of state.rows || []) {
+        row._mappingScope = data.mapping_origins?.[row.key] || "";
+        row._episodeGroups = data.episode_groups?.[row.key] || [];
+      }
       state.hasChanges = false;
       state.page = 0;
+      state.loading = false;
       ctx.renderRows();
 
       if (ctx.isPolicySource()) {
         const hasBaseline = state.baselineItems && Object.keys(state.baselineItems).length > 0;
         const hasManual = state.manualAdds && Object.keys(state.manualAdds).length > 0;
         const hasBlocks = Array.isArray(state.manualBlocks) && state.manualBlocks.length > 0;
-        const emptyMode = ctx.isManualSource() ? "manual" : "state";
-        ctx.showStateHint(hasBaseline || hasManual || hasBlocks ? null : emptyMode);
+        ctx.showStateHint(hasBaseline || hasManual || hasBlocks ? null : "state");
       } else if (state.source === "playlist") {
         ctx.showStateHint(state.snapshot ? null : "playlist");
       }
@@ -175,6 +229,8 @@
         ctx.setStatus(state.playlistWarnings[0]);
       }
     } catch (e) {
+      state.loadError = e;
+      state.loading = false;
       console.error(e);
       const msg = String(e || "");
 
@@ -189,24 +245,26 @@
         ctx.setTag("warn", "Missing state");
         ctx.setStatus("");
       } else {
+        if (!(state.rows || []).length) ctx.renderRows();
         ctx.setTag("error", "Load failed");
         ctx.setStatus(msg);
       }
     } finally {
       state.loading = false;
+      ctx.host?.removeAttribute("aria-busy");
       ctx.syncActionButtons();
     }
   }
 
   async function refreshEditor(ctx = {}, options = {}) {
     const state = ctx.state;
+    if (state.mappingEditing) return;
     const force = !!options.force;
     if (!force && (!editorIsVisible(ctx) || state.hasChanges || state.loading || state.saving)) return;
     syncSelectedScopeFromControls(ctx);
     state.page = 0;
     await ctx.loadSnapshots();
     await loadState(ctx);
-    await settleStateView(ctx);
     state.lastSyncAt = Date.now();
     ctx.syncHeaderPills();
   }
@@ -222,7 +280,6 @@
   Editor.LoadController = {
     editorIsVisible,
     syncSelectedScopeFromControls,
-    settleStateView,
     loadState,
     refreshEditor,
     queueEditorRefresh,

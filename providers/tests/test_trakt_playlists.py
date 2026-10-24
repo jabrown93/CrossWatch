@@ -60,6 +60,8 @@ def _router(monkeypatch, handlers):
 
     def fake_rwr(sess, method, url, **kw):
         captured.append({"method": method, "url": url, "json": kw.get("json"), "params": kw.get("params")})
+        if method == "GET" and int((kw.get("params") or {}).get("page", 1)) > 1:
+            return FakeResp(200, [])
         for (m, needle), resp in handlers.items():
             if method == m and needle in url:
                 return resp() if callable(resp) else resp
@@ -85,6 +87,39 @@ def test_list_resources_and_normalization(monkeypatch):
     assert r.name == "Weekend"
     assert r.can_add and r.can_remove and r.can_reorder
     assert r.is_smart is False
+    discovery = by_id["discovery:trakt:movies:trending"]
+    assert discovery.name == "Trending Movies"
+    assert discovery.is_smart is True
+    assert discovery.is_discovery is True
+    assert discovery.can_read is True
+    assert discovery.can_add is False and discovery.can_remove is False
+    assert discovery.media_types == ("movie",)
+
+
+def test_discovery_snapshot_reads_wrapped_and_direct_rows(monkeypatch):
+    rows = [
+        {"watchers": 12, "movie": {"title": "Dune", "year": 2021, "ids": {"trakt": 1, "tmdb": 438631}}},
+        {"title": "Arrival", "year": 2016, "ids": {"trakt": 2, "tmdb": 329865}},
+    ]
+    captured = _router(
+        monkeypatch,
+        {("GET", "/movies/trending"): FakeResp(200, rows, headers={"X-Pagination-Page-Count": "1"})},
+    )
+    snap = pl.get_snapshot(FakeAdapter(), "discovery:trakt:movies:trending")
+
+    assert snap.resource.is_discovery is True
+    assert snap.resource.writable is False
+    assert snap.ordered_keys() == ["tmdb:438631", "tmdb:329865"]
+    call = captured[0]
+    assert call["params"]["extended"] == "full"
+    assert call["params"]["limit"] == 100
+
+
+def test_discovery_feeds_are_read_only(monkeypatch):
+    _router(monkeypatch, {})
+    with pytest.raises(RuntimeError):
+        pl.add(FakeAdapter(), "discovery:trakt:movies:popular", [{"type": "movie", "ids": {"tmdb": "1"}}])
+    assert pl.reorder(FakeAdapter(), "discovery:trakt:movies:popular", ["tmdb:1"])["unsupported"] is True
 
 
 def test_watchlist_snapshot_and_writes_delegate(monkeypatch):
@@ -121,7 +156,7 @@ def test_snapshot_drops_unsupported_and_maps_keys(monkeypatch):
     )
     snap = pl.get_snapshot(FakeAdapter(), "123")
     keys = snap.ordered_keys()
-    assert keys == ["tmdb:438631", "tmdb:95396"]
+    assert keys == ["tmdb:438631", "tmdb:95396#show"]
     first = snap.items[0]
     assert first.playlist_item_id == "9001"
     assert first.position == 1
@@ -144,7 +179,7 @@ def test_add_and_remove_mixed_media(monkeypatch):
     add_res = pl.add(FakeAdapter(), "123", items)
     assert add_res["ok"] is True
     assert add_res["count"] == 2
-    assert set(add_res["confirmed_keys"]) == {"tmdb:438631", "tmdb:95396"}
+    assert set(add_res["confirmed_keys"]) == {"tmdb:438631", "tmdb:95396#show"}
 
     rm_res = pl.remove(FakeAdapter(), "123", items[:1])
     assert rm_res["count"] == 1
@@ -185,3 +220,53 @@ def test_create_respects_list_count_limit(monkeypatch):
     ad = FakeAdapter(settings={"limits": {"list": {"count": 1, "item_count": 100}}})
     with pytest.raises(pl.TraktCapacityError):
         pl.create(ad, "New List")
+
+
+def test_rename_and_delete_user_list(monkeypatch):
+    captured = _router(
+        monkeypatch,
+        {
+            ("PUT", "/users/me/lists/123"): FakeResp(200, {"name": "Renamed", "ids": {"trakt": 123}}),
+            ("DELETE", "/users/me/lists/123"): FakeResp(204),
+        },
+    )
+    ad = FakeAdapter()
+
+    renamed = pl.rename(ad, "123", "Renamed")
+    deleted = pl.delete(ad, "123")
+
+    assert renamed.id == "123"
+    assert renamed.name == "Renamed"
+    assert deleted["ok"] is True
+    assert any(c["method"] == "PUT" and c["json"] == {"name": "Renamed"} for c in captured)
+    assert any(c["method"] == "DELETE" and c["url"].endswith("/users/me/lists/123") for c in captured)
+
+
+def test_built_in_lists_cannot_be_renamed_or_deleted(monkeypatch):
+    _router(monkeypatch, {})
+    with pytest.raises(RuntimeError):
+        pl.rename(FakeAdapter(), pl.WATCHLIST_ID, "Nope")
+    with pytest.raises(RuntimeError):
+        pl.delete(FakeAdapter(), "discovery:trakt:movies:popular")
+
+
+def test_interactive_create_records_returned_resource_without_rereading(monkeypatch):
+    from cw_platform.interactive_reads import ReviewReads, use_review_reads
+
+    calls = _router(monkeypatch, {
+        ("GET", "/users/me/lists"): FakeResp(200, [LIST_ROW]),
+        ("POST", "/users/me/lists"): FakeResp(201, {"name": "New", "ids": {"trakt": 456}}),
+    })
+    adapter = FakeAdapter()
+    reads = ReviewReads()
+    try:
+        with use_review_reads(reads, collecting=True):
+            pl.list_resources(adapter)
+        before = len([call for call in calls if call["method"] == "GET"])
+        with use_review_reads(reads):
+            created = pl.create(adapter, "New")
+            assert created.id == "456"
+            assert "456" in {resource.id for resource in pl.list_resources(adapter)}
+        assert len([call for call in calls if call["method"] == "GET"]) == before
+    finally:
+        reads.close()

@@ -22,6 +22,7 @@ class MutableSyncOps:
             "ratings": True,
             "history": True,
             "progress": True,
+            "collection": True,
         }
 
     def build_index(self, _cfg: dict, *, feature: str) -> dict[str, dict]:
@@ -45,6 +46,37 @@ class MutableSyncOps:
         for item in items:
             bucket.pop(str(item["id"]), None)
         return {"count": len(items)}
+
+
+class RevealingCollectionCleanupOps(MutableSyncOps):
+    def __init__(self) -> None:
+        super().__init__(
+            {
+                "collection": {
+                    "one": {"id": "one", "type": "movie", "title": "Heat"},
+                    "two": {"id": "two", "type": "movie", "title": "Alien"},
+                }
+            }
+        )
+        self.hidden_tail = {"tail": {"id": "tail", "type": "movie", "title": "Arrival"}}
+
+    def remove(self, _cfg: dict, items: list[dict], *, feature: str, dry_run: bool = False) -> dict[str, int]:
+        result = super().remove(_cfg, items, feature=feature, dry_run=dry_run)
+        if feature == "collection" and not self.current_by_feature.get("collection") and self.hidden_tail:
+            self.current_by_feature["collection"] = self.hidden_tail
+            self.hidden_tail = {}
+        return result
+
+
+class CleanupCapabilityOps(MutableSyncOps):
+    def capabilities(self) -> dict[str, dict]:
+        return {
+            "watchlist": {"read": True, "remove": True},
+            "ratings": {"read": True, "unrate": False},
+            "history": {"read": True, "write": False},
+            "progress": {"read": True, "remove": True},
+            "collection": {"read": True, "remove": False, "source_only": True},
+        }
 
 
 def _snapshot_path(tmp_path: Path, stamp: str, feature: str, payload: dict) -> str:
@@ -256,6 +288,72 @@ def test_tools_clear(tmp_path: Path, monkeypatch) -> None:
     assert cleared["ok"] is True
     assert cleared["results"]["watchlist"]["removed"] == 2
     assert ops.current_by_feature["watchlist"] == {}
+
+
+def test_tools_clear_collection(tmp_path: Path, monkeypatch) -> None:
+    import services.snapshots as snapshots
+
+    ops = MutableSyncOps(
+        {
+            "collection": {
+                "one": {"id": "one", "type": "movie", "title": "Heat"},
+                "two": {"id": "two", "type": "episode", "title": "Pilot"},
+            }
+        }
+    )
+    _patch_ops(monkeypatch, snapshots, tmp_path, ops)
+
+    cleared = snapshots.clear_provider_features("PLEX", ["collection"], cfg={"version": "test"})
+
+    assert cleared["ok"] is True
+    assert cleared["results"]["collection"]["removed"] == 2
+    assert ops.current_by_feature["collection"] == {}
+
+
+def test_tools_clear_collection_retries_remaining_page_tail(tmp_path: Path, monkeypatch) -> None:
+    import services.snapshots as snapshots
+
+    ops = RevealingCollectionCleanupOps()
+    _patch_ops(monkeypatch, snapshots, tmp_path, ops)
+
+    cleared = snapshots.clear_provider_features("PLEX", ["collection"], cfg={"version": "test"})
+
+    assert cleared["ok"] is True
+    assert cleared["results"]["collection"]["removed"] == 3
+    assert cleared["results"]["collection"]["count"] == 3
+    assert cleared["results"]["collection"]["remaining"] == 0
+    assert cleared["results"]["collection"]["passes"] == 2
+    assert ops.current_by_feature["collection"] == {}
+
+
+@pytest.mark.parametrize("eventually_empty", [False, True])
+def test_tools_clear_counts_unique_items_and_reconciles_verification(tmp_path: Path, monkeypatch, eventually_empty) -> None:
+    import services.snapshots as snapshots
+
+    class DelayedCleanupOps(MutableSyncOps):
+        def __init__(self):
+            super().__init__({"history": {str(n): {"id": str(n), "type": "movie"} for n in range(3)}})
+            self.attempts = 0
+
+        def remove(self, _cfg, items, *, feature, dry_run=False):
+            self.attempts += 1
+            if self.attempts == 1:
+                self.current_by_feature[feature].pop("0")
+            elif eventually_empty:
+                self.current_by_feature[feature].clear()
+            return {"ok": False, "count": 1 if self.attempts == 1 else 0,
+                    "unresolved": [{"key": it["id"], "reason": "write_not_verified"} for it in items if it["id"] != "0"]}
+
+    ops = DelayedCleanupOps()
+    _patch_ops(monkeypatch, snapshots, tmp_path, ops)
+    result = snapshots.clear_provider_features("PLEX", ["history"], cfg={"version": "test"})
+    history = result["results"]["history"]
+    assert result["ok"] is eventually_empty
+    assert history["count"] == 3
+    assert history["removed"] == (3 if eventually_empty else 1)
+    assert history["remaining"] == (0 if eventually_empty else 2)
+    assert history["unresolved_count"] == (0 if eventually_empty else 2)
+    assert history["passes"] == 2
 
 
 def test_restore_bundle(tmp_path: Path, monkeypatch) -> None:
@@ -515,6 +613,49 @@ def test_provider_cleanup_background_job_tracks_progress(tmp_path: Path, monkeyp
     assert ops.current_by_feature["watchlist"] == {}
 
 
+def test_snapshot_manifest_reports_cleanup_features_separately(tmp_path: Path, monkeypatch) -> None:
+    import services.snapshots as snapshots
+
+    ops = CleanupCapabilityOps({})
+    _patch_ops(monkeypatch, snapshots, tmp_path, ops)
+    monkeypatch.setattr(snapshots, "_registry_sync_providers", lambda: ["PLEX"])
+    monkeypatch.setattr(snapshots, "list_instance_ids", lambda _cfg, _pid: ["default"])
+
+    row = snapshots.snapshot_manifest({})[0]
+
+    assert row["features"]["collection"] is True
+    assert row["cleanup_features"] == {
+        "watchlist": True,
+        "ratings": False,
+        "history": False,
+        "progress": True,
+        "collection": False,
+    }
+
+
+def test_provider_cleanup_skips_source_only_features(tmp_path: Path, monkeypatch) -> None:
+    import services.snapshots as snapshots
+
+    ops = CleanupCapabilityOps(
+        {
+            "collection": {"one": {"id": "one", "type": "movie", "title": "Heat"}},
+            "watchlist": {"two": {"id": "two", "type": "movie", "title": "Alien"}},
+        }
+    )
+    _patch_ops(monkeypatch, snapshots, tmp_path, ops)
+
+    result = snapshots.clear_provider_features("PLEX", ["collection", "watchlist"], cfg={})
+
+    assert result["ok"] is True
+    assert result["results"]["collection"] == {
+        "ok": True,
+        "skipped": True,
+        "reason": "cleanup_not_supported",
+    }
+    assert ops.current_by_feature["collection"] == {"one": {"id": "one", "type": "movie", "title": "Heat"}}
+    assert ops.current_by_feature["watchlist"] == {}
+
+
 def test_provider_cleanup_modal_owns_provider_cleanup_ui() -> None:
     from pathlib import Path
 
@@ -534,6 +675,8 @@ def test_provider_cleanup_modal_owns_provider_cleanup_ui() -> None:
     assert "/api/snapshots/tools/clear" in modal_js
     assert "/api/snapshots/manifest" in modal_js
     assert '"progress"' in modal_js
+    assert '"collection"' in modal_js
+    assert "Collections" in modal_js
     assert "data-feature" in modal_js
     assert "Provider Cleanup" in settings_py
     assert "openProviderCleanupModal" in modals_js

@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
 from cw_platform.provider_usage import (
     WEBHOOK_SOURCE_PROVIDERS,
-    _PROVIDER_LABELS,
     find_provider_usage,
     provider_label,
 )
+from cw_platform.modules_registry import provider_names
 from providers.scrobble.routes import ROUTE_PROVIDERS, ROUTE_SINKS
 
 
@@ -39,9 +40,12 @@ def test_every_webhook_sink_is_protected_from_deletion(sink: str):
 
 
 @pytest.mark.parametrize("sink", sorted(ROUTE_SINKS))
-def test_a_sink_that_is_not_selected_stays_deletable(sink: str):
+def test_a_sink_that_is_not_selected_has_no_sink_usage(sink: str):
     others = [s for s in sorted(ROUTE_SINKS) if s != sink]
-    assert find_provider_usage(webhook_cfg(others), sink) == []
+    usages = find_provider_usage(webhook_cfg(others), sink)
+    assert not any(u["role"] == "sink" for u in usages)
+    if sink not in WEBHOOK_SOURCE_PROVIDERS:
+        assert usages == []
 
 
 @pytest.mark.parametrize("provider", sorted(ROUTE_PROVIDERS))
@@ -56,13 +60,60 @@ def test_every_watcher_route_sink_is_protected(sink: str):
     assert any(u["feature"] == "watcher" and u["role"] == "sink" for u in usages), usages
 
 
-@pytest.mark.parametrize("provider", sorted(ROUTE_PROVIDERS | ROUTE_SINKS | set(WEBHOOK_SOURCE_PROVIDERS)))
-def test_scrobbler_providers_have_a_display_label(provider: str):
-    assert provider in _PROVIDER_LABELS, (
-        f"{provider} can appear in the Scrobbler screen and the delete-conflict message, "
-        "so it needs a label or it renders as an uppercase key"
-    )
-    assert provider_label(provider) == _PROVIDER_LABELS[provider]
+@pytest.mark.parametrize("provider", provider_names(upper=False))
+def test_registered_providers_use_their_declared_label(provider: str):
+    from cw_platform.modules_registry import load_sync_ops
+    from providers.auth.registry import auth_provider_manifest
+
+    ops = load_sync_ops(provider)
+    expected = ops.label() if ops is not None else auth_provider_manifest(provider)["label"]
+    assert provider_label(provider) == expected
+    assert provider_label(provider, "P01") == f"{expected} P01"
+
+
+@pytest.mark.parametrize("provider", provider_names(upper=False))
+@pytest.mark.parametrize("role", ["source", "target"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_all_registered_providers_share_instance_scoped_delete_guard(provider, role, enabled):
+    from api.provider_guard import usage_conflict_response
+    import json
+
+    cfg = {"pairs": [{"id": "shared", "enabled": enabled, role: provider.upper(), f"{role}_instance": "P01"}]}
+    response = usage_conflict_response(cfg, provider, "P01")
+    assert response is not None and response.status_code == 409
+    payload = json.loads(response.body)
+    assert payload["error"] == "provider_in_use"
+    assert payload["usages"][0]["role"] == role
+    assert payload["usages"][0]["enabled"] is enabled
+    assert provider_label(provider, "P01") in payload["message"]
+    assert usage_conflict_response(cfg, provider, "P02") is None
+
+
+def test_new_sync_registration_needs_no_usage_label_entry(monkeypatch):
+    from cw_platform import modules_registry
+
+    monkeypatch.setitem(modules_registry.MODULES["SYNC"], "_mod_NEW", "test.new")
+    monkeypatch.setattr(modules_registry, "import_module", lambda path: SimpleNamespace(OPS=SimpleNamespace(label=lambda: "New Provider")))
+    assert provider_label("new", "P01") == "New Provider P01"
+
+
+def test_new_auth_only_registration_needs_no_usage_label_entry(monkeypatch):
+    from cw_platform import modules_registry
+    from providers.auth import registry
+
+    monkeypatch.setitem(modules_registry.MODULES["AUTH"], "_auth_NEW", "test.auth_new")
+    monkeypatch.setattr(registry, "_safe_import", lambda path: SimpleNamespace(PROVIDER=SimpleNamespace(manifest=lambda: {"label": "New Auth Provider"})))
+    assert provider_label("new") == "New Auth Provider"
+
+
+def test_unavailable_sync_module_falls_back_to_auth_manifest(monkeypatch):
+    from cw_platform import modules_registry
+
+    def unavailable(name):
+        raise ImportError("unavailable")
+
+    monkeypatch.setattr(modules_registry, "load_sync_ops", unavailable)
+    assert provider_label("kitsu") == "Kitsu"
 
 
 def test_label_falls_back_without_crashing():
@@ -151,28 +202,18 @@ def read_asset(rel: str) -> str:
     return (Path(__file__).resolve().parents[1] / rel).read_text(encoding="utf-8", errors="ignore")
 
 
-def test_route_modal_never_offers_a_provider_as_its_own_destination():
-    js = read_asset("assets/js/modals/scrobbler-route/index.js")
+@pytest.mark.parametrize("modal", ["watcher", "webhook"])
+def test_modals_enforce_instance_scoped_destinations(modal: str):
+    import shutil
+    import subprocess
+    from pathlib import Path
 
-    assert 'function sinkProviders(selected = "", source = "") {' in js
-    assert 'const available = sinks.filter((p) => p !== self && allSinkProfiles(p).length);' in js
-    assert 'if (current === self) return available;' in js
-
-    assert 'function ratingSinkProviders(selected = [], source = "") {' in js
-    assert 'ratingSinks.includes(x) && x !== self' in js
-
-    assert 'optionsForProviders("sink", r.sink, r.provider)' in js
-    assert 'const sink = sinkProviders("", srcProvider)[0] || "";' in js
-    assert 'ratingSinkProviders(ratingTargets, r.provider)' in js
-    assert 'if (draft.sink === draft.provider) draft.sink = sinkProviders("", draft.provider)[0] || "";' in js
-
-
-def test_webhook_modal_never_offers_a_provider_as_its_own_destination():
-    js = read_asset("assets/js/modals/scrobbler-webhook/index.js")
-
-    assert "function sourceProviderKey() {" in js
-    assert "return sinks.filter((s) => s !== self && sinkProfiles(s).length > 0);" in js
-    assert "return ratingSinks.filter((s) => s !== self && sinkProfiles(s).length > 0);" in js
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js unavailable")
+    result = subprocess.run([node, "--test", f"--test-name-pattern={modal}", "tests/scrobbler-sink-instances.test.mjs"],
+                            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_both_modals_offer_every_route_sink():
@@ -183,7 +224,11 @@ def test_both_modals_offer_every_route_sink():
         assert offered == ROUTE_SINKS, f"{rel} offers {offered}, ROUTE_SINKS is {ROUTE_SINKS}"
 
 
-def test_scrob_is_the_only_provider_that_could_self_route():
-    from providers.scrobble.routes import ROUTE_PROVIDERS
+@pytest.mark.parametrize("provider", sorted(ROUTE_PROVIDERS & ROUTE_SINKS))
+def test_source_providers_require_distinct_destination_instances(provider: str):
+    from providers.scrobble.routes import same_scrobble_endpoint
 
-    assert ROUTE_PROVIDERS & ROUTE_SINKS == {"scrob"}
+    assert same_scrobble_endpoint(provider, "default", provider, "default")
+    assert same_scrobble_endpoint(provider, "P01", provider, "P01")
+    assert not same_scrobble_endpoint(provider, "default", provider, "P01")
+    assert not same_scrobble_endpoint(provider, "P01", provider, "default")

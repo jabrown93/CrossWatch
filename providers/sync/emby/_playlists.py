@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cw_platform.interactive_reads import retained_read, replaying
+
 from typing import Any, Mapping, Sequence
 
 from cw_platform.id_map import canonical_key, minimal as id_minimal
@@ -13,6 +15,7 @@ from ._common import (
     collection_remove_items,
     create_collection,
     create_playlist,
+    delete_item,
     key_of as emby_key_of,
     make_logger,
     normalize as emby_normalize,
@@ -21,6 +24,7 @@ from ._common import (
     playlist_remove_entries,
     resolve_item_id,
     sleep_ms,
+    update_item_name,
 )
 
 _PROVIDER = "EMBY"
@@ -35,6 +39,10 @@ class EmbyPlaylistError(RuntimeError):
 
 
 class EmbyPlaylistNotFound(EmbyPlaylistError):
+    pass
+
+
+class EmbyPlaylistUnsupported(EmbyPlaylistError):
     pass
 
 
@@ -138,6 +146,7 @@ def _fetch_resources(adapter: Any, endpoint_type: str) -> list[PlaylistResource]
     return out
 
 
+@retained_read
 def list_resources(adapter: Any) -> list[PlaylistResource]:
     out = _fetch_resources(adapter, "playlist")
     out.extend(_fetch_resources(adapter, "collection"))
@@ -188,13 +197,19 @@ def _accepts(endpoint_type: str, row: Mapping[str, Any]) -> bool:
     return typ in ("movie", "episode")
 
 
-def get_snapshot(adapter: Any, playlist_id: Any) -> PlaylistSnapshot:
-    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+@retained_read
+def _member_rows(adapter: Any, endpoint_type: str, raw_id: str):
     page_size = max(200, int(getattr(adapter.cfg, "watchlist_query_limit", 1000) or 1000))
     if endpoint_type == "collection":
-        rows, _total = _fetch_all_collection_items(adapter.client, adapter.cfg.user_id, raw_id, page_size=page_size)
+        rows, _total = _fetch_all_collection_items.__wrapped__(adapter.client, adapter.cfg.user_id, raw_id, page_size=page_size)
     else:
-        rows, _total = _fetch_all_playlist_items(adapter.client, raw_id, page_size=page_size)
+        rows, _total = _fetch_all_playlist_items.__wrapped__(adapter.client, raw_id, page_size=page_size)
+    return rows
+
+
+def get_snapshot(adapter: Any, playlist_id: Any) -> PlaylistSnapshot:
+    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+    rows = _member_rows(adapter, endpoint_type, raw_id)
     items: list[PlaylistItem] = []
     for pos, row in enumerate(rows):
         if not isinstance(row, Mapping) or not _accepts(endpoint_type, row):
@@ -249,6 +264,46 @@ def create(
     return res
 
 
+def rename(adapter: Any, playlist_id: Any, name: str, *, dry_run: bool = False) -> PlaylistResource:
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("playlist name required")
+    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+    if dry_run:
+        return PlaylistResource(
+            provider=_PROVIDER,
+            id=resource.id,
+            name=nm,
+            instance=resource.instance,
+            kind=resource.kind,
+            can_read=resource.can_read,
+            can_add=resource.can_add,
+            can_remove=resource.can_remove,
+            can_reorder=resource.can_reorder,
+            media_types=resource.media_types,
+            extra=dict(resource.extra or {}),
+        )
+    if not update_item_name(adapter.client, raw_id, nm):
+        raise EmbyPlaylistError(f"emby rename {endpoint_type} failed")
+    res = _resource_from_row(adapter, {"Id": raw_id, "Name": nm, "Type": "BoxSet" if endpoint_type == "collection" else "Playlist"}, endpoint_type)
+    if res is None:
+        raise EmbyPlaylistError(f"emby rename {endpoint_type} returned no id")
+    _info("rename_done", list_id=res.id, endpoint_type=endpoint_type, name=res.name)
+    return res
+
+
+def delete(adapter: Any, playlist_id: Any, *, dry_run: bool = False) -> dict[str, Any]:
+    endpoint_type, raw_id, resource = _resolved_resource(adapter, playlist_id)
+    if endpoint_type != "playlist":
+        raise EmbyPlaylistUnsupported("emby collections must be deleted in emby")
+    if dry_run:
+        return {"ok": True, "dry_run": True}
+    if not delete_item(adapter.client, raw_id):
+        raise EmbyPlaylistError("emby delete playlist failed")
+    _info("delete_done", list_id=resource.id)
+    return {"ok": True, "count": 1}
+
+
 def _accepted_items(adapter: Any, endpoint_type: str, items: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[str, str]], list[dict[str, Any]]]:
     accepted: list[tuple[str, str]] = []
     unresolved: list[dict[str, Any]] = []
@@ -298,11 +353,7 @@ def add(adapter: Any, playlist_id: Any, items: Sequence[Mapping[str, Any]]) -> d
 
 
 def _current_members(adapter: Any, endpoint_type: str, raw_id: str) -> tuple[list[str], dict[str, list[str]], dict[str, set[str]]]:
-    page_size = max(200, int(getattr(adapter.cfg, "watchlist_query_limit", 1000) or 1000))
-    if endpoint_type == "collection":
-        rows, _total = _fetch_all_collection_items(adapter.client, adapter.cfg.user_id, raw_id, page_size=page_size)
-    else:
-        rows, _total = _fetch_all_playlist_items(adapter.client, raw_id, page_size=page_size)
+    rows = _member_rows(adapter, endpoint_type, raw_id)
     ordered_keys: list[str] = []
     by_key: dict[str, list[str]] = {}
     keys_by_id: dict[str, set[str]] = {}
@@ -364,6 +415,8 @@ def reorder(adapter: Any, playlist_id: Any, ordered_keys: Sequence[str]) -> dict
     for key, ids in by_key.items():
         if ids and key not in item_id_by_key:
             item_id_by_key[key] = ids[0]
+    if replaying() and any(str(k) not in item_id_by_key for k in ordered_keys or []):
+        return {"ok": False, "count": 0, "reordered": 0, "error": "playlist_item_ids_unavailable"}
     target = [str(k) for k in (ordered_keys or []) if str(k) in item_id_by_key]
     work = [k for k in current if k in item_id_by_key]
     moves = 0

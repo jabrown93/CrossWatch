@@ -10,6 +10,7 @@ import secrets
 import hmac
 import urllib.parse
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from typing import Any, cast
 
 from fastapi import APIRouter, Query, Request, HTTPException, Body
@@ -17,7 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from urllib.parse import parse_qs
 
-from cw_platform.access_policy import media_account_allowlist_for_profile, media_account_scope_allows
+from cw_platform.access_policy import managed_profile_id, media_account_allowlist_for_profile, media_account_scope_allows, request_user
 from cw_platform.config_base import load_config, save_config
 from cw_platform.provider_instances import build_provider_config_view, instances_for_user_profile, list_instance_ids, normalize_instance_id
 from cw_platform.provider_usage import webhook_source_enabled
@@ -287,7 +288,9 @@ def _resolve_media_webhook_request(request: Request, provider: str, legacy_key: 
             blocked = _webhook_profile_gate(cfg, provider_lc, inst)
             if blocked:
                 return None, inst, blocked
-            return apply_webhook_settings(build_provider_config_view(cfg, provider_lc, inst), provider_lc, inst), inst, None
+            view = build_provider_config_view(cfg, provider_lc, inst)
+            view["_cw_scrobble_provider_configs"] = {provider_lc: cfg.get(provider_lc) or {}}
+            return apply_webhook_settings(view, provider_lc, inst), inst, None
         raise WebhookAuthError(provider_lc, "invalid_profile")
 
     ids = _ensure_webhook_ids(cfg)
@@ -314,6 +317,15 @@ def _webhook_ignore_log(prefix: str, target_error: dict[str, Any] | None) -> tup
     key = str((target_error or {}).get("error") or "").strip()
     text, level = _WEBHOOK_IGNORE_REASONS.get(key, (key or "unknown reason", "WARN"))
     return f"{prefix}: ignored ({text})", level
+
+
+def _webhook_parse_failure_log(prefix: str, provider: str, content_type: str, raw: bytes | bytearray | None, exc: BaseException) -> str:
+    body_len = len(raw or b"")
+    err_cls = exc.__class__.__name__
+    return (
+        f"{prefix}: failed to parse payload | provider={provider} "
+        f"content-type='{content_type or ''}' bytes={body_len} error_class={err_cls}"
+    )
 
 
 def _resolve_plexwatcher_target(request: Request) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
@@ -1101,12 +1113,16 @@ def api_plex_pms(instance: str | None = Query(None)) -> JSONResponse:
 
 
 def _currently_watching_user_filter(cfg: dict[str, Any], request: Request | None, requested_profile: Any) -> dict[str, Any]:
-    try:
-        from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
-        token = request.cookies.get(COOKIE_NAME) if request is not None else None
-        profile = effective_user_profile_id(cfg, token, requested_profile)
-    except Exception:
-        profile = "__none__"
+    user = request_user(request)
+    if isinstance(user, Mapping) and not bool(user.get("is_admin")):
+        profile = managed_profile_id(user) or "__none__"
+    else:
+        try:
+            from api.appAuthAPI import COOKIE_NAME, effective_user_profile_id
+            token = request.cookies.get(COOKIE_NAME) if request is not None else None
+            profile = effective_user_profile_id(cfg, token, requested_profile)
+        except Exception:
+            profile = "__none__"
     if not str(profile or "").strip():
         return {}
     user_filter = instances_for_user_profile(cfg, profile)
@@ -1409,13 +1425,7 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
             payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
             log("jf-webhook: parsed json payload", "DEBUG")
     except Exception as e:
-        snippet = (
-            raw[:200].decode("utf-8", errors="replace") if raw else "<no body>"
-        )
-        log(
-            f"jf-webhook: failed to parse payload: {e} | body[:200]={snippet}",
-            "ERROR",
-        )
+        log(_webhook_parse_failure_log("jf-webhook", "jellyfin", ct, raw, e), "ERROR")
         return JSONResponse({"ok": True}, status_code=200)
 
     md = (
@@ -1436,7 +1446,7 @@ async def webhook_jellyfintrakt(request: Request) -> JSONResponse:
     if mtype == "episode":
         series = (md.get("SeriesName") or md.get("SeriesTitle") or "").strip()
         ep_name = (md.get("Name") or md.get("EpisodeTitle") or "").strip()
-        season = md.get("ParentIndexNumber") or md.get("SeasonIndexNumber")
+        season = next((v for v in (md.get("ParentIndexNumber"), md.get("SeasonIndexNumber")) if v is not None), None)
         number = md.get("IndexNumber")
         if isinstance(season, int) and isinstance(number, int):
             title = f"{series} S{season:02}E{number:02}" + (
@@ -1571,13 +1581,7 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
             payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
             log("emby-webhook: parsed json payload", "DEBUG")
     except Exception as e:
-        snippet = (
-            raw[:200].decode("utf-8", errors="replace") if raw else "<no body>"
-        )
-        log(
-            f"emby-webhook: failed to parse payload: {e} | body[:200]={snippet}",
-            "ERROR",
-        )
+        log(_webhook_parse_failure_log("emby-webhook", "emby", ct, raw, e), "ERROR")
         return JSONResponse({"ok": True}, status_code=200)
 
     md = (
@@ -1598,7 +1602,7 @@ async def webhook_embytrakt(request: Request) -> JSONResponse:
     if mtype == "episode":
         series = (md.get("SeriesName") or md.get("SeriesTitle") or "").strip()
         ep_name = (md.get("Name") or md.get("EpisodeTitle") or "").strip()
-        season = md.get("ParentIndexNumber") or md.get("SeasonIndexNumber")
+        season = next((v for v in (md.get("ParentIndexNumber"), md.get("SeasonIndexNumber")) if v is not None), None)
         number = md.get("IndexNumber")
         if isinstance(season, int) and isinstance(number, int):
             title = f"{series} S{season:02}E{number:02}" + (
@@ -1738,13 +1742,7 @@ async def webhook_trakt(request: Request) -> JSONResponse:
             payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
             log("plex-webhook: parsed json payload", "DEBUG")
     except Exception as e:
-        snippet = (
-            raw[:200].decode("utf-8", errors="replace") if raw else "<no body>"
-        )
-        log(
-            f"plex-webhook: failed to parse payload: {e} | body[:200]={snippet}",
-            "ERROR",
-        )
+        log(_webhook_parse_failure_log("plex-webhook", "plex", ct, raw, e), "ERROR")
         return JSONResponse({"ok": True}, status_code=200)
 
     payload = payload or {}
@@ -1857,7 +1855,7 @@ async def webhook_plexwatcher(request: Request) -> JSONResponse:
         else:
             payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
     except Exception as e:
-        log(f"plexwatcher-webhook: failed to parse payload: {e}", "ERROR")
+        log(_webhook_parse_failure_log("plexwatcher-webhook", "plexwatcher", ct, raw, e), "ERROR")
         payload = {}
 
     if not isinstance(payload, dict):
@@ -1901,4 +1899,132 @@ async def webhook_plexwatcher(request: Request) -> JSONResponse:
         {"ok": True, **{k: v for k, v in res.items() if k != "error"}},
         status_code=200,
     )
-    
+
+
+@router.post("/webhook/kodiwatcher/pair")
+async def webhook_kodiwatcher_pair(request: Request) -> JSONResponse:
+    from providers.scrobble.kodi import addon as kodi_addon
+
+    cfg = load_config() or {}
+
+    raw = await request.body()
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+    except Exception:
+        payload = None
+    code = payload.get("code") if isinstance(payload, dict) else None
+
+    base = str(request.base_url).rstrip("/")
+    proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+    if proto == "https" and base.startswith("http://"):
+        base = "https://" + base[7:]
+    client = request.client.host if request.client else "-"
+    status_code, body = kodi_addon.pair(cfg, code, base, client)
+    if status_code != 200 and BASE_LOG:
+        try:
+            BASE_LOG(f"Rejected Kodi add-on pairing, reason={body.get('error')}, client={client}", level="WARN", module="WEBHOOK")
+        except Exception:
+            pass
+    return JSONResponse(body, status_code=status_code)
+
+
+@router.post("/webhook/kodiwatcher")
+async def webhook_kodiwatcher(request: Request) -> JSONResponse:
+    from starlette.concurrency import run_in_threadpool
+
+    from providers.scrobble.kodi import addon as kodi_addon
+
+    cfg = load_config() or {}
+    version = kodi_addon.reported_version()
+
+    token = str(request.headers.get(kodi_addon.TOKEN_HEADER) or "").strip() or str(_extract_url_params(request).get("token") or "").strip()
+    instance = kodi_addon.instance_for_token(cfg, token)
+    if instance is None:
+        client = request.client.host if request.client else "-"
+        if BASE_LOG:
+            try:
+                BASE_LOG(f"Rejected Kodi add-on request, reason=invalid_token, client={client}", level="WARN", module="WEBHOOK")
+            except Exception:
+                pass
+        return JSONResponse({"ok": False, "error": "invalid_token", "crosswatch_version": version}, status_code=401)
+
+    raw = await request.body()
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": True, "ignored": True, "error": "invalid_payload", "crosswatch_version": version}, status_code=200)
+
+    try:
+        result = await run_in_threadpool(kodi_addon.handle, request.app, cfg, instance, payload)
+    except Exception as e:
+        if BASE_LOG:
+            try:
+                BASE_LOG(f"Kodi add-on event failed: {type(e).__name__}: {e}", level="ERROR", module="KODI-WATCH")
+            except Exception:
+                pass
+        return JSONResponse({"ok": False, "error": "internal_error", "crosswatch_version": version}, status_code=500)
+    return JSONResponse(result, status_code=200)
+
+
+_STREMIO_ADDON_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Cache-Control": "no-store",
+}
+
+
+def _stremio_addon_instance(request: Request, cfg: dict[str, Any], token: str) -> str | None:
+    from providers.scrobble.stremio import addon as stremio_addon
+
+    instance = stremio_addon.instance_for_token(cfg, token)
+    if instance is None and BASE_LOG:
+        client = request.client.host if request.client else "-"
+        try:
+            BASE_LOG(f"Rejected Stremio add-on request, reason=invalid_token, client={client}", level="WARN", module="WEBHOOK")
+        except Exception:
+            pass
+    return instance
+
+
+@router.options("/webhook/stremio/{token}/{rest:path}")
+async def webhook_stremio_options(token: str, rest: str) -> JSONResponse:
+    return JSONResponse({}, status_code=200, headers=_STREMIO_ADDON_HEADERS)
+
+
+@router.get("/webhook/stremio/{token}/manifest.json")
+async def webhook_stremio_manifest(request: Request, token: str) -> JSONResponse:
+    from providers.scrobble.stremio import addon as stremio_addon
+
+    cfg = load_config() or {}
+    instance = _stremio_addon_instance(request, cfg, token)
+    if instance is None:
+        return JSONResponse({"err": "invalid_token"}, status_code=401, headers=_STREMIO_ADDON_HEADERS)
+    stremio_addon.mark_seen(instance)
+    return JSONResponse(stremio_addon.manifest(cfg, instance), status_code=200, headers=_STREMIO_ADDON_HEADERS)
+
+
+@router.get("/webhook/stremio/{token}/player/{rest:path}")
+async def webhook_stremio_player(request: Request, token: str, rest: str) -> JSONResponse:
+    from starlette.concurrency import run_in_threadpool
+
+    from providers.scrobble.stremio import addon as stremio_addon
+
+    cfg = load_config() or {}
+    instance = _stremio_addon_instance(request, cfg, token)
+    if instance is None:
+        return JSONResponse({"success": False, "err": "invalid_token"}, status_code=401, headers=_STREMIO_ADDON_HEADERS)
+
+    media_type, video_id, args = stremio_addon.split_resource_path(rest)
+    try:
+        result = await run_in_threadpool(stremio_addon.handle, request.app, cfg, instance, media_type, video_id, args)
+    except Exception as e:
+        if BASE_LOG:
+            try:
+                BASE_LOG(f"Stremio add-on event failed: {type(e).__name__}: {e}", level="ERROR", module="STREMIO-WATCH")
+            except Exception:
+                pass
+        return JSONResponse({"success": False, "err": "internal_error"}, status_code=500, headers=_STREMIO_ADDON_HEADERS)
+    return JSONResponse(result, status_code=200, headers=_STREMIO_ADDON_HEADERS)

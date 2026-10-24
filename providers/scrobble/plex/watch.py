@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import time, threading, re
+import ssl
+from socket import socket
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from typing import Any, Iterable, Mapping, Callable, cast
@@ -18,8 +20,9 @@ try:
 except Exception:
     BASE_LOG = None
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
-from cw_platform.account_match import media_account_allowed, normalize_media_account_name
+from cw_platform.account_match import exact_media_account_name, media_account_allowed
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
 from providers.scrobble.scrobble import (
     Dispatcher,
@@ -30,13 +33,30 @@ from providers.scrobble.scrobble import (
     mask_account as _mask_account,
 )
 from providers.scrobble.currently_watching import update_from_event as _cw_update, update_from_payload as _cw_update_payload
+from providers.scrobble.media_filters import event_ignore_reason, log_media_filter_drop
 from providers.scrobble.sources import source_enabled
+from providers.scrobble._show_tmdb import show_tmdb_id
+from providers.sync.plex._common import stable_client_id
+from providers.sync.plex._utils import _build_session, _resolve_verify_from_cfg, fetch_cloud_home_users, fetch_cloud_account_users
+from cw_platform.provider_instances import get_instance_block, sanitize_instance_label
 
 
 _CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
 _CFG_TTL_SEC = 2.0
 OFFLINE_INITIAL_RETRY_SECONDS = 30.0
 OFFLINE_MAX_RETRY_SECONDS = 300.0
+SESSION_CONTINUITY_SECONDS = 6 * 3600
+ACTIVE_PLAYBACK_SECONDS = 120.0
+
+
+class _PlexAlertListener(AlertListener):
+    def run(self) -> None:
+        import websocket
+
+        url = self._server.url(self.key, includeToken=True).replace("http", "ws", 1)
+        self._ws = websocket.WebSocketApp(url, on_message=self._onMessage, on_error=self._onError, socket=cast(socket | None, self._socket))
+        verify = self._server._session.verify is not False
+        self._ws.run_forever(sslopt={"cert_reqs": ssl.CERT_REQUIRED if verify else ssl.CERT_NONE, "check_hostname": verify})
 
 
 def _cfg(ttl: float = _CFG_TTL_SEC) -> dict[str, Any]:
@@ -106,7 +126,9 @@ def _try_discover_pms_token(cfg: dict[str, Any], baseurl: str, cloud_token: str,
         return None, None
 
     px = cfg.get("plex") or {}
-    client_id = str(px.get("client_id") or "crosswatch").strip() or "crosswatch"
+    client_id = str(px.get("client_id") or "").strip()
+    if not client_id:
+        client_id = stable_client_id()
     want_mid = str(px.get("machine_id") or "").strip().lower() or None
 
     try:
@@ -122,6 +144,8 @@ def _try_discover_pms_token(cfg: dict[str, Any], baseurl: str, cloud_token: str,
         "X-Plex-Client-Identifier": client_id,
         "X-Plex-Product": "CrossWatch",
         "X-Plex-Platform": "CrossWatch",
+        "X-Plex-Version": app_version(),
+        "User-Agent": http_user_agent("Plex", override_env="CW_PLEX_UA"),
         "Accept": "application/xml",
     }
 
@@ -271,13 +295,11 @@ def _as_set_str(v: Any) -> set[str]:
 
 def _ids_desc(ids: dict[str, Any] | None) -> str:
     d = ids or {}
-    for k in ("trakt", "tmdb", "imdb", "tvdb"):
-        if d.get(k):
-            return f"{k}:{d[k]}"
-    for k in ("trakt_show", "imdb_show", "tmdb_show", "tvdb_show"):
-        if d.get(k):
-            return f"{k.replace('_show', '')}:{d[k]}"
-    return "none"
+    return ", ".join(
+        f"{k}:{d[k]}"
+        for k in ("plex", "trakt", "tmdb", "imdb", "tvdb", "trakt_show", "imdb_show", "tmdb_show", "tvdb_show")
+        if d.get(k)
+    ) or "none"
 
 
 def _iter_guid_strings(value: Any) -> Iterable[str]:
@@ -374,7 +396,7 @@ class WatchService:
         self._stop = threading.Event()
         self._bg: threading.Thread | None = None
         self._psn_sessions: set[str] = set()
-        self._allowed_sessions: set[str] = set()
+        self._allowed_sessions: set[tuple[str, str, str]] = set()
         self._last_seen: dict[str, float] = {}
         self._last_emit: dict[str, tuple[str, float]] = {}
         self._attempt = 0
@@ -384,14 +406,26 @@ class WatchService:
         self._last_pause_ts: dict[str, float] = {}
         self._filtered_ts: dict[str, float] = {}
         self._route_filtered_ts: dict[str, float] = {}
+        self._identity_log_ts: dict[str, float] = {}
+        self._identity_miss: dict[str, int] = {}
+        self._identity_logged: dict[str, str] = {}
+        self._account_ctx: dict[str, Any] | None = None
+        self._instance_label: str | None = None
         self._last_probe: dict[str, float] = {}
         self._best_offset: dict[str, tuple[int, int, float]] = {}
         self._dur_cache: dict[int, tuple[int, float]] = {}
         self._last_event: dict[str, ScrobbleEvent] = {}
+        self._stop_sent: set[str] = set()
+        self._session_playback: dict[str, tuple[dict[str, str], float]] = {}
+        self._stop_fallback: dict[str, tuple[ScrobbleEvent, dict[str, str], float]] = {}
+        self._identity_recovery: dict[str, tuple[ScrobbleEvent, dict[str, str], float]] = {}
+        self._pkc_pending: dict[str, dict[str, Any]] = {}
         self._tl_last: dict[str, tuple[int, int, int, float]] = {}
         self._last_seek_emit: dict[str, float] = {}
-        self._sess_user_cache: dict[str, tuple[str, float]] = {}
         self._sess_identity_cache: dict[str, dict[str, Any]] = {}
+        self._user_alias_scope: tuple[str, str] | None = None
+        self._user_alias_cache: dict[str, list[str]] = {}
+        self._user_alias_expires = 0.0
         self._offline = False
         self._offline_failures = 0
         self._offline_retry = OFFLINE_INITIAL_RETRY_SECONDS
@@ -400,6 +434,9 @@ class WatchService:
         lvl = (str(level) or "INFO").upper()
         if lvl == "DEBUG" and not _is_debug_cfg(self._cfg_provider() or {}):
             return
+        shown = self._instance_display()
+        if shown.lower() != "default" and "inst=" not in msg:
+            msg = f"[{shown}] {msg}"
         if BASE_LOG is not None:
             try:
                 BASE_LOG(msg, level=lvl, module="PLEX-WATCH")
@@ -420,6 +457,11 @@ class WatchService:
             self._log(f"Plex watcher offline: {exc}; retrying with backoff", "WARNING")
             return
         self._offline_retry = min(OFFLINE_MAX_RETRY_SECONDS, max(OFFLINE_INITIAL_RETRY_SECONDS, self._offline_retry * 2.0))
+
+    def _listener_error(self, err: Any) -> None:
+        if self._stop.is_set():
+            return
+        self._mark_offline(err if isinstance(err, Exception) else RuntimeError(str(err)))
 
     def _mark_online(self) -> None:
         if self._offline:
@@ -513,13 +555,15 @@ class WatchService:
 
         return max(cand, key=score)
 
-    def _normalize_ms(self, off: int | None, dur: int | None) -> tuple[int | None, int | None]:
+    def _normalize_ms(self, off: int | None, dur: int | None, *, milliseconds: bool = False) -> tuple[int | None, int | None]:
         o = _safe_int(off) if off is not None else None
         d = _safe_int(dur) if dur is not None else None
         if o is None and d is None:
             return None, None
         if o is not None and o < 0:
             o = 0
+        if milliseconds:
+            return o, d
         if d is not None and d > 0:
             # Plex mixes seconds and milliseconds.
             if d < 36000 and o is not None and o < 36000:
@@ -599,6 +643,236 @@ class WatchService:
             return True, int(jump), dt
         return False, int(jump), dt
 
+    @staticmethod
+    def _playback_fingerprint(raw: dict[str, Any], session_key: str | None = None) -> dict[str, str]:
+        candidates: list[dict[str, Any]] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                sk = str(value.get("sessionKey") or value.get("session") or "").strip()
+                if sk:
+                    if session_key is None or sk == str(session_key):
+                        candidates.append(value)
+                    return
+                for key, child in value.items():
+                    if not str(key).startswith("_cw_"):
+                        visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(raw)
+        if len(candidates) > 1:
+            return {}
+        entry = candidates[0] if candidates else raw
+        if not candidates and session_key is not None:
+            sk = str(entry.get("sessionKey") or entry.get("session") or "").strip()
+            if sk and sk != str(session_key):
+                return {}
+        result = {
+            field: str(entry[field]).strip()
+            for field in ("ratingKey", "clientIdentifier", "guid", "account")
+            if entry.get(field) and str(entry[field]).strip()
+        }
+        if "ratingKey" not in result:
+            key = str(entry.get("ratingkey") or entry.get("itemID") or "").strip()
+            match = re.match(r"^/library/metadata/(\d+)", str(entry.get("key") or ""))
+            if key:
+                result["ratingKey"] = key
+            elif match is not None:
+                result["ratingKey"] = match.group(1)
+        return result
+
+    @staticmethod
+    def _playback_conflicts(previous: dict[str, str], current: dict[str, str]) -> bool:
+        fields = ("ratingKey", "clientIdentifier", "account")
+        if not (previous.get("ratingKey") and current.get("ratingKey")):
+            fields += ("guid",)
+        return any(previous.get(key) and current.get(key) and previous[key] != current[key] for key in fields)
+
+    def _same_playback(self, previous: dict[str, str], current: dict[str, str]) -> bool:
+        return not self._playback_conflicts(previous, current) and any(
+            previous.get(key) and previous.get(key) == current.get(key)
+            for key in ("ratingKey", "clientIdentifier", "guid")
+        )
+
+    def _forget_session(self, sk: str, *, keep_stop: bool = False) -> None:
+        self._identity_recovery.pop(sk, None)
+        previous = self._last_event.get(sk)
+        playback = self._session_playback.get(sk)
+        if keep_stop and previous is not None and playback is not None:
+            self._stop_fallback[sk] = (previous, dict(playback[0]), playback[1])
+        elif not keep_stop:
+            self._stop_fallback.pop(sk, None)
+        for state in (
+            self._session_playback, self._last_event, self._sess_identity_cache,
+            self._last_seen, self._last_emit, self._max_seen, self._first_seen,
+            self._last_pause_ts, self._last_probe, self._best_offset,
+            self._tl_last, self._last_seek_emit, self._identity_miss,
+        ):
+            state.pop(sk, None)
+        if not keep_stop:
+            self._identity_logged.pop(sk, None)
+        self._stop_sent.discard(sk)
+        self._allowed_sessions = {key for key in self._allowed_sessions if key[0] != sk}
+        self._pkc_pending = {
+            client: pending for client, pending in self._pkc_pending.items()
+            if pending.get("session_key") != sk
+        }
+
+    def _suspend_session_identity(self, sk: str) -> None:
+        previous = self._last_event.get(sk)
+        playback = self._session_playback.get(sk)
+        self._forget_session(sk)
+        if previous is not None and playback is not None:
+            self._identity_recovery[sk] = (previous, dict(playback[0]), playback[1])
+
+    def _expire_session_identity(self, sk: str) -> None:
+        now = time.time()
+        previous = self._session_playback.get(sk)
+        if previous and not 0 <= now - previous[1] < SESSION_CONTINUITY_SECONDS:
+            self._forget_session(sk)
+        fallback = self._stop_fallback.get(sk)
+        if fallback and not 0 <= now - fallback[2] < SESSION_CONTINUITY_SECONDS:
+            self._stop_fallback.pop(sk, None)
+        recovery = self._identity_recovery.get(sk)
+        if recovery and not 0 <= now - recovery[2] < SESSION_CONTINUITY_SECONDS:
+            self._identity_recovery.pop(sk, None)
+
+    def _playback_rewound(self, sk: str, entry: dict[str, Any]) -> bool:
+        offset = _safe_int(entry.get("viewOffset"))
+        best = self._best_offset.get(sk)
+        return offset is not None and best is not None and offset < best[0]
+
+    def _close_replaced_playback(self, sk: str, ts: float) -> None:
+        base = self._last_event.get(sk)
+        if not isinstance(base, ScrobbleEvent) or sk in self._stop_sent or self._stop.is_set():
+            return
+        if not 0 <= time.time() - ts < ACTIVE_PLAYBACK_SECONDS:
+            return
+        changes: dict[str, Any] = {"action": "stop", "raw": {**(base.raw or {}), "_cw_replaced_stop": True}}
+        progress = self._best_progress_for_session(sk)
+        best = self._best_offset.get(sk)
+        if progress is not None and best:
+            changes.update(progress=progress, position_ms=best[0], duration_ms=best[1])
+        else:
+            changes["progress"] = self._last_emit.get(sk, ("start", base.progress))[1]
+        ev = ScrobbleEvent(**{**base.__dict__, **changes})
+        self._stop_sent.add(sk)
+        if not self._dispatch.dispatch(ev):
+            return
+        try:
+            _cw_update("plex", ev, duration_ms=ev.duration_ms, provider_instance=str(self._instance_id or "default"))
+        except Exception:
+            pass
+        self._last_emit[sk] = ("stop", ev.progress)
+        self._log(f"event stop {ev.media_type} user={_mask_account(ev.account)} p={ev.progress} sess={sk} reason=replaced")
+
+    def _prepare_session(self, sk: str, fingerprint: dict[str, str], action: str, entry: dict[str, Any] | None = None) -> None:
+        self._expire_session_identity(sk)
+        replaced = self._session_playback.get(sk)
+        if replaced and not self._same_playback(replaced[0], fingerprint) and not any(
+            replaced[0].get(key) and fingerprint.get(key) and replaced[0][key] != fingerprint[key]
+            for key in ("clientIdentifier", "account")
+        ):
+            self._close_replaced_playback(sk, replaced[1])
+        if entry is not None and self._playback_rewound(sk, entry):
+            self._suspend_session_identity(sk)
+        now = time.time()
+        previous = self._session_playback.get(sk)
+        if previous:
+            old, ts = previous
+            matching = self._same_playback(old, fingerprint)
+            recent = 0 <= now - ts < ACTIVE_PLAYBACK_SECONDS
+            last_action = self._last_emit.get(sk, (None, None))[0]
+            if not matching:
+                self._forget_session(sk)
+            elif action == "start" and not recent and (sk in self._last_event or sk in self._sess_identity_cache):
+                self._forget_session(sk, keep_stop=True)
+            else:
+                fingerprint = {**old, **fingerprint}
+                if action == "start" and last_action in ("pause", "stop"):
+                    self._sess_identity_cache.pop(sk, None)
+                now = ts
+        self._session_playback[sk] = (fingerprint, now)
+
+    def _can_inherit_identity(self, sk: str, entry: dict[str, Any], *, action: str = "start") -> bool:
+        previous = self._session_playback.get(sk)
+        base = self._last_event.get(sk)
+        if previous is None or base is None or not base.account:
+            return False
+        fingerprint, ts = previous
+        if (
+            self._last_emit.get(sk, (None, None))[0] != action
+            or not 0 <= time.time() - ts < ACTIVE_PLAYBACK_SECONDS
+            or not self._same_playback(fingerprint, self._playback_fingerprint(entry, sk))
+            or self._playback_rewound(sk, entry)
+        ):
+            return False
+        cached = self._sess_identity_cache.get(sk)
+        if cached and str(cached.get("name") or "").strip() != str(base.account).strip():
+            return False
+        offset = _safe_int(entry.get("viewOffset"))
+        duration = _safe_int(entry.get("duration"))
+        best = self._best_offset.get(sk)
+        if duration is None and best:
+            duration = best[1]
+        if offset is not None and duration is not None:
+            is_seek, _, _ = self._is_seek_jump(best, offset, duration, time.time())
+            if is_seek:
+                return False
+        return True
+
+    def _progress_matches_session(self, sk: str, entry: dict[str, Any], *, verify_user: bool = False) -> bool:
+        self._expire_session_identity(sk)
+        recovery = self._identity_recovery.get(sk)
+        if recovery is not None:
+            base, fingerprint, _ = recovery
+            current = self._playback_fingerprint(entry, sk)
+            if not self._same_playback(fingerprint, current):
+                self._forget_session(sk)
+                return False
+            ident = self._resolve_session_identity(sk, current, allow_stale=False)
+            if not ident:
+                return False
+            candidate = self._event_with_session_identity(base, ident)
+            if candidate.account != base.account or not self._accepts_user(candidate):
+                self._forget_session(sk)
+                self._sess_identity_cache[sk] = ident
+                return False
+            self._identity_recovery.pop(sk, None)
+            self._last_event[sk] = candidate
+            self._last_emit[sk] = (candidate.action, candidate.progress)
+            self._session_playback[sk] = ({**fingerprint, **current}, time.time())
+        previous = self._session_playback.get(sk)
+        if not previous:
+            return False
+        fingerprint, ts = previous
+        current = self._playback_fingerprint(entry, sk)
+        if not 0 <= time.time() - ts < ACTIVE_PLAYBACK_SECONDS or not self._same_playback(fingerprint, current):
+            return False
+        if not verify_user or not self._needs_user_resolution() or self._shared_instance_identity():
+            return True
+        base = self._last_event.get(sk)
+        if base is None or self._last_emit.get(sk, (None, None))[0] == "stop":
+            return False
+        if self._can_inherit_identity(sk, entry):
+            return self._accepts_user(base)
+        rewound = self._playback_rewound(sk, entry)
+        if rewound:
+            self._sess_identity_cache.pop(sk, None)
+        ident = self._resolve_session_identity(sk, current, allow_stale=False)
+        if not ident:
+            if rewound:
+                self._suspend_session_identity(sk)
+            return False
+        candidate = self._event_with_session_identity(base, ident)
+        if candidate.account != base.account:
+            self._forget_session(sk)
+            self._sess_identity_cache[sk] = ident
+            return False
+        return self._accepts_user(candidate)
+
     def _emit_seek_update(self, session_key: str, pct: int, cfg: dict[str, Any], src: str) -> None:
         sk = str(session_key or "").strip()
         if not sk:
@@ -635,7 +909,7 @@ class WatchService:
         self._max_seen[sk] = max(pct_i, self._max_seen.get(sk, 0))
         accepted = bool(self._dispatch.dispatch(ev2))
         if not accepted:
-            self._throttled_route_filtered_log(ev2, "seek update")
+            self._throttled_route_filtered_log(ev2, "seek update", dispatched=True)
             self._clear_currently_watching(ev2)
             return
         try:
@@ -645,18 +919,19 @@ class WatchService:
         self._log(f"seek update p={pct_i}% sess={ev2.session_key}", "DEBUG")
 
     # Ingest progress from PSN, TimelineEntry, and ProgressNotification alerts.
-    def _ingest_progress_from_alert(self, alert: dict[str, Any], cfg: dict[str, Any] | None = None) -> None:
+    def _ingest_progress_from_alert(self, alert: dict[str, Any], cfg: dict[str, Any] | None = None, *, verified_session: str | None = None) -> None:
         cfg = cfg or _cfg()
         psn = alert.get("PlaySessionStateNotification")
         best_psn = self._best_psn_entry(psn)
-        if isinstance(best_psn, dict):
-            sk = str(best_psn.get("sessionKey") or "").strip()
+        psn_sk = str(best_psn.get("sessionKey") or "").strip() if isinstance(best_psn, dict) else ""
+        if isinstance(best_psn, dict) and self._progress_matches_session(psn_sk, best_psn, verify_user=psn_sk != verified_session):
+            sk = psn_sk
             rk = _safe_int(best_psn.get("ratingKey") or best_psn.get("ratingkey"))
             off = best_psn.get("viewOffset")
             if off is None:
                 off = best_psn.get("time")
             dur = best_psn.get("duration")
-            o, d = self._normalize_ms(_safe_int(off), _safe_int(dur))
+            o, d = self._normalize_ms(_safe_int(off), _safe_int(dur), milliseconds=best_psn.get("viewOffset") is not None)
             if d is None or d <= 0:
                 d = self._duration_ms_for(rk)
             if sk and o is not None and d is not None and d > 0:
@@ -686,7 +961,7 @@ class WatchService:
                 items = [x for x in data if isinstance(x, dict)]
             for entry in items:
                 sk = str(entry.get("sessionKey") or entry.get("session") or "").strip()
-                if not sk:
+                if not sk or not self._progress_matches_session(sk, entry, verify_user=sk != verified_session):
                     continue
                 off = entry.get("viewOffset")
                 if off is None:
@@ -767,11 +1042,18 @@ class WatchService:
 
     def _passes_filters(self, ev: ScrobbleEvent) -> bool:
         sk = str(ev.session_key) if ev.session_key is not None else None
-        cache_key: str | None = None
+        cache_key: tuple[str, str, str] | None = None
         if sk:
-            cache_key = f"{sk}|{_norm_user(ev.account or '')}|{str(ev.server_uuid or '').strip().lower()}"
+            cache_key = (sk, _norm_user(ev.account or ""), str(ev.server_uuid or "").strip())
 
         cfg = self._active_cfg()
+
+        ignore_reason = event_ignore_reason(ev, cfg)
+        if ignore_reason:
+            log_media_filter_drop(ev, ignore_reason)
+            if cache_key:
+                self._allowed_sessions.discard(cache_key)
+            return False
 
         # # A whitelist must be validated per event
         libs = _as_set_str((((cfg.get("plex") or {}).get("scrobble") or {}).get("libraries")))
@@ -809,35 +1091,200 @@ class WatchService:
                 return _safe_int(v.get("ratingKey") or v.get("ratingkey"))
         return None
 
-    def _resolve_session_identity(self, session_key: str | None) -> dict[str, Any] | None:
+    def _accepts_user(self, ev: ScrobbleEvent) -> bool:
+        try:
+            fn = getattr(self._dispatch, "accepts_user", None)
+            return bool(fn(ev)) if callable(fn) else True
+        except Exception:
+            return True
+
+    def _instance_display(self) -> str:
+        inst = str(self._instance_id or "").strip() or "default"
+        if self._instance_label is None:
+            label = ""
+            try:
+                cfg = self._cfg_provider() or {}
+                label = sanitize_instance_label(get_instance_block(cfg, "plex", inst).get("label"))
+            except Exception:
+                label = ""
+            self._instance_label = label or inst
+        return self._instance_label
+
+    def _plex_tv_headers(self, cfg: dict[str, Any], token: str) -> dict[str, str]:
+        px = cfg.get("plex") or {}
+        client_id = str(px.get("client_id") or "").strip() or stable_client_id()
+        return {
+            "X-Plex-Token": token,
+            "X-Plex-Client-Identifier": client_id,
+            "X-Plex-Product": "CrossWatch",
+            "X-Plex-Platform": "CrossWatch",
+            "X-Plex-Version": app_version(),
+            "User-Agent": http_user_agent("Plex", override_env="CW_PLEX_UA"),
+        }
+
+    def _server_is_owned(self, cfg: dict[str, Any], token: str, machine_id: str) -> bool | None:
+        try:
+            r = requests.get(
+                "https://plex.tv/api/resources",
+                params={"includeHttps": 1, "includeRelay": 1},
+                headers={**self._plex_tv_headers(cfg, token), "Accept": "application/xml"},
+                timeout=6,
+            )
+            r.raise_for_status()
+            for dev in list(ET.fromstring(r.text or "")):
+                attrs = dev.attrib or {}
+                cid = str(attrs.get("clientIdentifier") or attrs.get("machineIdentifier") or "").strip().lower()
+                if cid == machine_id:
+                    return str(attrs.get("owned") or "").strip().lower() in ("1", "true")
+        except Exception as e:
+            self._dbg(f"account context: resources lookup failed: {e}")
+            return None
+        self._dbg(f"account context: server {machine_id} not listed for this token")
+        return None
+
+    def _plex_tv_identity(self, cfg: dict[str, Any], token: str) -> dict[str, str] | None:
+        try:
+            r = requests.get(
+                "https://plex.tv/api/v2/user",
+                headers={**self._plex_tv_headers(cfg, token), "Accept": "application/json"},
+                timeout=6,
+            )
+            r.raise_for_status()
+            data = r.json() or {}
+        except Exception as e:
+            self._dbg(f"account context: identity lookup failed: {e}")
+            return None
+        name = str(data.get("username") or data.get("title") or "").strip()
+        if not name:
+            return None
+        return {"name": name, "user_id": str(data.get("id") or "").strip()}
+
+    def _refresh_account_context(self) -> None:
+        self._account_ctx = None
+        self._instance_label = None
+        cfg = self._active_cfg()
+        px = cfg.get("plex") or {}
+        token = str(px.get("account_token") or px.get("token") or "").strip()
+        try:
+            mid = str(getattr(self._plex, "machineIdentifier", "") or "").strip().lower()
+        except Exception:
+            mid = ""
+        if not token or not mid:
+            return
+
+        owned = self._server_is_owned(cfg, token, mid)
+        if owned:
+            self._log("Owner Plex token; session lookup active", "INFO")
+            return
+        if owned is None:
+            self._log(
+                "Could not determine Plex server ownership; falling back to session lookup",
+                "WARNING",
+            )
+            return
+
+        ident = self._plex_tv_identity(cfg, token)
+        if not ident:
+            self._log(
+                "Shared Plex token detected but plex.tv identity lookup failed; "
+                "falling back to session lookup",
+                "WARNING",
+            )
+            return
+
+        self._account_ctx = {"owned": False, "name": ident["name"], "user_id": ident["user_id"]}
+        self._log(
+            f"Shared Plex token; scrobbling as {_mask_account(ident['name'])} "
+            f"(user_id={ident['user_id'] or '-'}), skipping session lookup",
+            "INFO",
+        )
+
+    def _shared_instance_identity(self) -> dict[str, Any] | None:
+        ctx = self._account_ctx
+        if not isinstance(ctx, dict) or ctx.get("owned") is not False:
+            return None
+        name = str(ctx.get("name") or "").strip()
+        if not name:
+            return None
+        return {
+            "name": name,
+            "user_name": name,
+            "user_username": name,
+            "user_id": str(ctx.get("user_id") or ""),
+            "account_name": "",
+            "account_id": "",
+            "account_uuid": "",
+        }
+
+    def _needs_user_resolution(self) -> bool:
+        try:
+            fn = getattr(self._dispatch, "needs_user_resolution", None)
+            return bool(fn()) if callable(fn) else True
+        except Exception:
+            return True
+
+    def _log_identity(self, msg: str, throttle_key: str | None = None) -> None:
+        if throttle_key is not None:
+            now = time.time()
+            if now - self._identity_log_ts.get(throttle_key, 0.0) < 30.0:
+                return
+            self._identity_log_ts[throttle_key] = now
+        self._dbg(msg)
+
+    def _resolve_session_identity(self, session_key: str | None, fingerprint: dict[str, str] | None = None, *, allow_stale: bool = True) -> dict[str, Any] | None:
+        self._no_sessions_access = False
         if not (self._plex and session_key):
             return None
         sk = str(session_key).strip()
         if not sk:
             return None
+        fingerprint = fingerprint or {}
         now = time.time()
         cache = getattr(self, "_sess_identity_cache", None)
         stale_hit = None
         stale_age = None
         if isinstance(cache, dict):
             hit = cache.get(sk)
-            if isinstance(hit, dict):
+            if isinstance(hit, dict) and self._same_playback(hit.get("fingerprint") or {}, fingerprint):
                 try:
                     stale_age = now - float(hit.get("ts") or 0.0)
                 except Exception:
                     stale_age = None
                 stale_hit = hit
-                if stale_age is not None and stale_age < 15.0:
+                if stale_age is not None and 0 <= stale_age < 15.0:
                     return hit
+        t0 = time.time()
+
+        def _ms() -> int:
+            return int((time.time() - t0) * 1000)
+
+        now = time.time()
         try:
             el: Any = self._plex.query("/status/sessions")
             if el is None or not hasattr(el, "iter"):
+                self._log_identity(
+                    f"identity unresolved sess={sk} reason=bad_response "
+                    f"in={_ms()}ms",
+                    f"bad|{sk}",
+                )
                 return None
+
+            def _has_identity(d: dict[str, Any] | None) -> bool:
+                return bool(
+                    d
+                    and any(
+                        str(d.get(k) or "").strip()
+                        for k in ("name", "user_name", "user_id", "account_name", "account_id", "account_uuid")
+                    )
+                )
+
             ident: dict[str, Any] | None = None
             for v in el.iter("Video"):
-                if v.get("sessionKey") != sk:
+                vk = str(v.get("sessionKey") or "").strip()
+                if not vk:
                     continue
                 user_name = ""
+                user_username = ""
                 user_id = ""
                 acc_name = ""
                 acc_id = ""
@@ -846,6 +1293,7 @@ class WatchService:
                 u = v.find("User")
                 if u is not None:
                     user_id = str(u.get("id") or "").strip()
+                    user_username = str(u.get("username") or "").strip()
                     for attr in ("title", "name", "username"):
                         val = u.get(attr)
                         if val:
@@ -862,100 +1310,212 @@ class WatchService:
                             acc_name = str(val).strip()
                             break
 
-                ident = {
+                player = v.find("Player")
+                row_fingerprint = self._playback_fingerprint(dict(v.attrib))
+                if player is not None:
+                    client = str(player.get("machineIdentifier") or player.get("clientIdentifier") or "").strip()
+                    if client:
+                        row_fingerprint["clientIdentifier"] = client
+                if vk == sk:
+                    if self._playback_conflicts(row_fingerprint, fingerprint):
+                        stale_hit = None
+                        if isinstance(cache, dict):
+                            cache.pop(vk, None)
+                        continue
+                    row_fingerprint = {**fingerprint, **row_fingerprint}
+                row: dict[str, Any] = {
+                    "fingerprint": row_fingerprint,
                     "name": user_name or acc_name,
                     "user_name": user_name,
+                    "user_username": user_username,
                     "user_id": user_id,
                     "account_name": acc_name,
                     "account_id": acc_id,
                     "account_uuid": acc_uuid,
                     "ts": now,
                 }
-                break
+                if vk == sk:
+                    ident = row
+                if _has_identity(row) and isinstance(cache, dict):
+                    cache[vk] = row
 
-            if ident and isinstance(cache, dict):
-                cache[sk] = ident
-                uc = getattr(self, "_sess_user_cache", None)
-                if isinstance(uc, dict):
-                    nm = str(ident.get("name") or "").strip()
-                    if nm:
-                        uc[sk] = (nm, now)
-            if ident:
+            has_identity = _has_identity(ident)
+            if ident and has_identity:
+                self._identity_miss.pop(sk, None)
+                sig = "|".join(
+                    str(ident.get(k) or "")
+                    for k in ("name", "user_name", "user_id", "account_id", "account_uuid")
+                )
+                if self._identity_logged.get(sk) != sig:
+                    self._identity_logged[sk] = sig
+                    self._log_identity(
+                        f"identity resolved sess={sk} user={_mask_account(ident.get('name'))} "
+                        f"user_id={ident.get('user_id') or '-'} account_id={ident.get('account_id') or '-'} "
+                        f"in={_ms()}ms"
+                    )
                 return ident
-            
-            if isinstance(stale_hit, dict) and stale_age is not None and stale_age < 6 * 3600:
+            if allow_stale and isinstance(stale_hit, dict) and stale_age is not None and 0 <= stale_age < SESSION_CONTINUITY_SECONDS:
+                self._identity_miss.pop(sk, None)
+                self._log_identity(
+                    f"identity stale sess={sk} user={_mask_account(stale_hit.get('name'))} "
+                    f"age={int(stale_age)}s reason=session_not_listed in={_ms()}ms",
+                    f"stale|{sk}",
+                )
                 return stale_hit
+            misses = self._identity_miss.get(sk, 0) + 1
+            self._identity_miss[sk] = misses
+            if misses == 2:
+                self._log_identity(
+                    f"identity unresolved sess={sk} reason=session_not_listed "
+                    f"misses={misses} in={_ms()}ms"
+                )
             return None
         except Exception as e:
-            # allow falling back to configured username later.
+            reason = "sessions_error"
             try:
                 msg = str(e).lower()
                 if any(k in msg for k in ("401", "403", "unauthorized", "forbidden")):
                     self._no_sessions_access = True
+                    reason = "sessions_forbidden"
             except Exception:
                 pass
-            if isinstance(stale_hit, dict) and stale_age is not None and stale_age < 6 * 3600:
+            if allow_stale and isinstance(stale_hit, dict) and stale_age is not None and 0 <= stale_age < SESSION_CONTINUITY_SECONDS:
+                self._log_identity(
+                    f"identity stale sess={sk} user={_mask_account(stale_hit.get('name'))} "
+                    f"age={int(stale_age)}s reason={reason} in={_ms()}ms",
+                    f"stale|{sk}",
+                )
                 return stale_hit
+            self._log_identity(
+                f"identity unresolved sess={sk} reason={reason} err={e} in={_ms()}ms",
+                f"err|{sk}",
+            )
             return None
 
-    def _resolve_account_from_session(self, session_key: str | None) -> str | None:
-        ident = self._resolve_session_identity(session_key)
-        if not isinstance(ident, dict):
-            return None
-        name = str(ident.get("name") or "").strip()
-        return name or None
+    def _user_aliases(self, user_id: str) -> list[str]:
+        if not user_id.isdigit() or int(user_id) <= 0:
+            return []
+        plex_cfg = self._active_cfg().get("plex") or {}
+        token = str(plex_cfg.get("account_token") or plex_cfg.get("token") or "").strip()
+        scope = (str(plex_cfg.get("server_url") or ""), token)
+        if self._user_alias_scope != scope:
+            self._user_alias_scope = scope
+            self._user_alias_cache = {}
+            self._user_alias_expires = 0.0
+        if not token:
+            return []
+        now = time.monotonic()
+        if now >= self._user_alias_expires:
+            aliases: dict[str, list[str]] = {}
+            for fetch in (fetch_cloud_home_users, fetch_cloud_account_users):
+                try:
+                    rows = fetch(token, timeout=3.0)
+                except Exception:
+                    continue
+                for row in rows:
+                    uid = str(row.get("id") or "").strip()
+                    username = str(row.get("username") or "").strip()
+                    if uid.isdigit() and username:
+                        names = aliases.setdefault(str(int(uid)), [])
+                        if username not in names:
+                            names.append(username)
+            self._user_alias_cache = aliases
+            self._user_alias_expires = now + (300.0 if aliases else 60.0)
+        return list(self._user_alias_cache.get(str(int(user_id)), []))
 
-    def _stamp_account_identity(self, ev: ScrobbleEvent) -> None:
-        """Record the session's account identifiers on ev.raw.
-
-        A flat Plex alert carries no PlaySessionStateNotification, so the
-        accountID/accountUUID the session lookup already resolved would never
-        reach the activity row and an id:/uuid: scoped profile would lose it.
-        Written in the Account shape the webhook path uses so one extractor
-        covers every source. The identity lookup is cached, so this is free
-        after the first alert for a session.
-        """
-        raw = getattr(ev, "raw", None)
-        if not isinstance(raw, dict):
-            return
-        account = raw.get("Account") if isinstance(raw.get("Account"), dict) else {}
-        have_id = str(account.get("id") or "").strip()
-        have_uuid = str(account.get("uuid") or "").strip()
-        if have_id and have_uuid:
-            return
-        ident = self._resolve_session_identity(ev.session_key)
+    def _event_with_session_identity(self, ev: ScrobbleEvent, ident: dict[str, Any] | None) -> ScrobbleEvent:
         if not isinstance(ident, dict):
-            return
-        acc_id = have_id or str(ident.get("account_id") or "").strip()
-        acc_uuid = have_uuid or str(ident.get("account_uuid") or "").strip()
-        if not acc_id and not acc_uuid:
-            return
-        # Merge rather than replace: an alert can carry a title-only Account
-        # block, which would otherwise short-circuit this and leave the row
-        # unattributed. Existing values always win.
-        merged = dict(account)
-        if acc_id:
-            merged["id"] = acc_id
-        if acc_uuid:
-            merged["uuid"] = acc_uuid
-        raw["Account"] = merged
+            return ev
+        clean_ident: dict[str, Any] = {
+            "name": str(ident.get("name") or "").strip(),
+            "user_name": str(ident.get("user_name") or "").strip(),
+            "user_id": str(ident.get("user_id") or "").strip(),
+            "account_name": str(ident.get("account_name") or "").strip(),
+            "account_id": str(ident.get("account_id") or "").strip(),
+            "account_uuid": str(ident.get("account_uuid") or "").strip().lower(),
+        }
+        if not any(clean_ident.values()):
+            return ev
+        username = str(ident.get("user_username") or "").strip()
+        clean_ident["user_aliases"] = [username] if username else self._user_aliases(clean_ident["user_id"])
+        raw = dict(ev.raw or {})
+        raw["_cw_session_identity"] = clean_ident
+        account = clean_ident["name"] or ev.account
+        if account == ev.account and raw == (ev.raw or {}):
+            return ev
+        return ScrobbleEvent(**{**ev.__dict__, "account": account, "raw": raw})
+
+    def _event_with_unresolved_user_fallback(self, ev: ScrobbleEvent) -> ScrobbleEvent:
+        if str(ev.account or "").strip():
+            return ev
+        raw = dict(ev.raw or {})
+        raw["_cw_sessions_access_unavailable"] = True
+        return ScrobbleEvent(**{**ev.__dict__, "raw": raw})
+
+    def _needs_pkc_support(self) -> bool:
+        try:
+            fn = getattr(self._dispatch, "needs_pkc_support", None)
+            return bool(fn()) if callable(fn) else False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _psn_has_item(entry: dict[str, Any]) -> bool:
+        return any(str(entry.get(k) or "").strip() for k in ("ratingKey", "ratingkey", "key", "guid"))
+
+    def _drop_itemless_event(self, ev: ScrobbleEvent, entry: dict[str, Any]) -> None:
+        sk = str(ev.session_key or "").strip()
+        self._expire_session_identity(sk)
+        prev = self._last_event.get(sk) if sk else None
+        fallback = self._stop_fallback.get(sk) if sk else None
+        if prev is None and fallback:
+            prev = fallback[0]
+        if ev.action == "stop" and isinstance(prev, ScrobbleEvent):
+            client = str(entry.get("clientIdentifier") or "").strip()
+            if client and self._needs_pkc_support():
+                self._pkc_pending[client] = {
+                    "session_key": sk,
+                    "view_offset": _safe_int(entry.get("viewOffset")),
+                    "event": prev,
+                    "ts": time.time(),
+                }
+            self._clear_currently_watching(prev)
+        self._dbg(f"drop '{ev.action}' without item sess={sk or '?'}")
+
+    def _pkc_merged_stop(self, ev: ScrobbleEvent, entry: dict[str, Any]) -> ScrobbleEvent:
+        client = str(entry.get("clientIdentifier") or "").strip()
+        pending = self._pkc_pending.pop(client, None) if client else None
+        if not isinstance(pending, dict):
+            return ev
+        sk = str(ev.session_key or "").strip()
+        origin = str(pending.get("session_key") or "")
+        prev = pending.get("event")
+        offset = pending.get("view_offset")
+        if (
+            not isinstance(prev, ScrobbleEvent)
+            or not sk
+            or sk == origin
+            or sk in self._last_emit
+            or offset is None
+            or _safe_int(entry.get("viewOffset")) != offset
+            or time.time() - float(pending.get("ts") or 0.0) > 2.0
+            or not self._same_playback(self._playback_fingerprint(prev.raw or {}, prev.session_key), self._playback_fingerprint(entry))
+        ):
+            return ev
+        raw = dict(ev.raw or {})
+        ident = (prev.raw or {}).get("_cw_session_identity")
+        if isinstance(ident, dict):
+            raw["_cw_session_identity"] = dict(ident)
+        raw["_cw_pkc_merge"] = {"session_key": origin, "stop_session_key": sk}
+        self._dbg(f"PlexKodiConnect stop merged sess={origin} from sess={sk} user={_mask_account(prev.account)}")
+        return ScrobbleEvent(**{**ev.__dict__, "account": prev.account, "session_key": origin, "raw": raw})
 
     def _enrich_event_with_plex(self, ev: ScrobbleEvent) -> ScrobbleEvent | None:
         try:
             if not self._plex:
                 return ev
-            # Stamp before any return below: every event leaves this method
-            # through one of them, and they all share the same raw dict.
-            self._stamp_account_identity(ev)
-            acc = self._resolve_account_from_session(ev.session_key)
-            if acc and _norm_user(acc) != _norm_user(ev.account or ""):
-                ev = ScrobbleEvent(**{**ev.__dict__, "account": acc})
             rk = self._find_rating_key(ev.raw or {})
             if not rk:
-                if not ev.account:
-                    acc = self._resolve_account_from_session(ev.session_key)
-                    if acc:
-                        return ScrobbleEvent(**{**ev.__dict__, "account": acc})
                 return ev
 
             it = self._plex.fetchItem(int(rk))
@@ -971,6 +1531,35 @@ class WatchService:
             ids_raw: dict[str, Any] = dict(ev.ids or {}, plex=int(rk))
             ids_raw.update(_ids_from_guids_any(getattr(it, "guids", [])))
             ids = _normalize_ids(ids_raw)
+            raw = dict(ev.raw or {})
+            paths: list[str] = []
+            try:
+                parts = it.iterParts() if callable(getattr(it, "iterParts", None)) else []
+                for part in parts:
+                    file_val = getattr(part, "file", None)
+                    if file_val:
+                        paths.append(str(file_val))
+            except Exception:
+                pass
+            if not paths:
+                try:
+                    for media in getattr(it, "media", []) or []:
+                        for part in getattr(media, "parts", []) or []:
+                            file_val = getattr(part, "file", None)
+                            if file_val:
+                                paths.append(str(file_val))
+                except Exception:
+                    pass
+            if paths:
+                raw["_cw_file_paths"] = paths
+            for attr in ("editionTitle", "edition", "versionTitle"):
+                try:
+                    val = getattr(it, attr, None)
+                    if val:
+                        raw["_cw_edition_title"] = str(val)
+                        break
+                except Exception:
+                    pass
             season, number = ev.season, ev.number
             if media_type == "episode":
                 try:
@@ -984,8 +1573,12 @@ class WatchService:
                     show_ids_raw = _ids_from_guids_any(getattr(show, "guids", []))
                     for k, v in show_ids_raw.items():
                         ids.setdefault(f"{k}_show", str(v))
+                if not ids.get("tmdb_show"):
+                    known = {key: ids.get(f"{key}_show") for key in ("imdb", "tvdb")}
+                    tmdb_show = show_tmdb_id(self._active_cfg(), known, ids)
+                    if tmdb_show:
+                        ids["tmdb_show"] = str(tmdb_show)
 
-            account = ev.account or self._resolve_account_from_session(ev.session_key)
             return ScrobbleEvent(
                 action=ev.action,
                 media_type=("episode" if media_type == "episode" else "movie"),
@@ -995,10 +1588,10 @@ class WatchService:
                 season=season,
                 number=number,
                 progress=ev.progress,
-                account=account,
+                account=ev.account,
                 server_uuid=ev.server_uuid,
                 session_key=ev.session_key,
-                raw=ev.raw,
+                raw=raw,
             )
         except Exception:
             return ev
@@ -1061,19 +1654,21 @@ class WatchService:
             self._dbg(f"event filtered: user={_mask_account(ev.account)} server={ev.server_uuid} sess={ev.session_key}")
             self._filtered_ts[key] = now
 
-    def _throttled_route_filtered_log(self, ev: ScrobbleEvent, kind: str = "event") -> None:
-        key = f"{kind}|{ev.account}|{ev.server_uuid}|{ev.session_key or self._find_rating_key(ev.raw or {}) or '?'}"
-        now = time.time()
-        last = self._route_filtered_ts.get(key, 0.0)
-        if now - last >= 30.0:
-            self._dbg(f"{kind} filtered by route dispatcher: user={_mask_account(ev.account)} server={ev.server_uuid} sess={ev.session_key}")
-            self._route_filtered_ts[key] = now
+    def _throttled_route_filtered_log(self, ev: ScrobbleEvent, kind: str = "event", *, dispatched: bool = False) -> None:
+        if not dispatched and not str(ev.account or "").strip():
+            return
+        outcome = "not delivered" if dispatched else "filtered"
+        key = f"{outcome}|{kind}|{ev.account}|{ev.server_uuid}|{ev.session_key or self._find_rating_key(ev.raw or {}) or '?'}"
+        if key in self._route_filtered_ts:
+            return
+        self._route_filtered_ts[key] = time.time()
+        self._dbg(f"{kind} {outcome} by route dispatcher: user={_mask_account(ev.account)} server={ev.server_uuid} sess={ev.session_key}")
 
     def _clear_currently_watching(self, ev: ScrobbleEvent) -> None:
         try:
             _cw_update_payload(
                 "plex",
-                ev.media_type,
+                str(ev.media_type),
                 ev.title or "",
                 ev.year,
                 ev.season,
@@ -1090,6 +1685,8 @@ class WatchService:
             pass
 
     def _handle_alert(self, alert: dict[str, Any]) -> None:
+        if self._stop.is_set():
+            return
         try:
             t = (alert.get("type") or "").lower()
         except Exception:
@@ -1114,11 +1711,6 @@ class WatchService:
             if not source_enabled(cfg, "watcher"):
                 return
 
-            try:
-                self._ingest_progress_from_alert(alert, cfg)
-            except Exception:
-                pass
-
             px = (cfg.get("plex") or {})
             inst = {}
             if self._instance_id and str(self._instance_id) != "default":
@@ -1126,17 +1718,7 @@ class WatchService:
                     inst = ((px.get("instances") or {}).get(str(self._instance_id)) or {})
                 except Exception:
                     inst = {}
-            # For non-default Plex instances (e.g. Home users), Plex alert payloads may not
-            # include an account name. Use the configured instance username as a fallback so
-            # events are not dropped as unresolved user alerts.
-            fallback_username = ""
-            try:
-                if str(self._instance_id) != "default":
-                    fallback_username = str(inst.get("username") or "").strip()
-            except Exception:
-                fallback_username = ""
             defaults = {
-                "username": fallback_username,
                 "server_uuid": str((
                     server_uuid or
                     inst.get("server_uuid") or inst.get("machine_id") or
@@ -1160,42 +1742,102 @@ class WatchService:
             if not isinstance(ev, ScrobbleEvent):
                 self._dbg("alert parsed but no event produced (unknown shape)")
                 return
+            fingerprint = self._playback_fingerprint(ev.raw or {}, ev.session_key)
+            if ev.account:
+                fingerprint["account"] = str(ev.account).strip()
+            if isinstance(best_psn, dict) and not self._psn_has_item(best_psn):
+                previous = self._session_playback.get(str(ev.session_key or ""))
+                if previous and self._playback_conflicts(previous[0], fingerprint):
+                    self._forget_session(str(ev.session_key))
+                self._drop_itemless_event(ev, best_psn)
+                return
+            if ev.session_key:
+                self._prepare_session(
+                    str(ev.session_key), fingerprint, ev.action,
+                    best_psn if isinstance(best_psn, dict) else ev.raw or {},
+                )
+            if isinstance(best_psn, dict) and ev.action == "stop":
+                ev = self._pkc_merged_stop(ev, best_psn)
 
             # Ignore idle/incomplete Plex alerts with no user and no session.
             if not str(ev.account or "").strip() and not str(ev.session_key or "").strip():
                 return
-            if not ev.account and ev.session_key:
+            inherit_identity = bool(
+                ev.session_key and ev.action in ("start", "pause")
+                and self._can_inherit_identity(
+                    str(ev.session_key), best_psn if isinstance(best_psn, dict) else ev.raw or {}, action=ev.action,
+                )
+            )
+            if not ev.account and ev.session_key and (ev.action == "stop" or inherit_identity):
                 prev_ev = self._last_event.get(str(ev.session_key))
+                if prev_ev is None and ev.action == "stop":
+                    fallback = self._stop_fallback.get(str(ev.session_key))
+                    if fallback and self._same_playback(fallback[1], fingerprint):
+                        prev_ev = fallback[0]
                 prev_acc = str(getattr(prev_ev, "account", "") or "").strip() if prev_ev else ""
-                if prev_acc:
-                    ev = ScrobbleEvent(**{**ev.__dict__, "account": prev_acc})
+                if prev_ev is not None and prev_acc:
+                    raw = dict(ev.raw or {})
+                    ident = (prev_ev.raw or {}).get("_cw_session_identity")
+                    if isinstance(ident, dict):
+                        raw["_cw_session_identity"] = dict(ident)
+                    ev = ScrobbleEvent(**{**ev.__dict__, "account": prev_acc, "raw": raw})
 
-            acc = self._resolve_account_from_session(ev.session_key)
-            if acc and _norm_user(acc) != _norm_user(ev.account or ""):
-                ev = ScrobbleEvent(**{**ev.__dict__, "account": acc})
-
-            # Fall back to configured username.
-            if not str(ev.account or "").strip() and getattr(self, "_no_sessions_access", False):
-                cfg_user = (str(inst.get("username") or "").strip() if str(self._instance_id) != "default" else str(px.get("username") or "").strip())
-                if cfg_user:
-                    self._dbg(
-                        f"no sessions access; assume token user '{_mask_account(cfg_user)}' inst={self._instance_id} sess={ev.session_key}"
-                    )
-                    ev = ScrobbleEvent(**{**ev.__dict__, "account": cfg_user})
-
-            # Drop unresolved/no-user alerts before filter logging
             if not str(ev.account or "").strip():
-                return
+                shared = self._shared_instance_identity()
+                if shared:
+                    ev = self._event_with_session_identity(ev, shared)
+                elif self._needs_user_resolution():
+                    ident = self._resolve_session_identity(ev.session_key, fingerprint, allow_stale=ev.action == "stop")
+                    ev = self._event_with_session_identity(ev, ident)
+                    if not str(ev.account or "").strip() and getattr(self, "_no_sessions_access", False):
+                        ev = self._event_with_unresolved_user_fallback(ev)
+
+            if ev.session_key and ev.account:
+                sk = str(ev.session_key)
+                self._identity_recovery.pop(sk, None)
+                previous = self._session_playback.get(sk)
+                account = str(ev.account).strip()
+                fallback = self._stop_fallback.get(sk)
+                previous_account = str((previous[0].get("account") if previous else "") or (fallback[0].account if fallback else "") or "")
+                if previous_account and previous_account != account:
+                    identity = self._sess_identity_cache.get(sk)
+                    self._forget_session(sk)
+                    if identity:
+                        self._sess_identity_cache[sk] = identity
+                    self._session_playback[sk] = ({**fingerprint, "account": account}, time.time())
 
             if not self._passes_filters(ev):
                 self._throttled_filtered_log(ev)
                 return
+
+            if not self._accepts_user(ev):
+                self._throttled_route_filtered_log(ev)
+                return
+
+            if ev.session_key:
+                sk = str(ev.session_key)
+                current, ts = self._session_playback.get(sk, (fingerprint, time.time()))
+                if ev.account:
+                    current = {**current, "account": str(ev.account).strip()}
+                self._session_playback[sk] = (current, time.time())
+            try:
+                self._ingest_progress_from_alert(alert, cfg, verified_session=str(ev.session_key or ""))
+            except Exception:
+                pass
 
             enriched = self._enrich_event_with_plex(ev)
             if enriched is None:
                 return
             ev = enriched
             sk = str(ev.session_key) if ev.session_key else None
+            ignore_reason = event_ignore_reason(ev, cfg)
+            if ignore_reason:
+                log_media_filter_drop(ev, ignore_reason)
+                if sk:
+                    self._allowed_sessions.discard((sk, _norm_user(ev.account or ""), str(ev.server_uuid or "").strip()))
+                self._throttled_filtered_log(ev)
+                self._clear_currently_watching(ev)
+                return
             vo = None
             dur = None
             if isinstance(best_psn, dict):
@@ -1205,7 +1847,10 @@ class WatchService:
                 dur = best_psn.get("duration")
 
             rk = _safe_int((ev.ids or {}).get("plex")) or self._find_rating_key(ev.raw or {})
-            o, d = self._normalize_ms(_safe_int(vo), _safe_int(dur))
+            o, d = self._normalize_ms(
+                _safe_int(vo), _safe_int(dur),
+                milliseconds=isinstance(best_psn, dict) and best_psn.get("viewOffset") is not None,
+            )
             if d is None or d <= 0:
                 d = self._duration_ms_for(rk)
             if (o is None or o <= 0) and sk:
@@ -1255,6 +1900,7 @@ class WatchService:
                     best = prev
 
             if best != want:
+                normalized_progress_debug = best
                 ev = ScrobbleEvent(**{**ev.__dict__, "progress": best})
             if ev.action == "start" and ev.progress < 1:
                 ev = ScrobbleEvent(**{**ev.__dict__, "progress": 1})
@@ -1276,7 +1922,7 @@ class WatchService:
                 thr = _stop_pause_threshold(cfg)
                 maxp = self._max_seen.get(skd, ev.progress)
                 if ev.progress >= 98 and maxp < thr:
-                    ev = ScrobbleEvent(**{**ev.__dict__, "action": "pause", "progress": maxp})
+                    ev = ScrobbleEvent(**{**ev.__dict__, "action": "pause", "progress": maxp, "raw": {**(ev.raw or {}), "_cw_playback_action": "stop"}})
                     self._dbg(f"demote stop/pause sess={skd} p={ev.progress} max_seen={maxp} thr={thr}")
                 else:
                     first = self._first_seen.get(skd)
@@ -1294,28 +1940,34 @@ class WatchService:
                     if ev.action == "stop" and last_action == "stop" and abs(ev.progress - last_prog) <= 1:
                         self._dbg(f"suppress duplicate stop sess={sk} p={ev.progress}")
                         return
-                    if ev.action == last_action and ev.progress == last_prog:
+                    if ev.action == last_action and ev.progress == last_prog and not (ev.raw or {}).get("_cw_playback_action"):
                         if ev.action == "stop":
                             self._dbg(f"suppress duplicate stop sess={sk} p={ev.progress}")
                         return
 
+            self._log(
+                f"incoming '{ev.action}' user='{_mask_account(ev.account)}' server='{ev.server_uuid}' media='{_media_name(ev)}' sess={ev.session_key}",
+                "DEBUG",
+            )
+            self._log(f"ids resolved: {_media_name(ev)} -> {_ids_desc(ev.ids)} sess={ev.session_key}", "DEBUG")
+            if self._stop.is_set():
+                return
             accepted = bool(self._dispatch.dispatch(ev))
             if not accepted:
-                self._throttled_route_filtered_log(ev)
+                self._throttled_route_filtered_log(ev, dispatched=True)
                 self._clear_currently_watching(ev)
                 return
 
-            self._log(
-                f"incoming 'playing' user='{_mask_account(ev.account)}' server='{ev.server_uuid}' media='{_media_name(ev)}'",
-                "DEBUG",
-            )
-            self._log(f"ids resolved: {_media_name(ev)} -> {_ids_desc(ev.ids)}", "DEBUG")
             try:
                 _cw_update("plex", ev, duration_ms=d, provider_instance=str(self._instance_id or "default"))
             except Exception:
                 pass
             if sk and ev.action == "start":
                 self._last_event[sk] = ev
+                self._stop_fallback.pop(sk, None)
+                self._stop_sent.discard(sk)
+            elif sk and ev.action == "stop":
+                self._stop_sent.add(sk)
             self._log(f"event {ev.action} {ev.media_type} user={_mask_account(ev.account)} p={ev.progress} sess={ev.session_key}")
             if sk:
                 self._last_emit[sk] = (ev.action, ev.progress)
@@ -1324,30 +1976,53 @@ class WatchService:
             
     def start(self) -> None:
         self._stop.clear()
+        self._run()
+
+    def _run(self) -> None:
         cfg = self._cfg_provider() or {}
         if not source_enabled(cfg, "watcher"):
             self._log("Watcher disabled by config; not starting", "INFO")
             return
         lvl = "DEBUG" if self._quiet_startup else "INFO"
-        self._log(f"Ensuring Watcher is running; inst={self._instance_id} | wired sinks: {self.sinks_count()}", lvl)
+        self._log(f"Ensuring Watcher is running; inst={self._instance_display()} | wired sinks: {self.sinks_count()}", lvl)
         while not self._stop.is_set():
+            session = None
             try:
-                base, token = _plex_btok(self._cfg_provider() or {}, instance_id=self._instance_id)
+                cfg = self._cfg_provider() or {}
+                base, token = _plex_btok(cfg, instance_id=self._instance_id)
                 if not token:
                     self._log("Missing plex.account_token or plex.token in config.json", "ERROR")
                     return
-                self._plex = PlexServer(base, token)
-                self._listener = self._plex.startAlertListener(
+                session = _build_session(token, _resolve_verify_from_cfg(cfg, base))
+                self._plex = PlexServer(base, token, session=session)
+                self._refresh_account_context()
+                if self._stop.is_set():
+                    break
+                self._listener = _PlexAlertListener(
+                    self._plex,
                     callback=self._handle_alert,
-                    callbackError=lambda e: self._mark_offline(e if isinstance(e, Exception) else RuntimeError(str(e))),
+                    callbackError=self._listener_error,
                 )
+                self._listener.start()
+                if self._stop.is_set():
+                    break
                 self._attempt = 0
                 self._mark_online()
-                self._log(f"Watcher connected; inst={self._instance_id}", lvl)
+                self._log(f"Watcher connected; inst={self._instance_display()}", lvl)
                 while not self._stop.is_set() and self._listener and self._listener.is_alive():
                     time.sleep(0.5)
             except Exception as e:
                 self._mark_offline(e)
+            finally:
+                listener = self._listener
+                self._listener = None
+                if listener is not None:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                if session is not None:
+                    session.close()
             if self._stop.is_set():
                 break
             self._attempt += 1
@@ -1365,12 +2040,13 @@ class WatchService:
         except Exception:
             pass
         lvl = "DEBUG" if self._quiet_startup else "INFO"
-        self._log(f"Watch service stopping; inst={self._instance_id}", lvl)
+        self._log(f"Watch service stopping; inst={self._instance_display()}", lvl)
 
     def start_async(self) -> None:
         if self._bg and self._bg.is_alive():
             return
-        self._bg = threading.Thread(target=self.start, name="PlexWatch", daemon=True)
+        self._stop.clear()
+        self._bg = threading.Thread(target=self._run, name="PlexWatch", daemon=True)
         self._bg.start()
 
     def is_alive(self) -> bool:
@@ -1442,7 +2118,7 @@ def _emit(logger: Callable[..., None] | None, msg: str, level: str = "INFO") -> 
 
 
 def _norm_user(s: str) -> str:
-    return normalize_media_account_name(s)
+    return exact_media_account_name(s)
 
 
 def _account_key(payload: dict[str, Any]) -> str:
@@ -1647,7 +2323,7 @@ def _simkl_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: d
 
 
 
-def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: dict[str, Any], logger: Callable[..., None] | None) -> dict[str, Any]:
+def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: float, cfg: dict[str, Any], logger: Callable[..., None] | None) -> dict[str, Any]:
     md_cfg = (cfg.get("mdblist") or {}) if isinstance(cfg, dict) else {}
     apikey = str(md_cfg.get("api_key") or "").strip()
     provider_auth = _provider_auth()
@@ -1665,12 +2341,16 @@ def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg:
         return {"ok": False, "error": "no_ids"}
 
     base = "https://api.mdblist.com"
-    is_remove = int(rating or 0) <= 0
+    is_remove = float(rating or 0) <= 0
     url = f"{base}/sync/ratings/remove" if is_remove else f"{base}/sync/ratings"
 
     item: dict[str, Any] = {"ids": ids3}
     if not is_remove:
-        item["rating"] = int(rating)
+        from providers.sync.mdblist._ratings import _valid_rating
+
+        item["rating"] = _valid_rating(rating)
+        if item["rating"] is None:
+            return {"ok": False, "error": "invalid_rating"}
     body: dict[str, Any] = {bucket: [item]}
 
     tmo = float(md_cfg.get("timeout") or 10)
@@ -1766,6 +2446,12 @@ def process_rating_webhook(
         enable_crosswatch = "crosswatch" in custom_targets
         enable_floppy = "floppy" in custom_targets
         enable_punchplay = "punchplay" in custom_targets
+        enable_flicklist = "flicklist" in custom_targets
+        enable_scrob = "scrob" in custom_targets
+        enable_wetrakr = "wetrakr" in custom_targets
+        enable_anilist = "anilist" in custom_targets
+        enable_kitsu = "kitsu" in custom_targets
+        enable_myanimelist = "myanimelist" in custom_targets
     else:
         enable_trakt = bool(watch_cfg.get("plex_trakt_ratings"))
         enable_simkl = bool(watch_cfg.get("plex_simkl_ratings"))
@@ -1773,8 +2459,14 @@ def process_rating_webhook(
         enable_crosswatch = bool(watch_cfg.get("plex_crosswatch_ratings"))
         enable_floppy = bool(watch_cfg.get("plex_floppy_ratings"))
         enable_punchplay = bool(watch_cfg.get("plex_punchplay_ratings"))
+        enable_flicklist = bool(watch_cfg.get("plex_flicklist_ratings"))
+        enable_scrob = bool(watch_cfg.get("plex_scrob_ratings"))
+        enable_wetrakr = bool(watch_cfg.get("plex_wetrakr_ratings"))
+        enable_anilist = bool(watch_cfg.get("plex_anilist_ratings"))
+        enable_kitsu = bool(watch_cfg.get("plex_kitsu_ratings"))
+        enable_myanimelist = bool(watch_cfg.get("plex_myanimelist_ratings"))
 
-    if not (enable_trakt or enable_simkl or enable_mdblist or enable_crosswatch or enable_floppy or enable_punchplay):
+    if not (enable_trakt or enable_simkl or enable_mdblist or enable_crosswatch or enable_floppy or enable_punchplay or enable_flicklist or enable_scrob or enable_wetrakr or enable_anilist or enable_kitsu or enable_myanimelist):
         return {"ok": True, "ignored": True}
 
     if not payload:
@@ -1805,7 +2497,7 @@ def process_rating_webhook(
         return {"ok": True, "ignored": True}
 
     media_type = str(md.get("type") or "").lower().strip()
-    if media_type not in ("movie", "show", "episode"):
+    if media_type not in ("movie", "show", "episode") and not (media_type == "season" and enable_anilist):
         return {"ok": True, "ignored": True}
 
     rating_raw = md.get("userRating") if "userRating" in md else None
@@ -1814,9 +2506,12 @@ def process_rating_webhook(
     rating_val = _plex_rating_to_10(rating_raw) if rating_raw is not None else 0
     if rating_val is None:
         rating_val = 0
+    from providers.scrobble.plex.ratings_sync import plex_rating_value
+
+    rating_precise = plex_rating_value(rating_raw)
 
 
-    if media_type == "episode" and not (enable_trakt or enable_crosswatch or enable_punchplay):
+    if media_type == "episode" and not (enable_trakt or enable_crosswatch or enable_punchplay or enable_flicklist or enable_scrob or enable_wetrakr):
         return {"ok": True, "ignored": True}
 
     acc_key = _account_key(payload)
@@ -1824,9 +2519,24 @@ def process_rating_webhook(
     route_scope = str((route_hook or {}).get("route_id") or watch_cfg.get("route_id") or "global").strip() or "global"
     dedup_key = (route_scope, acc_key, rk or "?", media_type)
     prev = _LAST_RATING_BY_ACC.get(dedup_key) or {}
-    if prev and prev.get("rating") == rating_val and (time.time() - float(prev.get("ts", 0))) < 10:
+    if prev and prev.get("rating") == rating_precise and (time.time() - float(prev.get("ts", 0))) < 10:
         return {"ok": True, "dedup": True}
-    _LAST_RATING_BY_ACC[dedup_key] = {"rating": rating_val, "ts": time.time()}
+    _LAST_RATING_BY_ACC[dedup_key] = {"rating": rating_precise, "ts": time.time()}
+
+    sink_inst = str(watch_cfg.get("route_sink_instance") or "default").strip() or "default"
+    if media_type == "season":
+        from providers.scrobble.anilist.ratings import send_plex_rating
+        from providers.webhooks.plex import _plex_show_ids_from_metadata, _show_ids_from_md
+
+        season_show_ids = _show_ids_from_md(md) or _plex_show_ids_from_metadata(cfg, md, logger)
+        return {
+            "ok": True,
+            "action": "rating",
+            "media_type": media_type,
+            "rating": rating_precise,
+            "route_id": route_scope,
+            "anilist": send_plex_rating(cfg, sink_inst, media_type, md, {}, season_show_ids, rating_precise),
+        }
 
     ids = _all_ids_from_metadata(md)
 
@@ -1834,7 +2544,7 @@ def process_rating_webhook(
         try:
             base, token = _plex_btok(cfg)
             if token:
-                px = PlexServer(base, token)
+                px = PlexServer(base, token, session=_build_session(token, _resolve_verify_from_cfg(cfg, base)))
                 it = px.fetchItem(int(rk))
                 if it is not None:
                     ids.update(_ids_from_guids_any(getattr(it, "guids", [])))
@@ -1851,31 +2561,42 @@ def process_rating_webhook(
         _emit(logger, "rating event without usable external IDs; ignored", "DEBUG")
         return {"ok": True, "ignored": True}
 
-    results: dict[str, Any] = {"ok": True, "action": "rating", "media_type": media_type, "rating": rating_val, "route_id": route_scope}
+    results: dict[str, Any] = {"ok": True, "action": "rating", "media_type": media_type, "rating": rating_precise, "route_id": route_scope}
     if enable_trakt:
         results["trakt"] = _trakt_send_rating(media_type, ids, rating_val, cfg, logger)
     if enable_simkl and media_type in ("movie", "show"):
         results["simkl"] = _simkl_send_rating(media_type, ids, rating_val, cfg, logger)
     if enable_mdblist and media_type in ("movie", "show"):
-        results["mdblist"] = _mdblist_send_rating(media_type, ids, rating_val, cfg, logger)
+        results["mdblist"] = _mdblist_send_rating(media_type, ids, rating_precise, cfg, logger)
     ops_enabled = [
         name
-        for name, on in (("crosswatch", enable_crosswatch), ("floppy", enable_floppy), ("punchplay", enable_punchplay))
+        for name, on in (("crosswatch", enable_crosswatch), ("floppy", enable_floppy), ("punchplay", enable_punchplay), ("flicklist", enable_flicklist), ("scrob", enable_scrob), ("wetrakr", enable_wetrakr), ("kitsu", enable_kitsu), ("myanimelist", enable_myanimelist))
         if on
     ]
     if ops_enabled:
         from providers.scrobble.plex.ratings_sync import dispatch_ops_ratings
 
-        sink_inst = str(watch_cfg.get("route_sink_instance") or "default").strip() or "default"
+        show_ids = episode_ids = None
+        if media_type == "episode":
+            from providers.webhooks.plex import _episode_ids_from_md, _show_ids_from_md, _plex_show_ids_from_metadata
+
+            episode_ids = _episode_ids_from_md(md)
+            show_ids = _show_ids_from_md(md) or _plex_show_ids_from_metadata(cfg, md, logger)
         results.update(
             dispatch_ops_ratings(
                 media_type,
                 md,
                 ids,
-                rating_val,
+                rating_precise,
                 cfg,
                 enabled=ops_enabled,
                 instance_for=lambda _sink: sink_inst,
+                show_ids=show_ids,
+                episode_ids=episode_ids,
             )
         )
+    if enable_anilist and media_type in ("movie", "show"):
+        from providers.scrobble.anilist.ratings import send_plex_rating
+
+        results["anilist"] = send_plex_rating(cfg, sink_inst, media_type, md, ids, ids if media_type == "show" else None, rating_precise)
     return results

@@ -2,9 +2,15 @@
 # EMBY Module for common utilities
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+
+from cw_platform.path_matching import media_paths
+from .._path_matching import path_fallback
+from cw_platform.interactive_reads import retained_read
 from typing import Any, Iterable, Mapping, Sequence
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
+from threading import local
 import json
 import os
 import re
@@ -12,10 +18,29 @@ import shutil
 import time
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
 from cw_platform.id_map import minimal as id_minimal, canonical_key
+from cw_platform.log_context import log_run_id
 from .._log import log as cw_log
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
 
 _STATE_DIR = Path("/config/.cw_state")
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def scope_safe() -> str:
@@ -34,7 +59,7 @@ def state_file(name: str) -> str:
         legacy = _STATE_DIR / name
 
     # Auto-migrate legacy unscoped state to scoped file
-    if (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
+    if not str(_pair_scope() or "").startswith("cw2_") and (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
         try:
             _STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)
@@ -49,8 +74,9 @@ _BAD_NUM = re.compile(r"^\d{13,}$")
 
 CfgLike = Mapping[str, Any] | object
 
-# Adapter-scoped provider-index cache
-_PROVIDER_INDEX_CACHE: dict[tuple[int, tuple[str, ...]], tuple[float, dict[str, list[dict[str, Any]]]]] = {}
+# One shared index per sync thread; standalone calls cache on their adapter.
+_RUN_PROVIDER_INDEX = local()
+_RUN_LOOKUP_CACHE = local()
 
 
 def _debug_level() -> str:
@@ -291,6 +317,120 @@ def emby_scope_any(cfg: CfgLike) -> dict[str, Any]:
     return _emby_scope_from_list(libs)
 
 
+def emby_build_library_roots(http: Any, user_id: str | None = None) -> dict[str, dict[str, Any]]:
+    roots: dict[str, dict[str, Any]] = {}
+    try:
+        r = http.get(f"/Users/{user_id}/Views") if user_id else http.get("/Library/MediaFolders")
+    except Exception:
+        r = None
+    try:
+        if r is not None and getattr(r, "status_code", 0) == 200:
+            data = r.json() or {}
+            for item in data.get("Items") or data.get("ItemsList") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                lid = str(item.get("Id") or item.get("Key") or "").strip()
+                if not lid:
+                    continue
+                ctyp = str(item.get("CollectionType") or item.get("Type") or "").strip().lower()
+                if "movie" in ctyp:
+                    typ = "movie"
+                elif "series" in ctyp or "tv" in ctyp:
+                    typ = "show"
+                else:
+                    typ = ctyp or "lib"
+                roots[lid] = {"id": lid, "type": typ, "raw": item}
+    except Exception:
+        pass
+    if (os.environ.get("CW_DEBUG") or os.environ.get("CW_EMBY_DEBUG")) and roots:
+        cw_log("EMBY", "common", "debug", "index_fetch_counts", source="library_roots", roots=sorted(roots.keys()))
+    return roots
+
+
+def emby_get_library_roots(adapter: Any) -> dict[str, dict[str, Any]]:
+    roots = getattr(adapter, "_emby_library_roots", None)
+    if isinstance(roots, dict) and roots:
+        return roots
+    http = getattr(adapter, "client", None)
+    cfg = getattr(adapter, "cfg", None)
+    user_id = getattr(cfg, "user_id", None) if cfg is not None else None
+    if not http:
+        return {}
+    roots = emby_build_library_roots(http, str(user_id or "") or None)
+    setattr(adapter, "_emby_library_roots", roots)
+    return roots
+
+
+_emby_lib_anc_cache: dict[str, str | None] = {}
+
+
+def _emby_lib_id_via_ancestors(http: Any, user_id: str | None, item_id: str, roots: Mapping[str, Any]) -> str | None:
+    if not item_id:
+        return None
+    if item_id in _emby_lib_anc_cache:
+        return _emby_lib_anc_cache[item_id]
+    try:
+        params = {"Fields": "Id"}
+        if user_id:
+            params["UserId"] = str(user_id)
+        response = http.get(f"/Items/{item_id}/Ancestors", params=params)
+        if getattr(response, "status_code", 0) == 200:
+            root_keys = {str(k) for k in (roots or {}).keys()}
+            for ancestor in response.json() or []:
+                aid = str((ancestor or {}).get("Id") or "").strip()
+                if aid in root_keys:
+                    _emby_lib_anc_cache[item_id] = aid
+                    return aid
+    except Exception:
+        pass
+    _emby_lib_anc_cache[item_id] = None
+    return None
+
+
+def emby_resolve_library_id(
+    row: Mapping[str, Any],
+    roots: Mapping[str, Mapping[str, Any]],
+    scope_libs: list[str] | None = None,
+    http: Any | None = None,
+    user_id: str | None = None,
+    *,
+    allow_deep_lookup: bool = False,
+) -> str | None:
+    if scope_libs and len(scope_libs) == 1:
+        return str(scope_libs[0])
+
+    candidates: list[str] = []
+    for key in ("library_id", "LibraryId", "CollectionFolderId", "ParentId"):
+        value = row.get(key)
+        if value is not None:
+            candidates.append(str(value))
+    ancestors = row.get("AncestorIds") or []
+    if isinstance(ancestors, (list, tuple)):
+        candidates.extend(str(value) for value in ancestors if value is not None)
+
+    root_keys = {str(key) for key in (roots or {}).keys()}
+    for candidate in candidates:
+        if candidate in root_keys:
+            return candidate
+
+    if allow_deep_lookup and http and row.get("Id"):
+        found = _emby_lib_id_via_ancestors(http, user_id, str(row["Id"]), roots)
+        if found:
+            return found
+
+    want: str | None = None
+    typ = str(row.get("Type") or row.get("type") or "").strip().lower()
+    if typ in ("movie", "video"):
+        want = "movie"
+    elif typ in ("episode", "series", "season", "show"):
+        want = "show"
+    if want:
+        for lib_id, meta in roots.items():
+            if str((meta or {}).get("type") or "").lower() == want:
+                return str(lib_id)
+    return None
+
+
 # type & id helpers
 def _norm_type(t: Any) -> str:
     x = str(t or "").strip().lower()
@@ -363,6 +503,9 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
         base = dict(obj)
         res = id_minimal(base)
         raw = base.get("emby_item_id") or base.get("_emby_item_id") or (base.get("ids") or {}).get("emby")
+        res_ids = res.get("ids")
+        if isinstance(res_ids, dict):
+            res_ids.pop("emby", None)
         if raw:
             res["emby_item_id"] = str(raw)
         if "library_id" in base:
@@ -374,9 +517,8 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
     pids = obj.get("ProviderIds") if isinstance(pids := obj.get("ProviderIds"), Mapping) else obj.get("ids") or {}
     ids = {k: v for k, v in _ids_from_provider_ids(pids).items() if v}
     em_id = obj.get("Id") or (pids.get("emby") if isinstance(pids, Mapping) else None)
-    if em_id:
-        ids["emby"] = str(em_id)
-    row: dict[str, Any] = {"type": t, "title": title, "year": year, "ids": ids}
+    ids.pop("emby", None)
+    row: dict[str, Any] = {"type": t, "title": title, "year": year, "ids": ids, "media_paths": media_paths(obj)}
     if em_id:
         row["emby_item_id"] = str(em_id)
     lib_id = obj.get("LibraryId")
@@ -400,12 +542,13 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
         ).strip() or None
         if series_title:
             row["series_title"] = series_title
-        s = (
-            obj.get("ParentIndexNumber")
-            or obj.get("SeasonIndexNumber")
-            or obj.get("season")
-            or obj.get("season_number")
-        )
+        s = obj.get("ParentIndexNumber")
+        if s is None:
+            s = obj.get("SeasonIndexNumber")
+        if s is None:
+            s = obj.get("season")
+        if s is None:
+            s = obj.get("season_number")
         e = (
             obj.get("IndexNumber")
             or obj.get("EpisodeIndexNumber")
@@ -552,6 +695,8 @@ def build_provider_index(adapter: Any, *, feature: str | None = None) -> dict[st
         if parent_id:
             params["ParentId"] = parent_id
         r = http.get(f"/Users/{uid}/Items", params=params)
+        if getattr(r, "status_code", 0) != 200:
+            raise RuntimeError(f"emby_provider_index_http_{getattr(r, 'status_code', 0)}")
         body = r.json() or {}
         items = body.get("Items") or []
         signature = tuple(str(row.get("Id") or "") for row in items if isinstance(row, Mapping))
@@ -601,23 +746,68 @@ def build_provider_index(adapter: Any, *, feature: str | None = None) -> dict[st
     return out
 
 
+def _provider_index_context(adapter: Any, feature: str) -> tuple[tuple[Any, ...], bool]:
+    # CW_RUN_ID can remain in the environment after a run; use its context ID.
+    run_id = log_run_id.get()
+    cfg = adapter.cfg
+    server = str(getattr(cfg, "server", "") or "")
+    user = str(getattr(cfg, "user_id", "") or "")
+    credential = sha256(str(getattr(cfg, "access_token", "") or "").encode()).digest()
+    config = getattr(adapter, "config", None)
+    pair_scope = (config.get("_cw_pair_scope") if isinstance(config, Mapping) else None) or _pair_scope()
+    key = (run_id, server, user, credential, pair_scope, feature, tuple(sorted(emby_selected_library_ids(cfg, feature))))
+    share = bool(run_id and server and user and pair_scope and pair_scope.lower() not in {"unscoped", "default", "none"})
+    return key, share
+
+
+def _lookup_cache(adapter: Any, feature: str) -> dict[Any, Any]:
+    # Reuse metadata across batches only inside this run, pair, profile and feature.
+    key, share = _provider_index_context(adapter, feature)
+    key += (bool(getattr(adapter.cfg, "strict_id_matching", False)),)
+    if not share:
+        _RUN_LOOKUP_CACHE.entry = None
+    entry = getattr(_RUN_LOOKUP_CACHE, "entry", None) if share else None
+    if entry is None or entry[0] != key:
+        entry = getattr(adapter, "_emby_lookup_cache", None)
+    if entry is None or entry[0] != key or (not key[0] and time.monotonic() - entry[1] >= 300):
+        entry = (key, time.monotonic(), {})
+    adapter._emby_lookup_cache = entry
+    if share:
+        _RUN_LOOKUP_CACHE.entry = entry
+    return entry[2]
+
+
 def provider_index(adapter: Any, *, ttl_sec: int = 300, force_refresh: bool = False, feature: str = "history") -> dict[str, list[dict[str, Any]]]:
-    key = (id(adapter), tuple(sorted(emby_selected_library_ids(adapter.cfg, feature))))
-    now = time.time()
     if not force_refresh:
-        hit = _PROVIDER_INDEX_CACHE.get(key)
-        if hit and (now - hit[0]) < max(1, int(ttl_sec)):
-            return hit[1]
+        cached = _cached_provider_index(adapter, feature, ttl_sec=ttl_sec)
+        if cached is not None:
+            return cached
+    key, share = _provider_index_context(adapter, feature)
+    adapter._provider_index_cache = None
+    _RUN_PROVIDER_INDEX.entry = None
     idx = build_provider_index(adapter) if feature == "history" else build_provider_index(adapter, feature=feature)
-    _PROVIDER_INDEX_CACHE[key] = (now, idx)
+    entry = (key, time.monotonic(), idx)
+    adapter._provider_index_cache = entry
+    if share:
+        _RUN_PROVIDER_INDEX.entry = entry
     return idx
 
 
 def _cached_provider_index(adapter: Any, feature: str, *, ttl_sec: int = 300) -> dict[str, list[dict[str, Any]]] | None:
-    key = (id(adapter), tuple(sorted(emby_selected_library_ids(adapter.cfg, feature))))
-    hit = _PROVIDER_INDEX_CACHE.get(key)
-    if hit and (time.time() - hit[0]) < max(1, int(ttl_sec)):
-        return hit[1]
+    key, share = _provider_index_context(adapter, feature)
+    if not share:
+        _RUN_PROVIDER_INDEX.entry = None
+    shared = getattr(_RUN_PROVIDER_INDEX, "entry", None) if share else None
+    if shared is not None and shared[0] == key:
+        if getattr(adapter, "_provider_index_cache", None) is not shared:
+            cw_log("EMBY", "common", "debug", "index_cache_hit", source="run", count=len(shared[2]))
+        adapter._provider_index_cache = shared
+        return shared[2]
+    hit = getattr(adapter, "_provider_index_cache", None)
+    # Active syncs reuse the index for the entire run. Standalone adapters keep
+    # the existing TTL, without retaining them in a process-wide ID cache.
+    if hit is not None and hit[0] == key and (share or time.monotonic() - hit[1] < max(1, int(ttl_sec))):
+        return hit[2]
     return None
 
 
@@ -673,6 +863,7 @@ def get_series_episodes(http: Any, user_id: str, series_id: str, start: int = 0,
         "Limit": max(1, int(limit)),
         "Fields": "IndexNumber,ParentIndexNumber,SeasonId,SeriesId,ProviderIds,ProductionYear,Type",
         "EnableUserData": False,
+        "EnableTotalRecordCount": True,
     }
     r = http.get(f"/Shows/{series_id}/Episodes", params=q)
     if getattr(r, "status_code", 0) != 200:
@@ -682,7 +873,6 @@ def get_series_episodes(http: Any, user_id: str, series_id: str, start: int = 0,
     except Exception:
         return None
     data.setdefault("Items", [])
-    data.setdefault("TotalRecordCount", len(data["Items"]))
     return data
 
 
@@ -707,28 +897,77 @@ def _is_future_episode(it: Any) -> bool:
     return False
 
 
+_SERIES_FIELDS = "ProviderIds,ProductionYear,Type,Name,SeriesId,ParentId"
+
+
+def _items_by_ids(http: Any, uid: str, ids: list[str]) -> tuple[bool, dict[str, Mapping[str, Any]]]:
+    if not ids:
+        return True, {}
+    try:
+        r = http.get(
+            f"/Users/{uid}/Items",
+            params={"Ids": ",".join(ids), "Fields": _SERIES_FIELDS},
+        )
+    except Exception:
+        return False, {}
+    if getattr(r, "status_code", 0) != 200:
+        return False, {}
+    try:
+        arr = (r.json() or {}).get("Items") or []
+    except Exception:
+        return True, {}
+    out: dict[str, Mapping[str, Any]] = {}
+    for raw in arr if isinstance(arr, list) else []:
+        if not isinstance(raw, Mapping):
+            continue
+        rid = str(raw.get("Id") or "").strip()
+        if rid:
+            out[rid] = raw
+    return True, out
+
+
+def _series_id_for_episode(http: Any, uid: str, ep: Mapping[str, Any]) -> str:
+    sid = str(ep.get("SeriesId") or ep.get("seriesid") or "").strip()
+    if sid:
+        return sid
+    parent = str(ep.get("ParentId") or "").strip()
+    if not parent:
+        return ""
+    ok, rows = _items_by_ids(http, uid, [parent])
+    row = rows.get(parent)
+    if not ok or not isinstance(row, Mapping):
+        return ""
+    kind = str(row.get("Type") or "").strip()
+    if kind == "Series":
+        return parent
+    if kind == "Season":
+        return str(row.get("SeriesId") or row.get("ParentId") or "").strip()
+    return ""
+
+
 def _series_minimal_from_episode(
     http: Any,
     uid: str,
     ep: Mapping[str, Any],
     _cache: dict[str, dict[str, Any] | None],
 ) -> dict[str, Any] | None:
-    sid = ep.get("SeriesId") or ep.get("seriesid")
-    if not sid:
-        return None
-    if sid in _cache:
+    sid = str(ep.get("SeriesId") or ep.get("seriesid") or "").strip()
+    if sid and sid in _cache:
         return _cache[sid]
-    r = http.get(
-        f"/Users/{uid}/Items",
-        params={"Ids": sid, "Fields": "ProviderIds,ProductionYear,Type,Name"},
-    )
-    if getattr(r, "status_code", 0) == 200:
-        arr = (r.json() or {}).get("Items") or []
-        if arr:
-            m = normalize(arr[0])
-            _cache[sid] = m
-            return m
-    _cache[sid] = None
+    if not sid:
+        sid = _series_id_for_episode(http, uid, ep)
+        if not sid:
+            return None
+        if sid in _cache:
+            return _cache[sid]
+    ok, rows = _items_by_ids(http, uid, [sid])
+    row = rows.get(sid)
+    if isinstance(row, Mapping) and str(row.get("Type") or "").strip() == "Series":
+        m = normalize(row)
+        _cache[sid] = m
+        return m
+    if ok:
+        _cache[sid] = None
     return None
 
 
@@ -755,13 +994,11 @@ def prefetch_series_minimals(
         try:
             r = http.get(
                 f"/Users/{uid}/Items",
-                params={"Ids": ','.join(batch), "Fields": "ProviderIds,ProductionYear,Type,Name"},
+                params={"Ids": ','.join(batch), "Fields": _SERIES_FIELDS},
             )
         except Exception:
             r = None
         if r is None or getattr(r, 'status_code', 0) != 200:
-            for sid in batch:
-                _cache.setdefault(sid, None)
             continue
         try:
             arr = (r.json() or {}).get('Items') or []
@@ -770,13 +1007,12 @@ def prefetch_series_minimals(
         for raw in arr:
             try:
                 sid = str((raw or {}).get('Id') or '').strip()
-                if sid:
+                if sid and str((raw or {}).get('Type') or '').strip() == 'Series':
                     _cache[sid] = normalize(raw)
             except Exception:
                 pass
-        for sid in batch:
-            _cache.setdefault(sid, None)
 
+@retained_read
 def _fetch_all_playlist_items(
     http: Any,
     pid: str,
@@ -806,30 +1042,31 @@ def _fetch_all_series_episodes(
     page_size: int,
 ) -> list[Mapping[str, Any]] | None:
     start = 0
-    total: int | None = None
     out: list[Mapping[str, Any]] = []
+    seen_pages: set[tuple[str, ...]] = set()
     while True:
         body = get_series_episodes(http, uid, sid, start=start, limit=page_size)
         if body is None:
             return None
         rows: list[Mapping[str, Any]] = body.get("Items") or []
-        if total is None:
-            total = int(body.get("TotalRecordCount") or 0)
+        signature = tuple(str(row.get("Id") or "") for row in rows)
+        if rows and signature in seen_pages:
+            return None
+        seen_pages.add(signature)
+        total = body.get("TotalRecordCount")
         out.extend(rows)
         start += len(rows)
-        if not rows or (total is not None and start >= total):
+        if total is not None and start >= int(total):
+            break
+        if not rows:
+            return None if total is not None and start < int(total) else out
+        if total is None and len(rows) < page_size:
             break
     return out
 
 
-def _series_episodes_cached(adapter: Any, http: Any, uid: str, sid: str) -> list[Mapping[str, Any]]:
-    cache = getattr(adapter, "_emby_series_episodes_cache", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        try:
-            setattr(adapter, "_emby_series_episodes_cache", cache)
-        except Exception:
-            pass
+def _series_episodes_cached(adapter: Any, http: Any, uid: str, sid: str, *, feature: str = "history") -> list[Mapping[str, Any]]:
+    cache = _lookup_cache(adapter, feature).setdefault("episodes", {})
     key = str(sid)
     rows = cache.get(key)
     if rows is None:
@@ -841,6 +1078,7 @@ def _series_episodes_cached(adapter: Any, http: Any, uid: str, sid: str) -> list
     return rows or []
 
 
+@retained_read
 def _fetch_all_collection_items(
     http: Any,
     uid: str,
@@ -1002,6 +1240,34 @@ def playlist_move_item(http: Any, playlist_id: str, item_id: str, new_index: int
     if not iid:
         return True
     r = http.post(f"/Playlists/{playlist_id}/Items/{iid}/Move/{max(0, int(new_index))}")
+    return getattr(r, "status_code", 0) in (200, 204)
+
+
+def update_item_name(http: Any, item_id: str, name: str) -> bool:
+    iid = str(item_id or "").strip()
+    nm = str(name or "").strip()
+    if not iid or not nm:
+        return False
+    r = http.get(f"/Items/{iid}")
+    body: dict[str, Any] = {}
+    if getattr(r, "status_code", 0) == 200:
+        try:
+            data = r.json() or {}
+        except Exception:
+            data = {}
+        if isinstance(data, Mapping):
+            body.update(data)
+    body["Id"] = iid
+    body["Name"] = nm
+    r2 = http.post(f"/Items/{iid}", json=body)
+    return getattr(r2, "status_code", 0) in (200, 204)
+
+
+def delete_item(http: Any, item_id: str) -> bool:
+    iid = str(item_id or "").strip()
+    if not iid:
+        return False
+    r = http.delete(f"/Items/{iid}")
     return getattr(r, "status_code", 0) in (200, 204)
 
 
@@ -1272,13 +1538,77 @@ def _pick_from_candidates(
     return str(iid) if iid and not looks_like_bad_id(iid) else None
 
 
+def _public_ids(ids: Mapping[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in ("tmdb", "imdb", "tvdb"):
+        pair = format_provider_pair(key, ids.get(key))
+        if pair:
+            out[key] = pair.partition(".")[2]
+    return out
+
+
+def _row_matches_type(row: Mapping[str, Any], want_type: str | None) -> bool:
+    if not want_type:
+        return True
+    row_type = str(row.get("Type") or "").strip().lower()
+    if want_type == "movie":
+        return row_type in ("movie", "video")
+    if want_type in ("show", "series"):
+        return row_type == "series"
+    if want_type == "episode":
+        return row_type == "episode"
+    return True
+
+
+def _row_matches_title_year(row: Mapping[str, Any], title: str, year: Any) -> bool:
+    if not title:
+        return False
+    row_title = str(row.get("Name") or "").strip().lower()
+    if row_title != title.lower():
+        return False
+    if year is None:
+        return True
+    try:
+        return isinstance(row.get("ProductionYear"), int) and abs(int(row["ProductionYear"]) - int(year)) <= 1
+    except Exception:
+        return False
+
+
+def _native_row_matches_request(
+    row: Mapping[str, Any],
+    ids: Mapping[str, Any],
+    *,
+    want_type: str | None,
+    title: str,
+    year: Any,
+    strict: bool = False,
+) -> bool:
+    if not row or not _row_matches_type(row, want_type):
+        return False
+
+    requested_public = _public_ids(ids)
+    if requested_public:
+        row_public = _ids_from_provider_ids(row.get("ProviderIds"))
+        if any(row_public.get(key) == value for key, value in requested_public.items()):
+            return True
+        if row_public or strict:
+            return False
+        return _row_matches_title_year(row, title, year)
+
+    if strict:
+        return True
+    if title:
+        return _row_matches_title_year(row, title, year)
+    return True
+
+
 def _direct_query_by_pairs(
     http: Any,
     uid: str,
     pairs: list[str],
     include_types: str,
     scope: Mapping[str, Any],
-) -> list[Mapping[str, Any]]:
+) -> list[Mapping[str, Any]] | None:
     if not pairs:
         return []
     q = {
@@ -1287,21 +1617,67 @@ def _direct_query_by_pairs(
         "Recursive": True,
         "Fields": "ProviderIds,ProductionYear,Type,IndexNumber,ParentIndexNumber,SeriesId,ParentId,CollectionFolderId,AncestorIds,LibraryId,Name",
         "Limit": 50,
+        "EnableTotalRecordCount": True,
         "UserId": uid,
     }
     scope_values = dict(scope or {})
     parent_ids = [str(value) for value in scope_values.pop("ParentIds", []) if value]
     q.update(scope_values)
+    requested = set(pairs)
+    types = set(include_types.split(","))
     try:
-        rows: list[Mapping[str, Any]] = []
+        rows: dict[str, Mapping[str, Any]] = {}
         queries = [{**q, "ParentId": value, "Recursive": True} for value in sorted(parent_ids)] or [q]
         for query in queries:
-            r = http.get(f"/Users/{uid}/Items", params=query)
-            if getattr(r, "status_code", 0) == 200:
-                rows.extend((r.json() or {}).get("Items") or [])
-        return rows
-    except Exception:
-        return []
+            start = 0
+            seen_pages: set[tuple[str, ...]] = set()
+            while True:
+                r = http.get(f"/Users/{uid}/Items", params={**query, "StartIndex": start})
+                if getattr(r, "status_code", 0) != 200:
+                    raise RuntimeError(f"http_{getattr(r, 'status_code', 0)}")
+                body = r.json()
+                if not isinstance(body, Mapping) or not isinstance(body.get("Items"), list):
+                    raise RuntimeError("invalid_items_response")
+                page = body["Items"]
+                if any(not isinstance(row, Mapping) or not row.get("Id") for row in page):
+                    raise RuntimeError("invalid_item_row")
+                signature = tuple(str(row.get("Id") or "") for row in page)
+                if page and signature in seen_pages:
+                    raise RuntimeError("repeated_page")
+                seen_pages.add(signature)
+                for row in page:
+                    iid = str(row.get("Id") or "")
+                    row_pairs = {format_provider_pair(k, v)
+                                 for k, v in _ids_from_provider_ids(row.get("ProviderIds")).items()}
+                    if not requested.intersection(row_pairs) or row.get("Type") not in types:
+                        raise RuntimeError("unexpected_provider_id_result")
+                    if iid and not looks_like_bad_id(iid):
+                        rows[iid] = row
+                start += len(page)
+                total = body.get("TotalRecordCount")
+                if total is not None and start >= int(total):
+                    break
+                if not page:
+                    if total is not None and start < int(total):
+                        raise RuntimeError("incomplete_page")
+                    break
+                if total is None and len(page) < 50:
+                    break
+        return list(rows.values())
+    except Exception as exc:
+        cw_log("EMBY", "common", "debug", "id_query_failed", error=str(exc), include_types=include_types)
+        return None
+
+
+def _query_by_pairs(adapter: Any, pairs: list[str], include_types: str, scope: Mapping[str, Any], feature: str) -> list[Mapping[str, Any]]:
+    cache = _lookup_cache(adapter, feature).setdefault("queries", {})
+    key = (tuple(pairs), include_types, json.dumps(dict(scope), sort_keys=True))
+    if key not in cache:
+        rows = _direct_query_by_pairs(adapter.client, adapter.cfg.user_id, pairs, include_types, scope)
+        if rows is None:
+            return []
+        cache[key] = rows
+    return cache[key]
 
 
 def _episode_number_matches(row: Mapping[str, Any], season: Any, episode: Any) -> bool:
@@ -1318,19 +1694,14 @@ def _episode_number_matches(row: Mapping[str, Any], season: Any, episode: Any) -
         return False
 
 
+@path_fallback("EMBY")
 def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "history") -> str | None:
     http, uid = adapter.client, adapter.cfg.user_id
     selected_libs = emby_selected_library_ids(adapter.cfg, feature)
     setattr(adapter, "_emby_last_resolve_hint", None)
     ids = dict(it.get("ids") or {})
-    try:
-        memo: dict[str, str | None] = getattr(adapter, "_emby_resolve_cache")
-    except Exception:
-        memo = {}
-        try:
-            setattr(adapter, "_emby_resolve_cache", memo)
-        except Exception:
-            pass
+    strict = bool(getattr(adapter.cfg, "strict_id_matching", False))
+    memo = _lookup_cache(adapter, feature).setdefault("resolved", {})
     try:
         import json as _json
         mk = _json.dumps(
@@ -1344,6 +1715,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
                 "st": it.get("series_title"),
                 "sid": it.get("show_ids"),
                 "libs": sorted(selected_libs),
+                "library_hint": it.get("library_id") or it.get("libraryId") or it.get("source_library_id"),
             },
             sort_keys=True,
         )
@@ -1356,35 +1728,31 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
         )
     if mk in memo and memo[mk]:
         return memo[mk]
-    em = ids.get("emby")
-    if em and not looks_like_bad_id(em):
-        if selected_libs:
-            try:
-                response = http.get(
-                    f"/Users/{uid}/Items/{em}",
-                    params={"Fields": "LibraryId,CollectionFolderId,AncestorIds,ParentId,Type"},
-                )
-                row = response.json() or {} if getattr(response, "status_code", 0) == 200 else {}
-            except Exception:
-                row = {}
-            if not emby_filter_library_candidates([row] if row else [], selected_libs):
-                setattr(adapter, "_emby_last_resolve_hint", "outside_library_scope")
-                cw_log("EMBY", "common", "debug", "target_candidate_outside_library_scope", item_id=str(em), allowed_library_ids=sorted(selected_libs), resolution_method="provider_id")
-            else:
-                memo[mk] = str(em)
-                return str(em)
-        else:
-            cw_log("EMBY", "common", "debug", "resolve_hit", kind="direct", method="provider_id", item_id=str(em))
-            memo[mk] = str(em)
-            return str(em)
     t = _lookup_type(it)
     title = (it.get("title") or "").strip()
     year = it.get("year")
     season = it.get("season")
     episode = it.get("episode")
     series_title = (it.get("series_title") or "").strip()
+    em = ids.get("emby")
+    if em and not looks_like_bad_id(em):
+        try:
+            response = http.get(
+                f"/Users/{uid}/Items/{em}",
+                params={"Fields": "ProviderIds,ProductionYear,LibraryId,CollectionFolderId,AncestorIds,ParentId,Type,Name"},
+            )
+            row = response.json() or {} if getattr(response, "status_code", 0) == 200 else {}
+        except Exception:
+            row = {}
+        if selected_libs and not emby_filter_library_candidates([row] if row else [], selected_libs):
+            setattr(adapter, "_emby_last_resolve_hint", "outside_library_scope")
+            cw_log("EMBY", "common", "debug", "target_candidate_outside_library_scope", item_id=str(em), allowed_library_ids=sorted(selected_libs), resolution_method="provider_id")
+        elif row and str(row.get("Id") or "") == str(em) and _native_row_matches_request(row, ids, want_type=t, title=title, year=year, strict=strict):
+            memo[mk] = str(em)
+            return str(em)
+        else:
+            cw_log("EMBY", "common", "debug", "native_id_rejected", item_id=str(em), kind=t, title=title, year=year)
 
-    strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
     series_ids = dict(it.get("show_ids") or {})
     prio = _merged_guid_priority(adapter)
     ep_pairs = all_ext_pairs(ids, prio)
@@ -1394,20 +1762,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
         if pref.partition(".")[0] in ("tmdb", "imdb", "tvdb")
     ]
     series_pairs = all_ext_pairs(series_ids, prio) if series_ids else []
-    scope_hist: dict[str, Any] = {}
-    try:
-        scope_hist = emby_scope_history(adapter.cfg) or {}
-    except Exception:
-        scope_hist = {}
-    allowed_libs: list[str] = []
-    if isinstance(scope_hist, Mapping):
-        pid = scope_hist.get("ParentId")
-        if pid:
-            allowed_libs = [str(pid)]
-        else:
-            anc = scope_hist.get("ParentIds")
-            if isinstance(anc, (list, tuple)):
-                allowed_libs = [str(x) for x in anc if x]
+    allowed_libs = sorted(selected_libs)
     hint_lib = str(
         it.get("library_id")
         or it.get("libraryId")
@@ -1449,7 +1804,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
     else:
         scope = emby_library_scope(adapter.cfg, feature)
     if t == "movie":
-        rows = _direct_query_by_pairs(http, uid, ep_pairs, "Movie", scope)
+        rows = _query_by_pairs(adapter, ep_pairs, "Movie", scope, feature)
         if rows:
             rows2 = [r for r in _prefer_library(rows) if (r.get("Type") or "") == "Movie"]
             iid = _pick_from_candidates(rows2, want_type="movie", want_year=year)
@@ -1458,7 +1813,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
                 memo[mk] = iid
                 return iid
     elif t in ("show", "series"):
-        rows = _direct_query_by_pairs(http, uid, ep_pairs or series_pairs, "Series", scope)
+        rows = _query_by_pairs(adapter, ep_pairs or series_pairs, "Series", scope, feature)
         if rows:
             rows2 = [r for r in _prefer_library(rows) if (r.get("Type") or "") == "Series"]
             iid = _pick_from_candidates(rows2, want_type="show", want_year=year)
@@ -1468,7 +1823,7 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
                 return iid
     elif t == "episode":
         for pref in exact_episode_pairs:
-            rows = _direct_query_by_pairs(http, uid, [pref], "Episode,Series", scope)
+            rows = _query_by_pairs(adapter, [pref], "Episode,Series", scope, feature)
             episode_rows: list[Mapping[str, Any]] = []
             seen_episode_ids: set[str] = set()
             for row in _prefer_library(rows):
@@ -1531,125 +1886,24 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
                     season=season,
                     episode=episode,
                 )
-        ser_row: Mapping[str, Any] | None = None
-        matched_series_pair: str | None = None
-        known_idx = _cached_provider_index(adapter, feature)
-        series_lookups = [] if (known_idx and series_pairs and not any(p in known_idx for p in series_pairs)) else series_pairs
-        for pref in series_lookups:
-            rows = _direct_query_by_pairs(http, uid, [pref], "Series", scope)
-            series_rows = [r for r in _prefer_library(rows) if (r.get("Type") or "") == "Series"]
-            if series_rows:
-                ser_row = series_rows[0]
-                matched_series_pair = pref
-                break
-        if ser_row and season is not None and episode is not None:
-            sid = ser_row.get("Id")
-            if sid:
-                eps = _series_episodes_cached(adapter, http, uid, sid)
-                for ep in eps:
-                    if (
-                        int(ep.get("ParentIndexNumber") or -1) == int(season)
-                        and int(ep.get("IndexNumber") or -1) == int(episode)
-                    ):
-                        iid = str(ep.get("Id") or "")
-                        if iid:
-                            memo[mk] = iid
-                            cw_log(
-                                "EMBY",
-                                "common",
-                                "debug",
-                                "resolve_hit",
-                                kind="episode",
-                                method="show_provider_id_episode_number",
-                                provider_type=(matched_series_pair or "").partition(".")[0],
-                                provider_value=(matched_series_pair or "").partition(".")[2],
-                                season=int(season),
-                                episode=int(episode),
-                                item_id=iid,
-                            )
-                            return iid
-    idx = provider_index(adapter, feature=feature)
-    if t == "movie":
-        for pref in ep_pairs:
-            cands = idx.get(pref) or []
-            cands = _prefer_library(cands)
-            iid = _pick_from_candidates(cands, want_type="movie", want_year=year)
-            if iid:
-                cw_log(
-                    "EMBY",
-                    "common",
-                    "debug",
-                    "resolve_hit",
-                    kind="movie",
-                    method="provider_index",
-                    pref=pref,
-                    item_id=str(iid),
-                )
-                memo[mk] = iid
-                return iid
-    if t in ("show", "series"):
-        for pref in ep_pairs:
-            cands = [row for row in (idx.get(pref) or []) if (row.get("Type") or "").strip() == "Series"]
-            cands = _prefer_library(cands)
-            iid = _pick_from_candidates(cands, want_type="show", want_year=year)
-            if iid:
-                cw_log(
-                    "EMBY",
-                    "common",
-                    "debug",
-                    "resolve_hit",
-                    kind="series",
-                    method="provider_index",
-                    pref=pref,
-                    item_id=str(iid),
-                )
-                memo[mk] = iid
-                return iid
-    if t == "episode":
-        series_row: dict[str, Any] | None = None
-        matched_series_pair: str | None = None
-        if series_pairs:
-            idx_rows = provider_index(adapter, feature=feature)
+        if season is not None and episode is not None:
             for pref in series_pairs:
-                candidates = [
-                    row
-                    for row in _prefer_library(idx_rows.get(pref) or [])
-                    if (row.get("Type") or "") == "Series"
-                ]
-                if candidates:
-                    series_row = dict(candidates[0])
-                    matched_series_pair = pref
-                    break
-        if series_row and season is not None and episode is not None:
-            sid = series_row.get("Id")
-            if sid:
-                eps = _series_episodes_cached(adapter, http, uid, sid)
-                for row in eps:
-                    s = row.get("ParentIndexNumber")
-                    e = row.get("IndexNumber")
-                    if (
-                        isinstance(s, int)
-                        and isinstance(e, int)
-                        and s == int(season)
-                        and e == int(episode)
-                    ):
-                        iid = row.get("Id")
-                        if iid and not looks_like_bad_id(iid):
-                            cw_log(
-                                "EMBY",
-                                "common",
-                                "debug",
-                                "resolve_hit",
-                                kind="episode",
-                                method="show_provider_id_episode_number",
-                                provider_type=(matched_series_pair or "").partition(".")[0],
-                                provider_value=(matched_series_pair or "").partition(".")[2],
-                                season=int(season),
-                                episode=int(episode),
-                                item_id=str(iid),
-                            )
-                            memo[mk] = str(iid)
-                            return str(iid)
+                rows = _query_by_pairs(adapter, [pref], "Series", scope, feature)
+                for series in sorted(_prefer_library(rows), key=lambda row: str(row.get("Id") or "")):
+                    sid = str(series.get("Id") or "")
+                    if series.get("Type") != "Series" or not sid:
+                        continue
+                    episodes = _series_episodes_cached(adapter, http, uid, sid, feature=feature)
+                    for ep in sorted(episodes, key=lambda row: str(row.get("Id") or "")):
+                        iid = str(ep.get("Id") or "")
+                        if (iid and not looks_like_bad_id(iid) and ep.get("Type") == "Episode"
+                                and str(ep.get("SeriesId") or sid) == sid
+                                and _episode_number_matches(ep, season, episode)):
+                            memo[mk] = iid
+                            cw_log("EMBY", "common", "debug", "resolve_hit", kind="episode",
+                                   method="show_provider_id_episode_number", pref=pref,
+                                   season=season, episode=episode, item_id=iid)
+                            return iid
     def _items(resp: Any) -> list[Mapping[str, Any]]:
         try:
             body = resp.json() or {}
@@ -1802,21 +2056,18 @@ def resolve_item_ids(adapter: Any, it: Mapping[str, Any], *, feature: str = "his
     if not http or not uid:
         return []
 
-    raw_iid = it.get("emby_item_id") or it.get("_emby_item_id")
-    if raw_iid:
-        s = str(raw_iid).strip()
-        if s and not looks_like_bad_id(s):
-            return [s]
-
     one = resolve_item_id(adapter, it, feature=feature)
+    if getattr(adapter, "path_matching", False) and getattr(adapter, "_emby_last_resolve_hint", None) in {"path_match", "path_ambiguous", "path_id_conflict"}:
+        return [str(one)] if one else []
+    # A resolved episode/show needs no movie/series index expansion.
+    if one and _lookup_type(it) != "movie":
+        return [str(one)]
     selected_libs = emby_selected_library_ids(adapter.cfg, feature)
 
     ids = dict(it.get("ids") or {})
     native_id = str(ids.get("emby") or "").strip()
     if one and native_id and str(one) == native_id:
         return [str(one)]
-    show_ids = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else None
-
     t = _lookup_type(it)
     title = (it.get("title") or "").strip()
     year = it.get("year")
@@ -1825,48 +2076,20 @@ def resolve_item_ids(adapter: Any, it: Mapping[str, Any], *, feature: str = "his
     series_title = (it.get("series_title") or "").strip()
 
     strict = bool(getattr(getattr(adapter, "cfg", None), "strict_id_matching", False))
-    prio = guid_priority_from_cfg(getattr(getattr(adapter, "cfg", None), "watchlist_guid_priority", None))
-    pairs = all_ext_pairs(ids, prio)
-    if show_ids:
-        spairs = all_ext_pairs(show_ids, prio)
-        for p in spairs:
-            if p not in pairs:
-                pairs.append(p)
-
-    idx = build_provider_index(adapter) if feature == "history" else build_provider_index(adapter, feature=feature)
-
     def _valid(iid: Any) -> str | None:
         s = str(iid or "").strip()
         return s if s and not looks_like_bad_id(s) else None
 
-    def _items(resp: Any) -> list[Mapping[str, Any]]:
-        try:
-            body = resp.json() or {}
-            rows = body.get("Items") or []
-            return rows if isinstance(rows, list) else []
-        except Exception:
-            return []
-
     found: list[str] = []
 
     if t == "movie":
-        for pref in pairs:
-            rows = emby_filter_library_candidates(idx.get(pref) or [], selected_libs)
-            cands = [row for row in rows if (row.get("Type") or "") == "Movie"]
-            if isinstance(year, int):
-                yr = int(year)
-                cands_yr = [
-                    r for r in cands
-                    if isinstance(r.get("ProductionYear"), int) and abs(int(r["ProductionYear"]) - yr) <= 1
-                ]
-                if cands_yr:
-                    cands = cands_yr
-            for row in cands:
-                iid = _valid(row.get("Id"))
-                if iid and iid not in found:
-                    found.append(iid)
-            if found:
-                return found
+        rows = _query_by_pairs(adapter, all_ext_pairs(ids, _merged_guid_priority(adapter)), "Movie", emby_library_scope(adapter.cfg, feature), feature)
+        for row in emby_filter_library_candidates(rows, selected_libs, trust_query_scope=True):
+            iid = _valid(row.get("Id"))
+            if iid and iid not in found:
+                found.append(iid)
+        if found:
+            return found
 
         if title and not strict:
             try:
@@ -1895,23 +2118,6 @@ def resolve_item_ids(adapter: Any, it: Mapping[str, Any], *, feature: str = "his
                 pass
 
     if t == "episode":
-        for pref in pairs:
-            rows = emby_filter_library_candidates(idx.get(pref) or [], selected_libs)
-            cands = [row for row in rows if (row.get("Type") or "") == "Episode"]
-            for row in cands:
-                try:
-                    s_ok = (season is None) or (int(row.get("ParentIndexNumber") or 0) == int(season))
-                    e_ok = (episode is None) or (int(row.get("IndexNumber") or 0) == int(episode))
-                except Exception:
-                    s_ok, e_ok = True, True
-                if not (s_ok and e_ok):
-                    continue
-                iid = _valid(row.get("Id"))
-                if iid and iid not in found:
-                    found.append(iid)
-            if found:
-                return found
-
         if series_title and not strict:
             try:
                 q: dict[str, Any] = {

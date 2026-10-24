@@ -18,13 +18,19 @@ from ._common import (
     imdb_id,
     imdb_ids_from_item,
     item_from_movie_record,
+    item_from_series_record,
     library_records,
+    native_record_ids,
     now_iso,
     poster_url_from_item,
-    record_id,
+    read_drop_summary,
+    record_read_drop,
+    reset_read_drop_report,
     stremio_id_for_item,
+    stremio_write_id_for_item,
     tmdb_metadata_provider,
 )
+from providers.sync._log import log as cw_log
 
 
 def _image_url(detail: Mapping[str, Any], kind: str) -> str:
@@ -40,21 +46,6 @@ def _image_url(detail: Mapping[str, Any], kind: str) -> str:
                 return url
     return ""
 
-
-def _item_from_series_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
-    rid = imdb_id(record_id(record))
-    if not rid:
-        return None
-    item: dict[str, Any] = {"type": "show", "ids": {"imdb": rid}, "_stremio_id": rid}
-    title = str(record.get("name") or "").strip()
-    if title:
-        item["title"] = title
-    poster = str(record.get("poster") or "").strip()
-    if poster:
-        item["poster"] = poster
-    return item
-
-
 def _is_listed(record: Mapping[str, Any]) -> bool:
     return record.get("removed") is False and record.get("temp") is False
 
@@ -62,14 +53,15 @@ def _is_listed(record: Mapping[str, Any]) -> bool:
 def _metadata_enriched(adapter: Any, item: Mapping[str, Any], typ: str) -> dict[str, Any]:
     out = dict(item)
     stremio_id = stremio_id_for_item(out)
+    ids = merge_ids(ids_from(out), imdb_ids_from_item(out))
     if stremio_id:
         if not str(out.get("poster") or out.get("poster_url") or "").strip():
             out["poster"] = poster_url_from_item(out, stremio_id)
-        return out
+        if str(ids.get("tmdb") or "").strip():
+            return out
     provider = tmdb_metadata_provider(adapter)
     if provider is None:
         return out
-    ids = merge_ids(ids_from(out), imdb_ids_from_item(out))
     lookup = {k: str(ids.get(k) or "").strip() for k in ("tmdb", "imdb", "tvdb") if str(ids.get(k) or "").strip()}
     title = str(out.get("series_title") or out.get("show_title") or out.get("title") or "").strip()
     if title:
@@ -86,17 +78,27 @@ def _metadata_enriched(adapter: Any, item: Mapping[str, Any], typ: str) -> dict[
         return out
     detail_ids = detail.get("ids")
     ids_map: Mapping[str, Any] = detail_ids if isinstance(detail_ids, Mapping) else {}
+    portable_ids: dict[str, Any] = {}
+    tmdb = str(ids_map.get("tmdb") or "").strip()
+    if tmdb:
+        portable_ids["tmdb"] = tmdb
     found = imdb_id(ids_map.get("imdb"))
     if found:
+        portable_ids["imdb"] = found
+    tvdb = str(ids_map.get("tvdb") or "").strip()
+    if tvdb:
+        portable_ids["tvdb"] = tvdb
+    if portable_ids:
         out_ids_raw = out.get("ids")
         out_ids: Mapping[str, Any] = out_ids_raw if isinstance(out_ids_raw, Mapping) else {}
         merged = dict(out_ids)
-        merged["imdb"] = found
+        for key, value in portable_ids.items():
+            merged.setdefault(key, value)
         out["ids"] = merged
     if not str(out.get("title") or out.get("series_title") or "").strip() and str(detail.get("title") or "").strip():
         out["title"] = str(detail.get("title") or "").strip()
     if not str(out.get("poster") or out.get("poster_url") or "").strip():
-        poster = poster_url_from_item(out, found) or _image_url(detail, "poster")
+        poster = poster_url_from_item(out, found or stremio_id) or _image_url(detail, "poster")
         if poster:
             out["poster"] = poster
     return out
@@ -104,18 +106,33 @@ def _metadata_enriched(adapter: Any, item: Mapping[str, Any], typ: str) -> dict[
 
 def build_index(adapter: Any, **kwargs: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
+    reset_read_drop_report(adapter, "watchlist")
     for record in library_records(adapter, incremental=bool(kwargs.get("incremental"))):
         if not _is_listed(record):
             continue
         typ = str(record.get("type") or "").strip().lower()
-        item = item_from_movie_record(record) if typ == "movie" else _item_from_series_record(record) if typ in {"series", "show"} else None
+        if typ not in {"movie", "series", "show"}:
+            continue
+        ids, drop_reason = native_record_ids(adapter, record)
+        if not ids:
+            record_read_drop(adapter, "watchlist", record, drop_reason or "unsupported_stremio_id", requires_id="tmdb_api_key" if drop_reason == "bare_numeric_id_unverified" else "known_native_id")
+            continue
+        item = item_from_movie_record(record) if typ == "movie" else item_from_series_record(record)
         if item:
+            item = _metadata_enriched(adapter, item, "show" if typ in {"series", "show"} else "movie")
             out[canonical_item_key(item)] = item
+    summary = read_drop_summary(adapter, "watchlist")
+    if int(summary.get("dropped") or 0):
+        cw_log("STREMIO", "watchlist", "warn", "index_rows_dropped", indexed=len(out), **summary)
     return out
 
 
-def _unresolved(item: Mapping[str, Any], reason: str) -> dict[str, Any]:
-    return {"status": "unresolved", "reason": reason, "item": id_minimal(item)}
+def _unresolved(item: Mapping[str, Any], reason: str, key: str | None = None) -> dict[str, Any]:
+    out = {"status": "unresolved", "reason": reason, "item": id_minimal(item)}
+    if key:
+        out["key"] = key
+        out["canonical_key"] = key
+    return out
 
 
 def _apply_membership(record: dict[str, Any], item: Mapping[str, Any], listed: bool) -> None:
@@ -142,16 +159,17 @@ def _write(adapter: Any, items: Iterable[Mapping[str, Any]], listed: bool, *, dr
     attempted = 0
     for raw in [dict(x or {}) for x in items or [] if isinstance(x, Mapping)]:
         typ = str(id_minimal(raw).get("type") or raw.get("type") or "").strip().lower()
+        raw_key = canonical_item_key(raw)
         if typ in {"episode", "episodes", "season", "seasons"}:
-            entry = _unresolved(raw, "stremio_watchlist_type_unsupported")
+            entry = _unresolved(raw, "stremio_watchlist_type_unsupported", raw_key)
             unresolved.append(entry)
             results.append(entry)
             continue
         item = _metadata_enriched(adapter, raw, typ)
         key = canonical_item_key(item)
-        stremio_id = stremio_id_for_item(item)
+        stremio_id = stremio_write_id_for_item(item)
         if not stremio_id or typ not in {"movie", "show", "series", "tv"}:
-            entry = _unresolved(item, "stremio_id_missing")
+            entry = _unresolved(item, "stremio_id_missing", key)
             unresolved.append(entry)
             results.append(entry)
             continue
@@ -171,7 +189,7 @@ def _write(adapter: Any, items: Iterable[Mapping[str, Any]], listed: bool, *, dr
             _apply_membership(record, item, listed)
             datastore_put(adapter, [record])
         except Exception:
-            entry = {"status": "failed", "reason": "stremio_watchlist_write_failed", "item": id_minimal(item), "canonical_key": key}
+            entry = {"status": "failed", "reason": "stremio_watchlist_write_failed", "item": id_minimal(item), "key": key, "canonical_key": key}
             unresolved.append(entry)
             results.append(entry)
             continue

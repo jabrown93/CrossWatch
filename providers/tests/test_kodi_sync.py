@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from cw_platform.id_map import canonical_key
 from providers.sync import _mod_KODI as mod
 from providers.sync.kodi import _common as common
 from providers.auth._auth_KODI import KodiAuthError
@@ -54,9 +53,6 @@ def movie(**extra):
     return row
 
 
-MOVIE_KEY = canonical_key({"type": "movie", "ids": movie()["uniqueid"]})
-
-
 def episode(**extra):
     row = {
         "episodeid": 20,
@@ -85,10 +81,16 @@ def tvshow(**extra):
 def test_kodi_manifest_capabilities_are_scoped():
     manifest = mod.get_manifest()
 
-    assert manifest["features"] == {"watchlist": False, "ratings": True, "history": True, "progress": True, "playlists": False}
+    assert manifest["features"] == {"watchlist": False, "ratings": True, "history": True, "progress": True, "playlists": False, "collection": True}
     assert manifest["capabilities"]["history"]["read"] is True
+    assert manifest["capabilities"]["history"]["aggregated"] is True
+    assert manifest["capabilities"]["history"]["event_history"] is False
+    assert manifest["capabilities"]["history"]["rewatches"] == {"read": False, "write": False}
     assert manifest["capabilities"]["ratings"]["write"] is True
     assert manifest["capabilities"]["progress"]["types"]["episodes"] is True
+    assert manifest["capabilities"]["collection"]["read"] is True
+    assert manifest["capabilities"]["collection"]["write"] is False
+    assert manifest["capabilities"]["collection"]["types"] == {"movies": True, "shows": False, "seasons": False, "episodes": True}
 
 
 def test_kodi_sync_properties_match_jsonrpc_v13_5_contract():
@@ -96,10 +98,11 @@ def test_kodi_sync_properties_match_jsonrpc_v13_5_contract():
     episode_allowed = {"title", "showtitle", "season", "episode", "tvshowid", "uniqueid", "playcount", "lastplayed", "userrating", "resume"}
     show_allowed = {"title", "year", "uniqueid"}
 
-    for feature in ("history", "ratings", "progress", ""):
+    for feature in ("history", "ratings", "progress", "collection", ""):
         movie_props, episode_props, show_props = common.properties_for_feature(feature)
-        assert set(movie_props) <= movie_allowed
-        assert set(episode_props) <= episode_allowed
+        extra = {"dateadded"} if feature == "collection" else set()
+        assert set(movie_props) <= (movie_allowed | extra)
+        assert set(episode_props) <= (episode_allowed | extra)
         assert set(show_props) <= show_allowed
         assert "year" not in episode_props
 
@@ -109,9 +112,9 @@ def test_history_index_reads_movies_and_episodes():
 
     index = mod.feat_history.build_index(ad)
 
-    assert MOVIE_KEY in index
-    assert index[MOVIE_KEY]["watched"] is True
-    assert index[MOVIE_KEY]["watched_at"] == "2026-01-02T03:04:05Z"
+    assert "tmdb:329865" in index
+    assert index["tmdb:329865"]["watched"] is True
+    assert index["tmdb:329865"]["watched_at"] == common.kodi_lastplayed_to_iso("2026-01-02 03:04:05")
     ep = index["tmdb:63639#s01e01"]
     assert ep["type"] == "episode"
     assert ep["title"] == "The Target"
@@ -203,6 +206,43 @@ def test_kodi_library_rows_uses_v13_5_path_filters_without_extra_properties(monk
         assert "path" not in params["properties"]
 
 
+def test_collection_index_reads_library_inventory():
+    ad = adapter(
+        FakeKodiClient(
+            [movie(dateadded="2026-01-02T03:04:05Z")],
+            [episode(dateadded="2026-02-03T04:05:06Z")],
+            [tvshow()],
+        )
+    )
+
+    index = mod.feat_collection.build_index(ad)
+
+    assert sorted(index) == ["tmdb:329865", "tmdb:63639#s01e01"]
+    assert index["tmdb:329865"]["type"] == "movie"
+    assert index["tmdb:329865"]["collected_at"] == "2026-01-02T03:04:05Z"
+    ep = index["tmdb:63639#s01e01"]
+    assert ep["type"] == "episode"
+    assert ep["show_ids"] == {"tmdb": "63639", "tvdb": "280619"}
+    assert ep["season"] == 1 and ep["episode"] == 1
+    assert ep["collected_at"] == "2026-02-03T04:05:06Z"
+
+
+def test_collection_writes_are_source_only():
+    client = FakeKodiClient([movie()], [episode()], [tvshow()])
+    module = mod.KODIModule({"kodi": {"server": "http://localhost:8080", "connection_verified": True}})
+    module.client = client
+
+    result = module.add("collection", [{"type": "movie", "ids": {"tmdb": "329865"}}])
+    removed = module.remove("collection", [{"type": "movie", "ids": {"tmdb": "329865"}}])
+
+    assert result["ok"] is True and result["count"] == 0
+    assert result["reason"] == "unsupported"
+    assert result["unresolved"][0]["reason"] == "kodi_collection_write_unsupported"
+    assert removed["reason"] == "unsupported"
+    assert client.movie_writes == []
+    assert client.episode_writes == []
+
+
 def test_kodi_sync_logs_library_scope_filter_when_configured(monkeypatch):
     logs: list[tuple[str, str, str, dict[str, Any]]] = []
     monkeypatch.setattr(common, "log", lambda feature, level, event, **fields: logs.append((feature, level, event, fields)))
@@ -229,10 +269,10 @@ def test_ratings_and_progress_indexes_normalize_values():
     ratings = mod.feat_ratings.build_index(ad)
     progress = mod.feat_progress.build_index(ad)
 
-    assert MOVIE_KEY in ratings
-    assert ratings[MOVIE_KEY]["rating"] == 7
-    assert progress[MOVIE_KEY]["progress_ms"] == 120500
-    assert progress[MOVIE_KEY]["duration_ms"] == 6000000
+    assert "tmdb:329865" in ratings
+    assert ratings["tmdb:329865"]["rating"] == 7
+    assert progress["tmdb:329865"]["progress_ms"] == 120500
+    assert progress["tmdb:329865"]["duration_ms"] == 6000000
     assert int(progress["tmdb:63639#s01e01"]["progress_percent"]) == 11
 
 
@@ -243,15 +283,15 @@ def test_kodi_progress_assigns_managed_timestamp_for_new_resume(monkeypatch):
 
     progress = mod.feat_progress.build_index(ad)
 
-    assert progress[MOVIE_KEY]["progress_at"] == "2026-07-27T21:00:00Z"
-    assert progress[MOVIE_KEY]["progress_at_source"] == "kodi_first_observed"
+    assert progress["tmdb:329865"]["progress_at"] == "2026-07-27T21:00:00Z"
+    assert progress["tmdb:329865"]["progress_at_source"] == "kodi_first_observed"
 
 
 def test_kodi_progress_reuses_timestamp_until_resume_changes(monkeypatch):
     monkeypatch.setattr(common, "_utc_now_iso", lambda: "2026-07-29T21:00:00Z")
     old = {
         "type": "movie",
-        "ids": movie()["uniqueid"],
+        "ids": {"tmdb": "329865"},
         "title": "Arrival",
         "year": 2016,
         "progress_ms": 120500,
@@ -261,19 +301,19 @@ def test_kodi_progress_reuses_timestamp_until_resume_changes(monkeypatch):
         "progress_at_source": "kodi_first_observed",
     }
     ad = adapter(FakeKodiClient([movie()], [], []))
-    ad._kodi_progress_baseline = {MOVIE_KEY: old}
+    ad._kodi_progress_baseline = {"tmdb:329865": old}
 
     unchanged = mod.feat_progress.build_index(ad)
-    assert unchanged[MOVIE_KEY]["progress_at"] == "2026-07-27T21:00:00Z"
-    assert unchanged[MOVIE_KEY]["progress_at_source"] == "kodi_first_observed"
+    assert unchanged["tmdb:329865"]["progress_at"] == "2026-07-27T21:00:00Z"
+    assert unchanged["tmdb:329865"]["progress_at_source"] == "kodi_first_observed"
 
     ad2 = adapter(FakeKodiClient([movie(resume={"position": 240.0, "total": 6000.0})], [], []))
-    ad2._kodi_progress_baseline = {MOVIE_KEY: old}
+    ad2._kodi_progress_baseline = {"tmdb:329865": old}
     changed = mod.feat_progress.build_index(ad2)
 
-    assert changed[MOVIE_KEY]["progress_ms"] == 240000
-    assert changed[MOVIE_KEY]["progress_at"] == "2026-07-29T21:00:00Z"
-    assert changed[MOVIE_KEY]["progress_at_source"] == "kodi_resume_changed"
+    assert changed["tmdb:329865"]["progress_ms"] == 240000
+    assert changed["tmdb:329865"]["progress_at"] == "2026-07-29T21:00:00Z"
+    assert changed["tmdb:329865"]["progress_at_source"] == "kodi_resume_changed"
 
 
 def test_writes_history_ratings_and_progress_to_resolved_library_items():
@@ -289,7 +329,7 @@ def test_writes_history_ratings_and_progress_to_resolved_library_items():
     assert module.add("ratings", [source_ep])["count"] == 1
     assert module.add("progress", [source_movie])["count"] == 1
 
-    assert client.movie_writes[0] == (10, {"playcount": 1, "lastplayed": "2026-06-01 12:00:00"})
+    assert client.movie_writes[0] == (10, {"playcount": 1, "lastplayed": common.watched_at_to_kodi("2026-06-01T12:00:00Z")})
     assert client.episode_writes[0] == (20, {"userrating": 10})
     assert client.movie_writes[1] == (10, {"resume": {"position": 90.0, "total": 6000.0}})
 
@@ -339,3 +379,50 @@ def test_external_id_source_does_not_fallback_to_title_year():
     assert result["count"] == 0
     assert result["reason_counts"]["not_found"] == 1
     assert client.movie_writes == []
+
+
+def test_normalize_uniqueids_carries_native_anime_namespaces():
+    got = common.normalize_uniqueids(
+        {"anidb": "16627", "tvdb": "369144", "AniList": "139092", "MyAnimeList": "49784", "kitsu": "45154"}
+    )
+
+    assert got == {
+        "anidb": "16627",
+        "tvdb": "369144",
+        "anilist": "139092",
+        "mal": "49784",
+        "kitsu": "45154",
+    }
+
+
+def test_normalize_uniqueids_keeps_existing_namespace_behaviour():
+    assert common.normalize_uniqueids({"imdb": "tt2543164", "themoviedb": "329865", "thetvdb": "280619"}) == {
+        "imdb": "tt2543164",
+        "tmdb": "329865",
+        "tvdb": "280619",
+    }
+    assert common.normalize_uniqueids({"unknown": "tt99"}) == {"imdb": "tt99"}
+    assert common.normalize_uniqueids({"shoko": "12", "": "9"}) == {}
+
+
+def test_anidb_scraped_episode_keeps_native_show_identity():
+    ad = adapter(
+        FakeKodiClient(
+            [],
+            [episode(uniqueid={"tvdb": "9378874"}, season=1, episode=14, showtitle="Mairimashita! Iruma-kun")],
+            [tvshow(uniqueid={"anidb": "16627", "tvdb": "369144"})],
+        )
+    )
+
+    index = mod.feat_history.build_index(ad)
+    row = next(iter(index.values()))
+
+    assert row["show_ids"] == {"anidb": "16627", "tvdb": "369144"}
+    assert (row["season"], row["episode"]) == (1, 14)
+
+
+def test_native_only_show_ids_are_treated_as_external():
+    item = {"type": "episode", "show_ids": {"anidb": "16627"}, "season": 1, "episode": 14}
+
+    assert common._has_external_identifiers(item) is True
+    assert not any("|title:" in key for key in common.resolution_keys(item))

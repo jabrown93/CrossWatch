@@ -3,25 +3,31 @@
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (function(){
   const providers = Object.freeze({
-    CROSSWATCH: { key: "CROSSWATCH", label: "CrossWatch", shortLabel: "CW", brandClass: "brand-crosswatch", badgeId: "badge-crosswatch", authSectionId: "sec-crosswatch", authGroupId: "sec-auth-trackers", aliases: ["CROSSWATCH", "CW", "LOCALTRACKER", "LOCAL TRACKER"], hasLogo: true, hasLogLogo: true, tone: { solid: "#7c5cff", rgb: "124,92,255" }, watchlist: true, scrobblerSink: true },
-    PLEX: { key: "PLEX", label: "Plex", shortLabel: "Plex", brandClass: "brand-plex", badgeId: "badge-plex", authSectionId: "sec-plex", authGroupId: "sec-auth-media", aliases: ["PLEX"], statusLegacy: ["plex_connected", "plex"], hasLogo: true, hasLogLogo: true, tone: { solid: "#e5a000", rgb: "229,160,0" }, watchlist: true },
+    CROSSWATCH: { key: "CROSSWATCH", label: "CrossWatch", shortLabel: "CW", brandClass: "brand-crosswatch", badgeId: "badge-crosswatch", authSectionId: "sec-crosswatch", authGroupId: "sec-auth-trackers", aliases: ["CROSSWATCH", "CW", "LOCALTRACKER", "LOCAL TRACKER"], hasLogo: true, hasLogLogo: true, tone: { solid: "#7c5cff", rgb: "124,92,255" }, watchlist: true, collection: true, scrobblerSink: true },
+    PLEX: { key: "PLEX", label: "Plex", shortLabel: "Plex", brandClass: "brand-plex", badgeId: "badge-plex", authSectionId: "sec-plex", authGroupId: "sec-auth-media", aliases: ["PLEX"], statusLegacy: ["plex_connected", "plex"], hasLogo: true, hasLogLogo: true, tone: { solid: "#e5a000", rgb: "229,160,0" }, watchlist: true, collection: true, scrobblerSink: true },
     SIMKL: { key: "SIMKL", label: "SIMKL", shortLabel: "SIMKL", brandClass: "brand-simkl", badgeId: "badge-simkl", authSectionId: "sec-simkl", authGroupId: "sec-auth-trackers", aliases: ["SIMKL"], statusLegacy: ["simkl_connected", "simkl"], hasLogo: true, hasLogLogo: true, tone: { solid: "#00b8f5", rgb: "0,184,245" }, watchlist: true, playlists: true, scrobblerSink: true },
-    TRAKT: { key: "TRAKT", label: "Trakt", shortLabel: "Trakt", brandClass: "brand-trakt", badgeId: "badge-trakt", authSectionId: "sec-trakt", authGroupId: "sec-auth-trackers", aliases: ["TRAKT"], statusLegacy: ["trakt_connected", "trakt"], hasLogo: true, hasLogLogo: true, tone: { solid: "#ed1c24", rgb: "237,28,36" }, watchlist: true, scrobblerSink: true },
-    ANILIST: { key: "ANILIST", label: "AniList", shortLabel: "AniList", brandClass: "brand-anilist", badgeId: "badge-anilist", authSectionId: "sec-anilist", authGroupId: "sec-auth-trackers", aliases: ["ANILIST", "ANI LIST", "ANI-LIST"], statusLegacy: ["anilist_connected", "anilist"], hasLogo: true, hasLogLogo: false, tone: { solid: "#02a9ff", rgb: "2,169,255" }, watchlist: true },
+    TRAKT: { key: "TRAKT", label: "Trakt", shortLabel: "Trakt", brandClass: "brand-trakt", badgeId: "badge-trakt", authSectionId: "sec-trakt", authGroupId: "sec-auth-trackers", aliases: ["TRAKT"], statusLegacy: ["trakt_connected", "trakt"], hasLogo: true, hasLogLogo: true, tone: { solid: "#ed1c24", rgb: "237,28,36" }, watchlist: true, collection: true, scrobblerSink: true },
+    KITSU: { key: "KITSU", label: "Kitsu", shortLabel: "Kitsu", brandClass: "brand-kitsu", badgeId: "badge-kitsu", authSectionId: "sec-kitsu", authGroupId: "sec-auth-trackers", aliases: ["KITSU"], statusLegacy: ["kitsu_connected", "kitsu"], hasLogo: true, hasLogLogo: false, tone: { solid: "#fd755c", rgb: "253,117,92" }, watchlist: true, scrobblerSink: true },
+    MYANIMELIST: { key: "MYANIMELIST", label: "MyAnimeList", shortLabel: "MAL", brandClass: "brand-myanimelist", badgeId: "badge-myanimelist", authSectionId: "sec-myanimelist", authGroupId: "sec-auth-trackers", aliases: ["MYANIMELIST", "MY ANIME LIST", "MAL"], statusLegacy: ["myanimelist_connected", "myanimelist"], hasLogo: true, hasLogLogo: false, tone: { solid: "#2f52a2", rgb: "47,82,162" }, watchlist: true, ratings: true, history: true, progress: false, playlists: false, scrobblerSink: true, syncSurface: true },
+    ANILIST: { key: "ANILIST", label: "AniList", shortLabel: "AniList", brandClass: "brand-anilist", badgeId: "badge-anilist", authSectionId: "sec-anilist", authGroupId: "sec-auth-trackers", aliases: ["ANILIST", "ANI LIST", "ANI-LIST"], statusLegacy: ["anilist_connected", "anilist"], hasLogo: true, hasLogLogo: false, tone: { solid: "#02a9ff", rgb: "2,169,255" }, watchlist: true, scrobblerSink: true },
     TMDB: { key: "TMDB", label: "TMDb", shortLabel: "TMDb", brandClass: "brand-tmdb-sync", badgeId: "badge-tmdb", authSectionId: "sec-tmdb-sync", authGroupId: "sec-auth-trackers", aliases: ["TMDB", "TMDBSYNC", "TMDB SYNC", "TMDB-SYNC"], statusLegacy: ["tmdb_connected", "tmdb"], hasLogo: true, hasLogLogo: false, tone: { solid: "#01b4e4", rgb: "1,180,228" }, watchlist: true },
-    JELLYFIN: { key: "JELLYFIN", label: "Jellyfin", shortLabel: "Jellyfin", brandClass: "brand-jellyfin", badgeId: "badge-jellyfin", authSectionId: "sec-jellyfin", authGroupId: "sec-auth-media", aliases: ["JELLYFIN"], statusLegacy: ["jellyfin_connected", "jellyfin"], hasLogo: true, hasLogLogo: true, tone: { solid: "#7b61ff", rgb: "123,97,255" }, watchlist: true },
-    EMBY: { key: "EMBY", label: "Emby", shortLabel: "Emby", brandClass: "brand-emby", badgeId: "badge-emby", authSectionId: "sec-emby", authGroupId: "sec-auth-media", aliases: ["EMBY"], statusLegacy: ["emby_connected", "emby"], hasLogo: true, hasLogLogo: true, tone: { solid: "#3bb273", rgb: "59,178,115" }, watchlist: true },
-    MDBLIST: { key: "MDBLIST", label: "MDBList", shortLabel: "MDBList", brandClass: "brand-mdblist", badgeId: "badge-mdblist", authSectionId: "sec-mdblist", authGroupId: "sec-auth-trackers", aliases: ["MDBLIST", "MDB LIST", "MDB-LIST"], statusLegacy: ["mdblist_connected", "mdblist"], hasLogo: true, hasLogLogo: true, tone: { solid: "#2d74da", rgb: "45,116,218" }, watchlist: true, scrobblerSink: true },
+    JELLYFIN: { key: "JELLYFIN", label: "Jellyfin", shortLabel: "Jellyfin", brandClass: "brand-jellyfin", badgeId: "badge-jellyfin", authSectionId: "sec-jellyfin", authGroupId: "sec-auth-media", aliases: ["JELLYFIN"], statusLegacy: ["jellyfin_connected", "jellyfin"], hasLogo: true, hasLogLogo: true, tone: { solid: "#7b61ff", rgb: "123,97,255" }, watchlist: true, collection: true, scrobblerSink: true },
+    EMBY: { key: "EMBY", label: "Emby", shortLabel: "Emby", brandClass: "brand-emby", badgeId: "badge-emby", authSectionId: "sec-emby", authGroupId: "sec-auth-media", aliases: ["EMBY"], statusLegacy: ["emby_connected", "emby"], hasLogo: true, hasLogLogo: true, tone: { solid: "#3bb273", rgb: "59,178,115" }, watchlist: true, collection: true, scrobblerSink: true },
+    MDBLIST: { key: "MDBLIST", label: "MDBList", shortLabel: "MDBList", brandClass: "brand-mdblist", badgeId: "badge-mdblist", authSectionId: "sec-mdblist", authGroupId: "sec-auth-trackers", aliases: ["MDBLIST", "MDB LIST", "MDB-LIST"], statusLegacy: ["mdblist_connected", "mdblist"], hasLogo: true, hasLogLogo: true, tone: { solid: "#2d74da", rgb: "45,116,218" }, watchlist: true, collection: true, scrobblerSink: true },
     PUBLICMETADB: { key: "PUBLICMETADB", label: "PublicMetaDB", shortLabel: "PMDB", brandClass: "brand-publicmetadb", badgeId: "badge-publicmetadb", authSectionId: "sec-publicmetadb", authGroupId: "sec-auth-trackers", aliases: ["PUBLICMETADB", "PUBLIC META DB", "PUBLIC-META-DB", "PMDB"], statusLegacy: ["publicmetadb_connected", "publicmetadb"], hasLogo: true, hasLogLogo: true, tone: { solid: "#f5f5f5", rgb: "245,245,245" }, watchlist: true, ratings: true, history: true, progress: true, playlists: true },
-    FLOPPY: { key: "FLOPPY", label: "Floppy", shortLabel: "Floppy", brandClass: "brand-floppy", badgeId: "badge-floppy", authSectionId: "sec-floppy", authGroupId: "sec-auth-trackers", aliases: ["FLOPPY"], statusLegacy: ["floppy_connected", "floppy"], hasLogo: true, hasLogLogo: false, logoFile: "FLOPPY.png", tone: { solid: "#f5651e", rgb: "245,101,30" }, watchlist: true, ratings: true, history: true, progress: false, playlists: false, scrobblerSink: true },
+    FLOPPY: { key: "FLOPPY", label: "Floppy", shortLabel: "Floppy", brandClass: "brand-floppy", badgeId: "badge-floppy", authSectionId: "sec-floppy", authGroupId: "sec-auth-trackers", aliases: ["FLOPPY"], statusLegacy: ["floppy_connected", "floppy"], hasLogo: true, hasLogLogo: false, logoFile: "FLOPPY.png", tone: { solid: "#f5651e", rgb: "245,101,30" }, watchlist: true, ratings: true, history: true, progress: false, playlists: false, collection: true, scrobblerSink: true },
     NUVIO: { key: "NUVIO", label: "Nuvio", shortLabel: "Nuvio", brandClass: "brand-nuvio", badgeId: "badge-nuvio", authSectionId: "sec-nuvio", authGroupId: "sec-auth-clients", aliases: ["NUVIO"], statusLegacy: ["nuvio_connected", "nuvio"], hasLogo: true, hasLogLogo: true, logoFile: "NUVIO.png", tone: { solid: "#b048f0", rgb: "176,72,240" }, watchlist: true, ratings: false, history: true, progress: true, playlists: false },
-    KODI: { key: "KODI", label: "Kodi", shortLabel: "Kodi", brandClass: "brand-kodi", badgeId: "badge-kodi", authSectionId: "sec-kodi", authGroupId: "sec-auth-clients", aliases: ["KODI", "XBMC"], statusLegacy: ["kodi_connected", "kodi"], hasLogo: true, hasLogLogo: false, logoFile: "KODI.png", tone: { solid: "#17b5d1", rgb: "23,181,209" }, ratings: true, history: true, progress: true, playlists: false },
+    KODI: { key: "KODI", label: "Kodi", shortLabel: "Kodi", brandClass: "brand-kodi", badgeId: "badge-kodi", authSectionId: "sec-kodi", authGroupId: "sec-auth-clients", aliases: ["KODI", "XBMC"], statusLegacy: ["kodi_connected", "kodi"], hasLogo: true, hasLogLogo: false, logoFile: "KODI.png", tone: { solid: "#17b5d1", rgb: "23,181,209" }, ratings: true, history: true, progress: true, playlists: false, collection: true, scrobblerSink: true },
     STREMIO: { key: "STREMIO", label: "Stremio", shortLabel: "Stremio", brandClass: "brand-stremio", badgeId: "badge-stremio", authSectionId: "sec-stremio", authGroupId: "sec-auth-clients", aliases: ["STREMIO"], statusLegacy: ["stremio_connected", "stremio"], hasLogo: true, hasLogLogo: false, logoFile: "STREMIO.png", tone: { solid: "#722cfe", rgb: "114,44,254" }, watchlist: true, ratings: true, history: true, progress: true, playlists: false },
-    PUNCHPLAY: { key: "PUNCHPLAY", label: "PunchPlay", shortLabel: "PunchPlay", brandClass: "brand-punchplay", badgeId: "badge-punchplay", authSectionId: "sec-punchplay", authGroupId: "sec-auth-trackers", aliases: ["PUNCHPLAY", "PUNCH PLAY", "PUNCH-PLAY"], statusLegacy: ["punchplay_connected", "punchplay"], hasLogo: true, hasLogLogo: false, logoFile: "PUNCHPLAY.png", tone: { solid: "#f4400f", rgb: "244,64,15" }, watchlist: true, ratings: true, history: true, progress: true, playlists: false, scrobblerSink: true },
-    SCROB: { key: "SCROB", label: "Scrob", shortLabel: "Scrob", brandClass: "brand-scrob", badgeId: "badge-scrob", authSectionId: "sec-scrob", authGroupId: "sec-auth-trackers", aliases: ["SCROB"], statusLegacy: ["scrob_connected", "scrob"], hasLogo: true, hasLogLogo: false, logoFile: "SCROB.png", tone: { solid: "#6f36cc", rgb: "111,54,204" }, watchlist: true, ratings: true, history: true, progress: true, playlists: false, scrobblerSink: true },
+    WETRAKR: { key: "WETRAKR", label: "WeTrakr", shortLabel: "WeTrakr", brandClass: "brand-wetrakr", badgeId: "badge-wetrakr", authSectionId: "sec-wetrakr", authGroupId: "sec-auth-trackers", aliases: ["WETRAKR", "WE TRAKR"], statusLegacy: ["wetrakr_connected", "wetrakr"], hasLogo: true, hasLogLogo: false, tone: { solid: "#ffffff", rgb: "255,255,255" }, watchlist: true, ratings: true, history: true, progress: true, playlists: false, collection: false, scrobblerSink: true, syncSurface: true },
+    PUNCHPLAY: { key: "PUNCHPLAY", label: "PunchPlay", shortLabel: "PunchPlay", brandClass: "brand-punchplay", badgeId: "badge-punchplay", authSectionId: "sec-punchplay", authGroupId: "sec-auth-trackers", aliases: ["PUNCHPLAY", "PUNCH PLAY", "PUNCH-PLAY"], statusLegacy: ["punchplay_connected", "punchplay"], hasLogo: true, hasLogLogo: false, logoFile: "PUNCHPLAY.png", tone: { solid: "#f4400f", rgb: "244,64,15" }, watchlist: true, ratings: true, history: true, progress: true, playlists: false, collection: true, scrobblerSink: true },
+    BINGEBASE: { key: "BINGEBASE", label: "BingeBase", shortLabel: "BingeBase", brandClass: "brand-bingebase", badgeId: "badge-bingebase", authSectionId: "sec-bingebase", authGroupId: "sec-auth-trackers", aliases: ["BINGEBASE", "BINGE BASE", "BINGE-BASE"], statusLegacy: ["bingebase_connected", "bingebase"], hasLogo: true, hasLogLogo: false, logoFile: "BINGEBASE.png", tone: { solid: "#ff8533", rgb: "255,133,51" }, watchlist: false, ratings: false, history: false, progress: false, playlists: false, scrobblerSink: true, scrobbleOnly: true, syncSurface: false },
+    FLICKLIST: { key: "FLICKLIST", label: "FlickList", shortLabel: "FlickList", brandClass: "brand-flicklist", badgeId: "badge-flicklist", authSectionId: "sec-flicklist", authGroupId: "sec-auth-trackers", aliases: ["FLICKLIST", "FLICK LIST", "FLICK-LIST"], statusLegacy: ["flicklist_connected", "flicklist"], hasLogo: true, hasLogLogo: false, logoFile: "FLICKLIST.png", tone: { solid: "#0850b8", rgb: "8,80,184" }, watchlist: true, ratings: true, history: true, progress: true, playlists: true, collection: true, scrobblerSink: true },
+    SCROB: { key: "SCROB", label: "Scrob", shortLabel: "Scrob", brandClass: "brand-scrob", badgeId: "badge-scrob", authSectionId: "sec-scrob", authGroupId: "sec-auth-trackers", aliases: ["SCROB"], statusLegacy: ["scrob_connected", "scrob"], hasLogo: true, hasLogLogo: false, logoFile: "SCROB.png", tone: { solid: "#6f36cc", rgb: "111,54,204" }, watchlist: true, ratings: true, history: true, progress: true, playlists: false, collection: true, scrobblerSink: true },
     TAUTULLI: { key: "TAUTULLI", label: "Tautulli", shortLabel: "Tautulli", brandClass: "brand-tautulli", badgeId: "badge-tautulli", authSectionId: "sec-tautulli", authGroupId: "sec-auth-others", aliases: ["TAUTULLI"], statusLegacy: ["tautulli_connected", "tautulli"], hasLogo: true, hasLogLogo: false, tone: { solid: "#f59e0b", rgb: "245,158,11" } },
+    TRACEARR: { key: "TRACEARR", label: "Tracearr", shortLabel: "Tracearr", brandClass: "brand-tracearr", badgeId: "badge-tracearr", authSectionId: "sec-tracearr", authGroupId: "sec-auth-others", aliases: ["TRACEARR"], statusLegacy: ["tracearr_connected", "tracearr"], hasLogo: true, hasLogLogo: false, logoFile: "TRACEARR.png", tone: { solid: "#18d1e7", rgb: "24,209,231" } },
   });
-  const order = Object.freeze(["CROSSWATCH","PLEX","JELLYFIN","EMBY","SIMKL","TRAKT","ANILIST","TMDB","MDBLIST","PUBLICMETADB","PUNCHPLAY","FLOPPY","SCROB","NUVIO","KODI","STREMIO","TAUTULLI"]);
+  const order = Object.freeze(["CROSSWATCH","PLEX","JELLYFIN","EMBY","SIMKL","TRAKT","ANILIST","MYANIMELIST","KITSU","TMDB","MDBLIST","PUBLICMETADB","WETRAKR","PUNCHPLAY","BINGEBASE","FLICKLIST","FLOPPY","SCROB","NUVIO","KODI","STREMIO","TAUTULLI","TRACEARR"]);
   function normalizeToken(v){ return String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]+/g, ""); }
   function aliasPool(key){
     const info = providers[key];
@@ -49,6 +55,14 @@
   }
   function get(v){ return providers[keyOf(v)] || null; }
   function label(v){ const info = get(v); return info?.label || keyOf(v) || "?"; }
+  function instanceLabel(provider, instance, config = window.CW?.Cache?.getCfg?.() || window._cfgCache || {}){
+    const key = keyOf(provider).toLowerCase();
+    const id = String(instance || "default").trim() || "default";
+    const keys = key === "tmdb" ? ["tmdb_sync", "tmdb"] : key === "crosswatch" ? ["crosswatch", "cw"] : [key];
+    const block = keys.map(name => config[name]).find(value => value && typeof value === "object");
+    const entry = id.toLowerCase() === "default" ? block : block?.instances?.[id];
+    return String(entry?.label || "").trim() || (id.toLowerCase() === "default" ? "Default instance" : id);
+  }
   function shortLabel(v){ const info = get(v); return info?.shortLabel || info?.label || keyOf(v) || "?"; }
   function aliases(v){ const info = get(v); return Array.isArray(info?.aliases) && info.aliases.length ? info.aliases.slice() : [keyOf(v)].filter(Boolean); }
   function aliasesMap(){ return Object.fromEntries(order.map((key) => [key, aliases(key)])); }
@@ -61,13 +75,26 @@
   function authProviders(){ return order.map((key) => get(key)).filter((info) => info?.authSectionId).map((info) => ({ key: info.key, sectionId: info.authSectionId, groupId: info.authGroupId || "" })); }
   function watchlistProviders(){ return order.filter((key) => !!get(key)?.watchlist); }
   function scrobblerSinks(){ return order.filter((key) => !!get(key)?.scrobblerSink); }
+  function syncSurfaceProvider(v){ return get(v)?.syncSurface !== false; }
   function assetPath(path){
     const version = String(window.APP_VERSION || window.__CW_VERSION__ || "").trim();
     return version ? `${path}?v=${encodeURIComponent(version)}` : path;
   }
   function logoPath(v){ const info = get(v); if (!info?.hasLogo) return ""; const file = info.logoFile || `${info.key}.svg`; return assetPath(`/assets/img/${file}`); }
   function logLogoPath(v){ const info = get(v); return info?.hasLogLogo ? assetPath(`/assets/img/${info.key}-log.svg`) : ""; }
-  function brandInfo(v){ const info = get(v); return { cls: info?.brandClass || "", icon: logoPath(v) || "" }; }
+  function brandInfo(v){
+    const k = keyOf(v);
+    const info = get(k);
+    return {
+      key: info?.key || k,
+      label: label(k),
+      shortLabel: shortLabel(k),
+      cls: info?.brandClass || "",
+      icon: logoPath(k) || "",
+      logIcon: logLogoPath(k) || "",
+      tone: tone(k),
+    };
+  }
   function logoHtml(v, cls = "token-logo"){
     const k = keyOf(v);
     const src = logoPath(k);
@@ -80,11 +107,28 @@
     if (!src) return logoHtml(k, cls);
     return `<img class="${cls}" src="${src}" alt="${k} logo" width="28" height="28" loading="lazy">`;
   }
+  function dailyQuotaDetails(data) {
+    const remaining = data?.daily_remaining;
+    const reset = Number(data?.daily_resets_at);
+    const seen = Number(data?.daily_seen_at);
+    const now = Date.now() / 1000;
+    if (remaining == null || !Number.isFinite(Number(remaining)) || Number(remaining) < 0) return [];
+    if ((reset > 0 && reset <= now) || (!(reset > 0) && (!seen || now - seen >= 300))) return [];
+    const limit = Number(data?.daily_limit);
+    const lines = [`API calls left today: ${Number(remaining)}${Number.isFinite(limit) && limit > 0 ? ` / ${limit}` : ""}`];
+    if (reset > 0 && Number.isFinite(reset)) {
+      const date = new Date(reset * 1000);
+      const options = { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZoneName: "short" };
+      const label = window.CW?.ProfileDateTime?.format?.(date, options) || date.toLocaleString(undefined, options);
+      lines.push(`Resets: ${label}`);
+    }
+    return lines;
+  }
   (window.CW ||= {});
   window.CW.ProviderMeta = {
-    providers, order, get, normalizeToken, keyOf, matchKey, label, shortLabel, aliases, aliasesMap, badgeId, sectionId, authGroupId,
-    statusLegacy, tone, statusProviders, authProviders, watchlistProviders, scrobblerSinks, assetPath, logoPath, logLogoPath, brandInfo, logoHtml,
-    logLogoHtml, logo: logoPath, logLogo: logLogoPath,
+    providers, order, get, normalizeToken, keyOf, matchKey, label, instanceLabel, shortLabel, aliases, aliasesMap, badgeId, sectionId, authGroupId,
+    statusLegacy, tone, statusProviders, authProviders, watchlistProviders, scrobblerSinks, syncSurfaceProvider, assetPath, logoPath, logLogoPath, brandInfo, logoHtml,
+    logLogoHtml, dailyQuotaDetails, logo: logoPath, logLogo: logLogoPath,
     labels: Object.fromEntries(order.map((key) => [key, label(key)])),
   };
 })();

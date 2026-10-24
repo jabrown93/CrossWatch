@@ -27,6 +27,10 @@ _MEDIA_SERVER_LIBRARY_MESSAGES = {
 
 _SIMKL_HISTORY_MESSAGES = {
     "simkl_not_found:episodes": "SIMKL could not find this episode with the normal history payload.",
+    "simkl_not_found:anime:episodes": "SIMKL could not find this episode with the native anime history payload.",
+    "simkl_not_found:anime:shows": "SIMKL could not find this anime entry with the native anime history payload.",
+    "simkl_anime_unmapped:episodes": "CrossWatch could not map the source season and episode to the native SIMKL anime episode number.",
+    "simkl_write_response_ambiguous:anime_count": "SIMKL accepted the anime request but did not report enough episode detail to safely confirm the write.",
     "simkl_not_found:anime_retry:episodes": "SIMKL could not find this episode with the anime retry payload.",
     "simkl_anime_retry_unmapped:episodes": "CrossWatch confirmed this is SIMKL anime, but could not map the source season and episode to SIMKL's native anime episode number.",
     "simkl_write_response_ambiguous:add_count": "SIMKL accepted the request but did not report enough detail to safely confirm the write.",
@@ -35,15 +39,33 @@ _SIMKL_HISTORY_MESSAGES = {
 }
 
 _DIRECT_LABELS = {
+    "path_match": "Matched by file path",
+    "path_ambiguous": "Multiple file path matches",
+    "path_id_conflict": "File path matches but IDs disagree",
     "not_in_plex_catalog": "Not in library",
     "not_in_library": "Not in library",
     "not_in_catalog": "Not in library",
     "simkl_not_found:anime_retry:episodes": "SIMKL anime episode not found",
+    "simkl_not_found:anime:episodes": "SIMKL anime episode not found",
+    "simkl_not_found:anime:shows": "SIMKL anime entry not found",
+    "simkl_anime_unmapped:episodes": "SIMKL anime episode mapping missing",
+    "simkl_write_response_ambiguous:anime_count": "SIMKL anime response ambiguous",
     "simkl_not_found:episodes": "SIMKL episode not found",
     "simkl_anime_retry_unmapped:episodes": "SIMKL anime episode mapping missing",
     "simkl_write_response_ambiguous:add_count": "SIMKL write response ambiguous",
     "simkl_write_response_ambiguous:anime_retry_count": "SIMKL anime retry response ambiguous",
     "simkl_write_response_malformed:json": "SIMKL malformed response",
+    "not_mapped": "No anime mapping for this target",
+    "not_anime_or_no_mapping": "Not anime or no anime mapping",
+    "anime_mapping_unavailable": "Anime mapping not installed",
+    "missing_media_identity": "Missing show IDs",
+    "media_not_found": "Not found on target",
+    "anime_media_type_mismatch": "Anime type mismatch",
+    "episode_out_of_range": "Episode out of range",
+    "duplicate_stop": "Already recorded on target",
+    "duplicate": "Already recorded on target",
+    "pro_required": "Rewatch needs a paid plan on target",
+    "rewatch_unconfirmed": "Rewatch not confirmed by target",
 }
 
 TRACKER_TO_MEDIA_SERVER_MESSAGE = (
@@ -106,7 +128,7 @@ def reason_message(raw: Any, *, provider: Any = None, feature: Any = None) -> st
         if low == "not_in_plex_catalog":
             return f"{msg} {TRACKER_TO_MEDIA_SERVER_MESSAGE}"
         return msg
-    if provider_base in {"PLEX", "EMBY", "JELLYFIN"} and low in _MEDIA_SERVER_LIBRARY_MESSAGES:
+    if provider_base in {"PLEX", "EMBY", "JELLYFIN", "KODI"} and low in _MEDIA_SERVER_LIBRARY_MESSAGES:
         return _MEDIA_SERVER_LIBRARY_MESSAGES[low]
     if provider_base == "SIMKL" and feature_key == "history":
         if low in _SIMKL_HISTORY_MESSAGES:

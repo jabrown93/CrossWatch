@@ -23,6 +23,7 @@
     ["history", "hi", "History"],
     ["progress", "pr", "Progress"],
     ["playlists", "pl", "Playlists"],
+    ["collection", "co", "Collections"],
   ];
 
 
@@ -70,14 +71,15 @@
     const source = key(_pick.source);
     const target = key(_pick.target);
 
-    board.innerHTML = visibleProviders.map((item) => {
+    board.innerHTML = [...visibleProviders].sort((a, b) => providerLabel(a, key(a.key || a.name || a.label)).localeCompare(providerLabel(b, key(b.key || b.name || b.label)), undefined, { sensitivity: "base", numeric: true })).map((item) => {
       const providerKey = key(item.key || item.name || item.label);
       const label = providerLabel(item, providerKey);
       const cls = providerClass(providerKey);
       const isSource = providerKey === source;
       const isTarget = providerKey === target;
+      const sourceOnly = !isSource && !!source && item?.capabilities?.can_target === false;
       const btnClass = isSource ? "selected" : (source && !isTarget ? "target" : "");
-      const btnText = isSource ? "Clear Source" : (source ? "Set as Target" : "Set as Source");
+      const btnText = isSource ? "Clear Source" : (sourceOnly ? "Source only" : (source ? "Set as Target" : "Set as Source"));
       const logo = providerLogo(providerKey);
       const watermarkStyle = logo ? ` style="--wm:url('${logo}')"` : "";
       const badge = isSource
@@ -91,7 +93,8 @@
             <div class="prov-title">${label}</div>
             <div class="prov-features" aria-label="Supported features">${featureDots(item.features || {})}</div>
             <div class="prov-actions">
-              <button type="button" class="prov-btn ${btnClass}" data-action="pick" data-prov="${providerKey}">${btnText}</button>
+              <button type="button" class="prov-btn ${btnClass}" data-action="pick" data-prov="${providerKey}"${sourceOnly ? ' disabled title="This provider can only be used as a source"' : ""}>${btnText}</button>
+              ${isSource && item?.capabilities?.can_target !== false ? `<button type="button" class="prov-btn target" data-action="instance" data-prov="${providerKey}">Set as Target</button>` : ""}
               ${badge}
             </div>
           </div>
@@ -112,7 +115,7 @@
   function openPairModal(source, target) {
     const src = key(source);
     const dst = key(target);
-    if (!src || !dst || src === dst) return;
+    if (!src || !dst) return;
 
     _pick.target = dst;
     syncLegacySelectors(src, dst);
@@ -167,8 +170,12 @@
     if (!host || host.__cxConnectionsBound) return;
 
     host.addEventListener("click", (ev) => {
-      const btn = ev.target.closest?.(".prov-btn[data-action='pick']");
-      if (!btn || !host.contains(btn)) return;
+      const btn = ev.target.closest?.(".prov-btn[data-action]");
+      if (!btn || btn.disabled || !host.contains(btn)) return;
+      if (btn.dataset.action === "instance") {
+        openPairModal(_pick.source, btn.dataset.prov || "");
+        return;
+      }
       handlePick(btn.dataset.prov || "");
     });
 

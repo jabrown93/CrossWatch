@@ -19,18 +19,28 @@
     ["ratings", "star"],
     ["history", "play_arrow"],
     ["progress", "timelapse"],
-    ["playlists", "queue_music"]
+    ["playlists", "queue_music"],
+    ["collection", "inventory_2"]
   ].map(([key, icon]) => ({ key, icon, label: featureLabel(key) }));
   const FEAT_KEYS = FEATS.map((f) => f.key);
   const LAYOUT_KEY = "cw.syncHub.layout.v1";
   const DEFAULT_LAYOUT = {
+    watchlist: { order: 0, size: "small", hidden: false },
+    ratings: { order: 1, size: "small", hidden: false },
+    history: { order: 2, size: "small", hidden: false },
+    progress: { order: 3, size: "small", hidden: false },
+    playlists: { order: 4, size: "small", hidden: false },
+    collection: { order: 5, size: "small", hidden: false }
+  };
+  const LEGACY_DEFAULT_LAYOUT = {
     watchlist: { order: 0, size: "large", hidden: false },
     ratings: { order: 1, size: "large", hidden: false },
     history: { order: 2, size: "small", hidden: false },
     progress: { order: 3, size: "small", hidden: false },
-    playlists: { order: 4, size: "small", hidden: false }
+    playlists: { order: 4, size: "small", hidden: false },
+    collection: { order: 5, size: "small", hidden: false }
   };
-  const DEFAULT_ENABLED = { watchlist: true, ratings: true, history: true, progress: true, playlists: true };
+  const DEFAULT_ENABLED = { watchlist: true, ratings: true, history: true, progress: true, playlists: true, collection: true };
   const EMPTY_ENABLED = () => Object.fromEntries(FEAT_KEYS.map((k) => [k, false]));
   const mkLane = () => ({ added: 0, removed: 0, updated: 0, spotAdd: [], spotRem: [], spotUpd: [] });
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -104,8 +114,29 @@
     })
     .sort((a, b) => a[1].order - b[1].order || a[1]._idx - b[1]._idx)
     .map(([key, row], order) => [key, { order, size: row.size, hidden: row.hidden }]));
+  const isLegacyDefaultLayout = (raw) => {
+    if (!raw || typeof raw !== "object") return false;
+    const legacyKeys = ["watchlist", "ratings", "history", "progress", "playlists"];
+    const legacyMatch = legacyKeys.every((key) => {
+      const row = raw[key];
+      const legacy = LEGACY_DEFAULT_LAYOUT[key];
+      return row && typeof row === "object" && Number(row.order) === legacy.order && row.size === legacy.size && row.hidden === legacy.hidden;
+    });
+    if (!legacyMatch) return false;
+    const collection = raw.collection;
+    if (collection == null) return true;
+    const legacy = LEGACY_DEFAULT_LAYOUT.collection;
+    return typeof collection === "object" && Number(collection.order) === legacy.order && collection.size === legacy.size && collection.hidden === legacy.hidden;
+  };
   const readLayout = () => {
-    try { return normalizeLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) || "null")); }
+    try {
+      const raw = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "null");
+      if (isLegacyDefaultLayout(raw)) {
+        try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(DEFAULT_LAYOUT)); } catch {}
+        return normalizeLayout(DEFAULT_LAYOUT);
+      }
+      return normalizeLayout(raw);
+    }
     catch { return normalizeLayout(null); }
   };
   let hubLayout = readLayout();
@@ -154,7 +185,7 @@
       const s = String(v || "").trim().toLowerCase();
       if (!s) return false;
       if (key && s === key.trim().toLowerCase()) return true;
-      return /^(tmdb|imdb|tvdb|trakt|slug|mdblist|kitsu):/.test(s);
+      return /^(tmdb|imdb|tvdb|trakt|slug|mdblist|mal|anilist|kitsu):/.test(s);
     };
     const mKey = key.match(/#s(\d{1,3})e(\d{1,3})/i);
     const mRaw = rawTitle.match(/^s(\d{1,3})e(\d{1,3})$/i);
@@ -874,9 +905,12 @@
 
   const showTab = window.showTab;
   window.showTab = function (name) {
-    const ret = typeof showTab === "function" ? showTab.apply(this, arguments) : undefined;
+    const requested = name || "main";
+    const effective = DOC.classList.contains("cw-compact") && requested !== "main" ? "main" : requested;
+    const args = [effective, ...Array.prototype.slice.call(arguments, 1)];
+    const ret = typeof showTab === "function" ? showTab.apply(this, args) : undefined;
     try {
-      DOC.dataset.tab = name || "main";
+      DOC.dataset.tab = effective;
     } catch {}
     return ret;
   };
@@ -948,19 +982,27 @@
 
   const ensureRoot = () => {
     if (root && root.isConnected) return root;
+    if (!document.getElementById("cw-quick-add-style")) {
+      const style = document.createElement("link");
+      style.id = "cw-quick-add-style";
+      style.rel = "stylesheet";
+      style.href = `/assets/css/quick-add.css?v=${encodeURIComponent(window.APP_VERSION || "1")}`;
+      document.head.appendChild(style);
+    }
     root = document.createElement("div");
     root.id = ROOT_ID;
     root.className = "hidden";
     root.innerHTML = `
-      <div class="cw-qa-shell cw-qa-desktop" aria-hidden="true">
-        <button type="button" class="cw-qa-tab" aria-label="Open quick add item" title="Click to Quick Add, drag to move">
-          <span class="cw-qa-tab-text">Quick Add</span>
-          <span class="material-symbols-rounded cw-qa-grip" aria-hidden="true">drag_indicator</span>
+      <div class="cw-qa-shell cw-qa-desktop">
+        <button type="button" class="cw-qa-tab" aria-label="Quick add a movie or show" title="Quick add">
+          <span class="cw-qa-plus material-symbols-rounded" aria-hidden="true">add</span>
+          <span class="cw-qa-tab-text"><strong>Quick add</strong><small>Movies &amp; shows</small></span>
         </button>
+        <button type="button" class="cw-qa-grip" aria-label="Move Quick add up or down" title="Drag to move, or use the arrow keys"><span class="material-symbols-rounded" aria-hidden="true">drag_indicator</span></button>
       </div>
       <button type="button" class="cw-qa-shell cw-qa-fab" aria-label="Quick Add item" title="Click to Quick Add, drag to move">
-        <span class="material-symbols-rounded" aria-hidden="true">add</span>
-        <span>Quick Add</span>
+        <span class="cw-qa-plus material-symbols-rounded" aria-hidden="true">add</span>
+        <span>Quick add</span>
       </button>
     `;
     document.body.appendChild(root);
@@ -970,9 +1012,21 @@
     const fabBtn = root.querySelector(".cw-qa-fab");
     const gripBtn = root.querySelector(".cw-qa-grip");
     let suppressClickUntil = 0;
+    const mobilePositionBounds = () => {
+      const viewport = window.visualViewport;
+      const height = window.innerHeight || 0;
+      const top = Math.max(viewport?.offsetTop || 0, document.querySelector('body > header')?.getBoundingClientRect().bottom || 0);
+      const bottomInset = Math.max(0, height - ((viewport?.offsetTop || 0) + (viewport?.height || height)));
+      const nav = document.getElementById('cw-mobile-bottom-nav');
+      const navRect = nav?.getBoundingClientRect();
+      const minimum = Math.max(16 + bottomInset, navRect?.height ? height - navRect.top + 12 : 16, document.body.classList.contains('cw-has-bottom-nav') ? 80 : 16);
+      const maximum = Math.max(minimum, height - top - (fabBtn?.getBoundingClientRect().height || 52) - 32);
+      return { minimum, maximum };
+    };
     const applyStoredPosition = () => {
       root.style.setProperty("--cw-qa-desktop-top", `${clamp(readStoredNumber(DESKTOP_POS_KEY, 66), 18, 88)}%`);
-      root.style.setProperty("--cw-qa-mobile-bottom", `${clamp(readStoredNumber(MOBILE_POS_KEY, 22), 16, 120)}px`);
+      const { minimum, maximum } = mobilePositionBounds();
+      root.style.setProperty("--cw-qa-mobile-bottom", `${clamp(readStoredNumber(MOBILE_POS_KEY, 22), minimum, maximum)}px`);
     };
     const openModal = () => {
       if (typeof window.openManualWatchedModal === "function") window.openManualWatchedModal();
@@ -997,7 +1051,9 @@
       if (!event.isPrimary) return;
       const target = kind === "desktop" ? desktop : fabBtn;
       if (!target) return;
-      dragState = { kind, startX: event.clientX, startY: event.clientY, moved: false, pointerId: event.pointerId };
+      const { minimum, maximum } = mobilePositionBounds();
+      const startBottom = clamp(parseFloat(root.style.getPropertyValue("--cw-qa-mobile-bottom")) || 22, minimum, maximum);
+      dragState = { kind, startX: event.clientX, startY: event.clientY, startBottom, moved: false, pointerId: event.pointerId };
       target.setPointerCapture?.(event.pointerId);
       clearTimeout(closeTimer);
     };
@@ -1012,7 +1068,8 @@
         const pct = clamp((event.clientY / Math.max(window.innerHeight || 1, 1)) * 100, 18, 88);
         root.style.setProperty("--cw-qa-desktop-top", `${pct}%`);
       } else {
-        const bottom = clamp((window.innerHeight || 0) - event.clientY - 28, 16, 120);
+        const { minimum, maximum } = mobilePositionBounds();
+        const bottom = clamp(dragState.startBottom - dy, minimum, maximum);
         root.style.setProperty("--cw-qa-mobile-bottom", `${bottom}px`);
       }
     };
@@ -1039,6 +1096,8 @@
     };
 
     applyStoredPosition();
+    window.addEventListener("resize", applyStoredPosition);
+    window.visualViewport?.addEventListener("resize", applyStoredPosition);
     desktop?.addEventListener("mouseenter", openDrawer);
     desktop?.addEventListener("mouseleave", queueClose);
     desktop?.addEventListener("focusin", openDrawer);
@@ -1051,6 +1110,14 @@
       event.preventDefault();
       event.stopPropagation();
       beginDrag(event, "desktop");
+    });
+    gripBtn?.addEventListener("keydown", event => {
+      if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      const current = parseFloat(root.style.getPropertyValue("--cw-qa-desktop-top")) || 66;
+      const next = clamp(current + (event.key === "ArrowUp" ? -3 : 3), 18, 88);
+      root.style.setProperty("--cw-qa-desktop-top", `${next}%`);
+      writeStoredNumber(DESKTOP_POS_KEY, next);
     });
     window.addEventListener("pointermove", moveDrag);
     window.addEventListener("pointerup", endDrag);
@@ -1083,6 +1150,8 @@
     el.classList.toggle("is-desktop", showDesktop);
     el.classList.toggle("is-mobile", showMobile);
     el.classList.toggle("is-ready", canOpen());
+    el.querySelector(".cw-qa-tab").disabled = !canOpen();
+    el.querySelector(".cw-qa-fab").disabled = !canOpen();
     if (!showDesktop) el.classList.remove("is-open", "is-peek");
     if (showDesktop) maybePeek();
   };

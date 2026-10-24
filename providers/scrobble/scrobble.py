@@ -7,11 +7,19 @@ import json
 import inspect
 import re
 import time
+import threading
+import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal, Protocol
 
-from cw_platform.account_match import media_account_allowed, normalize_media_account_name
+from cw_platform.account_match import exact_media_account_name, media_account_allowed
+from providers.scrobble._log_dedupe import LogDeduplicator
+from providers.scrobble.anime_mapping import maybe_enrich_event_for_sink, sink_name_for_mapping
+from providers.scrobble.media_filters import event_ignore_reason, log_media_filter_drop
+from providers.scrobble.routes import ROUTE_SINGLE_ACCOUNT_PROVIDERS as SINGLE_ACCOUNT_PROVIDERS
+from providers.scrobble.routes import route_profile_accepts, route_profile_signature
 
 try:
     from _logging import log as BASE_LOG
@@ -71,7 +79,7 @@ def _ids_from_meta(meta: dict[str, Any]) -> dict[str, str]:
 
 
 def _norm_user(s: str) -> str:
-    return normalize_media_account_name(s)
+    return exact_media_account_name(s)
 
 
 def _as_filter_set(value: Any) -> set[str]:
@@ -87,6 +95,66 @@ def _as_filter_set(value: Any) -> set[str]:
             if clean:
                 out.add(clean)
     return out
+
+
+def _find_user_id(o: Any) -> str:
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if isinstance(k, str) and k.lower() in ("userid", "user_id"):
+                return str(v or "").strip().lower()
+        for v in o.values():
+            uid = _find_user_id(v)
+            if uid:
+                return uid
+    elif isinstance(o, list):
+        for v in o:
+            uid = _find_user_id(v)
+            if uid:
+                return uid
+    return ""
+
+
+def _find_psn(o: Any) -> list[dict[str, Any]] | None:
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if isinstance(k, str) and k.lower() == "playsessionstatenotification":
+                return v if isinstance(v, list) else [v]
+        for v in o.values():
+            r = _find_psn(v)
+            if r:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = _find_psn(v)
+            if r:
+                return r
+    return None
+
+
+def _event_identity(ev: ScrobbleEvent) -> tuple[str, str, str, str, tuple[str, ...]]:
+    raw = ev.raw or {}
+    ident = raw.get("_cw_session_identity") if isinstance(raw, dict) else None
+    if not isinstance(ident, dict):
+        ident = {}
+
+    n = (_find_psn(raw) or [None])[0] or {}
+    if not isinstance(n, dict):
+        n = {}
+    acc_id = str(ident.get("account_id") or n.get("accountID") or "")
+    acc_uuid = str(ident.get("account_uuid") or n.get("accountUUID") or "").lower()
+    user_id = str(ident.get("user_id") or "").strip().lower() or _find_user_id(raw)
+    account = (
+        str(
+            ev.account
+            or ident.get("name")
+            or ident.get("user_name")
+            or ident.get("account_name")
+            or ""
+        ).strip()
+    )
+    found = ident.get("user_aliases")
+    aliases = tuple(alias for alias in found if isinstance(alias, str) and alias.strip()) if isinstance(found, list) else ()
+    return account, user_id, acc_id, acc_uuid, aliases
 
 
 def _server_uuid_allowed(filt: dict[str, Any], server_uuid: str | None) -> bool:
@@ -196,8 +264,11 @@ def account_identifiers(raw: Any) -> tuple[str, str]:
 
     found = find_psn(raw or {}) or []
     n = max(found, key=_pssn_score) if found else {}
-    acc_id = str(n.get("accountID") or "").strip()
-    acc_uuid = str(n.get("accountUUID") or "").strip().lower()
+    # The watcher stamps what its session lookup resolved; a flat Plex alert has no PSSN.
+    ident = raw.get("_cw_session_identity") if isinstance(raw, dict) else None
+    ident = ident if isinstance(ident, dict) else {}
+    acc_id = str(ident.get("account_id") or n.get("accountID") or "").strip()
+    acc_uuid = str(ident.get("account_uuid") or n.get("accountUUID") or "").strip().lower()
     if isinstance(raw, dict) and not (acc_id and acc_uuid):
         # Webhooks carry the same identifiers under a flat Account block instead
         # of a PlaySessionStateNotification (providers/webhooks/plex.py), and the
@@ -259,7 +330,7 @@ class ScrobbleEvent:
 
 
 class ScrobbleSink(Protocol):
-    def send(self, event: ScrobbleEvent) -> None: ...
+    def send(self, event: ScrobbleEvent) -> dict[str, Any] | None: ...
 
 
 def from_plex_webhook(payload: Any, defaults: dict[str, Any] | None = None) -> ScrobbleEvent | None:
@@ -306,7 +377,7 @@ def from_plex_pssn(payload: dict[str, Any], defaults: dict[str, Any] | None = No
         "type": n.get("type") or "",
         "state": n.get("state") or "",
         "sessionKey": n.get("sessionKey"),
-        "account": n.get("account") or n.get("accountID") or defaults.get("username"),
+        "account": n.get("account"),
         "machineIdentifier": n.get("machineIdentifier") or defaults.get("server_uuid"),
     }
     return _event_from_meta(meta, payload)
@@ -396,23 +467,43 @@ def from_plex_flat_playing(payload: dict[str, Any], defaults: dict[str, Any] | N
         "type": first.get("type") or prog_src.get("type") or "",
         "state": prog_src.get("state") or first.get("state") or "",
         "sessionKey": first.get("sessionKey") or prog_src.get("sessionKey"),
-        "account": first.get("account") or prog_src.get("account") or defaults.get("username"),
+        "account": first.get("account") or prog_src.get("account"),
         "machineIdentifier": first.get("machineIdentifier") or prog_src.get("machineIdentifier") or defaults.get("server_uuid"),
     }
     return _event_from_meta(meta, payload)
+
+
+def plexkodiconnect_support_enabled(cfg: dict[str, Any]) -> bool:
+    try:
+        watch_cfg = ((cfg.get("scrobble") or {}).get("watch") or {})
+        route_options = watch_cfg.get("route_options") or {}
+        watch_options = route_options.get("watch") if isinstance(route_options, dict) else {}
+        return bool(isinstance(watch_options, dict) and watch_options.get("plexkodiconnect_support") is True)
+    except Exception:
+        return False
 
 
 class Dispatcher:
     def __init__(self, sinks: Iterable[ScrobbleSink], cfg_provider=None) -> None:
         self._sinks = list(sinks or [])
         self._cfg_provider = cfg_provider or _load_config
-        self._session_ok: set[str] = set()
+        self._session_ok: set[tuple[str, ...]] = set()
+        self._filter_identity = ""
         self._debounce: dict[str, float] = {}
         self._last_action: dict[str, str] = {}
         self._last_progress: dict[str, float] = {}
         self._sink_accepts_cfg: dict[int, bool] = {}
+        self._route_log_ts: dict[str, float] = {}
+        self._filter_log_state = LogDeduplicator()
+        self._filter_log_config_identity = ""
+        self._retry_after: dict[str, tuple[float, int]] = {}
+        self._dispatch_lock = threading.RLock()
+        self._pending: OrderedDict[str, tuple[float, ScrobbleEvent]] = OrderedDict()
+        self._config_identity = ""
+        self._inflight: set[int] = set()
+        self._failed_ids: OrderedDict[str, dict[str, str]] = OrderedDict()
 
-    def _send_sink(self, sink: Any, ev: ScrobbleEvent, cfg: dict[str, Any]) -> None:
+    def _send_sink(self, sink: Any, ev: ScrobbleEvent, cfg: dict[str, Any]) -> Any:
         sid = id(sink)
         ok = self._sink_accepts_cfg.get(sid)
         if ok is None:
@@ -425,20 +516,189 @@ class Dispatcher:
                 ok = False
             self._sink_accepts_cfg[sid] = ok
         if not ok:
-            sink.send(ev)
-            return
+            return sink.send(ev)
         try:
-            sink.send(ev, cfg=cfg)
+            return sink.send(ev, cfg=cfg)
         except TypeError:
-            sink.send(ev, cfg)
+            return sink.send(ev, cfg)
+
+    def _route_label(self, cfg: dict[str, Any]) -> str:
+        try:
+            w = ((cfg.get("scrobble") or {}).get("watch") or {})
+            rid = str(w.get("route_id") or "").strip()
+
+            def _side(name_key: str, inst_key: str) -> str:
+                name = str(w.get(name_key) or "").strip()
+                inst = str(w.get(inst_key) or "").strip()
+                if not name or not inst or inst.lower() == "default":
+                    return name
+                raw = cfg.get(name)
+                block = raw if isinstance(raw, dict) else {}
+                shown = str(block.get("label") or "").strip() or inst
+                return f"{name}[{shown}]"
+
+            prov = _side("route_provider", "route_provider_instance")
+            sink = _side("route_sink", "route_sink_instance")
+            pair = f"{prov}->{sink}" if prov and sink else (prov or sink)
+            if rid and pair:
+                return f"{rid} {pair}"
+            return rid or pair or "?"
+        except Exception:
+            return "?"
+
+    def _throttled_route_log(self, key: str, msg: str, lvl: str = "DEBUG") -> None:
+        now = time.time()
+        if now - self._route_log_ts.get(key, 0.0) >= 30.0:
+            self._route_log_ts[key] = now
+            _log(msg, lvl)
+
+    def _sync_filter_log_config(self, identity: str) -> None:
+        with self._dispatch_lock:
+            if identity != self._filter_log_config_identity:
+                self._filter_log_state.clear()
+                self._filter_log_config_identity = identity
+
+    def _log_filter_drop(self, ev: ScrobbleEvent, cfg: dict[str, Any], reason: str,
+                         identity: tuple[str, ...], lvl: str = "DEBUG") -> None:
+        route = self._route_label(cfg)
+        msg = f"route {route}: filtered user={mask_account(identity[0])} sess={ev.session_key} reason={reason}"
+        if not ev.session_key:
+            self._throttled_route_log(f"filter|{ev.server_uuid}|{reason}|{identity}", msg, lvl)
+            return
+        key = (ev.server_uuid, ev.session_key)
+        signature = (route, reason, *identity)
+        with self._dispatch_lock:
+            self._sync_filter_log_config(self._delivery_identity(cfg))
+            if self._filter_log_state.should_log(key, signature):
+                _log(msg, lvl)
+
+    def _fallback_account(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> str:
+        if str(ev.account or "").strip():
+            return ""
+        try:
+            watch_cfg = ((cfg.get("scrobble") or {}).get("watch") or {})
+            route_options = watch_cfg.get("route_options") or {}
+            watch_options = route_options.get("watch") if isinstance(route_options, dict) else {}
+            if not (isinstance(watch_options, dict) and bool(watch_options.get("unresolved_user_fallback"))):
+                return ""
+        except Exception:
+            return ""
+        raw = ev.raw if isinstance(ev.raw, dict) else {}
+        if not raw.get("_cw_sessions_access_unavailable"):
+            return ""
+        fallback = raw.get("_cw_unresolved_user_fallback")
+        if isinstance(fallback, dict):
+            fallback_account = str(fallback.get("account") or "").strip()
+        else:
+            fallback_account = str(fallback or "").strip()
+        if not fallback_account:
+            plex_cfg = cfg.get("plex") if isinstance(cfg, dict) else {}
+            if isinstance(plex_cfg, dict):
+                fallback_account = str(plex_cfg.get("username") or "").strip()
+        return fallback_account
+
+    def needs_pkc_support(self) -> bool:
+        try:
+            return plexkodiconnect_support_enabled(self._cfg_provider() or {})
+        except Exception:
+            return False
+
+    def _pkc_route_event(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> ScrobbleEvent:
+        raw = ev.raw if isinstance(ev.raw, dict) else {}
+        merge = raw.get("_cw_pkc_merge")
+        if not isinstance(merge, dict) or plexkodiconnect_support_enabled(cfg):
+            return ev
+        raw2 = dict(raw)
+        raw2.pop("_cw_pkc_merge", None)
+        raw2.pop("_cw_session_identity", None)
+        session_key = str(merge.get("stop_session_key") or "").strip() or ev.session_key
+        return ScrobbleEvent(**{**ev.__dict__, "account": None, "session_key": session_key, "raw": raw2})
+
+    def _route_event(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> ScrobbleEvent:
+        ev = self._pkc_route_event(ev, cfg)
+        fallback_account = self._fallback_account(ev, cfg)
+        if not fallback_account:
+            return ev
+        raw2 = dict(ev.raw if isinstance(ev.raw, dict) else {})
+        raw2["_cw_unresolved_user_fallback_used"] = True
+        self._throttled_route_log(
+            f"fallback|{fallback_account}|{ev.session_key}",
+            f"route {self._route_label(cfg)}: unresolved user fallback used "
+            f"user={mask_account(fallback_account)} sess={ev.session_key}",
+        )
+        return ScrobbleEvent(**{**ev.__dict__, "account": fallback_account, "raw": raw2})
+
+    def needs_user_resolution(self) -> bool:
+        try:
+            cfg = self._cfg_provider() or {}
+            watch_cfg = ((cfg.get("scrobble") or {}).get("watch") or {})
+            filt = watch_cfg.get("filters") or {}
+            if not isinstance(filt, dict):
+                filt = {}
+            scoped = bool(str(watch_cfg.get("route_profile_id") or "").strip())
+            if filt.get("username_whitelist") or str(filt.get("user_id") or "").strip() or scoped:
+                return True
+            route_options = watch_cfg.get("route_options") or {}
+            watch_options = route_options.get("watch") if isinstance(route_options, dict) else {}
+            return bool(isinstance(watch_options, dict) and watch_options.get("unresolved_user_fallback"))
+        except Exception:
+            return False
 
     def _passes_filters(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> bool:
-        cache_key: str | None = None
+        if not ((cfg.get("scrobble") or {}).get("watch") or {}).get("route_enabled", True):
+            return False
+        watch_cfg = (cfg.get("scrobble") or {}).get("watch") or {}
+        filter_identity = json.dumps(
+            [watch_cfg.get("filters"), watch_cfg.get("route_profile_id"), watch_cfg.get("route_provider"), route_profile_signature(cfg)],
+            sort_keys=True,
+            default=str,
+        )
+        if filter_identity != self._filter_identity:
+            self._session_ok.clear()
+            self._filter_identity = filter_identity
+        cache_key: tuple[str, ...] | None = None
         if ev.session_key:
-            cache_key = f"{ev.session_key}|{_norm_user(ev.account or '')}|{str(ev.server_uuid or '').strip().lower()}"
+            account, user_id, acc_id, acc_uuid, aliases = _event_identity(ev)
+            cache_key = (
+                str(ev.session_key),
+                str(ev.server_uuid or "").strip(),
+                _norm_user(account),
+                user_id,
+                acc_id,
+                acc_uuid,
+                *aliases,
+            )
+
+        ignore_reason = event_ignore_reason(ev, cfg)
+        if ignore_reason:
+            log_media_filter_drop(ev, ignore_reason)
+            return False
+
+        if cache_key:
             if cache_key in self._session_ok:
+                self._filter_log_state.discard((ev.server_uuid, ev.session_key))
                 return True
 
+        if not self._identity_allowed(ev, cfg):
+            return False
+        if cache_key:
+            self._session_ok.add(cache_key)
+        return True
+
+    def accepts_user(self, ev: ScrobbleEvent) -> bool:
+        try:
+            cfg = self._cfg_provider() or {}
+            ev = self._pkc_route_event(ev, cfg)
+            acct = self._fallback_account(ev, cfg)
+            if acct:
+                ev = ScrobbleEvent(**{**ev.__dict__, "account": acct})
+            return self._identity_allowed(ev, cfg)
+        except Exception:
+            return True
+
+    def _identity_allowed(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> bool:
+        if not ((cfg.get("scrobble") or {}).get("watch") or {}).get("route_enabled", True):
+            return False
         filt = (((cfg.get("scrobble") or {}).get("watch") or {}).get("filters") or {})
         if not isinstance(filt, dict):
             filt = {}
@@ -448,48 +708,48 @@ class Dispatcher:
         if not _server_uuid_allowed(filt, ev.server_uuid):
             return False
 
-        def find_user_id(o: Any) -> str:
-            if isinstance(o, dict):
-                for k, v in o.items():
-                    if isinstance(k, str) and k.lower() in ("userid", "user_id"):
-                        return str(v or "").strip().lower()
-                for v in o.values():
-                    uid = find_user_id(v)
-                    if uid:
-                        return uid
-            elif isinstance(o, list):
-                for v in o:
-                    uid = find_user_id(v)
-                    if uid:
-                        return uid
-            return ""
+        account, user_id, acc_id, acc_uuid, aliases = _event_identity(ev)
 
-        acc_id, acc_uuid = account_identifiers(ev.raw)
-        user_id = find_user_id(ev.raw or {})
+        resolved = bool(str(account or "").strip() or str(user_id or "").strip())
+        identity = (account, user_id, acc_id, acc_uuid)
 
-        def _allow() -> bool:
-            if cache_key:
-                self._session_ok.add(cache_key)
+        if want_user and want_user != user_id:
+            if resolved:
+                self._log_filter_drop(ev, cfg, "user_id", identity)
+            return False
+
+        provider = str(((cfg.get("scrobble") or {}).get("watch") or {}).get("route_provider") or "plex").lower()
+        scoped = bool(str(((cfg.get("scrobble") or {}).get("watch") or {}).get("route_profile_id") or "").strip())
+        if provider in SINGLE_ACCOUNT_PROVIDERS:
+            scoped = False
+        if not wl and scoped:
+            verdict = route_profile_accepts(cfg, account)
+            if verdict is None:
+                self._log_filter_drop(ev, cfg, "profile_scoped_without_whitelist", identity, "WARNING")
+                return False
+            if not verdict:
+                if resolved:
+                    self._log_filter_drop(ev, cfg, "profile_name", identity)
+                return False
+            if ev.session_key:
+                self._filter_log_state.discard((ev.server_uuid, ev.session_key))
             return True
 
-        if want_user:
-            if not user_id:
-                return False
-            if want_user != user_id:
-                return False
-
-        scoped = bool(str(((cfg.get("scrobble") or {}).get("watch") or {}).get("route_profile_id") or "").strip())
-        if not wl and scoped:
-            rid = str(((cfg.get("scrobble") or {}).get("watch") or {}).get("route_id") or "?")
-            _log(f"route {rid}: blocked account '{ev.account or '?'}' - profile-scoped route has no username whitelist", "WARNING")
+        accounts = [account]
+        if provider == "plex":
+            accounts.extend(aliases)
+        if not any(
+            media_account_allowed(wl, name, account_id=acc_id, account_uuid=acc_uuid, user_id=user_id, default_allow=not scoped)
+            for name in accounts
+        ):
+            if resolved:
+                self._log_filter_drop(ev, cfg, "username_whitelist", identity)
             return False
+        if ev.session_key:
+            self._filter_log_state.discard((ev.server_uuid, ev.session_key))
+        return True
 
-        if not media_account_allowed(wl, ev.account or "", account_id=acc_id, account_uuid=acc_uuid, user_id=user_id, default_allow=not scoped):
-            return False
-        return _allow()
-
-    def _should_send(self, ev: ScrobbleEvent, cfg: dict[str, Any]) -> bool:
-        sk = ev.session_key or "?"
+    def _should_send(self, ev: ScrobbleEvent, cfg: dict[str, Any], sk: str) -> bool:
         last_a = self._last_action.get(sk)
         last_p = self._last_progress.get(sk, -1)
         try:
@@ -501,7 +761,7 @@ class Dispatcher:
         if ev.action == "start" and last_p is not None and last_p >= sup and ev.progress >= sup:
             return False
 
-        changed = (ev.action != last_a) or (abs(ev.progress - (last_p or -1)) >= 1)
+        changed = (ev.action != last_a) or (abs(ev.progress - last_p) >= 1)
 
         if ev.action == "pause":
             now = time.time()
@@ -518,22 +778,231 @@ class Dispatcher:
 
     def accepts(self, ev: ScrobbleEvent) -> bool:
         cfg = self._cfg_provider() or {}
+        ev = self._route_event(ev, cfg)
         return self._passes_filters(ev, cfg)
 
     def dispatch(self, ev: ScrobbleEvent) -> bool:
+        return self._dispatch(ev)
+
+    def retry_pending(self, cancelled: threading.Event | None = None) -> None:
+        due: list[tuple[str, ScrobbleEvent]] = []
+        with self._dispatch_lock:
+            now = time.monotonic()
+            config_identity = self._config_identity
+            for sk, (created, ev) in list(self._pending.items()):
+                if cancelled is not None and cancelled.is_set():
+                    return
+                if now - created >= 3600:
+                    self._pending.pop(sk, None)
+                    self._retry_after.pop(sk, None)
+                    continue
+                if now >= self._retry_after.get(sk, (0.0, 0))[0]:
+                    due.append((sk, ev))
+        if not due or (cancelled is not None and cancelled.is_set()):
+            return
         cfg = self._cfg_provider() or {}
-        if not self._passes_filters(ev, cfg):
-            return False
-        if not self._should_send(ev, cfg):
-            return False
+        started = time.monotonic()
+        for sk, ev in due[:4]:
+            if cancelled is not None and cancelled.is_set():
+                return
+            self._dispatch(ev, retry_key=sk, cfg=cfg, config_identity=config_identity)
+            if time.monotonic() - started >= 1.0:
+                break
+
+    def _queue_pending(self, sk: str, ev: ScrobbleEvent) -> None:
+        now = time.monotonic()
+        self._pending[sk] = (self._pending.get(sk, (now, ev))[0], ev)
+        self._pending.move_to_end(sk)
+        if len(self._pending) > 1024:
+            expired, _ = self._pending.popitem(last=False)
+            self._retry_after.pop(expired, None)
+
+    def _failed_sink(self, sk: str, ev: ScrobbleEvent) -> None:
+        retry = self._retry_after.get(sk)
+        attempts = min(5, (retry[1] if retry else 0) + 1)
+        now = time.monotonic()
+        self._retry_after[sk] = (now + min(300, 30 * 2 ** (attempts - 1)), attempts)
+        self._last_action.pop(sk, None)
+        self._last_progress.pop(sk, None)
+        self._queue_pending(sk, ev)
+
+    def _delivery_identity(self, cfg: dict[str, Any]) -> str:
+        from providers.scrobble.routes import scrobble_sink_config
+
+        scrobble = cfg.get("scrobble") or {}
+        watch = scrobble.get("watch") or {}
+        sink = str(watch.get("route_sink") or "").strip().lower()
+        block = scrobble_sink_config(cfg, sink, watch.get("route_sink_instance"))[sink] if sink else {}
+        relevant = {"watch": {k: v for k, v in watch.items() if k != "routes"},
+                    "sink": block, "policy": scrobble.get("trakt"), "anime_mapping": cfg.get("anime_mapping")}
+        return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _session_key(self, sink: Any, ev: ScrobbleEvent) -> str:
+        identity: Any = ev.session_key
+        raw = ev.raw if isinstance(ev.raw, dict) else {}
+        playing = raw.get("NowPlayingItem")
+        item_id = playing.get("Id") if isinstance(playing, dict) else None
+        if not identity:
+            identity = [ev.title, ev.year, ev.ids]
+        return json.dumps([id(sink), ev.server_uuid, ev.account, identity, item_id, ev.media_type, ev.season, ev.number], sort_keys=True)
+
+    def _dispatch(self, ev: ScrobbleEvent, *, retry_key: str | None = None, cfg: dict[str, Any] | None = None,
+                  config_identity: str | None = None) -> bool:
+        from providers.scrobble.routes import same_scrobble_endpoint
+        with self._dispatch_lock:
+            if config_identity is not None and config_identity != self._config_identity:
+                return False
+            cfg = cfg if cfg is not None else (self._cfg_provider() or {})
+            identity = self._delivery_identity(cfg)
+            watch = ((cfg.get("scrobble") or {}).get("watch") or {})
+            if identity != self._config_identity:
+                self._sync_filter_log_config(identity)
+                if self._pending:
+                    _log(f"route {self._route_label(cfg)}: cancelled {len(self._pending)} queued deliveries after destination or route configuration changed", "WARNING")
+                self._pending.clear()
+                self._retry_after.clear()
+                self._session_ok.clear()
+                self._last_action.clear()
+                self._last_progress.clear()
+                self._debounce.clear()
+                self._failed_ids.clear()
+                self._config_identity = identity
+            if retry_key is not None:
+                if retry_key not in self._pending:
+                    return False
+                ev = self._pending[retry_key][1]
+            if same_scrobble_endpoint(watch.get("route_provider"), watch.get("route_provider_instance"), watch.get("route_sink"), watch.get("route_sink_instance")):
+                return False
+            ev = self._route_event(ev, cfg)
+            if not self._passes_filters(ev, cfg):
+                return False
+        if retry_key is None:
+            from cw_platform.event_archive.playback_recorder import prepare_playback, record_playback
+
+            ev = prepare_playback(ev)
+            record_playback(ev, cfg)
         sent = False
+        failed = False
+        queued = False
         for s in self._sinks:
+            sk = self._session_key(s, ev)
+            with self._dispatch_lock:
+                if identity != self._config_identity:
+                    return False
+                if retry_key is not None and (sk != retry_key or sk not in self._pending):
+                    continue
+                if id(s) in self._inflight:
+                    if retry_key is None:
+                        self._queue_pending(sk, ev)
+                        self._retry_after.setdefault(sk, (time.monotonic(), 0))
+                    queued = True
+                    continue
+                retry = self._retry_after.get(sk)
+                if retry and time.monotonic() < retry[0]:
+                    if sk in self._pending and retry_key is None:
+                        self._queue_pending(sk, ev)
+                    failed = True
+                    continue
+                if retry_key is None and sk in self._pending:
+                    self._queue_pending(sk, ev)
+                if sk in self._failed_ids and self._failed_ids[sk] != ev.ids:
+                    self._last_action.pop(sk, None)
+                    self._last_progress.pop(sk, None)
+                if not self._should_send(ev, cfg, sk):
+                    if retry_key is not None:
+                        self._pending.pop(sk, None)
+                        self._retry_after.pop(sk, None)
+                    continue
+                self._inflight.add(id(s))
+            delivered = False
             try:
-                self._send_sink(s, ev, cfg)
-                sent = True
-            except Exception as e:
-                _log(f"Sink error: {e}", "ERROR")
-        return sent or not self._sinks
+                log_delivery = bool(getattr(s, "log_delivery", True))
+                try:
+                    from providers.scrobble.episode_groups import send_grouped
+
+                    def send_event(event):
+                        mapped = bool((event.raw or {}).get("_cw_episode_group"))
+                        outgoing = event if mapped else maybe_enrich_event_for_sink(event, sink_name_for_mapping(s), cfg)
+                        return self._send_sink(s, outgoing, cfg)
+
+                    result = send_grouped(ev, cfg, send_event)
+                except Exception as e:
+                    result = {"ok": False, "error": str(e), "retryable": True}
+                delivered = True
+                with self._dispatch_lock:
+                    if identity != self._config_identity:
+                        continue
+                    pending = self._pending.get(sk)
+                    newer = pending is not None and pending[1] is not ev
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        from cw_platform.event_archive.playback_recorder import record_playback
+
+                        record_playback(ev, cfg, delivery="failed", reason=str(result.get("error") or "unknown"))
+                        failed = True
+                        self._failed_ids[sk] = dict(ev.ids)
+                        self._failed_ids.move_to_end(sk)
+                        if len(self._failed_ids) > 1024:
+                            expired, _ = self._failed_ids.popitem(last=False)
+                            self._last_action.pop(expired, None)
+                            self._last_progress.pop(expired, None)
+                            self._debounce.pop(f"{expired}|pause", None)
+                        if result.get("retryable", not result.get("skipped")):
+                            self._failed_sink(sk, pending[1] if newer and pending else ev)
+                        elif newer:
+                            self._last_action.pop(sk, None)
+                            self._last_progress.pop(sk, None)
+                            self._retry_after[sk] = (time.monotonic(), 0)
+                        else:
+                            self._retry_after.pop(sk, None)
+                            self._pending.pop(sk, None)
+                        if log_delivery:
+                            _log(f"route {self._route_label(cfg)}: failed {ev.action} "
+                                 f"user={mask_account(ev.account)} sess={ev.session_key} "
+                                 f"reason={result.get('error') or 'unknown'}", "ERROR")
+                        continue
+                    self._failed_ids.pop(sk, None)
+                    if isinstance(result, dict) and result.get("ignored") is True:
+                        self._last_action.pop(sk, None)
+                        self._last_progress.pop(sk, None)
+                        self._debounce.pop(f"{sk}|pause", None)
+                    if newer:
+                        self._retry_after[sk] = (time.monotonic(), 0)
+                    else:
+                        self._retry_after.pop(sk, None)
+                        self._pending.pop(sk, None)
+                    sent = True
+                    skipped = isinstance(result, dict) and (bool(result.get("skipped")) or result.get("log_status") == "skipped")
+                    if skipped and str((ev.raw or {}).get("_cw_playback_action") or ev.action) == "stop":
+                        from cw_platform.event_archive.playback_recorder import UNWRITTEN_SKIPS, record_playback
+
+                        skip_reason = str(result.get("reason") or "").strip().lower()
+                        if skip_reason in UNWRITTEN_SKIPS:
+                            record_playback(ev, cfg, delivery="skipped", reason=skip_reason)
+                    if log_delivery:
+                        status = "skipped" if skipped else "accepted"
+                        reason = str(result.get("reason") or "unknown") if skipped else ""
+                        details = ""
+                        if skipped and reason == "progress_step":
+                            for key, label in (("previous_progress", "previous_p"), ("progress_step", "step"),
+                                               ("previous_bucket", "previous_bucket"), ("progress_bucket", "bucket")):
+                                value = result.get(key)
+                                if isinstance(value, (int, float)):
+                                    details += f" {label}={value:g}"
+                        self._throttled_route_log(
+                            f"{id(s)}|{status}|{reason}|{ev.action}|{ev.account}|{ev.session_key}",
+                            f"route {self._route_label(cfg)}: {status} {ev.action} "
+                            f"user={mask_account(ev.account)} p={ev.progress} sess={ev.session_key}"
+                            + (f" reason={reason}{details}" if reason else ""),
+                        )
+            finally:
+                with self._dispatch_lock:
+                    self._inflight.discard(id(s))
+                    if not delivered and identity == self._config_identity:
+                        self._last_action.pop(sk, None)
+                        self._last_progress.pop(sk, None)
+                        self._debounce.pop(f"{sk}|pause", None)
+
+        return not failed and (sent or queued or not self._sinks)
 
 
 __all__ = (

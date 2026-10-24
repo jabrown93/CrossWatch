@@ -3,12 +3,55 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from ._mod_common import _confirmed_keys
+def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
+    attempted: list[str] = []
+    for it in items or []:
+        try:
+            k = str(it.get("_cw_event_key") or "").strip() if isinstance(it, Mapping) and it.get("_cw_rewatch_sync") is True else ""
+            if not k:
+                k = str(key_of(it) or "").strip()
+        except Exception:
+            k = ""
+        if k:
+            attempted.append(k)
+
+    unresolved_keys: set[str] = set()
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                if isinstance(u.get("key"), str) and u.get("key"):
+                    unresolved_keys.add(str(u.get("key")))
+                    continue
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                unresolved_keys.add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                try:
+                    k = str(obj.get("_cw_event_key") or "").strip() if obj.get("_cw_rewatch_sync") is True else ""
+                    if not k:
+                        k = str(key_of(obj) or "").strip()
+                except Exception:
+                    k = ""
+                if k:
+                    unresolved_keys.add(k)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in attempted:
+        if k in unresolved_keys or k in seen:
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
 
 def _crosswatch_key_of(obj: Any) -> str:
     try:
@@ -55,11 +98,23 @@ except Exception as e:
     cw_log("CROSSWATCH", "module", "warn", "feature_import_failed", import_feature="progress", error=str(e))
 
 try:
+    from .crosswatch import _collection as feat_collection
+except Exception as e:
+    feat_collection = None
+    cw_log("CROSSWATCH", "module", "warn", "feature_import_failed", import_feature="collection", error=str(e))
+
+try:
+    from .crosswatch import _playlists as feat_playlists
+except Exception as e:
+    feat_playlists = None
+    cw_log("CROSSWATCH", "module", "warn", "feature_import_failed", import_feature="playlists", error=str(e))
+
+try:
     from ._mod_common import make_snapshot_progress
 except Exception:
     make_snapshot_progress = None  # type: ignore[assignment]
 
-__VERSION__ = "1.0"
+__VERSION__ = "1.3"
 __all__ = ["get_manifest", "CROSSWATCHModule", "OPS"]
 
 _FEATURES: dict[str, Any] = {}
@@ -71,6 +126,10 @@ if feat_ratings:
     _FEATURES["ratings"] = feat_ratings
 if feat_progress:
     _FEATURES["progress"] = feat_progress
+if feat_collection:
+    _FEATURES["collection"] = feat_collection
+if feat_playlists:
+    _FEATURES["playlists"] = feat_playlists
 
 
 def _dbg(feature: str, msg: str, **fields: Any) -> None:
@@ -95,7 +154,8 @@ def _features_flags() -> dict[str, bool]:
         "history": "history" in _FEATURES,
         "ratings": "ratings" in _FEATURES,
         "progress": "progress" in _FEATURES,
-        "playlists": False,
+        "collection": "collection" in _FEATURES,
+        "playlists": "playlists" in _FEATURES,
     }
 
 
@@ -118,6 +178,8 @@ def get_manifest() -> Mapping[str, Any]:
                 "upsert": True,
                 "unrate": True,
                 "from_date": False,
+                "scale": "0-10",
+                "step": 0.1,
             },
             "history": {
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
@@ -133,6 +195,31 @@ def get_manifest() -> Mapping[str, Any]:
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "position": "milliseconds",
                 "timestamp": True,
+            },
+            "collection": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "read": True,
+                "upsert": True,
+                "remove": True,
+                "media_updates": True,
+            },
+            "playlists": {
+                "read": True,
+                "create": True,
+                "add": True,
+                "remove": True,
+                "reorder": True,
+                "rename": True,
+                "delete": True,
+                "smart": False,
+                "smart_writable": False,
+                "media_types": ["movie", "show", "season", "episode"],
+                "requires_ids": [],
+                "endpoint_types": ["playlist"],
+                "ordered_endpoint_types": ["playlist"],
+                "unordered_endpoint_types": [],
             },
             "snapshots": {
                 "root_dir_default": "/config/.cw_provider",
@@ -153,6 +240,7 @@ class CROSSWATCHConfig:
     restore_history: str | None = None
     restore_ratings: str | None = None
     restore_progress: str | None = None
+    restore_collection: str | None = None
 
     @property
     def base_path(self) -> Path:
@@ -162,6 +250,7 @@ class CROSSWATCHConfig:
 class CROSSWATCHModule:
     def __init__(self, cfg: Mapping[str, Any]):
         self.raw_cfg = cfg
+        self.instance_id: str = "default"
         cw_cfg = dict((cfg.get("CrossWatch") or cfg.get("crosswatch") or {}) or {})
 
         def _bool(key: str, default: bool) -> bool:
@@ -200,6 +289,7 @@ class CROSSWATCHModule:
             restore_history=_restore_id("restore_history"),
             restore_ratings=_restore_id("restore_ratings"),
             restore_progress=_restore_id("restore_progress"),
+            restore_collection=_restore_id("restore_collection"),
         )
 
         try:
@@ -232,7 +322,8 @@ class CROSSWATCHModule:
             "history": True,
             "ratings": True,
             "progress": True,
-            "playlists": False,
+            "collection": True,
+            "playlists": True,
         }
         present = _features_flags()
         return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
@@ -372,33 +463,7 @@ class _CrossWatchOPS:
         return CROSSWATCHModule.supported_features()
 
     def capabilities(self) -> Mapping[str, Any]:
-        return {
-            "bidirectional": True,
-            "provides_ids": True,
-            "index_semantics": "present",
-            "observed_deletes": True,
-            "ratings": {
-                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
-                "upsert": True,
-                "unrate": True,
-                "from_date": False,
-            },
-            "history": {
-                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
-                "upsert": True,
-                "remove": True,
-                "timestamp": True,
-                "event_history": True,
-                "rewatches": {"read": True, "write": True, "account_gate": False},
-            },
-            "progress": {
-                "upsert": True,
-                "remove": True,
-                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
-                "position": "milliseconds",
-                "timestamp": True,
-            },
-        }
+        return get_manifest()["capabilities"]
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
         root = (cfg or {}).get("CrossWatch") or (cfg or {}).get("crosswatch") or {}
@@ -417,6 +482,16 @@ class _CrossWatchOPS:
     def _adapter(self, cfg: Mapping[str, Any]) -> CROSSWATCHModule:
         return CROSSWATCHModule(cfg)
 
+    def _playlist_adapter(self, cfg: Mapping[str, Any], instance: str | None) -> CROSSWATCHModule:
+        from cw_platform.provider_instances import normalize_instance_id
+
+        adapter = self._adapter(cfg)
+        try:
+            adapter.instance_id = normalize_instance_id(instance)
+        except Exception:
+            adapter.instance_id = "default"
+        return adapter
+
     def build_index(
         self,
         cfg: Mapping[str, Any],
@@ -424,6 +499,11 @@ class _CrossWatchOPS:
         feature: str,
     ) -> Mapping[str, dict[str, Any]]:
         return self._adapter(cfg).build_index(feature)
+
+    def watchlist_absent(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]]) -> list[bool]:
+        if not feat_watchlist:
+            raise RuntimeError("CrossWatch watchlist is unavailable")
+        return feat_watchlist.absent_flags(self._adapter(cfg), items)
 
     def add(
         self,
@@ -447,5 +527,110 @@ class _CrossWatchOPS:
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
+
+    def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None):
+        return list(feat_playlists.list_resources(self._playlist_adapter(cfg, instance))) if feat_playlists else []
+
+    def get_playlist_snapshot(self, cfg: Mapping[str, Any], playlist_id: str, *, instance: str | None = None):
+        if not feat_playlists:
+            raise RuntimeError("CrossWatch playlists are unavailable")
+        return feat_playlists.get_snapshot(self._playlist_adapter(cfg, instance), playlist_id)
+
+    def create_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        name: str,
+        *,
+        media_type: str | None = None,
+        items: Iterable[Mapping[str, Any]] | None = None,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        if not feat_playlists:
+            raise RuntimeError("CrossWatch playlists are unavailable")
+        return feat_playlists.create(
+            self._playlist_adapter(cfg, instance),
+            name,
+            media_type=media_type,
+            items=list(items or []),
+            dry_run=dry_run,
+        )
+
+    def add_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        if not feat_playlists:
+            return {"ok": False, "error": "CrossWatch playlists are unavailable"}
+        return feat_playlists.add(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def remove_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        items: Iterable[Mapping[str, Any]],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        lst = list(items or [])
+        if dry_run:
+            return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
+        if not feat_playlists:
+            return {"ok": False, "error": "CrossWatch playlists are unavailable"}
+        return feat_playlists.remove(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def reorder_playlist_items(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        ordered_keys: Iterable[str],
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        keys = list(ordered_keys or [])
+        if dry_run:
+            return {"ok": True, "count": len(keys), "dry_run": True}
+        if not feat_playlists:
+            return {"ok": False, "error": "CrossWatch playlists are unavailable"}
+        return feat_playlists.reorder(self._playlist_adapter(cfg, instance), playlist_id, keys)
+
+    def rename_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        name: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        if not feat_playlists:
+            raise RuntimeError("CrossWatch playlists are unavailable")
+        if dry_run:
+            return feat_playlists.create(self._playlist_adapter(cfg, instance), name, dry_run=True)
+        return feat_playlists.rename(self._playlist_adapter(cfg, instance), playlist_id, name)
+
+    def delete_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        if dry_run:
+            return {"ok": True, "dry_run": True, "playlist_id": playlist_id}
+        if not feat_playlists:
+            return {"ok": False, "error": "CrossWatch playlists are unavailable"}
+        return feat_playlists.delete(self._playlist_adapter(cfg, instance), playlist_id)
 
 OPS = _CrossWatchOPS()

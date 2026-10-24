@@ -73,9 +73,8 @@
   };
 
   const buildArtUrl = (p) => {
-    if (p?.cover) return p.cover;
     const id = tmdbIdOf(p);
-    if (!id) return "/assets/img/placeholder_poster.svg";
+    if (!id) return p?.cover || "/assets/img/placeholder_poster.svg";
     return `/art/tmdb/${artTypeOf(p)}/${encodeURIComponent(String(id))}?size=w342${artEvidenceOf(p)}`;
   };
 
@@ -125,7 +124,9 @@
     return "";
   };
 
-  const instanceLabel = (value) => {
+  const instanceLabel = (value, friendly = "") => {
+    const label = String(friendly || "").trim();
+    if (label) return label;
     const raw = String(value || "").trim();
     if (!raw || raw.toLowerCase() === "default") return "Default";
     return raw;
@@ -157,11 +158,12 @@
     return hr < 24 ? `${hr}h ago` : `${Math.floor(hr / 24)}d ago`;
   };
 
-  const backdropFromMeta = (meta) => {
-    const id = meta?.ids?.tmdb;
+  const buildBackdropUrl = (p, meta = null) => {
+    const id = meta?.ids?.tmdb || meta?.ids?.id || tmdbIdOf(p);
     if (!id) return "";
-    const type = String(meta?.resolved_type || meta?.type || "").toLowerCase() === "movie" ? "movie" : "tv";
-    return `/art/tmdb/${type}/${encodeURIComponent(String(id))}?kind=backdrop&size=w1280`;
+    const resolved = meta?.resolved_type || meta?.type || window.CW?.Meta?.peek(p)?.resolved_type;
+    const type = String(resolved || p?.media_type || p?.type || "").toLowerCase() === "movie" ? "movie" : "tv";
+    return `/art/tmdb/${type}/${encodeURIComponent(String(id))}?kind=backdrop&size=w1280${artEvidenceOf(p)}`;
   };
 
   const SHARED_WATCH_KEY = "__CW_CURRENT_WATCHING_SHARED__";
@@ -289,11 +291,11 @@
   const baseChips = (p, releaseLabel = "") => {
     const chips = [];
     chips.push({ text: sourceLabel(p?.source), cls: sourceChipClass(p?.source) });
-    if (p?.provider_instance) chips.push({ text: instanceLabel(p.provider_instance) });
+    if (p?.provider_instance) chips.push({ text: instanceLabel(p.provider_instance, p.provider_instance_label) });
     chips.push({ text: mediaTypeLabel(p) });
     const sc = streamCount(p, countByKey);
     if (sc > 1) chips.push({ text: `${sc} streams`, cls: "pc-chip-streams" });
-    if (String(p?.media_type || p?.type || "").toLowerCase() === "episode" && p?.season && p?.episode) {
+    if (String(p?.media_type || p?.type || "").toLowerCase() === "episode" && p?.season !== null && p?.season !== undefined && p?.season !== "" && p?.episode) {
       chips.push({ text: `S${String(p.season).padStart(2, "0")}E${String(p.episode).padStart(2, "0")}` });
       return chips;
     }
@@ -422,7 +424,7 @@
       overview,
       poster: buildArtUrl(p),
       posterHref: tmdbUrl,
-      backdrop: meta ? backdropFromMeta(meta) : "",
+      backdrop: buildBackdropUrl(p, meta),
       information: meta ? FMT.informationFor(meta, isMovie) : "loading",
       rating,
       progress: progressModel(p),

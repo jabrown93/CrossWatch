@@ -16,12 +16,14 @@ try:
 except Exception:
     BASE_LOG = None
 
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config
-from cw_platform.provider_instances import get_provider_block, normalize_instance_id
+from cw_platform.provider_instances import normalize_instance_id, resolve_provider_block
 from providers.scrobble.currently_watching import update_from_event as _cw_update
 from providers.scrobble.currently_watching import update_from_payload as _cw_update_payload
 from providers.scrobble.scrob.sink import is_crosswatch_session
 from providers.scrobble.scrobble import Dispatcher, ScrobbleEvent, ScrobbleSink, mask_account
+from providers.scrobble.routes import watch_poll_seconds
 from providers.scrobble.sources import source_enabled
 from providers.auth._auth_SCROB import normalize_server_url
 from providers.sync.scrob._common import (
@@ -33,10 +35,10 @@ from providers.sync.scrob._common import (
     scrob_request,
 )
 
-BASE_POLL_SECONDS = 4.0
+BASE_POLL_SECONDS = 10.0
 MIN_POLL_SECONDS = 2.0
-MAX_BASE_POLL_SECONDS = 15.0
-MAX_IDLE_POLL_SECONDS = 20.0
+MAX_BASE_POLL_SECONDS = 60.0
+MAX_IDLE_POLL_SECONDS = 30.0
 OFFLINE_INITIAL_RETRY_SECONDS = 30.0
 OFFLINE_MAX_RETRY_SECONDS = 300.0
 SEEK_JUMP_PERCENT = 10.0
@@ -146,7 +148,9 @@ class ScrobWatchService:
         self._cfg_provider = cfg_provider
         self._instance_id = normalize_instance_id(instance_id)
         self._dispatch = dispatcher or Dispatcher(list(sinks or []), cfg_provider=self._active_cfg)
-        self._base_poll = _clamp_float(poll_secs, BASE_POLL_SECONDS, MIN_POLL_SECONDS, MAX_BASE_POLL_SECONDS)
+        self._default_poll = _clamp_float(poll_secs, BASE_POLL_SECONDS, MIN_POLL_SECONDS, MAX_BASE_POLL_SECONDS)
+        self._base_poll = self._default_poll
+        self._max_idle_poll = MAX_IDLE_POLL_SECONDS
         self._stop = threading.Event()
         self._bg: threading.Thread | None = None
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -159,7 +163,7 @@ class ScrobWatchService:
         self.session = requests.Session()
         try:
             self.session.headers.setdefault("Accept", "application/json")
-            self.session.headers.setdefault("User-Agent", "CrossWatch/Watcher/1.0")
+            self.session.headers["User-Agent"] = http_user_agent("Watcher", override_env="CW_SCROB_UA")
         except Exception:
             pass
 
@@ -186,7 +190,7 @@ class ScrobWatchService:
 
     def _block(self, cfg: Mapping[str, Any]) -> dict[str, Any]:
         try:
-            return get_provider_block(cfg, "scrob", self._instance_id) or {}
+            return resolve_provider_block(cfg, "scrob", self._instance_id) or {}
         except Exception:
             return _dict(cfg.get("scrob"))
 
@@ -381,6 +385,8 @@ class ScrobWatchService:
 
     def _tick(self) -> bool:
         cfg = self._active_cfg()
+        self._base_poll = watch_poll_seconds(cfg, self._default_poll)
+        self._max_idle_poll = watch_poll_seconds(cfg, MAX_IDLE_POLL_SECONDS, "idle_poll_seconds")
         if not self._configured(cfg):
             return False
 
@@ -443,7 +449,7 @@ class ScrobWatchService:
             if active:
                 self._idle_poll = self._base_poll
             else:
-                self._idle_poll = min(MAX_IDLE_POLL_SECONDS, max(self._base_poll, self._idle_poll + 1.5))
+                self._idle_poll = min(max(self._max_idle_poll, self._base_poll), max(self._base_poll, self._idle_poll * 1.5))
             self._stop.wait(self._idle_poll)
 
     def start_async(self) -> None:

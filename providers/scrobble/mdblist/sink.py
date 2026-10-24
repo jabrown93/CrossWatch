@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config
 from cw_platform.local_db.ttl_dedupe import once_per_ttl
 from cw_platform.provider_instances import normalize_instance_id
@@ -28,7 +29,7 @@ try:
     from providers.scrobble.scrobble import ScrobbleSink, ScrobbleEvent, mask_account as _mask_account  # type: ignore
 except ImportError:
     class ScrobbleSink:
-        def send(self, event: Any) -> None: ...
+        def send(self, event: Any) -> dict[str, Any] | None: ...
 
     class ScrobbleEvent:  # pragma: no cover
         ...
@@ -43,7 +44,7 @@ except ImportError:
 
 
 MDBLIST_API = "https://api.mdblist.com"
-APP_AGENT = "CrossWatch/Watcher/1.0"
+APP_AGENT = http_user_agent("Watcher", override_env="CW_MDBLIST_UA")
 _AR_TTL = 60
 
 _RESOLVE_TTL_S = 30 * 86400
@@ -78,11 +79,11 @@ def _log(msg: str, lvl: str = "INFO") -> None:
         return
     if BASE_LOG is not None:
         try:
-            BASE_LOG(str(msg), level=level, module="MDBLIST-SCROBBLE")
+            BASE_LOG(str(msg), level=level, module="MDBLIST-SINK")
             return
         except Exception:
             pass
-    print(f"[MDBLIST-SCROBBLE:{level}] {msg}")
+    print(f"[MDBLIST-SINK:{level}] {msg}")
 
 
 def _merged_provider_block(cfg: Mapping[str, Any], key: str, instance_id: Any = None) -> dict[str, Any]:
@@ -103,7 +104,7 @@ def _merged_provider_block(cfg: Mapping[str, Any], key: str, instance_id: Any = 
 
 def _app_meta(cfg: dict[str, Any]) -> dict[str, str]:
     rt = cfg.get("runtime") or {}
-    av = str(rt.get("version") or APP_AGENT)
+    av = app_version()
     ad = (rt.get("build_date") or "").strip()
     return {"app_version": av, **({"app_date": ad} if ad else {})}
 
@@ -609,7 +610,7 @@ class MDBListSink(ScrobbleSink):
         except Exception:
             pass
 
-    def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> None:
+    def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
         cfg = cfg or (self._cfg_provider() if self._cfg_provider else None) or _cfg()
         if not isinstance(cfg, dict):
             cfg = {}
@@ -622,7 +623,7 @@ class MDBListSink(ScrobbleSink):
             if not self._warn_no_key:
                 _log("Missing MDBList authentication in config.json - skipping scrobble", "ERROR")
                 self._warn_no_key = True
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "not_configured"}
 
         action_in = (getattr(ev, "action", "") or "").lower().strip()
         action = action_in if action_in in ("start", "pause", "stop") else "stop"
@@ -683,7 +684,7 @@ class MDBListSink(ScrobbleSink):
             if p_send > (p_glob if p_glob >= 0 else -1):
                 self._p_glob[mk] = p_send
             self._p_sess[(sk, mk)] = p_send
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "start_suppressed"}
 
         if action_in == "stop":
             if (not preserve_stop) and p_send >= 98 and last_sess >= 0 and last_sess < thr and (p_send - last_sess) >= 30:
@@ -706,7 +707,8 @@ class MDBListSink(ScrobbleSink):
                 self._p_sess[(sk, mk)] = int(p_send)
                 if int(p_send) > (p_glob if p_glob >= 0 else -1):
                     self._p_glob[mk] = int(p_send)
-                return
+                return {"ok": True, "log_status": "skipped", "reason": "progress_step",
+                        "progress_step": step, "previous_bucket": last_bucket, "progress_bucket": bucket}
             if last_act == "start":
                 p_payload = bucket
 
@@ -717,10 +719,10 @@ class MDBListSink(ScrobbleSink):
         done_key = f"{sk}:{mk}"
         record_complete = action == "stop" and p_send >= watched_at
         if record_complete and self._completed.get(done_key, -1.0) >= watched_at:
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "session_completed"}
         if action_in != "stop":
             if self._debounced(sk, action, _watch_pause_debounce(cfg)):
-                return
+                return {"ok": True, "log_status": "skipped", "reason": "debounced"}
 
         path = {"start": "/scrobble/start", "pause": "/scrobble/pause", "stop": "/scrobble/stop"}[action]
 

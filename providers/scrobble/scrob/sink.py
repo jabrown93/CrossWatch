@@ -11,10 +11,11 @@ from typing import Any
 
 import requests
 
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import load_config
 from cw_platform.event_archive import record_watch
 from cw_platform.local_db.ttl_dedupe import once_per_ttl
-from cw_platform.provider_instances import get_provider_block, normalize_instance_id
+from cw_platform.provider_instances import normalize_instance_id, resolve_provider_block
 from services.activity import record_scrobble_event
 
 try:
@@ -24,12 +25,13 @@ except Exception:
 
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 from providers.scrobble._watched_gate import resolve_stop_action
+from providers.scrobble.routes import scrobble_sink_config
 
 try:
     from providers.scrobble.scrobble import ScrobbleEvent, ScrobbleSink, mask_account  # type: ignore
 except ImportError:
     class ScrobbleSink:  # pragma: no cover
-        def send(self, event: Any) -> None: ...
+        def send(self, event: Any) -> dict[str, Any] | None: ...
 
     class ScrobbleEvent:  # pragma: no cover
         ...
@@ -46,10 +48,11 @@ from providers.sync.scrob._common import (
     as_int,
     ok_status,
     safe_json,
+    show_tvdb_for,
     webhook_post,
 )
 
-APP_AGENT = "CrossWatch/Watcher/1.0"
+APP_AGENT = http_user_agent("Watcher", override_env="CW_SCROB_UA")
 DEFAULT_WATCHED_AT = 90.0
 SESSION_TTL_SEC = 6 * 3600
 SESSION_PREFIX = "crosswatch"
@@ -139,11 +142,11 @@ def _log(msg: str, lvl: str = "INFO") -> None:
         return
     if BASE_LOG is not None:
         try:
-            BASE_LOG(msg, level=level, module="SCROBBLE")
+            BASE_LOG(msg, level=level, module="SCROB-SINK")
             return
         except Exception:
             pass
-    print(f"[SCROBBLE] {level}: {msg}")
+    print(f"[SCROB-SINK] {level}: {msg}")
 
 
 def _prune_sessions(now: float) -> None:
@@ -187,7 +190,7 @@ class ScrobSink(ScrobbleSink):
         self.session = requests.Session()
         try:
             self.session.headers.setdefault("Accept", "application/json")
-            self.session.headers.setdefault("User-Agent", APP_AGENT)
+            self.session.headers["User-Agent"] = APP_AGENT
         except Exception:
             pass
 
@@ -197,6 +200,8 @@ class ScrobSink(ScrobbleSink):
             try:
                 cfg = self._cfg_provider()
                 if isinstance(cfg, Mapping):
+                    if (cfg.get("_cw_scrobble_sink") or {}).get("provider") == "scrob":
+                        return scrobble_sink_config(dict(cfg), "scrob", self.instance_id)
                     return dict(cfg)
             except Exception:
                 pass
@@ -204,7 +209,7 @@ class ScrobSink(ScrobbleSink):
 
     def _block(self, cfg: Mapping[str, Any]) -> dict[str, Any]:
         try:
-            return get_provider_block(cfg, "scrob", self.instance_id) or {}
+            return resolve_provider_block(cfg, "scrob", self.instance_id) or {}
         except Exception:
             block = cfg.get("scrob") if isinstance(cfg, Mapping) else None
             return dict(block) if isinstance(block, Mapping) else {}
@@ -219,7 +224,7 @@ class ScrobSink(ScrobbleSink):
         except Exception:
             return DEFAULT_WATCHED_AT
 
-    def _kodi_item(self, event: Any, media_type: str) -> dict[str, Any] | None:
+    def _kodi_item(self, event: Any, media_type: str, cfg: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
         ids = {str(k): str(v) for k, v in (getattr(event, "ids", None) or {}).items() if v}
 
         def pick(*names: str) -> dict[str, str]:
@@ -236,6 +241,10 @@ class ScrobSink(ScrobbleSink):
             if season is None or number is None:
                 return None
             unique = pick("tmdb_show", "tvdb_show", "imdb_show")
+            if unique.get("tmdb") and not unique.get("tvdb") and cfg is not None:
+                tvdb = show_tvdb_for(_Adapter(dict(cfg), self.instance_id, self.session), unique["tmdb"])
+                if tvdb:
+                    unique["tvdb"] = str(tvdb)
             if not unique:
                 unique = pick("tmdb", "tvdb", "imdb")
             if not unique:
@@ -298,22 +307,22 @@ class ScrobSink(ScrobbleSink):
             else:
                 _SESSIONS[scope] = before
 
-    def send(self, event: Any) -> None:
+    def send(self, event: Any) -> dict[str, Any] | None:
         cfg = self.config
         block = self._block(cfg)
         if not (str(block.get("server_url") or "").strip() and str(block.get("api_key") or "").strip()):
             _log("SCROB: skip scrobble, not connected", "DEBUG")
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "not_configured"}
 
         raw_action = str(getattr(event, "action", "") or "").strip().lower()
         if raw_action not in ("start", "pause", "stop"):
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "invalid_action"}
 
         media_type = "episode" if str(getattr(event, "media_type", "") or "").lower() == "episode" else "movie"
-        item = self._kodi_item(event, media_type)
+        item = self._kodi_item(event, media_type, cfg)
         if item is None:
             _log("SCROB: skip scrobble, no supported ids", "DEBUG")
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "missing_external_ids"}
 
         try:
             progress_pct = max(0.0, min(100.0, float(getattr(event, "progress", 0.0) or 0.0)))

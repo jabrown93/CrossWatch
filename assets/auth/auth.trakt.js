@@ -33,7 +33,40 @@
   }
 
   var traktConnected = false;
+  var traktAuthError = "";
+  var traktMethodTouched = false;
   var traktPoller = null;
+
+  function activeTraktMethod(block) {
+    var m = _str(block && block.auth_method).toLowerCase();
+    if (m === "pin" || m === "app") return m;
+    if (_str(block && block.client_secret)) return "app";
+    if (_str(block && block.access_token)) return "app";
+    return "pin";
+  }
+
+  function currentTraktMethod() {
+    return (_el("trakt_auth_method") && _el("trakt_auth_method").value) === "app" ? "app" : "pin";
+  }
+
+  function setTraktMethodUI(method) {
+    var m = method === "app" ? "app" : "pin";
+    var hidden = _el("trakt_auth_method"); if (hidden) hidden.value = m;
+    document.querySelectorAll("#sec-trakt .trk-method").forEach(function (b) {
+      var on = (b.dataset.method || "") === m;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    var app = _el("trakt_app_panel");
+    if (app) app.style.display = m === "app" ? "" : "none";
+    updateTraktHint();
+  }
+
+  function onTraktMethodChange(method) {
+    traktMethodTouched = true;
+    try { trqcStop(); } catch (_) {}
+    setTraktMethodUI(method);
+  }
 
   function getTraktInstance() {
     return traktProfile ? traktProfile.getInstance() : "default";
@@ -51,12 +84,17 @@
     return traktProfile ? traktProfile.cfgBlock(cfg, true) : {};
   }
 
+  function hasTraktPendingDevice(block) {
+    return !!_str(block?._pending_device?.device_code || block?._pending_device?.user_code);
+  }
+
   async function refreshTraktInstanceOptions(preserve) {
     if (traktProfile) await traktProfile.refreshOptions(preserve);
   }
 
   function ensureTraktInstanceUI() {
     traktProfile?.ensureUI(() => {
+      traktMethodTouched = false;
       void hydrateAuthFromConfig();
       try { startTraktTokenPoll(); } catch (_) {}
     });
@@ -81,7 +119,8 @@
     try {
       var msg = _el('trakt_msg');
       if (!msg) return;
-      try { Shared.setConnectLocked(["btn-connect-trakt", "btn-trakt-restart"], !!traktConnected); } catch (_) {}
+      try { Shared.setConnectLocked(["btn-connect-trakt", "btn-trakt-restart"], !!traktConnected && !traktAuthError); } catch (_) {}
+      if (traktConnected && traktAuthError) return Shared.setStatusPill(msg, "warn", "Trakt login expired - reconnect");
       if (traktConnected) return Shared.setStatusPill(msg, "ok", "Connected");
       return Shared.setStatusPill(msg, null);
     } catch (_) {}
@@ -90,6 +129,7 @@
   function setTraktSuccess(show) {
     try {
       traktConnected = !!show;
+      traktAuthError = "";
       if (show) { try { trqcStop(); } catch (_) {} updateTraktBanner(); }
       else {
         try { Shared.setConnectLocked(["btn-connect-trakt", "btn-trakt-restart"], false); } catch (_) {}
@@ -118,7 +158,9 @@
             var isDefault = (getTraktInstance() === "default");
       _markSecretField(_el("trakt_client_id"),     _str(t.client_id || (isDefault ? (cfg.trakt && cfg.trakt.client_id) : "")));
       _markSecretField(_el("trakt_client_secret"), _str(t.client_secret || (isDefault ? (cfg.trakt && cfg.trakt.client_secret) : "")));
-      traktConnected = !!_str(t.access_token || (getTraktInstance() === 'default' ? a.access_token : ''));
+      traktConnected = !!_str(t.access_token || (getTraktInstance() === 'default' ? a.access_token : '')) && !hasTraktPendingDevice(t);
+      traktAuthError = _str(t.auth_error) === "reconnect_required" ? "reconnect_required" : "";
+      if (!traktMethodTouched) setTraktMethodUI(activeTraktMethod(t));
       _setVal("trakt_pin",           _str((t._pending_device && t._pending_device.user_code) || ''));
       if (traktConnected) { try { trqcStop(); } catch (_) {} }
       updateTraktHint();
@@ -136,10 +178,9 @@
   function updateTraktHint() {
     try {
       var cidState = _readSecretField(_el("trakt_client_id"));
-      var secState = _readSecretField(_el("trakt_client_secret"));
       var hint = _el("trakt_hint");
       if (!hint) return;
-      var show = !(cidState.hasValue && secState.hasValue);
+      var show = currentTraktMethod() === "app" && !cidState.hasValue;
       hint.classList.toggle("hidden", !show);
       hint.style.display = show ? "" : "none";
     } catch (_) {}
@@ -237,6 +278,11 @@
       var secEl = _el("trakt_client_secret");
       _wireSecretField(idEl, updateTraktHint);
       _wireSecretField(secEl, updateTraktHint);
+      document.querySelectorAll("#sec-trakt .trk-method").forEach(function (b) {
+        if (b.__wired) return;
+        b.__wired = true;
+        b.addEventListener("click", function () { onTraktMethodChange(b.dataset.method); });
+      });
 
       var copyRedirect = _el("btn-copy-trakt-redirect");
       if (copyRedirect && !copyRedirect.__wired) { copyRedirect.addEventListener("click", () => window.copyTraktRedirect()); copyRedirect.__wired = true; }
@@ -305,7 +351,7 @@
         return !(page && !page.classList.contains("hidden"));
       },
       classify: function (status, data) {
-        return traktTokenFromCfg(data) ? { state: "authorized" } : { state: "pending" };
+        return traktTokenFromCfg(data) && !hasTraktPendingDevice(getTraktCfgBlock(data)) ? { state: "authorized" } : { state: "pending" };
       },
     });
     return traktPoller;
@@ -320,27 +366,49 @@
     ensureTraktPoller().start({ intervalMs: 2000, deadlineMs: Number(deadlineMs) || 0 });
   }
 
+  function openTraktPopup() {
+    var win = null;
+    try {
+      win = window.open("about:blank", "_blank");
+      if (win) {
+        win.opener = null;
+        win.document.title = "Connecting to Trakt";
+        win.document.documentElement.style.background = "#0b0d12";
+        win.document.body.style.cssText = "margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0d12;color:#e9eefb;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center";
+        win.document.body.textContent = "Requesting your Trakt PIN…";
+      }
+    } catch (_) {}
+    return win;
+  }
+
+  function navigateTraktPopup(win, url) {
+    try {
+      if (win && !win.closed) {
+        win.location.href = url;
+        return true;
+      }
+    } catch (_) { try { win?.close(); } catch (_) {} }
+    return false;
+  }
+
   async function requestTraktPin() {
     try { trqcStop(); } catch (_) {}
     setTraktSuccess(false);
 
-    var cidEl = _el("trakt_client_id");
-    var secEl = _el("trakt_client_secret");
-    var cidState = _readSecretField(cidEl);
-    var secState = _readSecretField(secEl);
-
-    if (!cidState.hasValue) { _notify('Enter your Trakt Client ID'); return; }
-    if (!secState.hasValue) { _notify('Enter your Trakt Client Secret'); return; }
-
-    var payload = {};
-    if (cidState.value) payload.client_id = cidState.value;
-    if (secState.value) payload.client_secret = secState.value;
+    var method = currentTraktMethod();
+    var payload = { auth_method: method };
+    if (method === "app") {
+      var cid = _readSecretField(_el("trakt_client_id"));
+      var secret = _readSecretField(_el("trakt_client_secret"));
+      if (!cid.hasValue) { _notify("Enter your Trakt Client ID"); return; }
+      if (cid.value) payload.client_id = cid.value;
+      if (secret.value) payload.client_secret = secret.value;
+    }
 
     var connectBtn = _el("btn-connect-trakt");
     if (connectBtn) { connectBtn.disabled = true; connectBtn.classList.add("busy"); }
 
-    var win = null;
-    try { win = window.open("about:blank", "_blank"); } catch (_) {}
+    var win = openTraktPopup();
 
     var resp, data;
     try {
@@ -369,30 +437,32 @@
     }
 
     var code = _str(data.user_code);
-    var url  = _str(data.verification_url || data.verificationUrl) || "https://trakt.tv/activate";
+    var url  = _str(data.verification_url || data.verificationUrl) || "https://auth.trakt.tv/activate";
     var secs = Number(data.expiresIn || data.expires_in || 0) || 300;
 
     var helpEl = _el("trakt_qc_help");
     if (helpEl) helpEl.textContent = win
-      ? "Opening trakt.tv/activate — enter this code there and approve CrossWatch."
-      : "Open trakt.tv/activate and enter this code to approve CrossWatch.";
+      ? "Opening auth.trakt.tv/activate — enter this code there and approve CrossWatch."
+      : "Open auth.trakt.tv/activate and enter this code to approve CrossWatch.";
 
     trqcShowCode(code, secs);
     try { startTraktTokenPoll(trqcDeadline); } catch (_) {}
 
     if (win && !win.closed) {
       try {
+        win.document.open();
         win.document.write(
           '<!doctype html><meta charset="utf-8"><title>CrossWatch → Trakt</title>' +
           '<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0d12;color:#e9eefb;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center">' +
-          '<div><div style="font-size:14px;opacity:.7;margin-bottom:12px">Opening trakt.tv/activate…</div>' +
+          '<div><div style="font-size:14px;opacity:.7;margin-bottom:12px">Opening auth.trakt.tv/activate…</div>' +
           '<div style="font-size:36px;font-weight:700;letter-spacing:.22em;color:#8ff0c2">' + code + '</div>' +
           '<div style="font-size:12px;opacity:.6;margin-top:12px">Redirecting in a moment…</div></div></body>'
         );
+        win.document.close();
       } catch (_) {}
-      setTimeout(function () { try { if (win && !win.closed) win.location.href = url; } catch (_) {} }, 3000);
+      setTimeout(function () { navigateTraktPopup(win, url); }, 3000);
     } else {
-      _notify("Popup blocked - open trakt.tv/activate and enter the code.");
+      _notify("Popup blocked - open auth.trakt.tv/activate and enter the code.");
     }
 
     if (connectBtn) { connectBtn.disabled = false; connectBtn.classList.remove("busy"); }

@@ -21,11 +21,12 @@ from ._common import (
     _pair_scope,
     _is_capture_mode,
     _now_iso,
+    _chunk,
     headers_for_adapter,
 )
-from .._mod_common import _chunk_items as _chunk
-from cw_platform.id_map import minimal as id_minimal
+from cw_platform.id_map import migrate_media_index, minimal as id_minimal
 from .._log import log as cw_log
+from ._pagination import TraktPager, TraktPaginationError
 
 BASE = "https://api.trakt.tv"
 URL_RAT_MOV = f"{BASE}/sync/ratings/movies"
@@ -41,7 +42,7 @@ def _cache_path() -> Path:
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _MAX_BACKOFF_SECONDS = 30
-_MAX_PAGE_SIZE = 1000
+_MAX_PAGE_SIZE = 250
 _PROVIDER = "TRAKT"
 _FEATURE = "ratings"
 
@@ -85,7 +86,10 @@ def _load_cache_doc() -> dict[str, Any]:
         p = _cache_path()
         if not p.exists():
             return {}
-        return json.loads(p.read_text("utf-8") or "{}")
+        doc = json.loads(p.read_text("utf-8") or "{}")
+        if isinstance(doc, dict) and doc.get("schema") == 1:
+            doc["items"] = migrate_media_index(doc.get("items"))
+        return doc if isinstance(doc, dict) and doc.get("schema") == 1 else {}
     except Exception:
         return {}
 
@@ -96,7 +100,7 @@ def _save_cache_doc(items: Mapping[str, Any], wm: Mapping[str, Any]) -> None:
     try:
         p = _cache_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        doc = {"generated_at": _now_iso(), "items": dict(items), "wm": dict(wm or {})}
+        doc = {"schema": 1, "generated_at": _now_iso(), "items": dict(items), "wm": dict(wm or {})}
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True), "utf-8")
         os.replace(tmp, p)
@@ -237,14 +241,14 @@ def _fetch_bucket(
     rr: int,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for page in range(1, max_pages + 1):
-        last_status: int | None = None
+    pager = TraktPager("ratings", max_pages)
+    page = 1
+    while True:
         for attempt in range(max(int(rr or 0), 0) + 1):
             try:
                 r = sess.get(url, headers=headers, params={"page": page, "limit": per_page}, timeout=tmo)
-                last_status = r.status_code
                 if r.status_code == 200:
-                    rows = r.json() or []
+                    rows = pager.read(r, page)
                     if not rows:
                         return out
                     for row in rows:
@@ -308,8 +312,6 @@ def _fetch_bucket(
                             m["rated_at"] = ra
                         out.append(m)
 
-                    if len(rows) < per_page:
-                        return out
                     break
 
                 if r.status_code in _RETRYABLE_STATUS and attempt < rr:
@@ -318,20 +320,19 @@ def _fetch_bucket(
                     continue
 
                 _warn("http_failed", op="index", url=url, page=page, status=r.status_code, body=((r.text or "")[:200]))
-                return out
+                pager.read(r, page)
 
+            except TraktPaginationError:
+                raise
             except Exception as e:
                 if attempt < rr:
                     _warn("http_failed", op="index", url=url, page=page, error=str(e), attempt=attempt + 1, max_attempts=rr, retrying=True)
                     _sleep_backoff(attempt, None)
                     continue
                 _warn("http_failed", op="index", url=url, page=page, error=str(e))
-                return out
+                raise TraktPaginationError(f"Trakt ratings request failed on page {page}") from e
 
-        if last_status is not None and last_status != 200:
-            return out
-
-    return out
+        page += 1
 
 
 def _dedupe_canonical(items: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -347,7 +348,7 @@ def _dedupe_canonical(items: Iterable[dict[str, Any]]) -> dict[str, dict[str, An
     return idx
 
 
-def build_index(adapter: Any, *, per_page: int = 200, max_pages: int = 50) -> dict[str, dict[str, Any]]:
+def build_index(adapter: Any, *, per_page: int = 250, max_pages: int = 50) -> dict[str, dict[str, Any]]:
     per_page = int(getattr(adapter.cfg, "ratings_per_page", per_page) or per_page)
     per_page = max(1, min(per_page, _MAX_PAGE_SIZE))
     max_pages = int(getattr(adapter.cfg, "ratings_max_pages", max_pages) or max_pages)
@@ -392,6 +393,37 @@ def build_index(adapter: Any, *, per_page: int = 200, max_pages: int = 50) -> di
     return idx
 
 
+def _show_scope_ids(it: Mapping[str, Any]) -> dict[str, Any]:
+    src = dict(it.get("show_ids") or {})
+    out: dict[str, Any] = {}
+    for k in ("trakt", "slug", "tmdb", "imdb", "tvdb"):
+        v = src.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if k in ("imdb", "slug"):
+            out[k] = s
+        else:
+            out[k] = int(s) if s.isdigit() else None
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _show_key(ids: Mapping[str, Any]) -> str:
+    return json.dumps(
+        {k: ids.get(k) for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if ids.get(k)},
+        sort_keys=True,
+    )
+
+
+def _own_child_ids(kind: str, ids: dict[str, Any], it: Mapping[str, Any]) -> dict[str, Any]:
+    parent = _show_scope_ids(it)
+    if kind == "seasons" and ids and parent and any(k in parent for k in ids) and all(str(parent.get(k)) == str(v) for k, v in ids.items() if k in parent):
+        return {}
+    return ids
+
+
 def _bucketize_for_upsert(
     items: Iterable[Mapping[str, Any]],
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
@@ -401,28 +433,6 @@ def _bucketize_for_upsert(
 
     def push(bucket: str, obj: dict[str, Any]) -> None:
         body.setdefault(bucket, []).append(obj)
-
-    def show_scope_ids(it: Mapping[str, Any]) -> dict[str, Any]:
-        src = dict(it.get("show_ids") or {})
-        out: dict[str, Any] = {}
-        for k in ("trakt", "slug", "tmdb", "imdb", "tvdb"):
-            v = src.get(k)
-            if v is None:
-                continue
-            s = str(v).strip()
-            if not s:
-                continue
-            if k in ("imdb", "slug"):
-                out[k] = s
-            else:
-                out[k] = int(s) if s.isdigit() else None
-        return {k: v for k, v in out.items() if v is not None}
-
-    def show_key(ids: Mapping[str, Any]) -> str:
-        return json.dumps(
-            {k: ids.get(k) for k in ("trakt", "slug", "tmdb", "imdb", "tvdb") if ids.get(k)},
-            sort_keys=True,
-        )
 
     for it in items or []:
         rating = _valid_rating(it.get("rating"))
@@ -437,10 +447,11 @@ def _bucketize_for_upsert(
             continue
 
         ids = _sanitize_ids_for_trakt(kind, ids_for_trakt(it) or {})
+        ids = _own_child_ids(kind, ids, it)
         obj: dict[str, Any]
         if ids:
             obj = {"ids": ids, "rating": rating}
-        elif kind == "episodes":
+        elif kind in {"episodes", "seasons"}:
             # Allow show-scoped episode ratings
             obj = {"rating": rating}
         elif kind in {"movies", "shows"} and it.get("title"):
@@ -460,7 +471,22 @@ def _bucketize_for_upsert(
             push("shows", obj)
             t = "show"
         elif kind == "seasons":
-            push("seasons", obj)
+            if ids:
+                push("seasons", obj)
+            else:
+                show_ids = _show_scope_ids(it)
+                season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
+                try:
+                    season_i = int(str(season_raw))
+                except Exception:
+                    continue
+                if not show_ids:
+                    continue
+                entry = nested_shows.setdefault(_show_key(show_ids), {"ids": show_ids, "seasons": {}})
+                season_entry = entry["seasons"].setdefault(season_i, {"number": season_i})
+                season_entry["rating"] = rating
+                if ra:
+                    season_entry["rated_at"] = ra
             t = "season"
         elif kind == "episodes":
             season_no = it.get("season")
@@ -472,7 +498,7 @@ def _bucketize_for_upsert(
             if episode_no is None:
                 episode_no = it.get("episode_number")
 
-            show_ids = show_scope_ids(it)
+            show_ids = _show_scope_ids(it)
             show_scope_ok = bool(show_ids and season_no is not None and episode_no is not None)
             strong_ids = bool(ids and ("trakt" in ids or "tvdb" in ids))
             use_ids = bool(ids) and (strong_ids or not show_scope_ok)
@@ -481,7 +507,7 @@ def _bucketize_for_upsert(
             if use_ids:
                 push("episodes", obj)
             elif show_scope_ok:
-                skey = show_key(show_ids)
+                skey = _show_key(show_ids)
                 entry = nested_shows.setdefault(skey, {"ids": show_ids, "seasons": {}})
                 try:
                     season_i = int(str(season_no))
@@ -562,9 +588,27 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
 
     buckets: dict[str, list[dict[str, Any]]] = {}
     accepted_minimals: list[dict[str, Any]] = []
+    nested: dict[tuple[str, str], dict[str, Any]] = {}
 
     def push(bucket: str, obj: dict[str, Any]) -> None:
         buckets.setdefault(bucket, []).append(obj)
+
+    def push_nested(it: Mapping[str, Any], scope: str) -> bool:
+        show_ids = _show_scope_ids(it)
+        season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
+        episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
+        try:
+            season_i = int(str(season_raw))
+            episode_i = int(str(episode_raw)) if scope == "episode" else None
+        except Exception:
+            return False
+        if not show_ids:
+            return False
+        entry = nested.setdefault((_show_key(show_ids), scope), {"ids": show_ids, "seasons": {}})
+        season_entry = entry["seasons"].setdefault(season_i, {"number": season_i})
+        if episode_i is not None:
+            season_entry.setdefault("episodes", []).append({"number": episode_i})
+        return True
 
     for it in items or []:
         t_raw = str(it.get("type") or "").strip().lower()
@@ -574,7 +618,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         if kind not in {"movies", "shows", "seasons", "episodes"}:
             continue
 
-        ids = _sanitize_ids_for_trakt(kind, ids_for_trakt(it) or {})
+        ids = _own_child_ids(kind, _sanitize_ids_for_trakt(kind, ids_for_trakt(it) or {}), it)
         if kind == "movies":
             if ids:
                 push("movies", {"ids": ids})
@@ -598,19 +642,24 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 continue
             t = "show"
         elif kind == "seasons":
-            if not ids:
+            if ids:
+                push("seasons", {"ids": ids})
+            elif not push_nested(it, "season"):
                 continue
-            push("seasons", {"ids": ids})
             t = "season"
         elif kind == "episodes":
-            if not ids:
+            if ids:
+                push("episodes", {"ids": ids})
+            elif not push_nested(it, "episode"):
                 continue
-            push("episodes", {"ids": ids})
             t = "episode"
         else:
             continue
-        
+
         accepted_minimals.append(_accepted_minimal_for_cache(t, ids, it))
+
+    for entry in nested.values():
+        push("shows", {"ids": entry["ids"], "seasons": list(entry["seasons"].values())})
 
     if not buckets:
         _info("write_skipped", op="remove", reason="empty_payload", unresolved=0)

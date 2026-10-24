@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import date as dt_date, datetime, timezone
 from typing import Any, cast
 
 import requests
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 
 from cw_platform.access_policy import filter_instances_for_user, request_user
@@ -18,6 +20,13 @@ from cw_platform.provider_instances import build_provider_config_view, list_inst
 router = APIRouter(prefix="/api/manual", tags=["manual"])
 
 _LOG = logging.getLogger("crosswatch.api.manual")
+
+MANUAL_EPISODES_MAX = 500
+EPISODE_LIST_PROVIDERS = frozenset({"SIMKL"})
+COLLECTION_READ_ONLY_PROVIDERS = frozenset({"PLEX", "EMBY", "JELLYFIN", "KODI"})
+_EPISODE_LIST_TTL = 3600
+_EPISODE_LIST_CACHE: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]]]] = {}
+_EPISODE_LIST_LOCK = threading.Lock()
 
 
 def _tmdb_api_key(cfg: dict[str, Any]) -> str:
@@ -136,6 +145,174 @@ def _manual_external_ids(media_type: str, tmdb_id: Any) -> dict[str, Any]:
     return out
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _manual_episodes(value: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for raw in value if isinstance(value, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        season = _int_or_none(raw.get("season"))
+        episode = _int_or_none(raw.get("episode"))
+        if season is None or episode is None or season < 0 or episode < 1 or (season, episode) in seen:
+            continue
+        seen.add((season, episode))
+        out.append({"season": season, "episode": episode, "air_date": _parse_manual_date(raw.get("air_date"))})
+    out.sort(key=lambda row: (row["season"], row["episode"]))
+    return out
+
+
+def _manual_episode_item(show: dict[str, Any], row: dict[str, Any], watched_at: str) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "type": "episode",
+        "title": show.get("title") or "",
+        "series_title": show.get("title") or "",
+        "show_ids": dict(show.get("ids") or {}),
+        "ids": {},
+        "season": row["season"],
+        "episode": row["episode"],
+        "watched_at": watched_at,
+    }
+    if show.get("year") not in (None, ""):
+        item["year"] = show["year"]
+    return item
+
+
+def _split_source(value: Any) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    if not raw or raw.lower() == "tmdb":
+        return "", ""
+    provider, _, instance = raw.partition(":")
+    return provider.strip().upper(), normalize_instance_id(instance or "default")
+
+
+def _season_row(season: int, name: Any, episodes: list[dict[str, Any]] | None, count: Any = None) -> dict[str, Any]:
+    label = str(name or "").strip() or ("Specials" if season == 0 else f"Season {season}")
+    total = len(episodes) if episodes is not None else (_int_or_none(count) or 0)
+    return {"season": season, "name": label, "episode_count": total, "episodes": episodes}
+
+
+def _tmdb_season_list(tmdb_id: int) -> list[dict[str, Any]] | None:
+    from .metaAPI import _cfg_ui_locale, _tmdb_provider
+
+    provider = _tmdb_provider()
+    if provider is None:
+        return None
+    data = provider._get(f"https://api.themoviedb.org/3/tv/{tmdb_id}", {"language": _cfg_ui_locale() or "en-US"}, quiet_404=True) or {}
+    rows = []
+    for raw in data.get("seasons") or []:
+        season = _int_or_none(raw.get("season_number")) if isinstance(raw, dict) else None
+        if season is None or not (_int_or_none(raw.get("episode_count")) or 0):
+            continue
+        rows.append(_season_row(season, raw.get("name"), None, raw.get("episode_count")))
+    rows.sort(key=lambda row: (row["season"] == 0, row["season"]))
+    return rows
+
+
+def _tmdb_season_episodes(tmdb_id: int, season: int) -> list[dict[str, Any]] | None:
+    from .metaAPI import _cfg_ui_locale, _tmdb_provider
+
+    provider = _tmdb_provider()
+    if provider is None:
+        return None
+    data = provider._get(f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}", {"language": _cfg_ui_locale() or "en-US"}, quiet_404=True) or {}
+    rows = []
+    for raw in data.get("episodes") or []:
+        episode = _int_or_none(raw.get("episode_number")) if isinstance(raw, dict) else None
+        if episode is None or episode < 1:
+            continue
+        rows.append({"episode": episode, "name": str(raw.get("name") or ""), "air_date": _parse_manual_date(raw.get("air_date")) or ""})
+    return rows
+
+
+def _simkl_episode_rows(payload: Any) -> list[dict[str, Any]]:
+    seasons: dict[int, list[dict[str, Any]]] = {}
+    for raw in payload if isinstance(payload, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("type") or "episode").strip().lower()
+        season = _int_or_none(raw.get("season"))
+        episode = _int_or_none(raw.get("episode"))
+        if kind == "special" and season is None:
+            season = 0
+        if season is None or episode is None or season < 0 or episode < 1:
+            continue
+        seasons.setdefault(season, []).append({
+            "episode": episode,
+            "name": str(raw.get("title") or ""),
+            "air_date": _parse_manual_date(str(raw.get("date") or "")[:10]) or "",
+        })
+    rows = []
+    for season, episodes in seasons.items():
+        unique = {row["episode"]: row for row in episodes}
+        rows.append(_season_row(season, "", [unique[key] for key in sorted(unique)]))
+    rows.sort(key=lambda row: (row["season"] == 0, row["season"]))
+    return rows
+
+
+def _simkl_episode_list(cfg_view: dict[str, Any], tmdb_id: int) -> list[dict[str, Any]] | None:
+    from cw_platform.simkl_http import pace_session
+    from providers.sync.simkl._common import build_headers
+    from providers.sync.simkl._history import BASE, simkl_api_params_from_headers
+
+    headers = build_headers(cfg_view)
+    simkl_id = ""
+    with requests.Session() as session:
+        pace_session(session)
+        response = session.get(
+            f"{BASE}/search/id",
+            headers=headers,
+            params=simkl_api_params_from_headers(headers, tmdb=str(tmdb_id), type="show"),
+            timeout=10,
+        )
+        if not response.ok:
+            return None
+        found = response.json() if (response.text or "").strip() else []
+        for row in found if isinstance(found, list) else []:
+            if not isinstance(row, dict):
+                continue
+            raw_node = row.get("show")
+            node: dict[str, Any] = raw_node if isinstance(raw_node, dict) else row
+            if str(row.get("type") or node.get("type") or "").strip().lower() not in {"", "tv", "show"}:
+                continue
+            raw_ids = node.get("ids")
+            ids: dict[str, Any] = raw_ids if isinstance(raw_ids, dict) else {}
+            simkl_id = str(ids.get("simkl") or ids.get("simkl_id") or "").strip()
+            if simkl_id:
+                break
+        if not simkl_id.isdigit():
+            return None
+        response = session.get(
+            f"{BASE}/tv/episodes/{simkl_id}",
+            headers=headers,
+            params=simkl_api_params_from_headers(headers, extended="full"),
+            timeout=15,
+        )
+        if not response.ok:
+            return None
+        return _simkl_episode_rows(response.json() if (response.text or "").strip() else [])
+
+
+def _provider_episode_list(cfg: dict[str, Any], provider: str, instance: str, tmdb_id: int) -> list[dict[str, Any]] | None:
+    key = (provider, instance, tmdb_id)
+    now = time.monotonic()
+    with _EPISODE_LIST_LOCK:
+        hit = _EPISODE_LIST_CACHE.get(key)
+        if hit and now - hit[0] < _EPISODE_LIST_TTL:
+            return hit[1]
+    rows = _simkl_episode_list(build_provider_config_view(cfg, provider, instance), tmdb_id) if provider == "SIMKL" else None
+    if rows:
+        with _EPISODE_LIST_LOCK:
+            _EPISODE_LIST_CACHE[key] = (now, rows)
+    return rows
+
+
 def _manual_history_targets(cfg: dict[str, Any], user: Any = None) -> list[dict[str, Any]]:
     merged: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -152,7 +329,8 @@ def _manual_history_targets(cfg: dict[str, Any], user: Any = None) -> list[dict[
         history_ok = bool(supported.get("history"))
         ratings_ok = bool(supported.get("ratings"))
         watchlist_ok = bool(supported.get("watchlist"))
-        if not history_ok and not ratings_ok and not watchlist_ok:
+        collection_ok = bool(supported.get("collection")) and provider not in COLLECTION_READ_ONLY_PROVIDERS
+        if not history_ok and not ratings_ok and not watchlist_ok and not collection_ok:
             continue
 
         try:
@@ -184,9 +362,11 @@ def _manual_history_targets(cfg: dict[str, Any], user: Any = None) -> list[dict[
                 "history_enabled": history_ok,
                 "ratings_enabled": ratings_ok,
                 "watchlist_enabled": watchlist_ok,
+                "collection_enabled": collection_ok,
+                "episode_list": history_ok and provider in EPISODE_LIST_PROVIDERS,
             }
 
-    out = [v for v in merged.values() if bool(v.get("history_enabled") or v.get("watchlist_enabled"))]
+    out = [v for v in merged.values() if bool(v.get("history_enabled") or v.get("watchlist_enabled") or v.get("collection_enabled"))]
     out.sort(key=lambda item: (str(item.get("label") or "").lower(), str(item.get("instance") or "")))
     return out
 
@@ -197,6 +377,44 @@ def api_manual_providers(request: Request = cast(Request, None)) -> JSONResponse
 
     cfg = load_config() or {}
     return JSONResponse({"ok": True, "providers": _manual_history_targets(cfg, request_user(request))}, status_code=200)
+
+
+@router.get("/episodes")
+def api_manual_episodes(
+    request: Request,
+    tmdb: int = Query(..., ge=1),
+    source: str = Query("tmdb", max_length=120),
+    season: int | None = Query(None, ge=0),
+) -> JSONResponse:
+    from cw_platform.config_base import load_config
+
+    cfg = load_config() or {}
+    provider, instance = _split_source(source)
+    try:
+        if not provider:
+            if season is not None:
+                episodes = _tmdb_season_episodes(tmdb, season)
+                if episodes is None:
+                    return JSONResponse({"ok": False, "error": "tmdb_unavailable"}, status_code=200)
+                return JSONResponse({"ok": True, "source": "tmdb", "season": season, "episodes": episodes})
+            seasons = _tmdb_season_list(tmdb)
+            if seasons is None:
+                return JSONResponse({"ok": False, "error": "tmdb_unavailable"}, status_code=200)
+            return JSONResponse({"ok": True, "source": "tmdb", "seasons": seasons})
+        allowed = {
+            (str(row.get("provider") or "").upper(), normalize_instance_id(row.get("instance") or "default"))
+            for row in _manual_history_targets(cfg, request_user(request))
+            if row.get("episode_list")
+        }
+        if (provider, instance) not in allowed:
+            return JSONResponse({"ok": False, "error": "episode_list_not_available"}, status_code=400)
+        seasons = _provider_episode_list(cfg, provider, instance, tmdb)
+        if not seasons:
+            return JSONResponse({"ok": False, "error": "episode_list_not_found"}, status_code=200)
+        return JSONResponse({"ok": True, "source": f"{provider}:{instance}", "seasons": seasons})
+    except Exception:
+        _LOG.exception("manual episode list failed for %s", source)
+        return JSONResponse({"ok": False, "error": "episode_list_failed"}, status_code=200)
 
 
 @router.post("/watched")
@@ -222,9 +440,27 @@ def api_manual_watched(payload: dict[str, Any] = Body(...), request: Request = c
     do_history = bool(actions.get("history", True))
     do_watchlist = bool(actions.get("watchlist"))
     do_rating = bool(actions.get("rating"))
-    if not (do_history or do_watchlist or do_rating):
+    do_collection = bool(actions.get("collection"))
+    if not (do_history or do_watchlist or do_rating or do_collection):
         return JSONResponse({"ok": False, "error": "missing_actions"}, status_code=400)
 
+    raw_episodes = payload.get("episodes")
+    episodes = _manual_episodes(raw_episodes) if media_type == "show" and do_history else []
+    if raw_episodes and media_type == "show" and do_history and not episodes:
+        return JSONResponse({"ok": False, "error": "invalid_episodes"}, status_code=400)
+    if len(episodes) > MANUAL_EPISODES_MAX:
+        return JSONResponse({"ok": False, "error": "too_many_episodes"}, status_code=400)
+    source_provider, source_instance = _split_source(payload.get("episode_source"))
+    if episodes and source_provider:
+        picked = {
+            (str(raw.get("provider") or "").strip().upper(), normalize_instance_id(raw.get("instance") or raw.get("provider_instance") or "default"))
+            for raw in selected_targets
+            if isinstance(raw, dict)
+        }
+        if picked != {(source_provider, source_instance)}:
+            return JSONResponse({"ok": False, "error": "episode_source_mismatch"}, status_code=400)
+
+    date_mode = str(payload.get("date_mode") or "today").strip().lower()
     watched_at, dt_error = _manual_watched_at(
         cfg,
         media_type,
@@ -232,6 +468,8 @@ def api_manual_watched(payload: dict[str, Any] = Body(...), request: Request = c
         payload.get("date_mode"),
         payload.get("watched_on"),
     )
+    if not watched_at and episodes and dt_error == "release_date_unavailable" and all(row["air_date"] for row in episodes):
+        watched_at = _iso_noon_utc(min(row["air_date"] for row in episodes))
     if not watched_at:
         return JSONResponse({"ok": False, "error": dt_error or "invalid_watched_date"}, status_code=400)
 
@@ -258,6 +496,19 @@ def api_manual_watched(payload: dict[str, Any] = Body(...), request: Request = c
     if year not in (None, ""):
         item_payload["year"] = year
 
+    history_items = [
+        _manual_episode_item(
+            item_payload,
+            row,
+            _iso_noon_utc(row["air_date"]) if date_mode == "release" and row["air_date"] else watched_at,
+        )
+        for row in episodes
+    ] or [item_payload]
+
+    collection_payload = dict(item_payload)
+    collection_payload.pop("watched_at", None)
+    collection_payload["collected_at"] = watched_at
+
     results: list[dict[str, Any]] = []
     success_count = 0
 
@@ -282,7 +533,7 @@ def api_manual_watched(payload: dict[str, Any] = Body(...), request: Request = c
         history_skipped: str | None = None
         if do_history and bool(target.get("history_enabled")):
             try:
-                hr = ops.add(cfg_view, [item_payload], feature="history")
+                hr = ops.add(cfg_view, history_items, feature="history")
                 history_res = dict(hr) if isinstance(hr, dict) else {"ok": bool(hr)}
             except Exception:
                 _LOG.exception("manual history add failed for %s:%s", provider, instance)
@@ -319,10 +570,24 @@ def api_manual_watched(payload: dict[str, Any] = Body(...), request: Request = c
             else:
                 rating_skipped = "ratings_not_supported"
 
+        collection_res: dict[str, Any] | None = None
+        collection_skipped: str | None = None
+        if do_collection:
+            if bool(target.get("collection_enabled")):
+                try:
+                    cr = ops.add(cfg_view, [collection_payload], feature="collection")
+                    collection_res = dict(cr) if isinstance(cr, dict) else {"ok": bool(cr)}
+                except Exception:
+                    _LOG.exception("manual collection add failed for %s:%s", provider, instance)
+                    collection_res = {"ok": False, "error": "collection_add_failed"}
+            else:
+                collection_skipped = "collection_not_supported"
+
         history_ok = bool(history_res is None or bool(history_res.get("ok")) or history_skipped)
         watchlist_ok = bool(watchlist_res is None or bool(watchlist_res.get("ok")) or watchlist_skipped)
         rating_ok = bool(rating_res is None or bool(rating_res.get("ok")) or rating_skipped)
-        ok = history_ok and watchlist_ok and rating_ok
+        collection_ok = bool(collection_res is None or bool(collection_res.get("ok")) or collection_skipped)
+        ok = history_ok and watchlist_ok and rating_ok and collection_ok
         if ok:
             success_count += 1
 
@@ -339,12 +604,17 @@ def api_manual_watched(payload: dict[str, Any] = Body(...), request: Request = c
             entry["rating"] = rating_res
         if rating_skipped:
             entry["rating_skipped"] = rating_skipped
+        if collection_res is not None:
+            entry["collection"] = collection_res
+        if collection_skipped:
+            entry["collection_skipped"] = collection_skipped
         results.append(entry)
 
     return JSONResponse(
         {
             "ok": success_count > 0 and all(bool(it.get("ok")) for it in results),
             "watched_at": watched_at,
+            "episodes": len(episodes),
             "results": results,
         },
         status_code=200,

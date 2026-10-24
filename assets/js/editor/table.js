@@ -32,6 +32,91 @@
     return out;
   }
 
+  function presenceChips(row, ctx) {
+    const meta = window.CW?.ProviderMeta || {};
+    const targets = Array.isArray(ctx.state?.mergedTargets) ? ctx.state.mergedTargets : [];
+    const present = new Map((row.presence || []).map(entry => [entry[0], entry]));
+    const wrap = document.createElement("div");
+    wrap.className = "cw-presence";
+    const missing = [];
+    targets.forEach((target, index) => {
+      const entry = present.get(index);
+      if (!entry && !target.can_send) return;
+      const chip = document.createElement(entry ? "span" : "button");
+      const unverified = !!entry && target.verified === false;
+      chip.className = `cw-presence-chip ${entry ? "is-on" : "is-off"}${unverified ? " is-unverified" : ""}`;
+      const name = target.display || target.label || target.provider;
+      const src = meta.logoPath?.(target.provider) || meta.logLogoPath?.(target.provider) || "";
+      if (src) {
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = "";
+        chip.appendChild(img);
+      }
+      const friendly = String(target.instance_label || "").trim();
+      const account = target.instance !== "default" ? friendly || target.instance : /^default$/i.test(friendly) ? "" : friendly;
+      if (!src || account) {
+        const text = document.createElement("span");
+        text.textContent = src ? account : name;
+        chip.appendChild(text);
+      }
+      if (entry) {
+        chip.title = [unverified ? `Sent to ${name}` : `On ${name}`, entry[1] > 1 ? `${entry[1]} entries` : "", entry[2] != null ? String(entry[2]) : ""].filter(Boolean).join(" Â· ")
+          + (unverified ? ". Not validated, missing sync pair." : "");
+        chip.setAttribute("role", "img");
+        chip.setAttribute("aria-label", chip.title);
+      } else {
+        chip.type = "button";
+        chip.title = `Not on ${name}. Click to send it there.`;
+        chip.setAttribute("aria-label", chip.title);
+        chip.onclick = () => call(ctx, "sendRow", row, target);
+      }
+      if (entry) wrap.appendChild(chip);
+      else missing.push(chip);
+    });
+    wrap.append(...missing);
+    return wrap;
+  }
+
+  function episodeGroupBadges(row, ctx) {
+    const wrap = document.createElement("div");
+    wrap.className = "cw-presence cw-episode-groups";
+    if (ctx.state?.kind !== "history") return wrap;
+    for (const group of row._episodeGroups || []) {
+      const badge = document.createElement(group.can_edit ? "button" : "span");
+      badge.className = "cw-presence-chip cw-episode-group-badge";
+      badge.textContent = "Episode group";
+      const sides = ["source", "target"].map(side => {
+        const value = group[side];
+        const codes = value.episodes.map(item => `S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}`).join(", ");
+        return `${value.provider} (${value.instance}): ${codes}`;
+      });
+      badge.title = [group.name, group.pair_name, ...sides, `Completed scrobbles: ${group.scrobble ? "On" : "Off"}`].join("\n");
+      badge.setAttribute("aria-label", `Episode group: ${badge.title}`);
+      if (group.can_edit) {
+        badge.type = "button";
+        badge.setAttribute("aria-haspopup", "dialog");
+        badge.onclick = async () => {
+          const state = ctx.state || {};
+          if (state.hasChanges || state.saving || state.loading || state.mappingEditing) {
+            call(ctx, "setStatus", "Save or discard Editor changes before editing episode groups.");
+            return;
+          }
+          try {
+            const {openEpisodeGroups} = await import(`/assets/js/editor/episode-groups.js?v=${encodeURIComponent(window.APP_VERSION || "1")}`);
+            await openEpisodeGroups(badge, {pairId:group.pair_id, groupId:group.id, onSaved:() => call(ctx, "loadState")});
+          } catch (error) {
+            call(ctx, "setStatus", error.message || "Could not open episode group.");
+          }
+        };
+      } else {
+        badge.setAttribute("role", "img");
+      }
+      wrap.appendChild(badge);
+    }
+    return wrap;
+  }
+
   function createRowElement(row, ctx = {}) {
     const state = ctx.state || {};
     const anilistMode = !!ctx.anilistMode;
@@ -47,6 +132,7 @@
     selCb.type = "checkbox";
     selCb.name = fieldName("selected");
     selCb.className = "cw-checkbox";
+    selCb.setAttribute("aria-label", `Select ${row.title || row.key || "row"}`);
     selCb.checked = (state.selected || new Set()).has(row._rid);
     selCb.onchange = () => {
       if (!state.selected) state.selected = new Set();
@@ -55,7 +141,10 @@
       call(ctx, "syncBulkBar");
       call(ctx, "syncSelectPageCheckbox");
     };
-    tr.appendChild(cell(selCb));
+    const selectionLabel = document.createElement("label");
+    selectionLabel.className = "cw-row-select";
+    selectionLabel.appendChild(selCb);
+    tr.appendChild(cell(selectionLabel));
 
     const baselineRow = blockMode && row._origin === "baseline";
     const delBtn = document.createElement("button");
@@ -67,6 +156,7 @@
           ? (row.deleted ? "Restore for future syncs" : "Block from future syncs")
           : (row.deleted ? "Restore row" : "Remove manual correction"))
       : (row.deleted ? "Restore row" : "Delete row");
+    delBtn.setAttribute("aria-label", delBtn.title);
     delBtn.onclick = () => {
       row.deleted = !row.deleted;
       call(ctx, "markChanged");
@@ -74,23 +164,22 @@
     };
     const actionWrap = document.createElement("div");
     actionWrap.className = "cw-action-buttons";
-    actionWrap.appendChild(delBtn);
+    if (!ctx.merged) actionWrap.appendChild(delBtn);
     const delTd = cell(actionWrap);
     delTd.className = "cw-action-cell";
     if (ctx.wideActions) delTd.classList.add("cw-action-wide");
 
-    if (call(ctx, "canReplaceRow", row)) {
-      const t = String(call(ctx, "rowType", row) || "").toLowerCase();
-      const repBtn = document.createElement("button");
-      repBtn.type = "button";
-      repBtn.className = "cw-btn cw-btn-del";
-      repBtn.innerHTML = '<span class="material-symbol">published_with_changes</span>';
-      repBtn.title = t === "episode" ? "Replace episode" : t === "season" ? "Replace season" : "Replace item";
-      repBtn.onclick = () => call(ctx, "openItemReplacer", row, repBtn);
-      actionWrap.appendChild(repBtn);
-    }
-
-    if (blockMode) {
+    if (blockMode && (ctx.simple || ctx.merged) && typeof ctx.sendRow === "function") {
+      const sendBtn = document.createElement("button");
+      sendBtn.type = "button";
+      sendBtn.className = "cw-btn cw-btn-del cw-btn-send";
+      sendBtn.innerHTML = '<span class="material-symbol">send</span>';
+      sendBtn.title = "Send to or remove from providers";
+      sendBtn.setAttribute("aria-label", sendBtn.title);
+      sendBtn.disabled = !!row.deleted;
+      sendBtn.onclick = () => call(ctx, "sendRow", row);
+      actionWrap.appendChild(sendBtn);
+    } else if (blockMode) {
       const rawBtn = document.createElement("button");
       rawBtn.type = "button";
       rawBtn.className = "cw-btn cw-btn-del";
@@ -153,7 +242,24 @@
       const visual = call(ctx, "formatEpisodeVisualTitle", row);
       if (visual) titleIn.value = visual;
     };
-    titleRow.appendChild(titleIn);
+    if (ctx.merged) {
+      const text = document.createElement("strong");
+      text.className = "cw-merged-title";
+      text.textContent = titleIn.value || row.key || "";
+      titleRow.appendChild(text);
+    } else {
+      titleRow.appendChild(titleIn);
+    }
+    if (row._mappingScope) {
+      const indicator = document.createElement("span");
+      indicator.className = "material-symbols-rounded cw-mapping-indicator";
+      indicator.textContent = "link";
+      indicator.title = row._mappingScope === "pair" ? "Mapping saved for this pair"
+        : state.mappingPair ? "Shared mapping inherited by this pair" : "Shared mapping for all pairs using this provider instance";
+      indicator.setAttribute("role", "img");
+      indicator.setAttribute("aria-label", indicator.title);
+      titleRow.appendChild(indicator);
+    }
 
     const yearIn = document.createElement("input");
     yearIn.name = fieldName("year");
@@ -195,12 +301,11 @@
 
     const searchBtn = document.createElement("button");
     searchBtn.type = "button";
-    searchBtn.className = "cw-title-search-btn";
-    searchBtn.innerHTML = '<span class="material-symbol">search</span>';
-    const searchUsesCorrection = locked && call(ctx, "canReplaceRow", row);
-    searchBtn.title = searchUsesCorrection
-      ? (call(ctx, "usesCoordinateReplacer", row) ? "Replace episode" : "Search and add correction")
-      : "Search and fill IDs";
+    const searchUsesCorrection = !!call(ctx, "canReplaceRow", row);
+    searchBtn.className = searchUsesCorrection ? "cw-btn cw-btn-del cw-btn-map" : "cw-title-search-btn";
+    searchBtn.innerHTML = `<span class="material-symbol" aria-hidden="true">${searchUsesCorrection ? "compare_arrows" : "search"}</span>`;
+    searchBtn.title = searchUsesCorrection ? "Edit mapping" : "Search and fill IDs";
+    searchBtn.setAttribute("aria-label", searchBtn.title);
     searchBtn.disabled = locked && !searchUsesCorrection;
     if (searchBtn.disabled) {
       searchBtn.style.opacity = "0.6";
@@ -224,7 +329,10 @@
         typeBtn,
       });
     };
-    titleRow.appendChild(searchBtn);
+    if (searchUsesCorrection) actionWrap.appendChild(searchBtn);
+    else if (!ctx.merged) titleRow.appendChild(searchBtn);
+    if (ctx.merged) titleCell.appendChild(presenceChips(row, ctx));
+    if (row._episodeGroups?.length) titleCell.appendChild(episodeGroupBadges(row, ctx));
 
     const subType = (((row.raw && row.raw.type) || row.type || "") + "").toLowerCase();
     if (subType === "season" && row.raw && row.raw.series_title) {
@@ -240,7 +348,10 @@
     }
     dataCells.title = cell(titleCell, "cw-col-title");
 
-    const yearTd = cell(yearIn);
+    const yearText = document.createElement("span");
+    yearText.className = "cw-merged-year";
+    yearText.textContent = row.year || "";
+    const yearTd = cell(ctx.merged ? yearText : yearIn);
     yearTd.className = "cw-col-year";
     dataCells.year = yearTd;
     dataCells.id = cell(idAIn, "cw-col-id");
@@ -263,6 +374,8 @@
       extraBtn.onclick = () => call(ctx, "openRatingEditor", row, extraBtn, extraBtn);
     } else if (state.kind === "history") {
       extraBtn.onclick = () => call(ctx, "openHistoryEditor", row, extraBtn, extraBtn);
+    } else if (state.kind === "collection") {
+      extraBtn.onclick = () => call(ctx, "openCollectionEditor", row, extraBtn, extraBtn);
     } else if (state.kind === "progress") {
       extraBtn.onclick = () => call(ctx, "openProgressEditor", row, extraBtn, extraBtn);
     }
@@ -272,14 +385,128 @@
       const td = dataCells[column];
       if (!td) return;
       td.dataset.column = column;
+      td.dataset.label = ({key: 'Key', type: 'Type', title: 'Title', year: 'Year',
+        id: anilistMode ? 'MAL' : 'TMDB', imdb: 'IMDb', tvdb: 'TVDB', trakt: 'Trakt',
+        simkl: 'SIMKL', anilist: 'AniList', extra: call(ctx, 'columnLabel', 'extra') || 'Extra'})[column];
+      td.querySelectorAll('input,button').forEach(control => {
+        if (!control.hasAttribute('aria-label')) control.setAttribute('aria-label', td.dataset.label);
+      });
       tr.appendChild(td);
     });
 
+    const fieldsToggle = document.createElement("button");
+    fieldsToggle.type = "button";
+    fieldsToggle.className = "cw-btn cw-mobile-fields-toggle";
+    const expandedRows = (state.mobileExpandedRows ||= new Set());
+    const syncFields = () => {
+      const expanded = expandedRows.has(row._rid);
+      tr.classList.toggle("cw-mobile-fields-open", expanded);
+      fieldsToggle.setAttribute("aria-expanded", String(expanded));
+      fieldsToggle.textContent = expanded ? "Less" : "Fields";
+      fieldsToggle.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} fields for ${row.title || row.key || "row"}`);
+    };
+    fieldsToggle.onclick = () => {
+      if (expandedRows.has(row._rid)) expandedRows.delete(row._rid);
+      else expandedRows.add(row._rid);
+      syncFields();
+    };
+    syncFields();
+    actionWrap.appendChild(fieldsToggle);
+    if (locked && !ctx.merged) {
+      const mobileTitle = document.createElement("strong");
+      mobileTitle.className = "cw-mobile-row-title";
+      mobileTitle.textContent = titleIn.value || row.key || "Untitled";
+      titleCell.prepend(mobileTitle);
+      titleIn.classList.add("cw-locked-title-input");
+    }
+
+    return tr;
+  }
+
+  function createViewingGroupElement(unit, ctx = {}, expanded = false) {
+    const state = ctx.state || {};
+    const rows = (unit && unit.rows) || [];
+    const latest = rows[0];
+    if (!latest) return null;
+    const tr = document.createElement("tr");
+    tr.className = "cw-row-viewing-group";
+    if (latest.episode) tr.classList.add("cw-row-episode");
+
+    const selected = state.selected || new Set();
+    const picked = rows.filter(row => selected.has(row._rid)).length;
+    const selCb = document.createElement("input");
+    selCb.type = "checkbox";
+    selCb.name = `cw-group-${latest._rid || "new"}-selected`;
+    selCb.className = "cw-checkbox";
+    selCb.checked = picked === rows.length;
+    selCb.indeterminate = picked > 0 && picked < rows.length;
+    selCb.title = "Select every watch of this title";
+    selCb.setAttribute("aria-label", selCb.title);
+    selCb.onchange = () => {
+      if (!state.selected) state.selected = new Set();
+      rows.forEach(row => {
+        if (selCb.checked) state.selected.add(row._rid);
+        else state.selected.delete(row._rid);
+      });
+      call(ctx, "syncBulkBar");
+      call(ctx, "syncSelectPageCheckbox");
+      call(ctx, "renderRows");
+    };
+    const selectionLabel = document.createElement("label");
+    selectionLabel.className = "cw-row-select";
+    selectionLabel.appendChild(selCb);
+    tr.appendChild(cell(selectionLabel));
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "cw-btn cw-btn-del cw-viewing-toggle";
+    toggle.innerHTML = `<span class="material-symbol">${expanded ? "expand_less" : "expand_more"}</span>`;
+    toggle.title = expanded ? "Hide watches" : "Show watches";
+    toggle.setAttribute("aria-label", toggle.title);
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    toggle.onclick = () => {
+      if (!state.expandedViewings) state.expandedViewings = new Set();
+      if (state.expandedViewings.has(unit.base)) state.expandedViewings.delete(unit.base);
+      else state.expandedViewings.add(unit.base);
+      call(ctx, "renderRows");
+    };
+    const actionWrap = document.createElement("div");
+    actionWrap.className = "cw-action-buttons";
+    actionWrap.appendChild(toggle);
+    const actionTd = cell(actionWrap, "cw-action-cell");
+    if (ctx.wideActions) actionTd.classList.add("cw-action-wide");
+    tr.appendChild(actionTd);
+
+    const summary = document.createElement("div");
+    summary.className = "cw-viewing-summary";
+    const title = document.createElement("strong");
+    title.textContent = call(ctx, "formatEpisodeVisualTitle", latest) || latest.title || latest.key || "";
+    summary.appendChild(title);
+    if (latest._episodeGroups?.length) summary.appendChild(episodeGroupBadges(latest, ctx));
+    if (latest.year) {
+      const year = document.createElement("span");
+      year.className = "cw-viewing-year";
+      year.textContent = latest.year;
+      summary.appendChild(year);
+    }
+    const count = document.createElement("span");
+    count.className = "cw-viewing-count";
+    count.textContent = `${rows.length} watches`;
+    summary.appendChild(count);
+    const last = document.createElement("span");
+    last.className = "cw-viewing-latest";
+    call(ctx, "updateExtraDisplay", latest, last);
+    summary.appendChild(last);
+
+    const summaryTd = cell(summary, "cw-viewing-summary-cell");
+    summaryTd.colSpan = dataColumnOrder(ctx).length;
+    tr.appendChild(summaryTd);
     return tr;
   }
 
   Editor.Table = {
     createRowElement,
+    createViewingGroupElement,
   };
   window.CrossWatchEditorTable = Editor.Table;
 })();

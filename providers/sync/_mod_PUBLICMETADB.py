@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urljoin
 
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 
 from ._log import log as cw_log
@@ -25,7 +26,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.1"
+__VERSION__ = "1.2"
 __all__ = ["get_manifest", "PUBLICMETADBModule", "OPS"]
 
 
@@ -67,6 +68,7 @@ _PLAYLIST_CAPABILITIES: dict[str, Any] = {
     "create": True,
     "add": True,
     "remove": True,
+    "delete": True,
     "reorder": False,
     "smart": False,
     "smart_writable": False,
@@ -144,10 +146,10 @@ class PUBLICMETADBConfig:
     watchlist_name: str = "Watchlist"
     rate_get_per_sec: float = 20.0
     rate_post_per_sec: float = 3.0
-    watchlist_page_size: int = 100
-    history_per_page: int = 100
+    watchlist_page_size: int = 500
+    history_per_page: int = 500
     history_max_pages: int = 1000
-    progress_per_page: int = 100
+    progress_per_page: int = 500
     progress_max_pages: int = 1000
     ratings_label: str = "Overall"
     ratings_submit_per_hour: int = 200
@@ -172,7 +174,7 @@ class PUBLICMETADBClient:
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {cfg.api_key}",
-                "User-Agent": f"CrossWatch PublicMetaDB/{__VERSION__}",
+                "User-Agent": http_user_agent("PublicMetaDB", override_env="CW_PUBLICMETADB_UA"),
             }
         )
         self.session._rate_limiter = SimpleRateLimiter(
@@ -273,10 +275,10 @@ class PUBLICMETADBModule:
             watchlist_name=str(p.get("watchlist_name") or "Watchlist").strip() or "Watchlist",
             rate_get_per_sec=_float("get_per_sec", 20.0, 20.0),
             rate_post_per_sec=_float("post_per_sec", 3.0, 3.0),
-            watchlist_page_size=int(p.get("watchlist_page_size", 100) or 100),
-            history_per_page=int(p.get("history_per_page", 100) or 100),
+            watchlist_page_size=_int_range("watchlist_page_size", 500, 1, 500),
+            history_per_page=_int_range("history_per_page", 500, 1, 500),
             history_max_pages=int(p.get("history_max_pages", 1000) or 1000),
-            progress_per_page=int(p.get("progress_per_page", 100) or 100),
+            progress_per_page=_int_range("progress_per_page", 500, 1, 500),
             progress_max_pages=int(p.get("progress_max_pages", 1000) or 1000),
             ratings_label=str(p.get("ratings_label") or "Overall").strip() or "Overall",
             ratings_submit_per_hour=_int_range("ratings_submit_per_hour", 200, 1, 200),
@@ -508,6 +510,18 @@ class _PUBLICMETADBOPS:
         if dry_run:
             return {"ok": True, "count": len(lst), "dry_run": True, "unresolved": [], "confirmed_keys": []}
         return self._pl().remove(self._playlist_adapter(cfg, instance), playlist_id, lst)
+
+    def delete_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        if dry_run:
+            return {"ok": True, "dry_run": True, "playlist_id": playlist_id}
+        return self._pl().delete(self._playlist_adapter(cfg, instance), playlist_id)
 
     def reorder_playlist_items(
         self,

@@ -77,7 +77,7 @@
 
   const PROVIDER_LABELS = {
     plex: "Plex", emby: "Emby", jellyfin: "Jellyfin", kodi: "Kodi", floppy: "Floppy",
-    trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", stremio: "Stremio",
+    trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", stremio: "Stremio", bingebase: "BingeBase",
   };
 
   function providerLabel(provider) {
@@ -221,22 +221,27 @@
 
   function setConnectLocked(targets, locked, message) {
     const list = Array.isArray(targets) ? targets : [targets];
-    const title = txt(message) || "Already connected, delete existing connection first.";
     list.forEach((target) => {
       const node = typeof target === "string" ? el(target) : target;
       if (!node) return;
+      node.disabled = node.classList.contains("busy");
+      node.removeAttribute("aria-disabled");
+      node.classList.remove("cw-auth-connect-locked");
+      node.classList.toggle("cw-page-reconnect", !!locked && !/restart/i.test(node.id));
       if (locked) {
         if (!Object.prototype.hasOwnProperty.call(node.dataset, "cwConnectLockPrevTitle")) {
           node.dataset.cwConnectLockPrevTitle = node.getAttribute("title") || "";
         }
-        node.disabled = true;
-        node.setAttribute("aria-disabled", "true");
-        node.setAttribute("title", title);
-        node.classList.add("cw-auth-connect-locked");
+        if (!/restart/i.test(node.id)) {
+          if (node.dataset.cwConnectOriginalLabel === undefined) node.dataset.cwConnectOriginalLabel = node.innerHTML;
+          if (node.textContent !== "Reconnect") node.textContent = "Reconnect";
+        }
+        node.setAttribute("title", "Reconnect this connection profile");
       } else {
-        node.disabled = false;
-        node.removeAttribute("aria-disabled");
-        node.classList.remove("cw-auth-connect-locked");
+        if (node.dataset.cwConnectOriginalLabel !== undefined) {
+          node.innerHTML = node.dataset.cwConnectOriginalLabel;
+          delete node.dataset.cwConnectOriginalLabel;
+        }
         if (node.dataset.cwConnectLockPrevTitle !== undefined) {
           const previous = node.dataset.cwConnectLockPrevTitle;
           if (previous) node.setAttribute("title", previous);
@@ -245,6 +250,18 @@
         }
       }
     });
+  }
+
+  async function captureAuthCompletion(profile) {
+    const instance = profile.getInstance();
+    const response = await fetchJSON("/api/config?ts=" + Date.now(), { cache: "no-store" });
+    if (!response.ok || !response.data || profile.getInstance() !== instance) throw new Error("Could not load the connection profile");
+    const before = profile.cfgBlock(response.data, false)?.auth_completed_at;
+    return (current) => {
+      if (profile.getInstance() !== instance) return false;
+      const block = profile.cfgBlock(current || {}, false);
+      return !!(block?.access_token && block.auth_completed_at && block.auth_completed_at !== before);
+    };
   }
 
   function mediaAuthGuide(root, opts) {
@@ -445,6 +462,7 @@
     async function refreshOptions(preserve) {
       const sel = el(selectId);
       if (!sel) return;
+      sel.dataset.cwSort = "alphabetical";
       addDefaultOption(sel);
       let want = preserve === false ? "default" : getInstance();
       try {
@@ -562,6 +580,10 @@
       sel.id = selectId;
       sel.name = selectId;
       sel.className = "input";
+      sel.__cwIconSelectCfg = {
+        className: "cw-connection-profile-select",
+        menuClassName: `cw-connection-profile-menu cw-connection-profile-menu-${String(apiProvider || "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-")}`,
+      };
       sel.style.minWidth = "160px";
       sel.style.width = "auto";
       sel.style.maxWidth = "220px";
@@ -627,13 +649,17 @@
           });
           const j = await r.json().catch(() => ({}));
           const id = txt(j && j.id);
-          if (!r.ok || (j && j.ok === false) || !id) throw new Error(String((j && j.error) || "create_failed"));
+          if (!r.ok || (j && j.ok === false) || !id) {
+            const err = new Error(String((j && j.error) || "create_failed"));
+            if (j && j.limit) err.limit = j.limit;
+            throw err;
+          }
           setInstance(id);
           await refreshOptions(true);
           try { panel.dispatchEvent(new CustomEvent("cw-auth-profile-created", { bubbles: true, detail: { provider: apiProvider, instance: id } })); } catch (_) {}
           try { Promise.resolve(onChange?.()).catch(() => {}); } catch (_) {}
         } catch (e) {
-          const message = e && e.message === "profile_limit_reached" ? "Maximum 10 profiles reached." : (e && e.message ? e.message : e);
+          const message = e && e.message === "profile_limit_reached" ? `Maximum ${e.limit || 10} profiles reached.` : (e && e.message ? e.message : e);
           notify("Could not create profile: " + message);
         }
       });
@@ -860,6 +886,7 @@
     setStatusPill,
     setStatus,
     setConnectLocked,
+    captureAuthCompletion,
     mediaAuthGuide,
     setMediaAuthStep,
     applyMediaTabState,

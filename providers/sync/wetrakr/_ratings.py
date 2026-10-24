@@ -1,0 +1,40 @@
+# providers/sync/wetrakr/_ratings.py
+# CrossWatch - WeTrakr movie, show, season and episode ratings sync
+# Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
+from __future__ import annotations
+
+from cw_platform.interactive_reads import retained_read
+
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from providers.sync._log import log
+from ._common import WeTrakrSyncError, add_index_item, item_key, media_item, rating_value, tracking_rows, write_items
+
+
+@retained_read
+def build_index(adapter: Any, *, force: bool = False) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for kind, rows in tracking_rows(adapter, "ratings", force=force).items():
+        for row in rows:
+            item = media_item(row, kind)
+            interactions = row.get("interactions")
+            user = interactions.get("user") if isinstance(interactions, Mapping) else None
+            rating = user.get("rating") if isinstance(user, Mapping) else None
+            if not isinstance(rating, Mapping):
+                raise WeTrakrSyncError("invalid_rating_entry")
+            item["rating"] = rating_value(rating.get("rating"))
+            if isinstance(rating, Mapping) and rating.get("rated_at"):
+                item["rated_at"] = rating["rated_at"]
+            key = item_key(adapter, "ratings", item)
+            add_index_item(out, "ratings", key, item)
+    log("WETRAKR", "ratings", "info", "index_done", count=len(out))
+    return out
+
+
+def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
+    return write_items(adapter, "ratings", items, remove=False, dry_run=dry_run)
+
+
+def remove(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
+    return write_items(adapter, "ratings", items, remove=True, dry_run=dry_run)

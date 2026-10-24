@@ -13,7 +13,9 @@ from typing import Any
 
 import requests
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config
+from cw_platform.trakt_http import paced_request as trakt_paced_request
 from cw_platform.local_db.ttl_dedupe import once_per_ttl
 from cw_platform.provider_instances import normalize_instance_id
 
@@ -30,6 +32,7 @@ except Exception:
 from providers.scrobble.scrobble import ScrobbleEvent, ScrobbleSink
 from services.activity import record_scrobble_event
 from cw_platform.event_archive import record_watch
+from cw_platform.event_archive.playback_recorder import record_playback
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
 try:
     from api.watchlistAPI import remove_across_providers_by_ids as _rm_across_api
@@ -38,7 +41,7 @@ except ImportError:
 
 
 TRAKT_API = "https://api.trakt.tv"
-APP_AGENT = "CrossWatch/Watcher/1.0"
+APP_AGENT = http_user_agent("Watcher", override_env="CW_TRAKT_UA")
 _TOKEN_OVERRIDE: dict[str, str] = {}
 _AR_TTL = 60
 _SENSITIVE_KEYS = {
@@ -67,11 +70,11 @@ def _log(msg: str, level: str = "INFO") -> None:
         return
     if BASE_LOG is not None:
         try:
-            BASE_LOG(str(msg), level=lvl, module="TRAKT-SCROBBLE")
+            BASE_LOG(str(msg), level=lvl, module="TRAKT-SINK")
             return
         except Exception:
             pass
-    print(f"[TRAKT-SCROBBLE:{lvl}] {msg}")
+    print(f"[TRAKT-SINK:{lvl}] {msg}")
 
 
 def _mask_account(value: Any) -> str:
@@ -122,7 +125,7 @@ def _merged_provider_block(cfg: Mapping[str, Any], key: str, instance_id: Any = 
 
 def _app_meta(cfg: dict[str, Any]) -> dict[str, str]:
     rt = cfg.get("runtime") or {}
-    ver = str(rt.get("version") or APP_AGENT)
+    ver = app_version()
     bdate = (rt.get("build_date") or "").strip()
     out: dict[str, str] = {"app_version": ver}
     if bdate:
@@ -152,11 +155,11 @@ def _hdr(cfg: dict[str, Any], instance_id: Any = None) -> dict[str, str]:
 
 
 def _get(path: str, cfg: dict[str, Any], instance_id: Any = None) -> requests.Response:
-    return requests.get(f"{TRAKT_API}{path}", headers=_hdr(cfg, instance_id), timeout=10)
+    return trakt_paced_request(requests.get, "GET", f"{TRAKT_API}{path}", headers=_hdr(cfg, instance_id), timeout=10)
 
 
 def _post(path: str, body: dict[str, Any], cfg: dict[str, Any], instance_id: Any = None) -> requests.Response:
-    return requests.post(f"{TRAKT_API}{path}", headers=_hdr(cfg, instance_id), json=body, timeout=10)
+    return trakt_paced_request(requests.post, "POST", f"{TRAKT_API}{path}", headers=_hdr(cfg, instance_id), json=body, timeout=10)
 
 
 def _tok_refresh(instance_id: Any = None) -> bool:
@@ -762,7 +765,7 @@ class TraktSink(ScrobbleSink):
                 except Exception:
                     pass
 
-    def _deliver(self, job: dict[str, Any]) -> None:
+    def _deliver(self, job: dict[str, Any]) -> dict[str, Any] | None:
         ev = job["event"]
         cfg = job["cfg"]
         path = str(job["path"])
@@ -802,10 +805,11 @@ class TraktSink(ScrobbleSink):
                 _log(f"intent path={path} ids={_body_ids_desc(body)} p={body.get('progress')}", "DEBUG")
             res = self._send_http(path, body, cfg)
             if res.get("ok"):
+                record_playback(ev, cfg, delivery="succeeded")
                 if res.get("duplicate"):
                     _log(f"send path={path} status=409 duplicate", "DEBUG")
                     self._a_sess[(sk, mk)] = action
-                    return
+                    return {"ok": True, "skipped": True, "reason": "duplicate"}
                 try:
                     act = (res.get("resp") or {}).get("action") or path.rsplit("/", 1)[-1]
                 except Exception:
@@ -857,10 +861,11 @@ class TraktSink(ScrobbleSink):
                     _log(f"intent path={path} ids={_ids_desc_map(epi_ids)} p={body.get('progress')}", "DEBUG")
                 res = self._send_http(path, body, cfg)
                 if res.get("ok"):
+                    record_playback(ev, cfg, delivery="succeeded")
                     if res.get("duplicate"):
                         _log(f"send path={path} status=409 duplicate", "DEBUG")
                         self._a_sess[(sk, mk)] = action
-                        return
+                        return {"ok": True, "skipped": True, "reason": "duplicate"}
                     try:
                         act = (res.get("resp") or {}).get("action") or path.rsplit("/", 1)[-1]
                     except Exception:
@@ -897,11 +902,13 @@ class TraktSink(ScrobbleSink):
                 last_err = res
 
         if last_err:
+            record_playback(ev, cfg, delivery="failed", reason=str(last_err.get("status") or ""))
             _log(f"{path} {last_err.get('status')} err={_safe_log_repr(last_err.get('resp'))}", "ERROR")
             if action in ("start", "stop"):
                 self._note_watch(ev, action, cfg, p_send, status="fail", reason=str(last_err.get("status") or ""))
+        return last_err
 
-    def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> None:
+    def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
         cfg = cfg or (self._cfg_provider() if self._cfg_provider else None) or _cfg()
         if not isinstance(cfg, dict):
             cfg = {}
@@ -923,13 +930,13 @@ class TraktSink(ScrobbleSink):
             if not self._warn_no_client:
                 _log("Missing trakt.client_id/api_key in config.json - skipping scrobble", "WARNING")
                 self._warn_no_client = True
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "not_configured"}
 
         if not token:
             if not self._warn_no_token:
                 _log("Missing Trakt access_token - connect Trakt to enable scrobble", "WARNING")
                 self._warn_no_token = True
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "not_configured"}
 
         ev = self._bind_event(ev, cfg)
         sk = str(ev.session_key or "?")
@@ -949,25 +956,27 @@ class TraktSink(ScrobbleSink):
 
         if decision.path is None:
             self._a_sess[(sk, mk)] = ev.action
-            return
+            reason = "completion_held" if decision.held else "no_progress" if ev.action in ("pause", "stop") else "invalid_action"
+            return {"ok": True, "log_status": "skipped", "reason": reason}
 
         if ev.action == "start":
             step = float(_trakt_progress_step(cfg))
             last_act = self._a_sess.get((sk, mk))
             force_seek = bool((getattr(ev, "raw", None) or {}).get("_cw_seek"))
             if last_act == "start" and not force_seek and p_sess >= 0 and abs(decision.progress - p_sess) < step:
-                return
+                return {"ok": True, "log_status": "skipped", "reason": "progress_step", "previous_progress": p_sess, "progress_step": step}
         elif not decision.bypass_debounce and self._debounced(ev.session_key, ev.action, _watch_pause_debounce(cfg)):
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "debounced"}
 
-        self._enqueue(
-            {
-                "event": ev,
-                "cfg": dict(cfg),
-                "path": decision.path,
-                "progress": decision.progress,
-                "record_watched": decision.record_watched,
-                "action": ev.action,
-                "coalesce_key": f"{self._instance_id}:{sk}:{mk}",
-            }
-        )
+        job = {
+            "event": ev,
+            "cfg": dict(cfg),
+            "path": decision.path,
+            "progress": decision.progress,
+            "record_watched": decision.record_watched,
+            "action": ev.action,
+            "coalesce_key": f"{self._instance_id}:{sk}:{mk}",
+        }
+        if (ev.raw or {}).get("_cw_episode_group"):
+            return self._deliver(job)
+        self._enqueue(job)

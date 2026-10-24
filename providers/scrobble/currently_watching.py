@@ -17,6 +17,41 @@ from cw_platform.local_db.currently_watching import load_state as _db_load_state
 from cw_platform.local_db.currently_watching import replace_state as _db_replace_state
 from providers.scrobble.scrobble import ScrobbleEvent
 
+
+def _instance_label(cfg: Any, source: Any, provider_instance: Any) -> str:
+    inst = str(provider_instance or "").strip() or "default"
+    try:
+        from cw_platform.provider_instances import get_instance_block, sanitize_instance_label
+
+        return sanitize_instance_label(get_instance_block(cfg, str(source or ""), inst).get("label"))
+    except Exception:
+        return ""
+
+
+def _with_instance_labels(state: Any) -> Any:
+    if not isinstance(state, dict):
+        return state
+    streams = state.get("streams")
+    if not isinstance(streams, dict) or not streams:
+        return state
+    try:
+        from cw_platform.config_base import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        return state
+    seen: dict[tuple[str, str], str] = {}
+    for payload in streams.values():
+        if not isinstance(payload, dict):
+            continue
+        source = str(payload.get("source") or "")
+        inst = str(payload.get("provider_instance") or "")
+        key = (source, inst)
+        if key not in seen:
+            seen[key] = _instance_label(cfg, source, inst)
+        payload["provider_instance_label"] = seen[key]
+    return state
+
 STATE_VERSION = 2
 PRUNE_AFTER_SEC = 10 * 60
 ACTIVE_STATES = {"playing", "paused", "buffering"}
@@ -37,7 +72,7 @@ def _log(msg: str, lvl: str = "DEBUG") -> None:
 
 
 def load_state() -> dict[str, Any]:
-    return _db_load_state()
+    return _with_instance_labels(_db_load_state())
 
 
 def clear_state() -> int:
@@ -118,7 +153,7 @@ def _payload_key(source: str, payload: dict[str, Any]) -> str:
     raw_ids = payload.get("ids")
     ids: dict[str, Any] = raw_ids if isinstance(raw_ids, dict) else {}
     mt = str(payload.get("media_type") or payload.get("type") or "").lower()
-    season = str(payload.get("season") or "").strip()
+    season = "" if payload.get("season") is None else str(payload.get("season")).strip()
     episode = str(payload.get("episode") or "").strip()
 
     def _id(*keys: str) -> str:
@@ -143,7 +178,7 @@ def _payload_key(source: str, payload: dict[str, Any]) -> str:
     mt = str(payload.get("media_type") or payload.get("type") or "").lower()
     title = str(payload.get("title") or "")
     year = str(payload.get("year") or "")
-    season = str(payload.get("season") or "")
+    season = "" if payload.get("season") is None else str(payload.get("season"))
     episode = str(payload.get("episode") or "")
     pi = f":{provider_instance}" if provider_instance else ""
     return f"{source}{pi}:{mt}:{title}:{year}:{season}:{episode}"

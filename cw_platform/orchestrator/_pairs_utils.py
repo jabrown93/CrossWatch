@@ -5,10 +5,21 @@ from __future__ import annotations
 from collections.abc import Mapping, Callable
 from typing import Any
 import importlib
+import threading
 from collections.abc import Mapping as _Mapping
-from ..id_map import canonical_key as _ck, ID_KEYS
+from ..id_map import canonical_key as _ck, keys_for_item, migrate_media_key, ID_KEYS
+from ._planner import _rating_step
+from ..provider_instances import _config_key_for, normalize_instance_id
 
-LIBRARY_SCOPED_FEATURES = frozenset({"history", "ratings", "progress"})
+
+def pair_endpoint_config(cfg: Mapping[str, Any], provider: str, instance: str) -> dict[str, Any]:
+    blocks = cfg.get("_cw_pair_instance_blocks") or {}
+    block = (blocks.get(provider) or {}).get(normalize_instance_id(instance))
+    if block is None:
+        return dict(cfg)
+    return {**cfg, _config_key_for(cfg, provider): block, "_cw_provider_instance": normalize_instance_id(instance)}
+
+LIBRARY_SCOPED_FEATURES = frozenset({"history", "ratings", "progress", "collection"})
 
 LIBRARY_PROVIDER_KEYS = {
     "PLEX": "plex",
@@ -18,14 +29,16 @@ LIBRARY_PROVIDER_KEYS = {
 }
 
 
-def pair_feature_libraries(fcfg: Any, provider: str) -> list[str]:
+def pair_feature_libraries(fcfg: Any, provider: str, instance: str | None = None) -> list[str]:
     lib_cfg = (fcfg or {}).get("libraries") if isinstance(fcfg, Mapping) else None
     if not isinstance(lib_cfg, Mapping):
         return []
     name = str(provider or "").strip()
-    per = lib_cfg.get(name.upper())
-    if per is None:
-        per = lib_cfg.get(name.lower())
+    endpoint_key = f"{name.upper()}#{normalize_instance_id(instance)}"
+    if instance is not None and endpoint_key in lib_cfg:
+        per = lib_cfg[endpoint_key]
+    else:
+        per = lib_cfg.get(name.upper(), lib_cfg.get(name.lower()))
     if not isinstance(per, (list, tuple)):
         return []
     return [str(x).strip() for x in per if str(x).strip()]
@@ -46,7 +59,7 @@ def config_with_pair_libraries(
         key = LIBRARY_PROVIDER_KEYS.get(str(provider or "").strip().upper())
         if not key:
             continue
-        libs = pair_feature_libraries(fcfg, provider)
+        libs = pair_feature_libraries(fcfg, provider, cfg.get("_cw_provider_instance"))
         if not libs:
             continue
         if out is None:
@@ -58,6 +71,52 @@ def config_with_pair_libraries(
         out[key] = block
 
     return out if out is not None else base
+
+
+def ratings_step_for(ops) -> float:
+    try:
+        caps = ops.capabilities() or {}
+        per = caps.get("ratings") if isinstance(caps, Mapping) else None
+        if isinstance(per, Mapping):
+            return _rating_step(per.get("step"))
+    except Exception:
+        pass
+    return 1.0
+
+
+def ratings_zero_for(ops) -> bool:
+    try:
+        return (ops.capabilities().get("ratings") or {}).get("zero_is_rating") is True
+    except Exception:
+        return False
+
+
+_DECLARED_TYPE_ALIASES = {
+    "movies": "movie", "movie": "movie", "shows": "show", "show": "show", "series": "show", "tv": "show", "anime": "show",
+    "seasons": "season", "season": "season", "episodes": "episode", "episode": "episode",
+}
+
+
+def declared_types_for(ops, feature: str) -> set[str] | None:
+    try:
+        per = (ops.capabilities() or {}).get(feature)
+    except Exception:
+        return None
+    raw = per.get("types") if isinstance(per, Mapping) else None
+    if isinstance(raw, Mapping):
+        names = [name for name, enabled in raw.items() if enabled]
+    elif isinstance(raw, (list, tuple, set)):
+        names = list(raw)
+    else:
+        return None
+    return {_DECLARED_TYPE_ALIASES.get(str(name).strip().lower(), str(name).strip().lower()) for name in names}
+
+
+def collection_media_updates_for(ops) -> bool:
+    try:
+        return (ops.capabilities().get("collection") or {}).get("media_updates") is True
+    except Exception:
+        return False
 
 
 def supports_feature(ops, feature: str) -> bool:
@@ -118,10 +177,22 @@ def rate_remaining(h: Mapping[str, Any] | None) -> int | None:
     except Exception:
         return None
 
+_CTX_MISSING = object()
+_CTX_TARGETS: dict[int, tuple[Any, Any]] = {}
+_CTX_TARGETS_LOCK = threading.Lock()
+
+
+def _set_ctx(target: Any, ctx: Any) -> None:
+    with _CTX_TARGETS_LOCK:
+        if id(target) not in _CTX_TARGETS:
+            _CTX_TARGETS[id(target)] = (target, getattr(target, "ctx", _CTX_MISSING))
+    setattr(target, "ctx", ctx)
+
+
 def inject_ctx_into_provider(ops, ctx) -> None:
     try:
         try:
-            setattr(ops, "ctx", ctx)
+            _set_ctx(ops, ctx)
         except Exception:
             pass
 
@@ -131,7 +202,7 @@ def inject_ctx_into_provider(ops, ctx) -> None:
 
         try:
             mod = importlib.import_module(modname)
-            setattr(mod, "ctx", ctx)
+            _set_ctx(mod, ctx)
         except Exception:
             pass
 
@@ -147,13 +218,28 @@ def inject_ctx_into_provider(ops, ctx) -> None:
                     continue
                 try:
                     cmod = importlib.import_module(cname)
-                    setattr(cmod, "ctx", ctx)
+                    _set_ctx(cmod, ctx)
                 except Exception:
                     continue
         except Exception:
             pass
     except Exception:
         pass
+
+
+def release_ctx_from_providers(ctx) -> None:
+    with _CTX_TARGETS_LOCK:
+        for key, (target, original) in list(_CTX_TARGETS.items()):
+            try:
+                if getattr(target, "ctx", None) is not ctx:
+                    continue
+                if original is _CTX_MISSING:
+                    delattr(target, "ctx")
+                else:
+                    setattr(target, "ctx", original)
+                _CTX_TARGETS.pop(key, None)
+            except Exception:
+                continue
 
 def pair_key(a: str, b: str, *, mode: str = "two-way", src: str | None = None, dst: str | None = None) -> str:
     try:
@@ -167,10 +253,12 @@ def pair_key(a: str, b: str, *, mode: str = "two-way", src: str | None = None, d
     A, B = str(a).upper(), str(b).upper()
     return "-".join(sorted([A, B]))
 
-def manual_policy(state: _Mapping[str, Any] | None, provider: str, feature: str) -> tuple[dict[str, Any], set[str]]:
+def manual_policy(state: _Mapping[str, Any] | None, provider: str, feature: str, instance: str = "default") -> tuple[dict[str, Any], set[str]]:
     st = state or {}
     provs = st.get("providers") or {}
     p = provs.get(str(provider).upper()) or provs.get(str(provider).lower()) or {}
+    if instance != "default":
+        p = (p.get("instances") or {}).get(instance) or {}
     feat_key = str(feature).lower()
 
     f: Any = {}
@@ -201,10 +289,36 @@ def manual_policy(state: _Mapping[str, Any] | None, provider: str, feature: str)
     if isinstance(adds_raw, dict):
         for k, v in adds_raw.items():
             kk = str(k).strip()
-            if kk:
-                adds[kk] = v
+            if not kk:
+                continue
+            current = migrate_media_key(kk, v) if isinstance(v, _Mapping) else kk
+            if current not in adds or current == kk:
+                adds[current] = v
 
     return adds, blocks
+
+
+def manual_corrections(state: _Mapping[str, Any] | None, provider: str, feature: str, instance: str = "default") -> set[str]:
+    provs = (state or {}).get("providers") or {}
+    node = provs.get(str(provider).upper()) or provs.get(str(provider).lower()) or {}
+    if instance != "default":
+        node = (node.get("instances") or {}).get(instance) or {}
+    feat_key = str(feature).lower()
+    manual = node.get("manual")
+    block = manual.get(feat_key) if isinstance(manual, _Mapping) else None
+    if not isinstance(block, _Mapping) or not block:
+        block = node.get(feat_key)
+    if not isinstance(block, _Mapping):
+        return set()
+    records = block.get("mappings")
+    items = (block.get("adds") or {}).get("items") or {}
+    out: set[str] = set()
+    for key, record in (records.items() if isinstance(records, _Mapping) else ()):
+        original = record.get("original_key") if isinstance(record, _Mapping) else None
+        if original and str(original) != str(key):
+            item = items.get(key)
+            out.add(migrate_media_key(str(key), item) if isinstance(item, _Mapping) else str(key))
+    return out
 
 
 def merge_manual_adds(idx: dict[str, Any], adds: _Mapping[str, Any] | None) -> dict[str, Any]:
@@ -215,6 +329,11 @@ def merge_manual_adds(idx: dict[str, Any], adds: _Mapping[str, Any] | None) -> d
         kk = str(k).strip()
         if not kk:
             continue
+        if isinstance(v, _Mapping):
+            for alias in keys_for_item(v):
+                existing = out.get(alias)
+                if alias != kk and isinstance(existing, _Mapping) and existing.get("type") == v.get("type"):
+                    out.pop(alias, None)
         out[kk] = v
     return out
 
@@ -235,12 +354,16 @@ def filter_manual_block(items: list[dict[str, Any]] | None, blocked: set[str] | 
             pass
 
         ids = it.get("ids") or {}
+        show = str(it.get("type") or "").strip().lower() in ("show", "shows", "series", "tv", "anime")
         if isinstance(ids, _Mapping):
             for k in ID_KEYS:
                 v = ids.get(k)
                 if v is None or str(v) == "":
                     continue
-                if f"{str(k).lower()}:{str(v).lower()}" in blk:
+                token = f"{str(k).lower()}:{str(v).lower()}"
+                if show and k == "tmdb":
+                    token = f"{token}#show"
+                if token in blk:
                     return True
 
         t = str(it.get("title") or "").strip().lower()

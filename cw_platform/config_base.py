@@ -8,6 +8,8 @@ import json
 import os
 import re
 import secrets
+import stat
+import sys
 import base64
 import hashlib
 import threading
@@ -19,6 +21,7 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 from .config_env import apply_env_overrides, env_overrides
+from cw_platform.profile_preferences import clean_user_preferences
 
 
 def _current_version_norm() -> str:
@@ -53,14 +56,23 @@ DEFAULT_SCHEDULER_WEBHOOKS: dict[str, Any] = {
     "failure_url": "",
     "payload_format": "crosswatch",
     "notifiarr_channel_id": "",
+    "pushover_token": "",
+    "pushover_user": "",
     "timeout_seconds": 10,
     "alert_on_unresolved": False,
+    "alert_on_watcher": False,
+    "alert_on_provider_auth": False,
 }
 
 _ENC_PREFIX = "enc:v1:"
 MASS_DELETE_SAFETY_CONFIG_VERSION = 1
 _CONFIG_LOCK = threading.RLock()
 _CONFIG_FILE_LOCK_STATE = threading.local()
+_KEY_CACHE_LOCK = threading.Lock()
+_KEY_CACHE: dict[tuple[Any, ...], bytes] = {}
+_CIPHER_CACHE: dict[bytes, Any] = {}
+_CFG_CACHE_LOCK = threading.Lock()
+_CFG_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 def _config_key_file() -> Path:
     return CONFIG / ".cw_master_key"
@@ -109,8 +121,23 @@ def _load_config_key(*, create: bool) -> bytes | None:
             return _normalize_fernet_key(raw)
 
     key_path = _config_key_file()
-    if key_path.exists():
-        return _normalize_fernet_key(key_path.read_text(encoding="utf-8"))
+    try:
+        st = key_path.stat()
+        stamp: tuple[Any, ...] | None = (str(key_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp is not None:
+        with _KEY_CACHE_LOCK:
+            cached = _KEY_CACHE.get(stamp)
+        if cached is not None:
+            return cached
+        raw = key_path.read_text(encoding="utf-8")
+        _apply_owner_mode(key_path, _ownership_reference(_cfg_file()), mode=0o600)
+        key = _normalize_fernet_key(raw)
+        with _KEY_CACHE_LOCK:
+            _KEY_CACHE.clear()
+            _KEY_CACHE[stamp] = key
+        return key
 
     if not create:
         return None
@@ -123,10 +150,7 @@ def _load_config_key(*, create: bool) -> bytes | None:
     key = Fernet.generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.write_text(key.decode("ascii"), encoding="utf-8")
-    try:
-        os.chmod(key_path, 0o600)
-    except Exception:
-        pass
+    _apply_owner_mode(key_path, _ownership_reference(_cfg_file()), mode=0o600)
     return key
 
 
@@ -134,11 +158,19 @@ def _get_cipher(*, create: bool):
     key = _load_config_key(create=create)
     if not key:
         return None
+    with _KEY_CACHE_LOCK:
+        cipher = _CIPHER_CACHE.get(key)
+    if cipher is not None:
+        return cipher
     try:
         from cryptography.fernet import Fernet
     except Exception as e:
         raise RuntimeError("Missing dependency: cryptography is required for encrypted config support") from e
-    return Fernet(key)
+    cipher = Fernet(key)
+    with _KEY_CACHE_LOCK:
+        _CIPHER_CACHE.clear()
+        _CIPHER_CACHE[key] = cipher
+    return cipher
 
 
 def _encrypt_secret(value: str) -> str:
@@ -188,7 +220,7 @@ def _is_sensitive_path(path: tuple[str, ...]) -> bool:
         return True
 
     if len(clean) >= 3 and clean[0] == "scheduling" and clean[1] == "webhooks":
-        if clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url"}:
+        if clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url", "pushover_token", "pushover_user"}:
             return True
 
     leaf = clean[-1]
@@ -198,7 +230,7 @@ def _is_sensitive_path(path: tuple[str, ...]) -> bool:
         "client_secret",
         "account_token", "pms_token", "home_pin",
         "session_id",
-        "token_hash", "salt", "hash",
+        "token_hash", "token_digest", "salt", "hash",
         "device_code",
         "pending_secret",
         "_pending_request_token",
@@ -211,6 +243,7 @@ def _is_sensitive_path(path: tuple[str, ...]) -> bool:
         "password",
         "secret",
         "webhook_secret",
+        "webhook_url",
     }
     if leaf in exact:
         return True
@@ -276,7 +309,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "home_pin": "",                                 # Plex Home PIN for the selected profile (optional).
         "timeout": 10.0,                                # Optional HTTP timeout (seconds).
         "max_retries": 3,                               # Optional retry budget.
-        "fallback_GUID": False,                         # Opt-in GUID/Discover fallback for missing library items (history/ratings)
+        "fallback_GUID": False,
 
         "scrobble": {
             "libraries": [],                            # Whitelist of library IDs for scrobble (webhook/watch); empty = all
@@ -312,6 +345,8 @@ DEFAULT_CFG: dict[str, Any] = {
 
     "simkl": {
         "access_token": "",                             # OAuth2 / PIN access token
+        "refresh_token": "",
+        "token_expires_at": 0,
         "auth_method": "",                              # "pin" | "oauth" (metadata; runtime uses access_token + client_id)
         "client_id": "",                                # From your Simkl app (OAuth); baked app id when connected via PIN
         "client_secret": "",                            # From your Simkl app
@@ -323,15 +358,26 @@ DEFAULT_CFG: dict[str, Any] = {
         # Rate limits
         "rate_limit": {
             "post_per_sec": 1,
-            "get_per_sec": 10,
+            "get_per_sec": 2,
         },
     },
     
+    "kitsu": {
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "scope": "",
+        "user": {},
+        "reauth_required": False,
+    },
     "anilist": {
         "client_id": "",                                # From your AniList app
         "client_secret": "",                            # From your AniList app
         "access_token": "",                             # OAuth access token (saved after auth)
         "user": {},                                     # Viewer object (id/name)
+        "rate_limit": {
+            "post_per_sec": 0.45,
+        },
     },
 
     "mdblist": {
@@ -355,12 +401,12 @@ DEFAULT_CFG: dict[str, Any] = {
         # Watchlist
         "watchlist_shadow_ttl_hours": 0,                # Shadow TTL (hours); 0 = disabled
         "watchlist_shadow_validate": True,              # Validate shadow on every run
-        "watchlist_page_size": 200,                     # GET page size for /watchlist/items
+        "watchlist_page_size": 1000,                    # GET page size for /watchlist/items
         "watchlist_batch_size": 500,                    # Batch size for add/remove writes
         "watchlist_freeze_details": True,               # Store extra details for "not_found" freezes
 
         # Ratings
-        "ratings_per_page": 200,                        # Items per page when indexing
+        "ratings_per_page": 1000,                       # Items per page when indexing
         "ratings_max_pages": 50,                        # Max pages to fetch (safety cap)
         "ratings_chunk_size": 500,                      # Batch size for POST/REMOVE
         "ratings_write_delay_ms": 600,                  # Optional pacing between writes
@@ -384,10 +430,10 @@ DEFAULT_CFG: dict[str, Any] = {
         "watchlist_list_id": "",                        # Optional list id; empty = discover/create
         "watchlist_name": "Watchlist",                  # Default PublicMetaDB list name; pair config can override
         "watchlist_auto_create": True,                  # Create a private CrossWatch watchlist if missing
-        "watchlist_page_size": 100,                     # GET page size for list items
-        "history_per_page": 100,                        # GET page size for watched history
+        "watchlist_page_size": 500,                     # GET page size for list items
+        "history_per_page": 500,                        # GET page size for watched history
         "history_max_pages": 1000,                      # Safety cap for watched history fetches
-        "progress_per_page": 100,                       # GET page size for resume/progress
+        "progress_per_page": 500,                       # GET page size for resume/progress
         "progress_max_pages": 1000,                     # Safety cap for resume/progress fetches
         "ratings_label": "Overall",                     # PublicMetaDB rating label used by CrossWatch
         "ratings_submit_per_hour": 200,                 # PublicMetaDB contribution limit for rating creates
@@ -396,6 +442,30 @@ DEFAULT_CFG: dict[str, Any] = {
             "post_per_sec": 3,
             "get_per_sec": 20,
         },
+    },
+
+    "myanimelist": {
+        "auth_method": "hosted_oauth",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "bearer",
+        "expires_at": 0,
+        "username": "",
+        "user_id": "",
+        "auth_broker": "",
+        "reauth_required": False,
+    },
+
+    "wetrakr": {
+        "auth_method": "pkce",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "bearer",
+        "expires_at": 0,
+        "username": "",
+        "user_id": "",
+        "plan": "",
+        "reauth_required": False,
     },
 
     "punchplay": {
@@ -422,7 +492,42 @@ DEFAULT_CFG: dict[str, Any] = {
         },
     },
 
+    "bingebase": {
+        "auth_method": "device_code",
+        "access_token": "",
+        "username": "",
+        "user_id": "",
+        "webhook_url": "",
+        "api_key": "",
+        "timeout": 20.0,
+    },
+
+    "flicklist": {
+        "auth_method": "device_code",
+        "api_key": "",
+        "access_token": "",
+        "token": "",
+        "credential": "",
+        "client_id": "",                                # Optional override; CrossWatch FlickList app client_id is supplied internally
+        "expires_at": 0,
+        "stored_at": 0,
+        "username": "",
+        "user_id": "",
+        "display_name": "",
+        "avatar_url": "",
+        "timeout": 20.0,
+        "max_retries": 3,
+        "write_batch_size": 1000,
+        "history_per_page": 500,
+        "history_max_pages": 500,
+        "rate_limit": {
+            "get_per_sec": 0.2,
+            "post_per_sec": 0.2,
+        },
+    },
+
     "nuvio": {
+        "server_mode": "cloud",                         # "cloud" or "self_hosted"
         "base_url": "https://api.nuvio.tv",
         "access_token": "",
         "refresh_token": "",
@@ -485,13 +590,33 @@ DEFAULT_CFG: dict[str, Any] = {
          "history": {
              "user_id": "",                             # Optional user filter
              "per_page": 100,                           # Tautulli history page size
-             "max_pages": 5000                          # Safety cap
+             "max_pages": 5000,                         # Safety cap
+             "watched_only": True,                      # Skip partial playback sessions (Tautulli logs every play)
+             "min_percent": 90                          # Completion fallback when watched_status is absent
          },
      },
+
+    "tracearr": {
+        "server_url": "",                               # http(s)://host:3000
+        "api_key": "",                                  # Tracearr public API key (trr_pub_...)
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 10.0,                                # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget
+        "history": {
+            "user_id": "",                              # Optional Tracearr user id filter
+            "server_id": "",                            # Optional Tracearr server id filter
+            "per_page": 100,                            # Tracearr history page size (max 100)
+            "max_pages": 5000,                          # Safety cap
+            "watched_only": True,                       # Skip partial plays (uses the Tracearr watched flag)
+            "min_percent_movie": 85,                    # Completion fallback when the watched flag is absent
+            "min_percent_episode": 85                   # Completion fallback when the watched flag is absent
+        },
+    },
 
     "trakt": {
         "client_id": "",                                # From your Trakt app
         "client_secret": "",                            # From your Trakt app
+        "auth_method": "",
         "access_token": "",                             # OAuth2 access token
         "refresh_token": "",                            # OAuth2 refresh token
         "scope": "public",                              # OAuth2 scope (usually "public" or "private")
@@ -503,7 +628,7 @@ DEFAULT_CFG: dict[str, Any] = {
 
         # Rate limits
         "rate_limit": {
-            "get_per_sec": 3.33,
+            "get_per_sec": 1.66,
             "post_per_sec": 1,
         },
 
@@ -515,12 +640,12 @@ DEFAULT_CFG: dict[str, Any] = {
         "watchlist_freeze_details": True,               # Persist last status & ids in freeze store for debugging
 
         # Ratings
-        "ratings_per_page": 100,                        # Items per page when indexing (10–100; clamped to 100)
+        "ratings_per_page": 250,                        # Items per page when indexing (10–250; clamped to 250)
         "ratings_max_pages": 50,                        # Max pages per type; raise if you have >2k ratings/type
         "ratings_chunk_size": 100,                      # Batch size for POST/REMOVE
 
         # History
-        "history_per_page": 100,                        # Max allowed by Trakt; fastest without spamming
+        "history_per_page": 250,
         "history_max_pages": 10000,                     # Safety cap for huge libraries; lower to bound runtime
         "history_chunk_size": 100,                      # Batch size for history add/remove writes
         "history_unresolved": False,                    # bool, default false (enable the freeze file)
@@ -529,7 +654,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "_pending_device": {
             "user_code": "",                            # Temporary device code state for PIN login
             "device_code": "",                          # Temporary device code state for PIN login
-            "verification_url": "https://trakt.tv/activate",
+            "verification_url": "https://auth.trakt.tv/activate",
             "interval": 5,                              # Polling interval (seconds)
             "expires_at": 0,                            # Epoch when device_code expires
             "created_at": 0,                            # Epoch when device_code was created
@@ -539,7 +664,12 @@ DEFAULT_CFG: dict[str, Any] = {
     "api_key": "",                                      # v3 API Key (required)
     "session_id": "",                                   # v3 Session ID (filled after Connect)
     "account_id": "",                                   # v3 Account ID (auto-filled)
+    "read_token": "",                                   # v4 API Read Access Token (needed for lists)
+    "access_token": "",                                 # v4 user access token (filled after Connect)
+    "account_object_id": "",                            # v4 Account ID (auto-filled)
+    "v4_session_ref": "",                               # Ties the v4 token to the session it was created with
     "_pending_request_token": "",                       # Temporary token waiting for approval
+    "_pending_v4": False,                               # Pending token came from the v4 flow
     "_pending_created_at": 0,                           # Epoch when request token was created
     "timeout": 15.0,
     "max_retries": 3,
@@ -557,6 +687,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "webhook_secret": "",                           # Shared secret for X-CW-Webhook-Secret verification
         "timeout": 15.0,                                # HTTP timeout (seconds)
         "max_retries": 3,                               # Retry budget for API calls
+        "targeted_lookup": True,                        # Cache movie/series IDs; fetch matched series episodes. False indexes all episodes.
 
         "scrobble": {
             "libraries": []                             # whitelist of library GUIDs; empty = all
@@ -659,7 +790,7 @@ DEFAULT_CFG: dict[str, Any] = {
     },
 
     "crosswatch": {
-        "connected":        False,                      # True after local tracker connection is created
+        "connected":        True,                       # Fresh installs enable the local tracker by default
         "root_dir":         "/config/.cw_provider",     # Root folder for local provider state
         "enabled":          True,                       # Enable/disable CrossWatch as sync provider
         "retention_days":   30,                         # Snapshot retention in days; 0 = keep forever
@@ -717,6 +848,8 @@ DEFAULT_CFG: dict[str, Any] = {
         "debug_mods": False,                            # Extra verbode MODS logging for Synchronization Providers
         "state_dir": "",                                # Optional override for state dir (defaults to CONFIG/state)  - this will break container setups!
         "telemetry": {"enabled": True},                 # Usage stats
+        "max_profiles_per_provider": 10,                # Total profiles per provider incl. default (1-100)
+        "history_timestamp_tolerance_seconds": 60,      # Same-viewing history match window; 0 requires exact timestamps
 
         # progress
         "snapshot_ttl_sec": 300,                        # Reuse snapshots within 5 min
@@ -724,8 +857,10 @@ DEFAULT_CFG: dict[str, Any] = {
         "apply_chunk_pause_ms": 50,                     # Small pause between chunks
         "apply_chunk_size_by_provider": {               # Provider-specific apply chunk overrides
             "SIMKL": 500,
+            "WETRAKR": 500,
             "MDBLIST": 500,
             "PUBLICMETADB": 500,
+            "FLICKLIST": 1000,
             "PLEX": 500,
             "JELLYFIN": 500,
             "EMBY": 500,
@@ -755,8 +890,16 @@ DEFAULT_CFG: dict[str, Any] = {
         "release_tag": "v3",                            # AniBridge release tag
         "refresh_hours": 24,                            # Minimum age before an automatic refresh is considered
         "stale_after_days": 14,                         # UI/status warning threshold
-        "use_for_pairs": ["anilist", "simkl"],          # Providers that activate anime mapping when present in a pair ("*" = any pair)
+        "use_for_pairs": ["anilist", "myanimelist", "kitsu", "simkl", "crosswatch"],  # Providers that activate anime mapping when present in a pair ("*" = any pair)
         "features": ["watchlist", "ratings", "history"],  # Sync features where anime mapping may apply; history is opt-in per pair
+    },
+
+    "assistant": {
+        "enabled": False,
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "wiki_help": True,
     },
 
     # --- Scrobble ------------------------------------------------------------
@@ -772,7 +915,13 @@ DEFAULT_CFG: dict[str, Any] = {
             "routes": [],                               # Route-based config
             "plex_simkl_ratings": False,                # Watch mode: forward Plex ratings to SIMKL
             "plex_trakt_ratings": False,                # Watch mode: forward Plex ratings to Trakt
+            "plex_wetrakr_ratings": False,
+            "plex_anilist_ratings": False,
+            "plex_kitsu_ratings": False,
+            "plex_myanimelist_ratings": False,
             "plex_mdblist_ratings": False,              # Watch mode: forward Plex ratings to MDblist
+            "plex_flicklist_ratings": False,            # Watch mode: forward Plex ratings to FlickList
+            "plex_scrob_ratings": False,                # Watch mode: forward Plex ratings to Scrob
             "pause_debounce_seconds": 5,                # Ignore micro-pauses just after start
             "suppress_start_at": 99,                    # Kill near-end "start" flaps (credits)
             "filters": {
@@ -790,6 +939,8 @@ DEFAULT_CFG: dict[str, Any] = {
             "suppress_autoplay_seconds": 15,            # Plex autoplay when set on 10 sec (increase a few sec)
             "probe_session_progress": True,             # Call GET /status/sessions on your Plex server and match the item by ratingKey/sessionKey
             "plex_trakt_ratings": False,                # Watch mode: forward Plex ratings to Trakt
+            "plex_flicklist_ratings": False,            # Watch mode: forward Plex ratings to FlickList
+            "plex_scrob_ratings": False,                # Watch mode: forward Plex ratings to Scrob
             # Plex-only filters
             "filters_plex": {
                 "username_whitelist": [],               # Restrict accepted Account.title values (empty = allow all)
@@ -815,6 +966,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "every_n_hours": 12,                            # When mode=every_n_hours, run every N hours (2+ recommended)
         "daily_time": "03:30",                          # When mode=daily_time, run at this time (HH:MM, 24h)
         "custom_interval_minutes": 60,                  # When mode=custom_interval, run every N minutes (minimum 15)
+        "jitter_seconds": 300,                          # Random delay added to each scheduled run so installs do not all fire at once
         "webhooks": dict(DEFAULT_SCHEDULER_WEBHOOKS),    # Optional outbound scheduler lifecycle callbacks
         "advanced": {
             "enabled": False,                           # Advanced scheduler master toggle
@@ -867,6 +1019,7 @@ DEFAULT_CFG: dict[str, Any] = {
             "expires_at": 0,
         },
         "sessions": [],
+        "api_tokens": [],
         "last_login_at": 0,
         "users": {},
         # External OIDC SSO (e.g. Authentik). Login requires a linked identity;
@@ -949,7 +1102,7 @@ _SECRET_PATHS: list[tuple[str, ...]] = [
     ("app_auth", "password", "salt"),
     ("app_auth", "session", "token_hash"),
     ("app_auth", "oidc", "client_secret"),
-    # API key
+    # Removed static API key; still redacted if an old config.json carries one.
     ("security", "api_key"),
 ]
 
@@ -973,22 +1126,29 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # Provider-specific secret fields
     provider_secret_keys: dict[str, set[str]] = {
         "plex": {"account_token", "pms_token", "home_pin", "webhook_secret"},
-        "simkl": {"access_token", "client_secret", "_pending_pin"},
+        "simkl": {"access_token", "refresh_token", "client_secret", "_pending_pin"},
         "anilist": {"access_token", "client_secret"},
+        "kitsu": {"access_token", "refresh_token", "password"},
         "mdblist": {"api_key", "access_token", "refresh_token", "_pending_device"},
         "publicmetadb": {"api_key"},
+        "myanimelist": {"access_token", "refresh_token"},
+        "wetrakr": {"access_token", "refresh_token"},
         "punchplay": {"access_token", "refresh_token", "_pending_device"},
+        "bingebase": {"access_token", "webhook_url", "api_key", "_pending_device"},
+        "flicklist": {"api_key", "access_token", "token", "_pending_device"},
         "nuvio": {"access_token", "refresh_token", "_pending_tv_login", "_pending_tv_caller"},
         "stremio": {"auth_key", "authKey"},
         "floppy": {"api_token"},
         "scrob": {"api_key", "password", "access_token"},
         "tautulli": {"api_key"},
+        "tracearr": {"api_key"},
         "trakt": {"access_token", "refresh_token", "client_secret"},
         "jellyfin": {"access_token", "api_key", "password", "webhook_secret"},
         "emby": {"access_token", "api_key", "password", "webhook_secret"},
         "kodi": {"password"},
         "tmdb": {"api_key"},
-        "tmdb_sync": {"api_key", "session_id", "_pending_request_token"},
+        "tmdb_sync": {"api_key", "session_id", "_pending_request_token", "read_token", "access_token", "_pending_access_token"},
+        "assistant": {"api_key"},
     }
 
     MASK = _REDACT
@@ -1056,6 +1216,16 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(s, dict) and s.get("token_hash"):
                     s["token_hash"] = MASK
 
+        api_tokens = a.get("api_tokens")
+        if isinstance(api_tokens, list):
+            for t in api_tokens:
+                if isinstance(t, dict) and t.get("token_hash"):
+                    t["token_hash"] = MASK
+                if isinstance(t, dict) and t.get("token_digest"):
+                    t["token_digest"] = MASK
+                if isinstance(t, dict) and t.get("secret"):
+                    t["secret"] = MASK
+
         totp = a.get("totp")
         if isinstance(totp, dict):
             _mask_leaf(totp, "secret")
@@ -1092,7 +1262,7 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if isinstance(scheduling, dict):
         hooks = scheduling.get("webhooks")
         if isinstance(hooks, dict):
-            for key in ("url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url"):
+            for key in ("url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url", "pushover_token", "pushover_user"):
                 _mask_leaf(hooks, key)
 
     return out
@@ -1110,13 +1280,19 @@ CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
     "emby",
     "kodi",
     "tautulli",
+    "tracearr",
     "trakt",
     "simkl",
     "mdblist",
     "anilist",
+    "myanimelist",
+    "kitsu",
     "tmdb_sync",
     "publicmetadb",
+    "wetrakr",
     "punchplay",
+    "bingebase",
+    "flicklist",
     "nuvio",
     "stremio",
     "floppy",
@@ -1125,6 +1301,7 @@ CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
     "metadata",
     "tmdb",
     "anime_mapping",
+    "assistant",
     "sync",
     "pairs",
     "scrobble",
@@ -1136,14 +1313,18 @@ CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
     "ui",
 )
 
-OBSOLETE_CONFIG_KEYS: tuple[str, ...] = ("mobile_auth",)
+OBSOLETE_CONFIG_KEYS: tuple[str, ...] = ("mobile_auth", "runtime.kodi_addon")
 
 
 def cleanup_obsolete_config_keys(cfg: dict[str, Any]) -> list[str]:
     changed: list[str] = []
     for key in OBSOLETE_CONFIG_KEYS:
-        if key in cfg:
-            cfg.pop(key, None)
+        *parents, leaf = key.split(".")
+        node: Any = cfg
+        for part in parents:
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, dict) and leaf in node:
+            node.pop(leaf, None)
             changed.append(key)
     return changed
 
@@ -1163,6 +1344,42 @@ def _cfg_file() -> Path:
     return CONFIG / "config.json"
 
 
+def _ownership_reference(path: Path) -> os.stat_result | None:
+    path_stat: os.stat_result | None = None
+    parent_stat: os.stat_result | None = None
+    try:
+        if path.exists():
+            path_stat = path.stat()
+    except Exception:
+        path_stat = None
+    try:
+        if path.parent.exists():
+            parent_stat = path.parent.stat()
+    except Exception:
+        parent_stat = None
+    if os.name != "nt" and path_stat is not None and parent_stat is not None:
+        try:
+            if os.geteuid() == 0 and path_stat.st_uid == 0 and parent_stat.st_uid != 0:
+                return parent_stat
+        except Exception:
+            pass
+    return path_stat or parent_stat
+
+
+def _apply_owner_mode(path: Path, ref: os.stat_result | None, *, mode: int | None = None) -> None:
+    if ref is None:
+        return
+    if os.name != "nt":
+        try:
+            os.chown(path, ref.st_uid, ref.st_gid)
+        except Exception:
+            pass
+    try:
+        os.chmod(path, mode if mode is not None else stat.S_IMODE(ref.st_mode))
+    except Exception:
+        pass
+
+
 @contextmanager
 def _config_file_lock() -> Iterator[None]:
     depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0) or 0)
@@ -1174,8 +1391,18 @@ def _config_file_lock() -> Iterator[None]:
             _CONFIG_FILE_LOCK_STATE.depth = depth
         return
     lock_path = CONFIG / "config.json.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as f:
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        f = lock_path.open("a+b")
+    except PermissionError:
+        _CONFIG_FILE_LOCK_STATE.depth = 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_STATE.depth = 0
+        return
+    _apply_owner_mode(lock_path, _ownership_reference(_cfg_file()), mode=0o660)
+    with f:
         _CONFIG_FILE_LOCK_STATE.depth = 1
         try:
             try:
@@ -1249,11 +1476,17 @@ def _write_json_atomic(p: Path, data: dict[str, Any]) -> None:
 
         suffix = f".{_time.time_ns()}.{_os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
         tmp = p.with_suffix(suffix)
+        ref = _ownership_reference(p)
+        mode = stat.S_IMODE(ref.st_mode) if ref is not None and p.exists() else 0o600
 
         with tmp.open("w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
+        _apply_owner_mode(tmp, ref, mode=mode)
         tmp.replace(p)
+        _apply_owner_mode(p, ref, mode=mode)
+        if p == _cfg_file():
+            invalidate_config_cache()
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1314,12 +1547,20 @@ def _normalize_scheduler_webhooks(value: Any) -> dict[str, Any]:
     out["alert_on_unresolved"] = _scheduler_webhook_flag(
         src.get("alert_on_unresolved") if src.get("alert_on_unresolved") is not None else src.get("alertOnUnresolved")
     )
+    out["alert_on_watcher"] = _scheduler_webhook_flag(
+        src.get("alert_on_watcher") if src.get("alert_on_watcher") is not None else src.get("alertOnWatcher")
+    )
+    out["alert_on_provider_auth"] = _scheduler_webhook_flag(
+        src.get("alert_on_provider_auth") if src.get("alert_on_provider_auth") is not None else src.get("alertOnProviderAuth")
+    )
     out["url"] = _http_url_or_blank(src.get("url") or src.get("default_url"))
     out["base_url"] = _http_url_or_blank(src.get("base_url") or src.get("healthchecks_base_url"))
     for key in ("start_url", "success_url", "failure_url"):
         out[key] = _http_url_or_blank(src.get(key))
     out["payload_format"] = _scheduler_webhook_payload_format(src.get("payload_format") or src.get("format"))
     out["notifiarr_channel_id"] = _digits_or_blank(src.get("notifiarr_channel_id") or src.get("notifiarrChannelId"))
+    out["pushover_token"] = _pushover_key_or_blank(src.get("pushover_token") or src.get("pushoverToken"))
+    out["pushover_user"] = _pushover_key_or_blank(src.get("pushover_user") or src.get("pushoverUser"))
     try:
         timeout = int(src.get("timeout_seconds", 10) or 10)
     except Exception:
@@ -1345,12 +1586,19 @@ def _scheduler_webhook_payload_format(value: Any) -> str:
     text = str(value or "").strip().lower().replace("-", "_")
     if text in {"notifiarr", "notifiarr_passthrough"}:
         return "notifiarr"
+    if text in {"pushover", "ntfy"}:
+        return text
     return "crosswatch"
 
 
 def _digits_or_blank(value: Any) -> str:
     text = str(value or "").strip()
     return text if text.isdigit() else ""
+
+
+def _pushover_key_or_blank(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if len(text) == 30 and text.isascii() and text.isalnum() else ""
 
 
 def _set_nested_value(dst: dict[str, Any], path: str | Iterable[str], value: Any) -> None:
@@ -1432,6 +1680,7 @@ def apply_migration_overrides(cfg: dict[str, Any]) -> tuple[dict[str, Any], list
 # Feature normalization
 _ALLOWED_RATING_TYPES: list[str] = ["movies", "shows", "seasons", "episodes"]
 _ALLOWED_RATING_MODES: list[str] = ["only_new", "from_date", "all"]
+_ALLOWED_COLLECTION_TYPES: list[str] = ["movies", "shows", "seasons", "episodes"]
 _ALLOWED_UI_PROTOCOLS: list[str] = ["http", "https"]
 
 
@@ -1475,6 +1724,35 @@ def _normalize_ratings_feature(val: dict[str, Any]) -> dict[str, Any]:
     return v
 
 
+def _normalize_collection_feature(val: dict[str, Any]) -> dict[str, Any]:
+    v: dict[str, Any] = dict(val or {})
+    v["enable"] = bool(v.get("enable", False))
+    v["add"] = bool(v.get("add", False))
+    v["remove"] = bool(v.get("remove", False))
+    for flag in ("media_info", "media_updates"):
+        if flag in v:
+            v[flag] = bool(v.get(flag))
+
+    raw_types = _as_list(v.get("types"))
+    types = [str(t).strip().lower() for t in raw_types]
+    if "all" in types:
+        types = list(_ALLOWED_COLLECTION_TYPES)
+    else:
+        types = [t for t in _ALLOWED_COLLECTION_TYPES if t in types]
+        if not types:
+            types = ["movies"]
+    v["types"] = types
+
+    return v
+
+
+def _normalize_remove_mode(raw: Any) -> str | None:
+    mode = str(raw or "").strip().lower()
+    if not mode:
+        return None
+    return "mirror" if mode == "mirror" else "source_deletes"
+
+
 def _normalize_features_map(features: dict[str, Any] | None) -> dict[str, Any]:
     f: dict[str, Any] = dict(features or {})
     for name, val in list(f.items()):
@@ -1483,10 +1761,18 @@ def _normalize_features_map(features: dict[str, Any] | None) -> dict[str, Any]:
             v.setdefault("enable", True)
             v.setdefault("add", True)
             v.setdefault("remove", False)
+            if "remove_mode" in v:
+                remove_mode = _normalize_remove_mode(v.get("remove_mode"))
+                if remove_mode is None:
+                    v.pop("remove_mode", None)
+                else:
+                    v["remove_mode"] = remove_mode
 
             # Ratings has extra fields
             if name == "ratings":
                 v = _normalize_ratings_feature(v)
+            elif name == "collection":
+                v = _normalize_collection_feature(v)
             f[name] = v
             continue
 
@@ -1551,7 +1837,12 @@ def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
     t["api_key"] = str(t.get("api_key") or "").strip()
     t["session_id"] = str(t.get("session_id") or "").strip()
     t["account_id"] = str(t.get("account_id") or "").strip()
+    t["read_token"] = str(t.get("read_token") or "").strip()
+    t["access_token"] = str(t.get("access_token") or "").strip()
+    t["account_object_id"] = str(t.get("account_object_id") or "").strip()
+    t["v4_session_ref"] = str(t.get("v4_session_ref") or "").strip()
     t["_pending_request_token"] = str(t.get("_pending_request_token") or "").strip()
+    t["_pending_v4"] = bool(t.get("_pending_v4"))
     try:
         t["_pending_created_at"] = int(t.get("_pending_created_at") or 0)
     except Exception:
@@ -1570,7 +1861,11 @@ def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
     if not t["api_key"]:
         t["session_id"] = ""
         t["account_id"] = ""
+        t["access_token"] = ""
+        t["account_object_id"] = ""
+        t["v4_session_ref"] = ""
         t["_pending_request_token"] = ""
+        t["_pending_v4"] = False
         t["_pending_created_at"] = 0
 
 
@@ -1599,8 +1894,39 @@ def _tmdb_api_key(cfg: dict[str, Any]) -> str:
 
 
 def _normalize_trakt(cfg: dict[str, Any]) -> None:
-    t = _ensure_dict(cfg, "trakt")
-    _normalize_rate_limit(t, 1.0, 3.33)
+    t0 = cfg.get("trakt")
+    if isinstance(t0, dict):
+        t = t0
+    else:
+        t = {}
+        cfg["trakt"] = t
+
+    rl0 = t.get("rate_limit")
+    if isinstance(rl0, dict):
+        rl = rl0
+    else:
+        rl = {}
+        t["rate_limit"] = rl
+
+    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    # Allow 0 to disable throttling.
+    post_rps = _rate("post_per_sec", 1.0)
+    get_rps = _rate("get_per_sec", 1.66)
+    if get_rps == 3.33:
+        get_rps = 1.66
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
 
 
 def _normalize_simkl(cfg: dict[str, Any]) -> None:
@@ -1698,10 +2024,10 @@ def _normalize_publicmetadb(cfg: dict[str, Any]) -> None:
             n = default
         p[name] = max(lo, min(n, hi))
 
-    _int_range("watchlist_page_size", 100, 1, 500)
-    _int_range("history_per_page", 100, 1, 500)
+    _int_range("watchlist_page_size", 500, 1, 500)
+    _int_range("history_per_page", 500, 1, 500)
     _int_range("history_max_pages", 1000, 1, 100000)
-    _int_range("progress_per_page", 100, 1, 500)
+    _int_range("progress_per_page", 500, 1, 500)
     _int_range("progress_max_pages", 1000, 1, 100000)
     _int_range("ratings_submit_per_hour", 200, 1, 200)
     _int_range("ratings_update_per_hour", 100, 1, 100)
@@ -1719,8 +2045,15 @@ def _normalize_nuvio(cfg: dict[str, Any]) -> None:
         cfg["nuvio"] = n
 
     def _block(block: dict[str, Any]) -> None:
+        mode = str(block.get("server_mode") or "").strip().lower()
+        block["server_mode"] = "self_hosted" if mode == "self_hosted" else "cloud"
         block["base_url"] = str(block.get("base_url") or "https://api.nuvio.tv").strip().rstrip("/") or "https://api.nuvio.tv"
         block.pop("public_client_key", None)
+        key = str(block.get("publishable_key") or "").strip()
+        if block["server_mode"] == "self_hosted" and key:
+            block["publishable_key"] = key
+        else:
+            block.pop("publishable_key", None)
         block["access_token"] = str(block.get("access_token") or "").strip()
         block["refresh_token"] = str(block.get("refresh_token") or "").strip()
         try:
@@ -2057,7 +2390,7 @@ def _normalize_scheduling(cfg: dict[str, Any]) -> None:
     adv["workflows"] = wf_out
 
 
-ANIME_MAPPING_PAIRS_DEFAULT: list[str] = ["anilist", "simkl"]
+ANIME_MAPPING_PAIRS_DEFAULT: list[str] = ["anilist", "myanimelist", "kitsu", "simkl", "crosswatch"]
 ANIME_MAPPING_FEATURES_DEFAULT: list[str] = ["watchlist", "ratings", "history"]
 
 
@@ -2579,6 +2912,10 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
 
     sessions = a.get("sessions")
     a["sessions"] = sessions if isinstance(sessions, list) else []
+
+    api_tokens = a.get("api_tokens")
+    a["api_tokens"] = [x for x in api_tokens if isinstance(x, dict)] if isinstance(api_tokens, list) else []
+
     try:
         a["last_login_at"] = int(a.get("last_login_at", 0) or 0)
     except Exception:
@@ -2615,14 +2952,11 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
             updated_at = 0
         return {"file": name, "content_type": content_type, "updated_at": updated_at}
 
-    def _clean_managed_preferences(raw_user: dict[str, Any]) -> dict[str, bool]:
+    def _clean_managed_preferences(raw_user: dict[str, Any]) -> dict[str, Any]:
         prefs = raw_user.get("preferences")
         if not isinstance(prefs, dict):
             return {}
-        return {
-            "playing_card": prefs.get("playing_card") is not False,
-            "quick_add": prefs.get("quick_add") is not False,
-        }
+        return clean_user_preferences(prefs)
 
     def _clean_managed_plex_sso(raw_user: dict[str, Any]) -> dict[str, Any]:
         plex_sso_user = raw_user.get("plex_sso")
@@ -2733,10 +3067,11 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
                 "role": "user",
                 "profile_id": str(raw_user.get("profile_id", "") or "").strip().lower(),
                 "permissions": {
-                    "dashboard": bool(perms.get("dashboard", True)),
-                    "watchlist": bool(perms.get("watchlist", True)),
-                    "playback": bool(perms.get("playback", True)),
-                    "write": bool(perms.get("write", False)),
+                    "dashboard": perms.get("monitor") is not True and bool(perms.get("dashboard", True)),
+                    "watchlist": perms.get("monitor") is not True and bool(perms.get("watchlist", True)),
+                    "playback": perms.get("monitor") is not True and bool(perms.get("playback", True)),
+                    "write": perms.get("monitor") is not True and bool(perms.get("write", False)),
+                    "monitor": perms.get("monitor") is True,
                 },
                 "password": upwd,
                 "totp": clean_totp,
@@ -2825,8 +3160,27 @@ def _log_env_locks(applied: list[tuple[str, ...]]) -> None:
         print(f"[CONFIG] INFO: Config locked by environment: {names}")
 
 
+def invalidate_config_cache() -> None:
+    with _CFG_CACHE_LOCK:
+        _CFG_CACHE.clear()
+
+
+def _config_stamp(p: Path) -> tuple[Any, ...] | None:
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (str(p), st.st_mtime_ns, st.st_size)
+
+
 def load_config() -> dict[str, Any]:
     p = _cfg_file()
+    stamp = _config_stamp(p)
+    if stamp is not None:
+        with _CFG_CACHE_LOCK:
+            cached = _CFG_CACHE.get(stamp)
+        if cached is not None:
+            return copy.deepcopy(cached)
     first_run = not p.exists()
     user_cfg: dict[str, Any] = {}
     if p.exists():
@@ -2844,10 +3198,10 @@ def load_config() -> dict[str, Any]:
         user_cw = user_cfg.get("crosswatch") if isinstance(user_cfg.get("crosswatch"), dict) else user_cfg.get("CrossWatch")
         cw = cfg.get("crosswatch")
         if isinstance(cw, dict):
-            if isinstance(user_cw, dict) and "connected" not in user_cw and user_cw.get("enabled") is not False:
-                cw["connected"] = True
+            if isinstance(user_cw, dict) and "connected" not in user_cw:
+                cw["connected"] = user_cw.get("enabled") is not False
             elif not isinstance(user_cw, dict):
-                cw["connected"] = False
+                cw["connected"] = bool(first_run)
             user_insts = user_cw.get("instances") if isinstance(user_cw, dict) else None
             insts = cw.get("instances")
             if isinstance(user_insts, dict) and isinstance(insts, dict):
@@ -2905,6 +3259,11 @@ def load_config() -> dict[str, Any]:
     except Exception:
         pass
 
+    if stamp is not None and stamp == _config_stamp(p):
+        with _CFG_CACHE_LOCK:
+            _CFG_CACHE.clear()
+            _CFG_CACHE[stamp] = copy.deepcopy(cfg)
+
     return cfg
 
 
@@ -2927,7 +3286,107 @@ def _revert_env_paths(payload: dict[str, Any], prev_raw: dict[str, Any]) -> None
             _delete_nested_value(payload, path)
 
 
+_ROTATING_TOKEN_EXPIRY: dict[str, str] = {
+    "trakt": "expires_at",
+    "simkl": "token_expires_at",
+    "mdblist": "expires_at",
+    "myanimelist": "expires_at",
+    "wetrakr": "expires_at",
+    "nuvio": "expires_at",
+    "punchplay": "expires_at",
+}
+_ROTATING_TOKEN_FIELDS: tuple[str, ...] = (
+    "access_token",
+    "refresh_token",
+    "token_type",
+    "scope",
+    "refresh_expires_at",
+    "auth_error",
+)
+_TOKEN_LINEAGE_KEY = "_rotated_refresh_tokens"
+_TOKEN_LINEAGE_MAX = 8
+
+
+def _log_config_debug(msg: str) -> None:
+    try:
+        from _logging import log
+
+        log(msg, level="DEBUG", module="CONFIG")
+    except Exception:
+        pass
+
+
+def _save_caller() -> str:
+    try:
+        here = os.path.normcase(os.path.abspath(__file__))
+        frame = sys._getframe(1)
+        while frame is not None:
+            filename = frame.f_code.co_filename
+            if os.path.normcase(os.path.abspath(filename)) != here and "contextlib" not in filename:
+                return f"{Path(filename).name}:{frame.f_code.co_name}:{frame.f_lineno}"
+            frame = frame.f_back
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _token_lineage(block: dict[str, Any]) -> list[str]:
+    raw = block.get(_TOKEN_LINEAGE_KEY)
+    return [str(x) for x in raw if str(x or "").strip()] if isinstance(raw, list) else []
+
+
+def _keep_newer_token(new: dict[str, Any], old: dict[str, Any], expiry_key: str) -> bool:
+    new_rt = str(new.get("refresh_token") or "").strip()
+    old_rt = str(old.get("refresh_token") or "").strip()
+    old_lineage = _token_lineage(old)
+    if not new_rt or not old_rt:
+        return False
+    if new_rt == old_rt:
+        if old_lineage:
+            new[_TOKEN_LINEAGE_KEY] = old_lineage
+        return False
+    if _token_digest(new_rt) in old_lineage:
+        for key in (*_ROTATING_TOKEN_FIELDS, expiry_key, _TOKEN_LINEAGE_KEY):
+            if key in old:
+                new[key] = copy.deepcopy(old[key])
+            else:
+                new.pop(key, None)
+        return True
+    new[_TOKEN_LINEAGE_KEY] = ([_token_digest(old_rt)] + old_lineage)[:_TOKEN_LINEAGE_MAX]
+    return False
+
+
+def _preserve_rotated_tokens(data: dict[str, Any], prev: dict[str, Any]) -> list[str]:
+    kept: list[str] = []
+    for provider, expiry_key in _ROTATING_TOKEN_EXPIRY.items():
+        new_root = data.get(provider)
+        old_root = prev.get(provider)
+        if not isinstance(new_root, dict) or not isinstance(old_root, dict):
+            continue
+        pairs: list[tuple[str, dict[str, Any], dict[str, Any]]] = [("default", new_root, old_root)]
+        new_insts = new_root.get("instances")
+        old_insts = old_root.get("instances")
+        if isinstance(new_insts, dict) and isinstance(old_insts, dict):
+            for inst, blk in new_insts.items():
+                old_blk = old_insts.get(inst)
+                if isinstance(blk, dict) and isinstance(old_blk, dict):
+                    pairs.append((str(inst), blk, old_blk))
+        for inst, blk, old_blk in pairs:
+            if _keep_newer_token(blk, old_blk, expiry_key):
+                kept.append(f"{provider}:{inst}")
+    return kept
+
+
 def save_config(cfg: dict[str, Any]) -> None:
+    with _config_io_lock():
+        _save_config_locked(cfg)
+
+
+def _save_config_locked(cfg: dict[str, Any]) -> None:
     data: dict[str, Any] = dict(cfg or {})
     # UI round-trips the GET /api/config response, which carries this marker.
     data.pop("_env_locked", None)
@@ -2979,14 +3438,22 @@ def save_config(cfg: dict[str, Any]) -> None:
     except Exception:
         prev_raw = {}
 
+    try:
+        prev_cfg = cast(dict[str, Any], _transform_secret_tree(prev_raw, decrypt=True)) if isinstance(prev_raw, dict) else {}
+    except Exception:
+        prev_cfg = {}
+
     if not bool(getattr(_CONFIG_FILE_LOCK_STATE, "atomic_update", False)):
-        try:
-            prev_cfg = cast(dict[str, Any], _transform_secret_tree(prev_raw, decrypt=True)) if isinstance(prev_raw, dict) else {}
-            prev_auth = prev_cfg.get("app_auth") if isinstance(prev_cfg, dict) else None
-            if isinstance(prev_auth, dict):
-                data["app_auth"] = prev_auth
-        except Exception:
-            pass
+        prev_auth = prev_cfg.get("app_auth") if isinstance(prev_cfg, dict) else None
+        if isinstance(prev_auth, dict):
+            data["app_auth"] = prev_auth
+
+    try:
+        kept = _preserve_rotated_tokens(data, prev_cfg)
+        if kept:
+            _log_config_debug(f"kept newer rotated tokens over a stale config write: {', '.join(kept)} (caller={_save_caller()})")
+    except Exception:
+        pass
 
     final_data = _order_config_for_write(cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw)))
     _revert_env_paths(final_data, prev_raw)

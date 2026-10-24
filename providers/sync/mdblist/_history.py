@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import re
+import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, TypeGuard
 
@@ -22,7 +24,11 @@ from cw_platform.id_map import canonical_key, minimal as id_minimal
 
 from .._log import log as cw_log
 
+from .._mod_common import request_with_retries
+
 from ._common import (
+    CursorPager,
+    SHOW_BATCH_LIMIT,
     MDBListFetchError,
     START_OF_TIME_ISO,
     STATE_DIR,
@@ -317,12 +323,9 @@ def _comparison_alias_keys_for_episode(
     native_ids = _anime_native_ids(item)
     coords: set[tuple[int, int]] = set()
 
-    # MDBList can return long-running anime with the absolute number in the
-    # episode field even when the season field is not season 1, e.g. One Piece
-    # S23E1156. In that case resolving the raw S/E as an aired coordinate can
-    # double-count the absolute offset, so use the episode value as absolute.
+    # Keep absolute anime episode numbers to avoid counting the season offset twice.
     absolute_like = bool(absolute is not None and absolute >= 50 and season is not None and season > 1)
-    if absolute_like and native_ids:
+    if absolute_like and native_ids and absolute is not None:
         try:
             coords.update(resolve_axis_coordinates(native_ids, absolute, release_tag=release_tag))
         except Exception:
@@ -443,6 +446,14 @@ def _migrate_cache(items: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
     return normalized, changed
 
 
+def _cache_is_stale() -> bool:
+    try:
+        doc = read_json(_cache_path())
+        return not isinstance(doc, Mapping) or doc.get("version") != 1
+    except Exception:
+        return True
+
+
 def _load_cache() -> dict[str, Any]:
     try:
         p = _cache_path()
@@ -460,9 +471,10 @@ def _load_cache() -> dict[str, Any]:
         return {}
 
 
-def _save_cache(items: Mapping[str, Any]) -> None:
+def _save_cache(items: Mapping[str, Any], *, complete: bool = False) -> None:
     try:
-        doc = {"generated_at": _now_iso(), "items": dict(items)}
+        version = 1 if complete or not _cache_is_stale() else 0
+        doc = {"version": version, "generated_at": _now_iso(), "items": dict(items)}
         write_json(_cache_path(), doc)
     except Exception as e:
         _warn("cache_save_failed", error=str(e))
@@ -524,7 +536,7 @@ def _event_key(item: Mapping[str, Any]) -> str | None:
     if not _iso_ok(w):
         return None
     ts = _as_epoch(_iso_z(w))
-    if not ts:
+    if ts is None:
         return None
     return f"{_base_key(item)}@{ts}"
 
@@ -998,13 +1010,12 @@ def _build_event_index(
 
     out: dict[str, dict[str, Any]] = {}
     latest_seen: str | None = None
-    offset = 0
-    pages = 0
+    pager = CursorPager(per_page, max_pages)
     tick = 0
     complete_fetch = True
 
     while True:
-        params: dict[str, Any] = {"apikey": apikey, "offset": offset, "limit": per_page, "plays": "all"}
+        params: dict[str, Any] = {"apikey": apikey, **pager.params(), "plays": "all"}
         try:
             r = mdblist_request(
                 adapter,
@@ -1015,16 +1026,17 @@ def _build_event_index(
                 max_retries=retries,
             )
         except Exception as e:
-            _warn("http_failed", op="index", method="GET", url=URL_LIST, offset=offset, plays="all", error=f"{type(e).__name__}: {e}")
+            _warn("http_failed", op="index", method="GET", url=URL_LIST, page=pager.pages + 1, plays="all", error=f"{type(e).__name__}: {e}")
             complete_fetch = False
             break
 
         if r.status_code != 200:
-            _warn("http_failed", op="index", method="GET", url=URL_LIST, status=r.status_code, offset=offset, plays="all", body=(r.text or '')[:160])
+            _warn("http_failed", op="index", method="GET", url=URL_LIST, status=r.status_code, page=pager.pages + 1, plays="all", body=(r.text or '')[:160])
             complete_fetch = False
             break
 
         data = r.json() if (r.text or "").strip() else {}
+        more = pager.advance(data, r)
         buckets = {
             "movies": data.get("movies") or [],
             "shows": data.get("shows") or [],
@@ -1054,23 +1066,11 @@ def _build_event_index(
             except Exception:
                 pass
 
-        pages += 1
-        if pages >= max_pages:
-            _warn("index_reconcile", reason="safety_cap_hit", strategy="event_snapshot", max_pages=max_pages)
-            complete_fetch = False
+        if not more:
             break
-
-        pag = data.get("pagination") if isinstance(data, Mapping) else None
-        if isinstance(pag, Mapping) and pag.get("has_more") is False:
-            break
-
-        rows_total = sum(len(v) for v in buckets.values() if isinstance(v, list))
-        if rows_total == 0:
-            break
-        offset += per_page
 
     if not complete_fetch:
-        _warn("index_reconcile", reason="incomplete_snapshot", strategy="event_snapshot", fetched=len(out), pages=pages)
+        _warn("index_reconcile", reason="incomplete_snapshot", strategy="event_snapshot", fetched=len(out), pages=pager.pages)
         raise MDBListFetchError("history plays snapshot incomplete")
 
     if prog:
@@ -1092,6 +1092,7 @@ def build_index(
 ) -> dict[str, dict[str, Any]]:
     cfg = _cfg(adapter)
     event_mode = _rewatches_enabled(adapter)
+    cache_stale = not event_mode and _cache_is_stale()
     cached_raw = {} if event_mode else _load_cache()
     cached: dict[str, dict[str, Any]] = {
         str(k): dict(v) for k, v in (cached_raw or {}).items() if isinstance(v, Mapping)
@@ -1111,7 +1112,7 @@ def build_index(
         return cached
 
     per_page = _cfg_int(cfg, "history_per_page", per_page)
-    per_page = max(1, min(int(per_page), 5000))
+    per_page = max(1, min(int(per_page), 1000))
     max_pages = _cfg_int(cfg, "history_max_pages", max_pages)
     max_pages = max(1, min(int(max_pages), 2000))
 
@@ -1148,9 +1149,9 @@ def build_index(
     journal_iso = _iso_z(journal_ts) if _iso_ok(journal_ts) else None
     wm = get_watermark("history")
     journal_wm = get_watermark("history_journal")
-    force_baseline = False
+    force_baseline = cache_stale
 
-    if acts_watched_iso and journal_iso and wm and journal_wm:
+    if acts_watched_iso and journal_iso and wm and journal_wm and not force_baseline:
         a = _as_epoch(acts_watched_iso) or 0
         b = _as_epoch(wm) or 0
         jn = _as_epoch(journal_iso) or 0
@@ -1163,7 +1164,7 @@ def build_index(
             journal_limit = max(50, min(per_page, 1000))
             journal = adapter.fetch_journal(since=journal_wm, limit=journal_limit, category="watched")
             journal_oldest = str(journal.get("journal_oldest_at") or "").strip()
-            if _iso_ok(journal_oldest) and (_as_epoch(journal_wm) or 0) < (_as_epoch(_iso_z(journal_oldest)) or 0):
+            if journal.get("requires_full_sync") is True or (_iso_ok(journal_oldest) and (_as_epoch(journal_wm) or 0) < (_as_epoch(_iso_z(journal_oldest)) or 0)):
                 _warn("index_reconcile", reason="journal_window_stale", strategy="full_replace", journal_oldest_at=journal_oldest, journal_watermark=journal_wm)
                 force_baseline = True
             if not force_baseline:
@@ -1218,12 +1219,11 @@ def build_index(
 
     out: dict[str, dict[str, Any]] = {}
     latest_seen: str | None = None
-    offset = 0
-    pages = 0
+    pager = CursorPager(per_page, max_pages)
     tick = 0
     complete_fetch = True
     while True:
-        params: dict[str, Any] = {"apikey": apikey, "offset": offset, "limit": per_page}
+        params: dict[str, Any] = {"apikey": apikey, **pager.params()}
         if since_req:
             params["since"] = since_req
         try:
@@ -1236,16 +1236,22 @@ def build_index(
                 max_retries=retries,
             )
         except Exception as e:
-            _warn("http_failed", op="index", method="GET", url=URL_LIST, offset=offset, error=f"{type(e).__name__}: {e}")
+            _warn("http_failed", op="index", method="GET", url=URL_LIST, page=pager.pages + 1, error=f"{type(e).__name__}: {e}")
             complete_fetch = False
             break
 
         if r.status_code != 200:
-            _warn("http_failed", op="index", method="GET", url=URL_LIST, status=r.status_code, offset=offset, body=(r.text or '')[:160])
+            _warn("http_failed", op="index", method="GET", url=URL_LIST, status=r.status_code, page=pager.pages + 1, body=(r.text or '')[:160])
             complete_fetch = False
             break
 
         data = r.json() if (r.text or "").strip() else {}
+        bucket_names = ("movies", "shows", "seasons", "episodes")
+        if not isinstance(data, Mapping) or not any(name in data for name in bucket_names):
+            raise MDBListFetchError("Invalid MDBList history snapshot response")
+        if any(not isinstance(data[name], list) for name in bucket_names if name in data):
+            raise MDBListFetchError("Invalid MDBList history snapshot rows")
+        more = pager.advance(data, r)
         buckets = {
             "movies": data.get("movies") or [],
             "shows": data.get("shows") or [],
@@ -1285,21 +1291,12 @@ def build_index(
             except Exception:
                 pass
 
-        pages += 1
-        if pages >= max_pages:
-            _warn("index_reconcile", reason="safety_cap_hit", strategy="delta", max_pages=max_pages)
-            complete_fetch = False
+        if not more:
             break
-
-        pag = data.get("pagination") if isinstance(data, Mapping) else None
-        if isinstance(pag, Mapping) and pag.get("has_more") is False:
-            break
-
-        rows_total = sum(len(v) for v in buckets.values() if isinstance(v, list))
-        if rows_total == 0:
-            break
-        offset += per_page
         
+    if not complete_fetch:
+        raise MDBListFetchError("MDBList history snapshot incomplete")
+
     normalized_out, dropped_out = _normalize_rollups(out)
     if dropped_out["shows"] or dropped_out["seasons"]:
         _dbg(
@@ -1310,27 +1307,8 @@ def build_index(
             scope="delta",
         )
 
-    if normalized_out and (force_baseline or complete_fetch):
-        # /sync/watched is fetched as a full current snapshot here.
-        merged_base = {str(k): dict(v) for k, v in normalized_out.items()}
-    else:
-        merged_base = dict(cached)
-        if normalized_out:
-            for k, v in normalized_out.items():
-                merged_base[str(k)] = dict(v)
-
-    merged, dropped_merged = _normalize_rollups(merged_base)
-    if dropped_merged["shows"] or dropped_merged["seasons"]:
-        _dbg(
-            "index_reconcile",
-            reason="rollups_pruned",
-            shows=dropped_merged["shows"],
-            seasons=dropped_merged["seasons"],
-            scope="merged",
-        )
-
-    if out or force_baseline or dropped_merged["shows"] or dropped_merged["seasons"]:
-        _save_cache(merged)
+    merged = normalized_out
+    _save_cache(merged, complete=True)
 
     update_watermark_if_new("history", latest_seen or acts_watched_iso)
     if journal_iso:
@@ -2152,7 +2130,7 @@ def _write(
 
         stage = "" if body_key == bucket else body_key
 
-        for part in _chunk(rows, chunk_size):
+        for part in _chunk(rows, min(chunk_size, SHOW_BATCH_LIMIT) if bucket == "shows" else chunk_size):
             payload = {bucket: part}
             url = URL_REMOVE if unwatch else URL_UPSERT
             attempt = 0
