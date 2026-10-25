@@ -79,7 +79,11 @@ def _patch_fs(monkeypatch, m):
 
 
 def _adapter(session):
-    return SimpleNamespace(client=SimpleNamespace(session=session), cfg=SimpleNamespace(timeout=5, history_chunk_size=100))
+    return SimpleNamespace(
+        client=SimpleNamespace(session=session), cfg=SimpleNamespace(timeout=5, history_chunk_size=100),
+        raw_cfg={"anime_mapping": {"enabled": True},
+                 "_cw_pair_feature_options": {"feature": "history", "use_anime_mapping": True}},
+    )
 
 
 def _episode(tvdb, tmdb, season, episode, series, *, number_abs=None):
@@ -97,11 +101,11 @@ def _episode(tvdb, tmdb, season, episode, series, *, number_abs=None):
 
 
 def _dbz(season, episode, number_abs):
-    return _episode("81472", "12971", season, episode, "Dragon Ball Z", number_abs=number_abs)
+    return {**_episode("81472", "12971", season, episode, "Dragon Ball Z", number_abs=number_abs), "simkl_bucket": "anime"}
 
 
 def _aot(season, episode):
-    return _episode("267440", "1429", season, episode, "Attack on Titan")
+    return {**_episode("267440", "1429", season, episode, "Attack on Titan"), "simkl_bucket": "anime"}
 
 
 def _s00(show_tvdb, show_tmdb, episode, series, *, ep_tvdb=None):
@@ -361,6 +365,7 @@ def test_anime_like_s00_unmapped_is_unresolved(monkeypatch):
     adapter = _adapter(session)
 
     item = _s00("267440", "1429", 2, "Attack on Titan")
+    item["simkl_bucket"] = "anime"
     ok, unresolved = m.add(adapter, [item])
 
     assert ok == 0
@@ -597,7 +602,7 @@ def test_simkl_target_override_beats_source_tvdb_redirect(monkeypatch):
         },
     }
 
-    ids = m._native_anime_ids_for_mismatched_show(session, {}, 5, item, state)
+    ids = m._native_anime_ids_for_mismatched_show(session, {}, 5, item, state, mapping_enabled=True)
     mapped = m._anime_retry_episode_number(
         item,
         ids,
@@ -1305,3 +1310,76 @@ def test_source_episode_id_aliases_survive_when_episode_ids_are_absent(monkeypat
     assert ("tvdb", "355411") in out
     assert ("tvdb", "355412") in out
     assert ("tvdb", "81472") not in out
+
+
+class _MixedRedirectSession(_Session):
+    def __init__(self, *, anime_map=None, non_anime_map=None, post_handler=None, episodes_map=None):
+        super().__init__(post_handler=post_handler, redirect_map=anime_map, episodes_map=episodes_map)
+        self._non_anime_map = {str(k): str(v) for k, v in (non_anime_map or {}).items()}
+
+    def get(self, url, headers=None, params=None, timeout=None, allow_redirects=None):
+        import sync.simkl._history as m
+
+        if url == m.URL_REDIRECT:
+            tvdb = str((params or {}).get("tvdb") or "")
+            other = self._non_anime_map.get(tvdb)
+            if other:
+                self.gets.append({"url": url, "params": params})
+                return _Resp(302, {}, headers={"Location": f"https://simkl.com/tv/{other}/x"})
+        return super().get(url, headers=headers, params=params, timeout=timeout, allow_redirects=allow_redirects)
+
+
+def _not_found_once(tvdb, tmdb, season, episode):
+    state = {"sent": False}
+
+    def handler(url, body):
+        if not state["sent"] and isinstance(body, dict) and "shows" in body:
+            state["sent"] = True
+            return _Resp(200, _ok_add(not_found={
+                "movies": [],
+                "shows": [],
+                "episodes": [{
+                    "ids": {"tvdb": tvdb, "tmdb": tmdb},
+                    "seasons": [{"number": season, "episodes": [{"number": episode}]}],
+                }],
+            }))
+        return _Resp(200, _ok_add(episodes=1))
+
+    return handler
+
+
+def test_non_anime_tvdb_not_found_skips_anime_retry(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    session = _MixedRedirectSession(
+        non_anime_map={"161511": "34307"},
+        post_handler=_not_found_once("161511", "34307", 1, 1),
+    )
+    adapter = _adapter(session)
+
+    _ok, unresolved = m.add(adapter, [_episode("161511", "34307", 1, 1, "Shameless (US)")])
+
+    assert list(_anime_of(session, m.URL_ADD)) == []
+    reasons = {u.get("reason") or u.get("hint") for u in unresolved}
+    assert "simkl_anime_retry_unmapped:episodes" not in reasons
+    assert "simkl_not_found:episodes" in reasons
+
+
+def test_anime_tvdb_not_found_is_unresolved_without_retry(monkeypatch):
+    import sync.simkl._history as m
+
+    _patch_fs(monkeypatch, m)
+    session = _MixedRedirectSession(
+        anime_map={"267440": "39687"},
+        episodes_map={},
+        post_handler=_not_found_once("267440", "1429", 4, 17),
+    )
+    adapter = _adapter(session)
+
+    _ok, unresolved = m.add(adapter, [_aot(4, 17)])
+
+    reasons = {u.get("reason") or u.get("hint") for u in unresolved}
+    assert "simkl_anime_retry_unmapped:episodes" not in reasons
+    assert "simkl_not_found:episodes" in reasons
+    assert len(session.posts) == 1

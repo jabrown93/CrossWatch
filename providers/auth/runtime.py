@@ -8,6 +8,9 @@ from typing import Any
 
 import requests
 
+from cw_platform.connection_status import record_response
+from cw_platform.provider_instances import build_provider_config_view
+
 
 def _key(provider: Any) -> str:
     return str(provider or "").strip().lower().replace("-", "_")
@@ -27,10 +30,30 @@ def _backend(provider: Any) -> Any:
         from providers.auth import _auth_STREMIO as stremio_auth
 
         return stremio_auth
+    if name in {"myanimelist", "mal"}:
+        from providers.auth import _auth_MYANIMELIST as mal_auth
+
+        return mal_auth
+    if name == "wetrakr":
+        from providers.auth import _auth_WETRAKR as wetrakr_auth
+
+        return wetrakr_auth
     if name in {"punchplay", "punch_play"}:
         from providers.auth import _auth_PUNCHPLAY as punchplay_auth
 
         return punchplay_auth
+    if name in {"bingebase", "binge_base", "binge-base"}:
+        from providers.auth import _auth_BINGEBASE as bingebase_auth
+
+        return bingebase_auth
+    if name in {"flicklist", "flick_list", "flick-list"}:
+        from providers.auth import _auth_FLICKLIST as flicklist_auth
+
+        return flicklist_auth
+    if name == "kitsu":
+        from providers.auth import _auth_KITSU
+
+        return _auth_KITSU
     if name == "scrob":
         from providers.auth import _auth_SCROB as scrob_auth
 
@@ -83,4 +106,8 @@ def request_with_auth(
     cfg: Mapping[str, Any] | None,
     **kwargs: Any,
 ) -> requests.Response:
-    return _backend(provider).request_with_auth(session, method, url, cfg=cfg, **kwargs)
+    response = _backend(provider).request_with_auth(session, method, url, cfg=cfg, **kwargs)
+    if cfg is not None:
+        view = build_provider_config_view(cfg, provider, kwargs.get("instance_id") or "default")
+        record_response(provider, view, int(response.status_code))
+    return response

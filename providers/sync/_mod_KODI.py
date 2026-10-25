@@ -7,16 +7,17 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from providers.sync._mod_common import build_op_result
+from providers.sync.kodi import _collection as feat_collection
 from providers.sync.kodi import _history as feat_history
 from providers.sync.kodi import _progress as feat_progress
 from providers.sync.kodi import _ratings as feat_ratings
 from providers.sync.kodi._common import KodiClient, health_payload, is_configured, item_key, make_config, pick_instance_id
 
-__VERSION__ = "0.2"
+__VERSION__ = "0.3"
 __all__ = ["get_manifest", "KODIModule", "OPS"]
 
-_FEATURES = {"watchlist": False, "ratings": True, "history": True, "progress": True, "playlists": False}
-_FEATURE_MODULES = {"history": feat_history, "ratings": feat_ratings, "progress": feat_progress}
+_FEATURES = {"watchlist": False, "ratings": True, "history": True, "progress": True, "playlists": False, "collection": True}
+_FEATURE_MODULES = {"history": feat_history, "ratings": feat_ratings, "progress": feat_progress, "collection": feat_collection}
 
 
 def get_manifest() -> Mapping[str, Any]:
@@ -38,6 +39,8 @@ def get_manifest() -> Mapping[str, Any]:
             "remove": True,
             "observed_deletes": True,
             "aggregated": True,
+            "event_history": False,
+            "rewatches": {"read": False, "write": False},
         },
         "ratings": {
             "read": True,
@@ -63,6 +66,16 @@ def get_manifest() -> Mapping[str, Any]:
                 },
             },
         },
+        "collection": {
+            "read": True,
+            "write": False,
+            "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
+            "upsert": False,
+            "remove": False,
+            "observed_deletes": True,
+            "notes": "Kodi collection is the local video library inventory. CrossWatch can read movies and episodes but cannot add or remove files from Kodi.",
+        },
+        "library_presence": {"features": ["history", "ratings", "progress"]},
     }
     return {
         "name": "KODI",
@@ -80,7 +93,7 @@ def get_manifest() -> Mapping[str, Any]:
 class KODIModule:
     def __init__(self, cfg: Mapping[str, Any]):
         self.config = cfg or {}
-        self.instance_id = pick_instance_id()
+        self.instance_id = pick_instance_id(cfg)
         self.cfg = make_config(self.config, self.instance_id)
         if not self.cfg.server:
             raise RuntimeError("Kodi config requires server")
@@ -120,6 +133,11 @@ class KODIModule:
             return build_op_result(ok=True, count=0, unsupported=True)
         return mod.remove(self, items, dry_run=dry_run)
 
+    def library_presence(self, feature: str, items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        from .kodi import _presence
+
+        return _presence.presence(self, items, feature=str(feature or "history").strip().lower())
+
 
 class _KODIOPS:
     def name(self) -> str:
@@ -154,6 +172,9 @@ class _KODIOPS:
 
     def remove(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]], *, feature: str, dry_run: bool = False) -> dict[str, Any]:
         return self._adapter(cfg).remove(feature, items, dry_run=dry_run)
+
+    def library_presence(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]], *, feature: str) -> list[dict[str, Any]]:
+        return self._adapter(cfg).library_presence(feature, items)
 
 
 OPS = _KODIOPS()

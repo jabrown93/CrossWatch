@@ -69,7 +69,11 @@ class FakeStats:
 
 
 class FakeStateStore:
+    def __init__(self):
+        self.last = None
+
     def save_last(self, d):
+        self.last = d
         pass
 
     def load_state(self):
@@ -123,6 +127,84 @@ def _pair_cfg(mode="one-way"):
             }
         ],
     }
+
+
+def _history_pair_cfg(mode="one-way"):
+    return {
+        "runtime": {},
+        "sync": {},
+        "pairs": [
+            {
+                "id": "p1",
+                "source": "FAKESRC",
+                "target": "FAKEDST",
+                "source_instance": "default",
+                "target_instance": "default",
+                "enabled": True,
+                "mode": mode,
+                "features": {"history": {"enable": True}},
+            }
+        ],
+    }
+
+
+def test_run_pairs_includes_blocked_from_one_way_feature(monkeypatch):
+    events: list[tuple[str, dict[str, Any]]] = []
+    ctx = _ctx(_history_pair_cfg("one-way"))
+    ctx.emit = lambda event, **fields: events.append((event, dict(fields)))
+    monkeypatch.setattr(pairs, "supports_feature", lambda *_a, **_k: True)
+    monkeypatch.setattr(pairs, "health_feature_ok", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        pairs,
+        "run_one_way_feature",
+        lambda *_a, **_k: {
+            "updated": 0,
+            "added": 0,
+            "removed": 0,
+            "skipped": 0,
+            "unresolved": 0,
+            "blocked": 7,
+            "errors": 0,
+        },
+    )
+    monkeypatch.setattr(pairs, "run_two_way_feature", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no two-way")))
+
+    result = pairs.run_pairs(ctx)
+
+    assert result["blocked"] == 7
+    assert ctx.state_store.last["result"]["blocked"] == 7
+    assert [fields["blocked"] for event, fields in events if event == "run:done"] == [7]
+
+
+def test_run_pairs_includes_blocked_from_two_way_feature(monkeypatch):
+    events: list[tuple[str, dict[str, Any]]] = []
+    ctx = _ctx(_history_pair_cfg("two-way"))
+    ctx.emit = lambda event, **fields: events.append((event, dict(fields)))
+    monkeypatch.setattr(pairs, "supports_feature", lambda *_a, **_k: True)
+    monkeypatch.setattr(pairs, "health_feature_ok", lambda *_a, **_k: True)
+    monkeypatch.setattr(pairs, "run_one_way_feature", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no one-way")))
+    monkeypatch.setattr(
+        pairs,
+        "run_two_way_feature",
+        lambda *_a, **_k: {
+            "upd_to_A": 0,
+            "upd_to_B": 0,
+            "adds_to_A": 0,
+            "adds_to_B": 0,
+            "rem_from_A": 0,
+            "rem_from_B": 0,
+            "skipped": 0,
+            "unresolved": 0,
+            "blocked": 4,
+            "errors": 0,
+        },
+    )
+
+    result = pairs.run_pairs(ctx)
+
+    assert result["blocked"] == 4
+    assert ctx.state_store.last["result"]["blocked"] == 4
+    assert [fields["blocked"] for event, fields in events if event == "run:done"] == [4]
 
 
 def test_pairs_routes_playlists_to_dedicated_runner(config_base, monkeypatch):
@@ -208,8 +290,79 @@ def test_playlist_pair_records_feature_totals(config_base, monkeypatch):
     ]
 
 
+def test_playlist_pair_refreshes_mapping_endpoints_after_run(config_base, monkeypatch):
+    from services import playlists as svc
+
+    calls: list[str] = []
+    cfg = _pair_cfg("one-way")
+    ctx = _ctx(cfg)
+    monkeypatch.setattr(glue, "resolve_pair_mappings", lambda _cfg, _pair: [playlists_runner.resolve_mapping(cfg, cfg["playlists"]["mappings"][0])])
+    monkeypatch.setattr(glue, "run_mapping", lambda *a, **k: {"ok": True, "added": 1, "removed": 0, "reordered": 0, "unresolved_count": 0})
+    monkeypatch.setattr(svc, "refresh_mapping_endpoints", lambda _cfg, mapping: calls.append(str(mapping.get("id") or "")) or {"ok": True, "endpoints": []})
+
+    result = glue.run_playlist_mappings(
+        ctx,
+        "FAKESRC",
+        "FAKEDST",
+        fcfg={"mappings": ["MAP-01"]},
+        health_map={},
+        full_cfg=cfg,
+        pair=cfg["pairs"][0],
+    )
+
+    assert result["added"] == 1
+    assert calls == ["MAP-01"]
+
+
+def test_pair_scope_runs_playlist_pair_without_narrowing_config(config_base, monkeypatch):
+    seen: list[str] = []
+    cfg = _pair_cfg("one-way")
+    cfg["pairs"][0]["id"] = "pair_playlist_1"
+    cfg["pairs"].insert(0, {
+        "id": "regular_pair",
+        "source": "FAKESRC",
+        "target": "FAKEDST",
+        "source_instance": "default",
+        "target_instance": "default",
+        "enabled": True,
+        "mode": "one-way",
+        "features": {"watchlist": {"enable": True}},
+    })
+    ctx = _ctx(cfg)
+    ctx.pair_scope_ids = ["pair_playlist_1"]
+
+    def fake_playlist(ctx, src, dst, *, fcfg, health_map, full_cfg, pair):
+        seen.append(str(pair.get("id") or ""))
+        assert full_cfg is cfg
+        assert [p["id"] for p in full_cfg["pairs"]] == ["regular_pair", "pair_playlist_1"]
+        return {"added": 1, "removed": 0, "updated": 0, "unresolved": 0, "skipped": 0, "errors": 0}
+
+    monkeypatch.setattr(pairs, "run_playlist_mappings", fake_playlist)
+    monkeypatch.setattr(pairs, "run_one_way_feature", lambda *a, **k: (_ for _ in ()).throw(AssertionError("regular pair should not run")))
+
+    result = pairs.run_pairs(ctx)
+
+    assert seen == ["pair_playlist_1"]
+    assert result["added"] == 1
+
+
 def test_manual_and_scheduled_share_core_runner():
     from services import playlists as svc
 
     assert glue.run_mapping is playlists_runner.run_mapping
     assert svc.runner.run_mapping is playlists_runner.run_mapping
+
+
+def test_failed_mapping_run_is_stored_so_activity_can_count_it(monkeypatch):
+    from cw_platform.orchestrator import _pairs_playlists as pairs_playlists
+
+    stored = []
+    monkeypatch.setattr(pairs_playlists, "store_result", lambda mapping, result: stored.append((mapping["id"], result)))
+    pairs_playlists._store_failure({"id": "MAP-01"}, RuntimeError("plex playlist not found: 48643"), dry_run=True)
+    assert stored == []
+    pairs_playlists._store_failure({"id": "MAP-01"}, RuntimeError("plex playlist not found: 48643"), dry_run=False)
+    mapping_id, result = stored[0]
+    assert mapping_id == "MAP-01"
+    assert result["ok"] is False and result["errors"] == 1
+    assert result["error"] == "plex playlist not found: 48643"
+    assert result["finished_at"] > 0

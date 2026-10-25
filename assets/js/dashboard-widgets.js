@@ -24,10 +24,28 @@
   const UNITS = 2;
   const WIDE_UNITS = 3;
   const WIDGET_REFRESH_TTL_MS = 60 * 1000;
+  const WIDGET_FETCH_TIMEOUT_MS = 60 * 1000;
   const WIDGET_FETCH_RETRY_DELAYS = [350, 900, 1800];
-  const IMAGE_PREWARM_MAX = 12;
+  const WIDGET_LOADING_DELAY_MS = 700;
+  const REFRESHABLE_WIDGETS = ["history", "ratings", "scrobble", "progress", "playlists"];
+  const WIDGET_PAYLOAD_KEYS = {
+    history: "recent_history",
+    ratings: "latest_ratings",
+    scrobble: "recent_scrobble",
+    progress: "recent_progress",
+    playlists: "recent_playlists",
+  };
+  const WIDGET_COUNT_CHIPS = {
+    history: ["recent-history-count-chip", "item"],
+    ratings: ["latest-ratings-count-chip", "rating"],
+    scrobble: ["recent-scrobble-count-chip", "scrobble"],
+    progress: ["recent-progress-count-chip", "progress sync"],
+    playlists: ["recent-playlists-count-chip", "playlist sync"],
+  };
   const visibleCounts = { history: GRID_PAGE_STEP, ratings: RATING_PAGE_STEP, scrobble: GRID_PAGE_STEP, progress: GRID_PAGE_STEP, playlists: GRID_PAGE_STEP };
   const latestItems = { history: [], ratings: [], scrobble: [], progress: [], playlists: [] };
+  const latestTotals = { history: 0, ratings: 0, scrobble: 0, progress: 0, playlists: 0 };
+  const loadedWidgetKinds = new Set();
   const EMPTY_META = {
     history: { title: "No history yet", copy: "Watched items will appear here." },
     ratings: { title: "No ratings yet", copy: "Your ratings and scores will appear here." },
@@ -39,7 +57,11 @@
   };
   const ON_PROFILE_PAGE = !!document.getElementById("profile-hero");
   const LAYOUT_KEY = ON_PROFILE_PAGE ? "cw.profileWidgets.layout.v3" : "cw.dashboardWidgets.layout.v3";
+  const mobileViewport = window.matchMedia("(max-width: 760px)");
+  const mobileLayoutKey = `${LAYOUT_KEY}.mobile.v1`;
+  let layoutKey = mobileViewport.matches ? mobileLayoutKey : LAYOUT_KEY;
   const SETTINGS_KEY = "cw.dashboardWidgets.settings.v1";
+  const DATA_CACHE_KEY = ON_PROFILE_PAGE ? "cw.profileWidgets.data.v1" : "cw.dashboardWidgets.data.v1";
   const ALL_WIDGETS = [
     { key: "watchlist", id: "placeholder-card", label: "Watchlist" },
     { key: "history", id: "recent-history-widget", label: "Recent History" },
@@ -97,13 +119,13 @@
   }
 
   function readLayout() {
-    try { return normalizeLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) || "null")); }
+    try { return normalizeLayout(JSON.parse(localStorage.getItem(layoutKey) || localStorage.getItem(LAYOUT_KEY) || "null")); }
     catch { return normalizeLayout(null); }
   }
 
   function saveLayout(nextLayout) {
     widgetLayout = normalizeLayout(nextLayout);
-    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(widgetLayout)); } catch {}
+    try { localStorage.setItem(layoutKey, JSON.stringify(widgetLayout)); } catch {}
     window.dispatchEvent(new CustomEvent("cw:dashboard-widgets-layout-changed"));
     applyVisibility(lastSettings || {});
   }
@@ -142,9 +164,83 @@
     } catch {}
   }
 
+  function widgetDataCacheScope() {
+    return `${ON_PROFILE_PAGE ? "profile" : "main"}:${overviewProfileId() || "all"}`;
+  }
+
+  function readCachedWidgetData() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(DATA_CACHE_KEY) || "null");
+      if (!raw || typeof raw !== "object" || raw.scope !== widgetDataCacheScope()) return null;
+      const payload = raw.payload && typeof raw.payload === "object" ? raw.payload : null;
+      return payload?.ok ? payload : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeCachedWidgetData(payload) {
+    try {
+      if (!payload?.ok || payload.not_modified) return;
+      localStorage.setItem(DATA_CACHE_KEY, JSON.stringify({
+        t: Date.now(),
+        scope: widgetDataCacheScope(),
+        payload,
+      }));
+    } catch {}
+  }
+
+  function clearCachedWidgetData() {
+    try { localStorage.removeItem(DATA_CACHE_KEY); } catch {}
+  }
+
+  function hasOwn(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj || {}, key);
+  }
+
+  function normalizeRefreshKinds(kinds) {
+    if (!kinds) return null;
+    const list = Array.isArray(kinds) ? kinds : String(kinds).split(",");
+    const out = list.map((kind) => String(kind || "").trim()).filter((kind) => REFRESHABLE_WIDGETS.includes(kind));
+    return out.length ? new Set(out) : new Set();
+  }
+
+  function applyWidgetPayload(data, active, kinds = null) {
+    const wanted = normalizeRefreshKinds(kinds);
+    let applied = 0;
+    for (const kind of REFRESHABLE_WIDGETS) {
+      if (!active[kind]) continue;
+      if (wanted && !wanted.has(kind)) continue;
+      const payloadKey = WIDGET_PAYLOAD_KEYS[kind];
+      if (!hasOwn(data, payloadKey)) continue;
+      const block = data?.[payloadKey] || {};
+      const items = Array.isArray(block.items) ? block.items : [];
+      const total = Number(block.total ?? items.length);
+      const rawChipTotal = kind === "scrobble"
+        ? block.scrobble_total
+        : (block.library_total !== undefined ? block.library_total : block.total);
+      const chipTotal = Number(rawChipTotal ?? items.length);
+      const [chipId, chipLabel] = WIDGET_COUNT_CHIPS[kind];
+      latestTotals[kind] = Math.max(items.length, Number.isFinite(total) ? total : 0);
+      const chipCount = kind === "scrobble"
+        ? Math.max(0, Number.isFinite(chipTotal) ? chipTotal : latestTotals[kind])
+        : Math.max(items.length, Number.isFinite(chipTotal) ? chipTotal : latestTotals[kind]);
+      setCountChip(chipId, chipCount, chipLabel);
+      latestItems[kind] = items;
+      loadedWidgetKinds.add(kind);
+      renderWidget(kind);
+      applied += 1;
+    }
+    if (applied) {
+      if (!wanted) lastLoadedAt = Date.now();
+      hasLoaded = true;
+    }
+    return applied;
+  }
+
   function resetLayout() {
     widgetLayout = normalizeLayout(null);
-    try { localStorage.removeItem(LAYOUT_KEY); } catch {}
+    try { localStorage.setItem(layoutKey, JSON.stringify(widgetLayout)); } catch {}
     window.dispatchEvent(new CustomEvent("cw:dashboard-widgets-layout-changed"));
     applyVisibility(lastSettings || {});
   }
@@ -203,9 +299,28 @@
   }
 
   function widgetPageStep(key) {
+    if (profileGridLimitApplies(key)) return GRID_PAGE_STEP;
     if (effectiveSize(key) === "large") return widgetView(key) === "media" ? MEDIA_PAGE_STEP : (key === "ratings" ? RATING_PAGE_STEP : PAGE_STEP);
     const step = widgetView(key) === "grid" ? GRID_PAGE_STEP : (key === "ratings" ? RATING_PAGE_STEP : PAGE_STEP);
     return effectiveSpan(key) === 2 ? step * 2 : step;
+  }
+
+  function profileGridLimitApplies(key) {
+    return ON_PROFILE_PAGE && REFRESHABLE_WIDGETS.includes(key) && effectiveSize(key) !== "large" && widgetView(key) === "grid";
+  }
+
+  function widgetMaxItems(key) {
+    return profileGridLimitApplies(key) ? GRID_PAGE_STEP : MAX_WIDGET_ITEMS;
+  }
+
+  function widgetTotal(key) {
+    const total = Number(latestTotals[key] || 0);
+    return Math.max(latestItems[key]?.length || 0, Number.isFinite(total) ? total : 0);
+  }
+
+  function widgetFetchLimit(key) {
+    const maxItems = widgetMaxItems(key);
+    return Math.max(1, Math.min(maxItems, Math.max(visibleCounts[key] || 0, widgetPageStep(key))));
   }
 
   function resetVisibleCount(key) {
@@ -327,7 +442,7 @@
       .finally(() => {
         authRetryQueued = false;
         if (authSetupPending()) return;
-        window.setTimeout(() => refreshDashboardWidgets({ forceConfig: true }), 25);
+        window.setTimeout(() => refreshDashboardWidgets({ forceConfig: true, preserve: true }), 25);
       });
   }
 
@@ -343,36 +458,96 @@
     if (hasLoaded || !isOnMain() || authSetupPending()) return;
     const settings = readCachedSettings();
     if (!settings) return;
+    lastSettings = settings;
     applyVisibility(settings);
     const active = activeWidgetSettings(settings);
-    if (active.history) setLoading($("#recent-history-list"));
-    if (active.ratings) setLoading($("#latest-ratings-grid"), "ratings");
-    if (active.scrobble) setLoading($("#recent-scrobble-list"));
-    if (active.progress) setLoading($("#recent-progress-list"));
-    if (active.playlists) setLoading($("#recent-playlists-list"));
+    if (active.watchlist) {
+      window.CW?.WatchlistPreview?.renderCachedPreview?.({ preserveIfSame: true });
+    }
+    const cached = readCachedWidgetData();
+    if (cached) {
+      applyWidgetPayload(cached, active);
+      return;
+    }
   }
 
   function markWidgetsDirty(delay = 150, opts = {}) {
     widgetsDirty = true;
     dirtyVersion += 1;
     if (!isOnMain()) return;
-    scheduleWidgetRefresh(delay, { ...opts, force: true, preserve: hasLoaded });
+    const preserve = opts.preserve === false ? hasLoaded : true;
+    scheduleWidgetRefresh(delay, { ...opts, force: true, preserve });
+  }
+
+  function syncLaneHasUpdates(lane) {
+    if (!lane || typeof lane !== "object") return false;
+    for (const key of ["added", "removed", "updated", "created", "deleted", "applied", "failed", "skipped", "blocked"]) {
+      if (Number(lane[key] || 0) > 0) return true;
+    }
+    for (const key of ["spotlight_add", "spotlight_remove", "spotlight_update", "items"]) {
+      if (Array.isArray(lane[key]) && lane[key].length) return true;
+    }
+    return false;
+  }
+
+  function syncFeatureWidgetKind(feature) {
+    const key = String(feature || "").trim().toLowerCase();
+    if (["watch", "watched", "history"].includes(key)) return "history";
+    if (["rating", "ratings"].includes(key)) return "ratings";
+    if (key === "progress") return "progress";
+    if (["playlist", "playlists"].includes(key)) return "playlists";
+    return "";
+  }
+
+  function widgetKindsFromSyncEvent(event) {
+    const features = event?.detail?.summary?.features;
+    if (!features || typeof features !== "object") return null;
+    const kinds = new Set();
+    for (const [feature, lane] of Object.entries(features)) {
+      const kind = syncFeatureWidgetKind(feature);
+      if (kind && syncLaneHasUpdates(lane)) kinds.add(kind);
+    }
+    return Array.from(kinds);
+  }
+
+  function refreshForSyncComplete(event) {
+    const kinds = widgetKindsFromSyncEvent(event);
+    if (kinds && kinds.length) markWidgetsDirty(250, { kinds });
+    else markWidgetsDirty(250);
   }
 
   function scheduleScrobbleStopRefresh() {
     window.clearTimeout(scrobbleStopRefreshTimer);
     scrobbleStopRefreshTimer = window.setTimeout(() => {
       scrobbleStopRefreshTimer = null;
-      markWidgetsDirty(0);
+      markWidgetsDirty(0, { kinds: ["scrobble", "history", "progress"] });
     }, 1000);
+  }
+
+  function refreshForScrobbleStopped() {
+    scheduleScrobbleStopRefresh();
+    try {
+      window.dispatchEvent(new CustomEvent("watchlist:refresh", { detail: { source: "scrobble-stop" } }));
+    } catch {}
   }
 
   async function fetchJSON(url) {
     if (authSetupPending()) throw new Error("auth setup pending");
-    if (window.CW?.API?.j) return window.CW.API.j(url);
-    const res = await fetch(url, { cache: "no-store" });
+    if (window.CW?.API?.j) return window.CW.API.j(url, {}, WIDGET_FETCH_TIMEOUT_MS);
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = controller ? window.setTimeout(() => controller.abort("timeout"), WIDGET_FETCH_TIMEOUT_MS) : 0;
+    let res;
+    try {
+      res = await fetch(url, { cache: "no-store", signal: controller?.signal });
+    } finally {
+      if (timer) window.clearTimeout(timer);
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
+  }
+
+  function isTimeoutError(e) {
+    return e === "timeout" || e?.name === "AbortError";
   }
 
   async function fetchWidgetPayload(url) {
@@ -385,6 +560,7 @@
       } catch (e) {
         if (authPendingError(e)) throw e;
         lastError = e;
+        if (isTimeoutError(e)) break;
         const delay = WIDGET_FETCH_RETRY_DELAYS[attempt];
         if (!delay) break;
         await new Promise((resolve) => window.setTimeout(resolve, delay));
@@ -510,6 +686,85 @@
 
   function ensureLayoutToolbar() {
     updateLayoutToolbar();
+  }
+
+  function updateMobilePicker(settings = lastSettings || {}) {
+    const card = $("#dashboard-widgets-card");
+    if (!card) return;
+    let picker = $("#cw-mobile-widgets");
+    if (!picker) {
+      picker = document.createElement("details");
+      picker.id = "cw-mobile-widgets";
+      picker.className = "cw-mobile-widgets";
+      picker.innerHTML = `<summary><span class="material-symbols-rounded" aria-hidden="true">tune</span><span>Mobile settings</span><span class="cw-mobile-widget-count"></span></summary>
+        <div class="cw-mobile-widget-options">
+          <h3>Touch feedback</h3>
+          <label><input type="checkbox" data-mobile-notification-alerts><span class="material-symbols-rounded cw-mobile-widget-icon" aria-hidden="true">notifications_active</span><span>Notification alerts</span><small>Banner and vibration when supported, while open</small></label>
+          <label><input type="checkbox" data-mobile-haptics><span class="material-symbols-rounded cw-mobile-widget-icon" aria-hidden="true">vibration</span><span>Haptic feedback</span><small>Short vibration on menu taps</small></label>
+          <h3>Dashboard widgets</h3><p>Choose what appears on this device's mobile dashboard. Desktop settings stay separate.</p>
+          <label><input type="checkbox" data-mobile-sync-results><span class="material-symbols-rounded cw-mobile-widget-icon" aria-hidden="true">sync_alt</span><span>Sync results</span><small>Watchlist, ratings, history and other sync-result cards</small></label>
+          <label><input type="checkbox" data-mobile-provider-stats><span class="material-symbols-rounded cw-mobile-widget-icon" aria-hidden="true">bar_chart</span><span>Provider statistics</span><small>Provider totals and feature selector</small></label>
+          ${WIDGETS.map(({ key, label }) => `<label><input type="checkbox" data-mobile-widget="${key}"><span class="material-symbols-rounded cw-mobile-widget-icon" aria-hidden="true">${({watchlist:"movie",history:"history",ratings:"star",scrobble:"sensors",progress:"play_circle",playlists:"queue_music"})[key]}</span><span>${esc(label)}</span><small></small></label>`).join("")}
+          <button type="button" class="cw-mobile-widget-reset">Reset mobile widgets</button>
+        </div>`;
+      document.body.appendChild(picker);
+      const providerStats = picker.querySelector('[data-mobile-provider-stats]');
+      providerStats.checked = true;
+      try { providerStats.checked = localStorage.getItem('cw.mobile.providerStats') !== '0'; } catch {}
+      document.body.classList.toggle('cw-mobile-hide-provider-stats', !providerStats.checked);
+      providerStats.addEventListener('change', () => {
+        document.body.classList.toggle('cw-mobile-hide-provider-stats', !providerStats.checked);
+        try { localStorage.setItem('cw.mobile.providerStats', providerStats.checked ? '1' : '0'); } catch {}
+        window.dispatchEvent(new Event('resize'));
+      });
+      const syncResults = picker.querySelector('[data-mobile-sync-results]');
+      try { syncResults.checked = localStorage.getItem('cw.mobile.syncResults') === '1'; } catch {}
+      document.body.classList.toggle('cw-mobile-sync-results', syncResults.checked);
+      syncResults.addEventListener('change', () => {
+        document.body.classList.toggle('cw-mobile-sync-results', syncResults.checked);
+        try { localStorage.setItem('cw.mobile.syncResults', syncResults.checked ? '1' : '0'); } catch {}
+      });
+      const notificationAlerts = picker.querySelector('[data-mobile-notification-alerts]');
+      try { notificationAlerts.checked = localStorage.getItem('cw.mobile.notificationAlerts') === '1'; } catch {}
+      notificationAlerts.addEventListener('change', () => {
+        try { localStorage.setItem('cw.mobile.notificationAlerts', notificationAlerts.checked ? '1' : '0'); } catch {}
+        window.dispatchEvent(new CustomEvent('cw:mobile-notification-alerts-changed'));
+      });
+      const haptics = picker.querySelector('[data-mobile-haptics]');
+      const supportsHaptics = typeof navigator.vibrate === 'function';
+      haptics.disabled = !supportsHaptics;
+      try { haptics.checked = supportsHaptics && localStorage.getItem('cw.mobile.haptics') !== '0'; } catch {}
+      if (!supportsHaptics) haptics.parentElement.querySelector('small').textContent = 'Not supported by this browser';
+      haptics.addEventListener('change', () => {
+        try { localStorage.setItem('cw.mobile.haptics', haptics.checked ? '1' : '0'); } catch {}
+        if (haptics.checked && supportsHaptics) {
+          try { navigator.vibrate(30); } catch {}
+        }
+      });
+      picker.addEventListener("change", (event) => {
+        const input = event.target.closest("[data-mobile-widget]");
+        if (!input || !mobileViewport.matches) return;
+        patchLayout(input.dataset.mobileWidget, { hidden: !input.checked });
+        if (input.checked) markWidgetsDirty(0);
+      });
+      picker.querySelector(".cw-mobile-widget-reset").addEventListener("click", () => {
+        if (!mobileViewport.matches) return;
+        resetLayout();
+        markWidgetsDirty(0);
+      });
+    }
+    const menu = $("#cw-mobile-navigation");
+    if (menu && picker.parentElement !== menu) menu.appendChild(picker);
+    let shown = 0;
+    for (const input of picker.querySelectorAll("[data-mobile-widget]")) {
+      const key = input.dataset.mobileWidget;
+      const enabled = settings[key] !== false;
+      input.checked = enabled && !widgetLayout[key]?.hidden;
+      input.disabled = !enabled;
+      input.parentElement.querySelector("small").textContent = enabled ? "" : "Unavailable";
+      if (input.checked) shown += 1;
+    }
+    picker.querySelector(".cw-mobile-widget-count").textContent = `${shown} shown`;
   }
 
   function showAllWidgets() {
@@ -966,49 +1221,6 @@
     return `/art/tmdb/${kind}/${encodeURIComponent(String(tmdb))}?kind=backdrop&size=${encodeURIComponent(size)}&locale=${encodeURIComponent(window.__CW_LOCALE || navigator.language || "en-US")}${title}${year}`;
   }
 
-  function prewarmImageUrls(urls) {
-    const list = [...new Set((urls || []).filter(Boolean))].slice(0, IMAGE_PREWARM_MAX);
-    if (!list.length) return;
-    if (navigator.connection?.saveData) return;
-    const run = () => {
-      let index = 0;
-      const next = () => {
-        const url = list[index++];
-        if (!url) return;
-        let settled = false;
-        const img = new Image();
-        const done = () => {
-          if (settled) return;
-          settled = true;
-          window.setTimeout(next, 160);
-        };
-        img.onload = done;
-        img.onerror = done;
-        img.decoding = "async";
-        img.src = url;
-        window.setTimeout(done, 3500);
-      };
-      next();
-    };
-    const start = () => {
-      if ("requestIdleCallback" in window) window.requestIdleCallback(run, { timeout: 4000 });
-      else window.setTimeout(run, 800);
-    };
-    window.setTimeout(start, 900);
-  }
-
-  function prewarmWidgetImages(active) {
-    const urls = [];
-    for (const kind of ["history", "ratings", "scrobble", "progress"]) {
-      if (!active?.[kind]) continue;
-      const limit = Math.min(latestItems[kind]?.length || 0, visibleCounts[kind] || PAGE_STEP);
-      for (const item of (latestItems[kind] || []).slice(0, limit)) {
-        urls.push(poster(item), coverPoster(item, "w342"), backdropPoster(item, null, "w780"));
-      }
-    }
-    prewarmImageUrls(urls);
-  }
-
   function tmdbLink(item) {
     const tmdb = item?.tmdb;
     if (!tmdb) return "";
@@ -1114,8 +1326,14 @@
   }
 
   function openProfileWidgetPreview(kind, index) {
-    if (!ON_PROFILE_PAGE || !["history", "ratings", "scrobble", "progress"].includes(kind)) return false;
+    if (!["history", "ratings", "scrobble", "progress"].includes(kind)) return false;
     const item = latestItems[kind]?.[Number(index)];
+    const modal = window.CW?.ProfileMediaModal;
+    if (item && modal?.canOpen?.(item)) {
+      void modal.open(item);
+      return true;
+    }
+    if (!ON_PROFILE_PAGE) return false;
     const open = window.CW?.WatchlistPreview?.openPreviewDrawer || window.openPreviewDrawer;
     if (!item || !open) return false;
     void open(item);
@@ -1133,7 +1351,7 @@
     const artStyle = art ? ` style="--cw-history-art:url(&quot;${esc(art)}&quot;)"` : "";
     const route = sourceRouteTitle(item?.sources);
     return `
-      <${tag} class="cw-history-widget-item"${hrefAttr}${artStyle}${widgetItemAttrs("history", index)}>
+      <${tag} class="cw-history-widget-item cw-history-widget-item--stack"${hrefAttr}${artStyle}${widgetItemAttrs("history", index)}>
         <span class="cw-history-thumb">
           <img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg'">
           ${age ? `<span class="cw-rating-grid-age">${esc(age)}</span>` : ""}
@@ -1179,7 +1397,7 @@
     const source = scrobbleSourceRow(item);
     const sinks = scrobbleSinkIcons(item?.targets);
     return `
-      <${tag} class="cw-history-widget-item cw-history-widget-item--activity"${hrefAttr}${artStyle}${widgetItemAttrs("scrobble", index)}>
+      <${tag} class="cw-history-widget-item cw-history-widget-item--stack cw-history-widget-item--activity"${hrefAttr}${artStyle}${widgetItemAttrs("scrobble", index)}>
         <span class="cw-history-thumb">
           <img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg'">
           ${age ? `<span class="cw-rating-grid-age">${esc(age)}</span>` : ""}
@@ -1209,7 +1427,7 @@
     const art = poster(item);
     const route = sourceRouteTitle(item?.sources);
     return `
-      <${tag} class="cw-history-widget-item cw-history-widget-item--progress"${hrefAttr}${widgetItemAttrs("progress", index)}>
+      <${tag} class="cw-history-widget-item cw-history-widget-item--stack cw-history-widget-item--progress"${hrefAttr}${widgetItemAttrs("progress", index)}>
         <span class="cw-history-thumb">
           <img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg'">
           ${age ? `<span class="cw-rating-grid-age">${esc(age)}</span>` : ""}
@@ -1323,11 +1541,11 @@
     const route = sourceRouteTitle(item?.sources);
     const rawType = String(item?.type || "").toLowerCase();
     const ratedLabel = relTime(item?.sort_epoch || 0);
-    const season = Number(item?.season || 0);
+    const season = item?.season === null || item?.season === undefined || item?.season === "" ? -1 : Number(item.season);
     const episode = Number(item?.episode || 0);
     const mediaDetail = rawType === "episode"
-      ? (item?.episode_label || (season && episode ? `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}` : "Episode"))
-      : rawType === "season" && season
+      ? (item?.episode_label || (season >= 0 && episode ? `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}` : "Episode"))
+      : rawType === "season" && season >= 0
         ? `S${String(season).padStart(2, "0")}`
         : "";
     const titleParts = [title, mediaDetail ? `${rawType === "season" ? "Season" : "Episode"}: ${mediaDetail}` : "", ratedLabel ? `Rated ${ratedLabel}` : ""].filter(Boolean);
@@ -1350,7 +1568,7 @@
     const art = poster(item);
     const route = sourceRouteTitle(item?.sources);
     return `
-      <${tag} class="cw-history-widget-item cw-history-widget-item--rating"${hrefAttr}${widgetItemAttrs("ratings", index)}>
+      <${tag} class="cw-history-widget-item cw-history-widget-item--stack cw-history-widget-item--rating"${hrefAttr}${widgetItemAttrs("ratings", index)}>
         <span class="cw-history-thumb">
           <img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg'">
           ${ratedLabel ? `<span class="cw-rating-grid-age">${esc(ratedLabel)}</span>` : ""}
@@ -1378,9 +1596,54 @@
       </div>`;
   }
 
-  function setLoading(host, kind = "list") {
+  function hasPreservableContent(host) {
+    if (!host || !host.children.length) return false;
+    if (host.querySelector(".cw-dash-skeleton")) return false;
+    const empty = host.querySelector(".cw-dash-empty");
+    if (!empty) return true;
+    return !empty.classList.contains("cw-dash-empty--error");
+  }
+
+  function setWidgetLoadError(host, message, preserve) {
+    if (preserve && hasPreservableContent(host)) return;
+    setEmpty(host, "error", message);
+  }
+
+  function showWidgetToast(message, ok = false) {
+    try {
+      const fn = window.CW?.DOM?.showToast || window._cwShowToast || window.showToast;
+      const host = document.getElementById("save_msg") || document.querySelector(".save-toast");
+      if (host && typeof fn === "function") {
+        fn(String(message || ""), !!ok);
+        return;
+      }
+    } catch {}
+    try {
+      let el = document.querySelector(".save-toast");
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "save-toast hide";
+        el.setAttribute("aria-live", "polite");
+        document.body.appendChild(el);
+      }
+      el.textContent = String(message || "");
+      el.classList.remove("hide", "error", "ok");
+      el.classList.add(ok ? "ok" : "error");
+      window.clearTimeout(showWidgetToast._timer);
+      showWidgetToast._timer = window.setTimeout(() => el.classList.add("hide"), 2200);
+    } catch {}
+  }
+
+  function setExpandBusy(btn, busy) {
+    if (!btn) return;
+    btn.toggleAttribute("disabled", !!busy);
+    if (busy) btn.setAttribute("aria-busy", "true");
+    else btn.removeAttribute("aria-busy");
+  }
+
+  function setLoading(host, kind) {
     if (!host) return;
-    const widgetKey = kind === "list" ? (host.closest(".cw-dash-widget")?.dataset?.widgetKey || kind) : kind;
+    const widgetKey = WIDGET_KEYS.includes(kind) ? kind : (host.closest(".cw-dash-widget")?.dataset?.widgetKey || kind);
     const view = widgetView(widgetKey);
     setWidgetEmpty(widgetKey, false);
     host.classList.toggle("cw-widget-view-icon", view === "icon");
@@ -1422,8 +1685,34 @@
       </div>`).join("");
   }
 
+  function scheduleSlowWidgetLoading(hosts, requestedKinds) {
+    if (!requestedKinds.length) return () => {};
+    const timer = window.setTimeout(() => {
+      for (const kind of requestedKinds) {
+        if (!loadedWidgetKinds.has(kind)) setLoading(hosts[kind], kind);
+      }
+    }, WIDGET_LOADING_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }
+
+  const HISTORY_PAGE_LINKS = {
+    history: { href: "/profile#history/synced", label: "Open synced history" },
+    scrobble: { href: "/profile#history/scrobble", label: "Open all scrobbles" },
+    ratings: { href: "/profile#ratings", label: "Open all ratings" },
+  };
+
+  function historyPageLink(kind) {
+    const link = HISTORY_PAGE_LINKS[kind];
+    if (!link || !(ON_PROFILE_PAGE || document.getElementById("cw-nav-profile-link"))) return "";
+    return `<a class="cw-dash-see-more cw-dash-history-link" href="${esc(link.href)}">
+        <span class="cw-dash-see-more-label">${esc(link.label)}</span>
+        <span class="material-symbols-rounded" aria-hidden="true">arrow_forward</span>
+      </a>`;
+  }
+
   function renderCarousel(host, items, count, cardFn, kind) {
-    const visible = Math.min(count, items.length, MAX_WIDGET_ITEMS);
+    const maxItems = widgetMaxItems(kind);
+    const visible = Math.min(count, items.length, maxItems);
     const cards = items.slice(0, visible).map(cardFn).join("");
     host.innerHTML = `
       <div class="cw-widget-carousel" data-cw-widget-carousel="${esc(kind)}">
@@ -1439,7 +1728,7 @@
       </div>`;
   }
 
-  function renderPagedList(host, items, count, cardFn, emptyText, kind, keepPager = false, horizontal = false) {
+  function renderPagedList(host, items, count, cardFn, emptyText, kind, horizontal = false) {
     if (!host) return;
     if (!items.length) {
       setEmpty(host, kind, emptyText);
@@ -1448,30 +1737,23 @@
     setWidgetEmpty(kind, false);
     if (horizontal) {
       renderCarousel(host, items, count, cardFn, kind);
+      host.insertAdjacentHTML("beforeend", historyPageLink(kind));
       scheduleMasonry();
       return;
     }
-    const visible = Math.min(count, items.length);
-    const hasMore = visible < items.length;
-    const moreContent = kind === "playlists"
-      ? `<span class="cw-dash-see-more-label">${hasMore ? "View more playlists" : "View all playlists"}</span>`
-      : `<span class="material-symbols-rounded">expand_more</span>`;
-    const button = hasMore || keepPager
-      ? `<button type="button" class="cw-dash-see-more" data-cw-widget-more="${esc(kind)}" aria-label="${hasMore ? `Show more ${esc(kind)} items` : `All ${esc(kind)} items shown`}"${hasMore ? "" : " disabled"}>
-          ${moreContent}
-        </button>`
-      : "";
-    host.innerHTML = `${items.slice(0, visible).map(cardFn).join("")}${button}`;
+    const maxItems = widgetMaxItems(kind);
+    const visible = Math.min(count, items.length, maxItems);
+    host.innerHTML = `${items.slice(0, visible).map(cardFn).join("")}${historyPageLink(kind)}`;
     scheduleMasonry();
   }
 
   function renderWidget(kind) {
     const defs = {
-      history: { host: $("#recent-history-list"), list: historyCard, icon: (item, index) => mediaPosterCard(item, "history", index), media: (item, index) => mediaLandscapeCard(item, "history", index), keepPager: false },
-      ratings: { host: $("#latest-ratings-grid"), list: ratingListCard, icon: ratingCard, media: (item, index) => mediaLandscapeCard(item, "ratings", index), keepPager: false },
-      scrobble: { host: $("#recent-scrobble-list"), list: activityCard, icon: (item, index) => mediaPosterCard(item, "scrobble", index), media: (item, index) => mediaLandscapeCard(item, "scrobble", index), keepPager: true },
-      progress: { host: $("#recent-progress-list"), list: progressCard, icon: (item, index) => mediaPosterCard(item, "progress", index), media: (item, index) => mediaLandscapeCard(item, "progress", index), keepPager: true },
-      playlists: { host: $("#recent-playlists-list"), list: playlistCard, icon: playlistPosterCard, keepPager: true },
+      history: { host: $("#recent-history-list"), list: historyCard, icon: (item, index) => mediaPosterCard(item, "history", index), media: (item, index) => mediaLandscapeCard(item, "history", index) },
+      ratings: { host: $("#latest-ratings-grid"), list: ratingListCard, icon: ratingCard, media: (item, index) => mediaLandscapeCard(item, "ratings", index) },
+      scrobble: { host: $("#recent-scrobble-list"), list: activityCard, icon: (item, index) => mediaPosterCard(item, "scrobble", index), media: (item, index) => mediaLandscapeCard(item, "scrobble", index) },
+      progress: { host: $("#recent-progress-list"), list: progressCard, icon: (item, index) => mediaPosterCard(item, "progress", index), media: (item, index) => mediaLandscapeCard(item, "progress", index) },
+      playlists: { host: $("#recent-playlists-list"), list: playlistCard, icon: playlistPosterCard },
     };
     const def = defs[kind];
     if (!def) return;
@@ -1487,14 +1769,37 @@
       cardFn,
       "",
       kind,
-      def.keepPager,
       effectiveSize(kind) === "large"
     );
+  }
+
+  function clearDashboardWidgetState() {
+    clearCachedWidgetData();
+    loadSeq += 1;
+    widgetsDirty = true;
+    dirtyVersion += 1;
+    lastLoadedAt = 0;
+    loadedWidgetKinds.clear();
+    const settings = lastSettings || readCachedSettings() || widgetSettings(currentConfig?.ui || currentConfig?.user_interface || {});
+    lastSettings = settings;
+    for (const kind of REFRESHABLE_WIDGETS) {
+      latestItems[kind] = [];
+      latestTotals[kind] = 0;
+      resetVisibleCount(kind);
+      const [chipId, chipLabel] = WIDGET_COUNT_CHIPS[kind];
+      setCountChip(chipId, 0, chipLabel);
+      renderWidget(kind);
+      loadedWidgetKinds.add(kind);
+    }
+    hasLoaded = true;
+    applyVisibility(settings);
+    scheduleMasonry();
   }
 
   function applyVisibility(settings) {
     const card = $("#dashboard-widgets-card");
     if (!card) return;
+    updateMobilePicker(settings);
     ensureLayoutToolbar();
     ensureWidgetControls();
     let anyVisible = false;
@@ -1526,53 +1831,60 @@
     scheduleMasonry();
   }
 
-  async function refreshDashboardWidgets({ forceConfig = false, force = false, preserve = false } = {}) {
+  async function refreshDashboardWidgets({ forceConfig = false, force = false, preserve = true, kinds = null } = {}) {
     if (!isOnMain()) {
       hideDashboardWidgets();
-      return;
+      return false;
     }
     revealCachedWidgets();
     const fresh = hasLoaded && (Date.now() - lastLoadedAt) < WIDGET_REFRESH_TTL_MS;
-    if (!force && !widgetsDirty && fresh) return;
+    if (!force && !widgetsDirty && fresh) return true;
     if (authSetupPending()) {
       scheduleAuthReadyRefresh();
-      return;
+      return false;
     }
     if (forceConfig) cfgPromise = null;
     const seq = ++loadSeq;
     const refreshVersion = dirtyVersion;
     try { await window.CW?.OverviewProfile?.ready; } catch {}
+    if (seq !== loadSeq) return null;
+    if (!isOnMain()) return false;
+    if (!hasLoaded) revealFromCache();
     let cfg;
+    let widgetUrl = "";
+    let widgetStartedAt = 0;
     try {
       cfg = await getConfig(forceConfig);
     } catch (e) {
       if (authPendingError(e)) {
         scheduleAuthReadyRefresh();
-        return;
+        return false;
       }
       if (preserve && hasLoaded) {
         revealCachedWidgets();
-        return;
+        return false;
       }
       hideDashboardWidgets();
-      return;
+      return false;
     }
     const settings = widgetSettings(cfg?.ui || cfg?.user_interface || {});
     currentConfig = cfg;
     lastSettings = settings;
-    if (seq !== loadSeq || !isOnMain()) return;
-    if (!preserve || !hasLoaded) {
-      ["history", "ratings", "scrobble", "progress", "playlists"].forEach(resetVisibleCount);
-    }
+    if (seq !== loadSeq) return null;
+    if (!isOnMain()) return false;
     applyVisibility(settings);
     writeCachedSettings(settings, hasTmdbKeyInConfig(cfg));
     const active = activeWidgetSettings(settings);
     if (active.watchlist) {
       Promise.resolve(window.updatePreviewVisibility?.()).catch(() => null);
     }
-    if (!active.watchlist && !active.history && !active.ratings && !active.scrobble && !active.progress && !active.playlists) return;
+    if (!active.watchlist && !active.history && !active.ratings && !active.scrobble && !active.progress && !active.playlists) return true;
     if (!hasTmdbKeyInConfig(cfg)) {
       $("#placeholder-card")?.classList.add("hidden");
+    }
+    const cachedPayload = readCachedWidgetData();
+    if (!hasLoaded && cachedPayload) {
+      applyWidgetPayload(cachedPayload, active);
     }
 
     const historyHost = $("#recent-history-list");
@@ -1580,69 +1892,119 @@
     const scrobbleHost = $("#recent-scrobble-list");
     const progressHost = $("#recent-progress-list");
     const playlistsHost = $("#recent-playlists-list");
-    if (!preserve || !hasLoaded) {
-      if (active.history) setLoading(historyHost);
-      if (active.ratings) setLoading(ratingsHost, "ratings");
-      if (active.scrobble) setLoading(scrobbleHost);
-      if (active.progress) setLoading(progressHost);
-      if (active.playlists) setLoading(playlistsHost);
-    }
+    const hosts = { history: historyHost, ratings: ratingsHost, scrobble: scrobbleHost, progress: progressHost, playlists: playlistsHost };
+    const wantedKinds = normalizeRefreshKinds(kinds);
+    const requestedKinds = REFRESHABLE_WIDGETS.filter((key) => active[key] && (!wantedKinds || wantedKinds.has(key)));
+    if (!preserve) requestedKinds.forEach(resetVisibleCount);
+    const partialRefresh = !!wantedKinds;
+    const stopSlowLoading = scheduleSlowWidgetLoading(hosts, requestedKinds);
 
     try {
-      const requestedKinds = ["history", "ratings", "scrobble", "progress", "playlists"].filter((key) => active[key]);
       if (!requestedKinds.length) {
-        hasLoaded = true;
-        lastLoadedAt = Date.now();
-        widgetsDirty = dirtyVersion !== refreshVersion;
-        return;
+        stopSlowLoading();
+        if (!partialRefresh) {
+          hasLoaded = true;
+          lastLoadedAt = Date.now();
+          widgetsDirty = dirtyVersion !== refreshVersion;
+        }
+        return true;
       }
       const params = new URLSearchParams({
         include: requestedKinds.join(","),
-        history_limit: String(MAX_WIDGET_ITEMS),
-        ratings_limit: String(MAX_WIDGET_ITEMS),
-        scrobble_limit: String(MAX_WIDGET_ITEMS),
-        progress_limit: String(MAX_WIDGET_ITEMS),
-        playlists_limit: String(MAX_WIDGET_ITEMS),
+        history_limit: String(widgetFetchLimit("history")),
+        ratings_limit: String(widgetFetchLimit("ratings")),
+        scrobble_limit: String(widgetFetchLimit("scrobble")),
+        progress_limit: String(widgetFetchLimit("progress")),
+        playlists_limit: String(widgetFetchLimit("playlists")),
       });
       const userProfile = overviewProfileId();
       if (userProfile) params.set("user_profile", userProfile);
-      const data = await fetchWidgetPayload(`/api/dashboard/widgets?${params.toString()}`);
-      if (seq !== loadSeq || !isOnMain()) return;
-
-      const historyItems = Array.isArray(data?.recent_history?.items) ? data.recent_history.items : [];
-      const scrobbleItems = Array.isArray(data?.recent_scrobble?.items) ? data.recent_scrobble.items : [];
-      const ratingItems = Array.isArray(data?.latest_ratings?.items) ? data.latest_ratings.items : [];
-      const progressItems = Array.isArray(data?.recent_progress?.items) ? data.recent_progress.items : [];
-      const playlistItems = Array.isArray(data?.recent_playlists?.items) ? data.recent_playlists.items : [];
-      setCountChip("recent-history-count-chip", data?.recent_history?.total ?? historyItems.length, "item");
-      setCountChip("latest-ratings-count-chip", data?.latest_ratings?.total ?? ratingItems.length, "rating");
-      setCountChip("recent-scrobble-count-chip", data?.recent_scrobble?.total ?? scrobbleItems.length, "scrobble");
-      setCountChip("recent-progress-count-chip", data?.recent_progress?.total ?? progressItems.length, "progress sync");
-      setCountChip("recent-playlists-count-chip", data?.recent_playlists?.total ?? playlistItems.length, "playlist sync");
-      latestItems.history = historyItems;
-      latestItems.ratings = ratingItems;
-      latestItems.scrobble = scrobbleItems;
-      latestItems.progress = progressItems;
-      latestItems.playlists = playlistItems;
-      hasLoaded = true;
-      lastLoadedAt = Date.now();
-      widgetsDirty = dirtyVersion !== refreshVersion;
-      for (const kind of ["history", "ratings", "scrobble", "progress", "playlists"]) {
-        if (active[kind]) renderWidget(kind);
+      const anyWidgetBlank = requestedKinds.some((kind) => !(latestItems[kind]?.length));
+      if (!forceConfig && !anyWidgetBlank && !partialRefresh && cachedPayload?.version) params.set("known_version", cachedPayload.version);
+      widgetUrl = `/api/dashboard/widgets?${params.toString()}`;
+      widgetStartedAt = Date.now();
+      const data = await fetchWidgetPayload(widgetUrl);
+      stopSlowLoading();
+      if (seq !== loadSeq) return null;
+      if (!isOnMain()) return false;
+      if (data?.not_modified && cachedPayload) {
+        hasLoaded = true;
+        lastLoadedAt = Date.now();
+        widgetsDirty = dirtyVersion !== refreshVersion;
+        if (requestedKinds.some((kind) => !hasPreservableContent(hosts[kind]))) {
+          applyWidgetPayload(cachedPayload, active, partialRefresh ? requestedKinds : null);
+        }
+        return true;
       }
-      prewarmWidgetImages(active);
+      const applied = applyWidgetPayload(data, active, partialRefresh ? requestedKinds : null);
+      if (!partialRefresh) {
+        writeCachedWidgetData(data);
+        widgetsDirty = dirtyVersion !== refreshVersion;
+      }
+      return applied > 0;
     } catch (e) {
+      stopSlowLoading();
       if (authPendingError(e)) {
         scheduleAuthReadyRefresh();
-        return;
+        return false;
       }
-      if (preserve && hasLoaded) return;
-      if (active.history) setEmpty(historyHost, "error", "Recent history could not be loaded.");
-      if (active.ratings) setEmpty(ratingsHost, "error", "Latest ratings could not be loaded.");
-      if (active.scrobble) setEmpty(scrobbleHost, "error", "Recent scrobble could not be loaded.");
-      if (active.progress) setEmpty(progressHost, "error", "Recent progress could not be loaded.");
-      if (active.playlists) setEmpty(playlistsHost, "error", "Recent playlists could not be loaded.");
+      try {
+        if (window.console?.warn && widgetUrl) {
+          window.console.warn("[CrossWatch] dashboard widgets refresh failed", {
+            elapsed_ms: widgetStartedAt ? Date.now() - widgetStartedAt : 0,
+            error: String(e?.message || e || "unknown"),
+            url: widgetUrl,
+          });
+        }
+      } catch {}
+      const shouldShowWidgetError = (kind) => active[kind] && (!partialRefresh || requestedKinds.includes(kind));
+      if (shouldShowWidgetError("history")) setWidgetLoadError(historyHost, "Recent history could not be loaded.", preserve);
+      if (shouldShowWidgetError("ratings")) setWidgetLoadError(ratingsHost, "Latest ratings could not be loaded.", preserve);
+      if (shouldShowWidgetError("scrobble")) setWidgetLoadError(scrobbleHost, "Recent scrobble could not be loaded.", preserve);
+      if (shouldShowWidgetError("progress")) setWidgetLoadError(progressHost, "Recent progress could not be loaded.", preserve);
+      if (shouldShowWidgetError("playlists")) setWidgetLoadError(playlistsHost, "Recent playlists could not be loaded.", preserve);
+      return false;
     }
+  }
+
+  function expandWidget(kind, opts = {}) {
+    if (!REFRESHABLE_WIDGETS.includes(kind)) return false;
+    const step = widgetPageStep(kind);
+    const total = Math.min(widgetTotal(kind), widgetMaxItems(kind));
+    const current = visibleCounts[kind] || step;
+    const next = Math.min(current + step, total || latestItems[kind]?.length || current);
+    if (next <= current) return false;
+    visibleCounts[kind] = next;
+
+    const afterRender = () => {
+      if (!opts.scrollAmount) return;
+      requestAnimationFrame(() => {
+        const row = widgetNode(kind)?.querySelector(".cw-widget-carousel-row");
+        if (!row) return;
+        row.scrollLeft = Number(opts.previousLeft || 0);
+        row.scrollBy({ left: Number(opts.scrollAmount || 0), behavior: "smooth" });
+      });
+    };
+
+    if (next > (latestItems[kind]?.length || 0) && (latestItems[kind]?.length || 0) < total) {
+      setExpandBusy(opts.button, true);
+      void refreshDashboardWidgets({ force: true, preserve: true, kinds: [kind] }).then((ok) => {
+        setExpandBusy(opts.button, false);
+        if (ok === null) return;
+        const loadedEnough = (latestItems[kind]?.length || 0) >= next || widgetTotal(kind) <= current;
+        if (!ok && !loadedEnough) {
+          visibleCounts[kind] = current;
+          renderWidget(kind);
+          showWidgetToast("Could not load more items.");
+          return;
+        }
+        afterRender();
+      });
+    } else {
+      renderWidget(kind);
+      afterRender();
+    }
+    return true;
   }
 
   async function refreshFromButton(btn) {
@@ -1665,6 +2027,19 @@
   function initDashboardWidgets() {
     ensureLayoutToolbar();
     ensureWidgetControls();
+    updateMobilePicker();
+    mobileViewport.addEventListener("change", () => {
+      layoutKey = mobileViewport.matches ? mobileLayoutKey : LAYOUT_KEY;
+      widgetLayout = readLayout();
+      customizeOpen = false;
+      for (const kind of REFRESHABLE_WIDGETS) {
+        resetVisibleCount(kind);
+        renderWidget(kind);
+      }
+      applyVisibility(lastSettings || {});
+      window.dispatchEvent(new CustomEvent("cw:dashboard-widgets-layout-changed"));
+      markWidgetsDirty(0);
+    });
     revealFromCache();
     window.dispatchEvent(new CustomEvent("cw:dashboard-widgets-layout-changed"));
     $("#recent-history-refresh")?.addEventListener("click", (e) => refreshFromButton(e.currentTarget));
@@ -1731,17 +2106,8 @@
         const kind = String(scrollBtn.getAttribute("data-cw-widget-scroll") || "");
         const dir = Number(scrollBtn.dataset.dir || 1) < 0 ? -1 : 1;
         const amount = Math.max(220, Math.floor(row.clientWidth * 0.82));
-        if (dir > 0 && latestItems[kind]?.length > (visibleCounts[kind] || widgetPageStep(kind))) {
-          const step = widgetPageStep(kind);
-          const previousLeft = row.scrollLeft;
-          visibleCounts[kind] = Math.min((visibleCounts[kind] || step) + step, latestItems[kind].length);
-          renderWidget(kind);
-          requestAnimationFrame(() => {
-            const nextRow = widgetNode(kind)?.querySelector(".cw-widget-carousel-row");
-            if (!nextRow) return;
-            nextRow.scrollLeft = previousLeft;
-            nextRow.scrollBy({ left: amount, behavior: "smooth" });
-          });
+        if (dir > 0 && Math.min(widgetTotal(kind), widgetMaxItems(kind)) > (visibleCounts[kind] || widgetPageStep(kind))) {
+          expandWidget(kind, { button: scrollBtn, previousLeft: row.scrollLeft, scrollAmount: amount });
           return;
         }
         row.scrollBy({ left: dir * amount, behavior: "smooth" });
@@ -1759,16 +2125,11 @@
           return;
         }
       }
-      const btn = event.target?.closest?.("[data-cw-widget-more]");
-      if (!btn) return;
-      const kind = String(btn.getAttribute("data-cw-widget-more") || "");
-      if (!["history", "ratings", "scrobble", "progress", "playlists"].includes(kind)) return;
-      const step = widgetPageStep(kind);
-      visibleCounts[kind] = Math.min((visibleCounts[kind] || step) + step, latestItems[kind].length);
-      renderWidget(kind);
     });
+    document.addEventListener("cw-mobile-navigation-ready", () => updateMobilePicker());
     document.addEventListener("tab-changed", (event) => {
       const id = event?.detail?.id || event?.detail?.tab;
+
       if (String(id || "").toLowerCase() === "main") {
         revealCachedWidgets();
         setTimeout(() => refreshDashboardWidgets({ preserve: hasLoaded }), 50);
@@ -1778,10 +2139,10 @@
     window.addEventListener("cw-user-profiles-changed", () => markWidgetsDirty(150, { forceConfig: true, preserve: hasLoaded }));
     window.addEventListener("cw:overview-profile-changed", () => markWidgetsDirty(0, { preserve: hasLoaded }));
     window.addEventListener("activity-log-cleared", () => markWidgetsDirty(100));
-    window.addEventListener("sync-complete", () => markWidgetsDirty(250));
-    window.addEventListener("cw:scrobble-stopped", scheduleScrobbleStopRefresh);
+    window.addEventListener("cw:sync-state-cleared", clearDashboardWidgetState);
+    window.addEventListener("sync-complete", refreshForSyncComplete);
+    window.addEventListener("cw:scrobble-stopped", refreshForScrobbleStopped);
     window.addEventListener("cw:manual-watched-saved", () => markWidgetsDirty(250));
-    window.addEventListener("watchlist:refresh", () => markWidgetsDirty(250));
     window.addEventListener("cw:watchlist-widget-state", (event) => {
       setWidgetEmpty("watchlist", !!event?.detail?.empty);
       cacheWatchlistEmpty(!!event?.detail?.empty);
@@ -1789,12 +2150,16 @@
     });
     window.addEventListener("resize", scheduleMasonry);
     if (authSetupPending()) scheduleAuthReadyRefresh();
-    window.addEventListener("load", () => setTimeout(() => refreshDashboardWidgets({ forceConfig: true }), 100), { once: true });
-    refreshDashboardWidgets();
+    window.addEventListener("load", () => {
+      setTimeout(() => {
+        if (!hasLoaded) refreshDashboardWidgets({ forceConfig: true, preserve: true });
+      }, 100);
+    }, { once: true });
+    refreshDashboardWidgets({ preserve: true });
   }
 
   window.CW = window.CW || {};
-  window.CW.DashboardWidgets = { refresh: refreshDashboardWidgets, showAll: showAllWidgets, hiddenCount: hiddenWidgetCount };
+  window.CW.DashboardWidgets = { refresh: refreshDashboardWidgets, clear: clearDashboardWidgetState, showAll: showAllWidgets, hiddenCount: hiddenWidgetCount };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initDashboardWidgets, { once: true });

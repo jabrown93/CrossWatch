@@ -8,12 +8,7 @@
   const DOM = CW.DOM || {};
   const META = CW.ProviderMeta || {};
 
-  const isTV = (v) => /^(tv|show|shows|series|season|episode|anime)$/i.test(String(v || ""));
   const byId = (id) => document.getElementById(id);
-  const readValue = (id, fallback = "") => {
-    const el = byId(id);
-    return el && "value" in el ? (el.value ?? fallback) : fallback;
-  };
   const readText = (id, fallback = "") => {
     const el = byId(id);
     return el ? (el.textContent ?? fallback) : fallback;
@@ -26,11 +21,6 @@
     const el = byId(id);
     if (el) el.textContent = value ?? "";
   };
-  const setChecked = (id, on) => {
-    const el = byId(id);
-    if (el) el.checked = !!on;
-  };
-  const boolSelect = (id) => String(readValue(id, "false")).toLowerCase() === "true";
   const onReady = (fn) => {
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", fn, { once: true });
     else fn();
@@ -49,12 +39,17 @@
     { key: "PLEX", paths: [["plex"]], keys: ["account_token", "token"] },
     { key: "SIMKL", paths: [["simkl"], ["auth", "simkl"]], keys: ["access_token"] },
     { key: "TRAKT", paths: [["trakt"], ["auth", "trakt"]], keys: ["access_token"] },
+    { key: "KITSU", paths: [["kitsu"]], keys: ["access_token"] },
     { key: "ANILIST", paths: [["anilist"], ["auth", "anilist"]], keys: ["access_token", "token"] },
     { key: "JELLYFIN", paths: [["jellyfin"], ["auth", "jellyfin"]], keys: ["access_token"] },
     { key: "EMBY", paths: [["emby"], ["auth", "emby"]], keys: ["access_token", "api_key", "token"] },
     { key: "MDBLIST", paths: [["mdblist"], ["auth", "mdblist"]], keys: ["api_key", "access_token"] },
     { key: "PUBLICMETADB", paths: [["publicmetadb"], ["auth", "publicmetadb"]], keys: ["api_key"] },
+    { key: "MYANIMELIST", paths: [["myanimelist"]], keys: ["access_token"] },
+    { key: "WETRAKR", paths: [["wetrakr"]], keys: ["access_token"] },
     { key: "PUNCHPLAY", paths: [["punchplay"], ["auth", "punchplay"]], keys: ["access_token"] },
+    { key: "BINGEBASE", paths: [["bingebase"], ["auth", "bingebase"]], keys: ["access_token", "webhook_url"] },
+    { key: "FLICKLIST", paths: [["flicklist"], ["auth", "flicklist"]], keys: ["api_key", "access_token", "token"] },
     { key: "NUVIO", paths: [["nuvio"], ["auth", "nuvio"]], keys: ["access_token", "refresh_token"] },
     { key: "STREMIO", paths: [["stremio"], ["auth", "stremio"]], keys: ["auth_key", "authKey"] },
   ];
@@ -68,9 +63,8 @@
     lastStatusMs: 0,
     navSeq: 0,
     pairedFetchAt: 0,
-    softMainBusy: false,
   };
-  let mainBootLoadRefreshDone = false;
+  let mainRefreshStarted = false;
   const AUTO_STATUS = false;
   const STATUS_MIN_INTERVAL = 24 * 60 * 60 * 1000;
   const UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
@@ -81,7 +75,7 @@
   const statusCacheKey = () => `${STATUS_CACHE_KEY}.${String(window.CW?.OverviewProfile?.id || "").trim() || "all"}`;
   const DETAILS_MAX_LINES = 300;
   const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
-  const ROUTE_TABS = new Set(["main", "watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"]);
+  const ROUTE_TABS = new Set(["main", "snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
   const SETTINGS_PANES = new Set(["overview", "providers", "sync", "scrobbler", "scheduling", "app", "maintenance"]);
   let routeSyncing = false;
 
@@ -106,9 +100,7 @@
     if (!managed) return true;
     const perms = auth?.permissions || {};
     if (normalized === "main") return perms.dashboard !== false;
-    if (normalized === "playback_progress") return perms.playback !== false;
-    if (normalized === "watchlist") return perms.watchlist !== false;
-    if (["snapshots", "playlists", "editor"].includes(normalized)) return perms.write === true;
+    if (["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync"].includes(normalized)) return perms.write === true;
     return false;
   }
 
@@ -116,8 +108,6 @@
     const tab = normalizeRouteTab(value);
     if (canUseRouteTab(tab)) return tab;
     if (canUseRouteTab("main")) return "main";
-    if (canUseRouteTab("watchlist")) return "watchlist";
-    if (canUseRouteTab("playback_progress")) return "playback_progress";
     if (canUseRouteTab("snapshots")) return "snapshots";
     if (canUseRouteTab("playlists")) return "playlists";
     if (canUseRouteTab("editor")) return "editor";
@@ -147,6 +137,12 @@
   }
 
   function routeHash(tab, pane) {
+    if (tab === "import_export") return "#import_export" + (window.location.hash.startsWith("#import_export?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
+    if (tab === "interactive_sync") return "#interactive_sync" + (window.location.hash.startsWith("#interactive_sync?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
+    if (tab === "logs") return "#logs" + (window.location.hash.startsWith("#logs?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
+    if (tab === "capture_compare") return "#capture_compare" + (window.location.hash.startsWith("#capture_compare?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
+    if (tab === "events") return "#events" + (window.location.hash.startsWith("#events?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
+    if (tab === "maintenance") return "#maintenance" + (window.location.hash.startsWith("#maintenance?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
     if (tab === "main") return "";
     if (tab === "settings") {
       const settingsPane = normalizeSettingsPane(pane || window.__cwSettingsPane || "overview");
@@ -287,119 +283,10 @@
     return res.json();
   }
 
-  function maybeCall(fn, ...args) {
-    if (typeof fn !== "function") return undefined;
-    return fn(...args);
-  }
-
   function queueSafe(fn) {
     queueMicrotask(() => {
       try { fn(); } catch {}
     });
-  }
-
-  const providerInstanceCache = new Map();
-  const providerUsersCache = new Map();
-
-  async function cwGetProviderInstances(provider, opts = {}) {
-    const key = String(provider || "").trim().toLowerCase();
-    if (!key) return [{ id: "default", name: "default" }];
-
-    const ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : 15_000;
-    const force = !!opts.force;
-    const now = Date.now();
-    const slot = providerInstanceCache.get(key) || { ts: 0, list: null, pending: null };
-    providerInstanceCache.set(key, slot);
-
-    if (!force && Array.isArray(slot.list) && (now - slot.ts) < ttlMs) return slot.list;
-    if (slot.pending) return slot.pending;
-
-    slot.pending = (async () => {
-      try {
-        const data = await requestJSON(`/api/provider-instances/${encodeURIComponent(key)}`);
-        slot.list = [{ id: "default", name: "default" }].concat(
-          (data.instances || []).map((item) => ({ id: item.id, name: item.name || item.id }))
-        );
-      } catch {
-        slot.list = [{ id: "default", name: "default" }];
-      }
-      slot.ts = Date.now();
-      return slot.list;
-    })().finally(() => {
-      slot.pending = null;
-    });
-
-    return slot.pending;
-  }
-
-  async function cwGetProviderUsers(provider, instanceId = "default", opts = {}) {
-    const prov = String(provider || "").trim().toLowerCase();
-    const inst = String(instanceId || "default").trim() || "default";
-    if (!prov) return [];
-
-    const ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : 15_000;
-    const force = !!opts.force;
-    const cacheKey = `${prov}:${inst}`;
-    const now = Date.now();
-    const slot = providerUsersCache.get(cacheKey) || { ts: 0, value: null, pending: null };
-    providerUsersCache.set(cacheKey, slot);
-
-    if (!force && Array.isArray(slot.value) && (now - slot.ts) < ttlMs) return slot.value;
-    if (slot.pending) return slot.pending;
-
-    slot.pending = (async () => {
-      try {
-        slot.value = await requestJSON(`/api/${encodeURIComponent(prov)}/users?instance=${encodeURIComponent(inst)}`);
-      } catch {
-        slot.value = [];
-      }
-      slot.ts = Date.now();
-      return slot.value;
-    })().finally(() => {
-      slot.pending = null;
-    });
-
-    return slot.pending;
-  }
-
-  function cwEnsureScrobbleRoutes(cfg) {
-    if (!cfg || typeof cfg !== "object") return cfg;
-    cfg.scrobble ||= {};
-    cfg.scrobble.watch ||= {};
-    const watch = cfg.scrobble.watch;
-    if (!Array.isArray(watch.routes)) watch.routes = [];
-    return cfg;
-  }
-
-  function cwNextRouteId(routes) {
-    const used = new Set((routes || []).map((row) => row?.id).filter(Boolean));
-    let index = 1;
-    while (used.has(`R${index}`)) index += 1;
-    return `R${index}`;
-  }
-
-  function applyServerSecret(inputId, hasSecret) {
-    const el = byId(inputId);
-    if (!el) return;
-    el.value = hasSecret ? "********" : "";
-    el.dataset.masked = hasSecret ? "1" : "0";
-    el.dataset.loaded = "1";
-    el.dataset.touched = "";
-    el.dataset.clear = "";
-  }
-
-  function startSecretLoad(inputId) {
-    const el = byId(inputId);
-    if (!el) return;
-    el.dataset.loaded = "0";
-    el.dataset.touched = "";
-  }
-
-  function finishSecretLoad(inputId, hasSecret) {
-    applyServerSecret(inputId, !!hasSecret);
-    if (String(inputId || "") === "tmdb_api_key") {
-      try { window.cwMetaSettingsHubUpdate?.(); } catch {}
-    }
   }
 
   function getConfiguredProviders(cfg = window._cfgCache || {}) {
@@ -415,6 +302,7 @@
     if ([cfg?.scrob, cfg?.auth?.scrob].some(hasScrobConfig)) set.add("SCROB");
     if ([cfg?.tmdb_sync, cfg?.auth?.tmdb_sync].some(hasTmdbConfig)) set.add("TMDB");
     if ([cfg?.tautulli, cfg?.auth?.tautulli].some((block) => hasAnyConfigValue(block, ["api_key", "server_url", "server"]))) set.add("TAUTULLI");
+    if ([cfg?.tracearr, cfg?.auth?.tracearr].some((block) => hasAnyConfigValue(block, ["api_key", "server_url", "server"]))) set.add("TRACEARR");
 
     if ([cfg?.crosswatch, cfg?.CrossWatch].some(hasCrosswatchConfig)) set.add("CROSSWATCH");
     return set;
@@ -476,7 +364,8 @@
       });
     }
 
-    const wanted = PROVIDER_ORDER.filter((key) => allowed.has(key));
+    const wanted = PROVIDER_ORDER.filter((key) => allowed.has(key))
+      .sort((a, b) => providerLabel(a).localeCompare(providerLabel(b), undefined, { sensitivity: "base", numeric: true }));
 
     ["source-provider", "target-provider"].forEach((id) => {
       const select = byId(id);
@@ -663,12 +552,18 @@
 
   function saveStatusCache(providers) {
     try {
-      localStorage.setItem(statusCacheKey(), JSON.stringify({ providers: normalizeProviders(providers), updatedAt: Date.now(), v: 1 }));
+      const payload = { providers: normalizeProviders(providers), updatedAt: Date.now(), v: 1 };
+      window._statusCache = payload;
+      localStorage.setItem(statusCacheKey(), JSON.stringify(payload));
     } catch {}
   }
 
   function loadStatusCache(maxAgeMs = 10 * 60 * 1000) {
     try {
+      const memory = window._statusCache;
+      if (memory?.providers && (Date.now() - (memory.updatedAt || 0)) <= maxAgeMs) {
+        return { providers: normalizeProviders(memory.providers), updatedAt: memory.updatedAt };
+      }
       const cached = JSON.parse(localStorage.getItem(statusCacheKey()) || "null");
       if (!cached?.providers) return null;
       if ((Date.now() - (cached.updatedAt || 0)) > maxAgeMs) return null;
@@ -752,11 +647,19 @@
       const type = String(info.vip_type || "vip").toLowerCase();
       const label = /plus|ep/.test(type) ? "VIP+" : "VIP";
       tag = `<span class="tag vip" title="Trakt ${label}">${svgCheck()}${label}</span>`;
+    } else if (providerKey === "WETRAKR" && (info?.vip || info?.plan === "vip")) {
+      tag = `<span class="tag vip" title="WeTrakr VIP">${svgCrown()}VIP</span>`;
     }
 
     const tips = [];
     const instanceTip = instancesTooltip(info);
     if (instanceTip) tips.push(instanceTip);
+    if (providerKey === "WETRAKR" && info && typeof info === "object") {
+      if (info.username) tips.push(`Account: ${info.username}`);
+      if (info.vip || info.plan === "vip") tips.push("Plan: VIP");
+      else if (info.plan === "free") tips.push("Plan: Free");
+      tips.push(...(META.dailyQuotaDetails?.(info) || []));
+    }
     if (providerKey === "TRAKT" && info && typeof info === "object") {
       const limits = info.limits || {};
       const watchlist = limits.watchlist || {};
@@ -813,17 +716,19 @@
     }));
   }
 
-  async function refreshStatus(force = false) {
+  async function refreshStatus(force = false, verify = force) {
     if (authSetupPending()) return UI.status;
     const now = Date.now();
     if (!force && state.lastStatusMs && (now - state.lastStatusMs) < STATUS_MIN_INTERVAL) return UI.status;
     state.lastStatusMs = now;
 
     try {
-      await refreshPairedProviders(force ? 0 : 5000);
-      const payload = typeof API.Status?.get === "function"
-        ? await API.Status.get(!!force)
-        : await requestJSON("/api/status", {}, 15000);
+      const [, payload] = await Promise.all([
+        refreshPairedProviders(force ? 0 : 5000),
+        typeof API.Status?.get === "function"
+          ? API.Status.get(!!force, !!verify)
+          : requestJSON(verify ? "/api/status?fresh=1" : "/api/status", {}, 15000),
+      ]);
       state.appDebug = !!payload?.debug;
       const providers = extractProviderStatus(payload);
       renderConnectorStatus(providers, { stale: false });
@@ -975,39 +880,21 @@
     byId("stats-card")?.classList.remove("hidden");
   }
 
-  async function softRefreshMain() {
-    if (authSetupPending()) return;
-    if (state.softMainBusy) return;
-    state.softMainBusy = true;
-    enforceMainLayout();
-    try {
-      await Promise.allSettled([
-        refreshStatus(false),
-        refreshStats(false),
-        Promise.resolve(window.refreshInsights?.()),
-        Promise.resolve(window.updatePreviewVisibility?.()),
-      ]);
-    } finally {
-      state.softMainBusy = false;
-    }
-  }
-
   async function hardRefreshMain() {
     if (authSetupPending()) return;
+    mainRefreshStarted = true;
     enforceMainLayout();
     state.lastStatusMs = 0;
-    const previewAlreadyRendered = !!(window.wallLoaded || byId("poster-row")?.childElementCount);
-    await Promise.allSettled([
-      refreshStatus(false),
-      Promise.resolve(window.refreshInsights?.(true)),
-      previewAlreadyRendered ? Promise.resolve(window.updatePreviewVisibility?.()) : Promise.resolve(),
-    ]);
-
     if (!window.esSum) queueSafe(() => window.openSummaryStream?.());
     if (!window.esLogs) queueSafe(() => window.openLogStream?.());
-    if (!previewAlreadyRendered) {
-      try { await window.updatePreviewVisibility?.(); } catch {}
-    }
+
+    const pending = [
+      refreshStatus(false),
+      Promise.resolve(window.updatePreviewVisibility?.()),
+      Promise.resolve(typeof window.Insights?.refreshInsightsFastThenFull === "function"
+        ? window.Insights.refreshInsightsFastThenFull()
+        : window.refreshInsights?.()),
+    ];
 
     if (typeof window.refreshSchedulingBanner === "function") {
       window.refreshSchedulingBanner();
@@ -1016,11 +903,12 @@
         try { window.refreshSchedulingBanner?.(); } catch {}
       }, { once: true });
     }
+    await Promise.allSettled(pending);
   }
 
   function setTabHeaderState(tab) {
-    ["main", "watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"].forEach((name) => {
-      byId(`tab-${name}`)?.classList.toggle("active", name === tab);
+    ["main", "snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "maintenance", "settings"].forEach((name) => {
+      byId(`tab-${name}`)?.classList.toggle("active", name === tab || (name === "snapshots" && tab === "capture_compare"));
     });
   }
 
@@ -1029,11 +917,16 @@
     byId("stats-card")?.classList.toggle("hidden", tab !== "main");
     if (tab !== "main") byId("placeholder-card")?.classList.add("hidden");
 
-    byId("page-watchlist")?.classList.toggle("hidden", tab !== "watchlist");
-    byId("page-playback_progress")?.classList.toggle("hidden", tab !== "playback_progress");
     byId("page-snapshots")?.classList.toggle("hidden", tab !== "snapshots");
+    byId("page-capture_compare")?.classList.toggle("hidden", tab !== "capture_compare");
     byId("page-playlists")?.classList.toggle("hidden", tab !== "playlists");
     byId("page-editor")?.classList.toggle("hidden", tab !== "editor");
+    byId("page-analyzer")?.classList.toggle("hidden", tab !== "analyzer");
+    byId("page-maintenance")?.classList.toggle("hidden", tab !== "maintenance");
+    byId("page-events")?.classList.toggle("hidden", tab !== "events");
+    byId("page-logs")?.classList.toggle("hidden", tab !== "logs");
+    byId("page-import_export")?.classList.toggle("hidden", tab !== "import_export");
+    byId("page-interactive_sync")?.classList.toggle("hidden", tab !== "interactive_sync");
     byId("page-settings")?.classList.toggle("hidden", tab !== "settings");
 
     delete document.documentElement.dataset.cwInitialTab;
@@ -1075,14 +968,17 @@
     if (managed) {
       const perms = auth?.permissions || {};
       const dashboardAllowed = perms.dashboard !== false;
-      const watchlistAllowed = perms.watchlist !== false;
-      const playbackAllowed = perms.playback !== false;
       const writeAllowed = perms.write === true;
-      if (!(tab === "main" && dashboardAllowed) && !(tab === "watchlist" && watchlistAllowed) && !(tab === "playback_progress" && playbackAllowed) && !(["snapshots", "playlists", "editor"].includes(tab) && writeAllowed)) tab = allowedRouteTab(tab);
+      if (!(tab === "main" && dashboardAllowed) && !(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export"].includes(tab) && writeAllowed)) tab = allowedRouteTab(tab);
     }
     writeRouteHash(tab);
 
-    if (state.currentTab === tab) {
+    if (state.currentTab === tab && !(tab === "editor" && byId("page-editor")?.querySelector("[data-editor-load-error]"))) {
+      if (tab === "interactive_sync") window.InteractiveSync?.refresh?.();
+      if (tab === "maintenance") await window.MaintenancePage?.mount?.(byId("page-maintenance"));
+      if (tab === "capture_compare") await window.CaptureComparePage?.mount?.(byId("page-capture_compare"));
+      if (tab === "events") await window.EventsPage?.mount?.(byId("page-events"));
+      if (tab === "logs") await window.LogsPage?.mount?.(byId("page-logs"));
       if (tab === "settings") {
         const pane = normalizeSettingsPane(window.__cwSettingsPane || readRouteHash().pane || "overview");
         window.__cwSettingsPane = pane;
@@ -1095,6 +991,9 @@
     const previousTab = state.currentTab;
     const isCurrentNavigation = () => navSeq === state.navSeq;
 
+    if (previousTab === "capture_compare") window.CaptureComparePage?.hide?.();
+    if (previousTab === "events") window.EventsPage?.hide?.();
+    if (previousTab === "logs") window.LogsPage?.hide?.();
     setTabHeaderState(tab);
     setPageVisibility(tab);
     document.dispatchEvent(new CustomEvent("tab-changed", { detail: { id: tab, tab } }));
@@ -1105,48 +1004,19 @@
 
     if (tab === "main") {
       enforceMainLayout();
-      if (previousTab === "main") await softRefreshMain();
-      else await hardRefreshMain();
-      if (!isCurrentNavigation()) return;
       logPanel?.classList.remove("hidden");
       queueSafe(() => {
-        if (byId("det-log") && !window.esDet) {
+        if (isCurrentNavigation() && byId("det-log") && !window.esDet) {
           try { window.openDetailsLog?.(); } catch {}
         }
       });
+      await hardRefreshMain();
       return;
     }
 
     layout?.classList.add("single");
     layout?.classList.remove("full");
     logPanel?.classList.add("hidden");
-
-    if (tab === "watchlist") {
-      try {
-        await ensurePageModule("watchlist", "/assets/js/watchlist.js", "Watchlist", {
-          refreshEvent: "watchlist:refresh",
-        });
-      } catch (e) {
-        console.warn("Watchlist load/refresh failed:", e);
-      }
-      if (!isCurrentNavigation()) return;
-      return;
-    }
-
-    if (tab === "playback_progress") {
-      try {
-        await ensurePageModule("playback_progress", "/assets/js/playback_progress.js", "PlaybackProgress");
-        window.PlaybackProgress?.mount?.(byId("page-playback_progress"));
-      } catch (e) {
-        console.warn("Playback Progress load/refresh failed:", e);
-        const root = byId("playback-progress-root");
-        if (root && (!root.children.length || root.querySelector(".cw-page-loading"))) {
-          root.innerHTML = '<div class="cw-page-load-error">Playback Progress failed to load. Refresh the page and try again.</div>';
-        }
-      }
-      if (!isCurrentNavigation()) return;
-      return;
-    }
 
     if (tab === "snapshots") {
       try {
@@ -1175,26 +1045,150 @@
       return;
     }
 
-    if (tab === "editor") {
+    if (tab === "interactive_sync") {
+      await ensurePageModule("interactive-sync", "/assets/js/interactive-sync.js", "InteractiveSync");
+      return;
+    }
+
+    if (tab === "maintenance") {
       try {
-        await ensurePageModule("editor-datetime", "/assets/js/editor/datetime.js", "CrossWatchEditorDateTime");
-        await ensurePageModule("editor-search", "/assets/js/editor/search.js", "CrossWatchEditorSearch");
-        await ensurePageModule("editor-rows", "/assets/js/editor/rows.js", "CrossWatchEditorRows");
-        await ensurePageModule("editor-sources", "/assets/js/editor/sources.js", "CrossWatchEditorSources");
-        await ensurePageModule("editor-importers", "/assets/js/editor/importers.js", "CrossWatchEditorImporters");
-        await ensurePageModule("editor-persistence", "/assets/js/editor/persistence.js", "CrossWatchEditorPersistence");
-        await ensurePageModule("editor-table", "/assets/js/editor/table.js", "CrossWatchEditorTable");
-        await ensurePageModule("editor-chrome", "/assets/js/editor/chrome.js", "CrossWatchEditorChrome");
-        await ensurePageModule("editor-row-editor", "/assets/js/editor/row-editor.js", "CrossWatchEditorRowEditor");
-        await ensurePageModule("editor-table-controller", "/assets/js/editor/table-controller.js", "CrossWatchEditorTableController");
-        await ensurePageModule("editor-file-utils", "/assets/js/editor/file-utils.js", "CrossWatchEditorFileUtils");
-        await ensurePageModule("editor-load-controller", "/assets/js/editor/load-controller.js", "CrossWatchEditorLoadController");
-        await ensurePageModule("editor-extra-editors", "/assets/js/editor/extra-editors.js", "CrossWatchEditorExtraEditors");
-        await ensurePageModule("editor-metadata-replacer", "/assets/js/editor/metadata-replacer.js", "CrossWatchEditorMetadataReplacer");
-        await ensurePageModule("editor-send-modal", "/assets/js/editor/send-modal.js", "CrossWatchEditorSendModal");
+        const root = byId("page-maintenance");
+        if (root && !root.querySelector(".cw-maint")) root.innerHTML = '<div class="cw-page-loading" role="status">Loading maintenance tools...</div>';
+        await ensurePageModule("maintenance", "/assets/js/maintenance/index.js", "MaintenancePage");
+        if (!isCurrentNavigation()) return;
+        await window.MaintenancePage.mount(root);
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        const root = byId("page-maintenance");
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Maintenance tools failed to load. Refresh the page and try again.</div>';
+        console.error("Maintenance tools failed to load", error);
+      }
+      return;
+    }
+
+    if (tab === "import_export") {
+      try {
+        await ensurePageModule("import-export", "/assets/js/import-export/index.js", "ImportExport");
+        if (!isCurrentNavigation()) return;
+        await window.ImportExport.mount(byId("page-import_export"));
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        window.ImportExport?.unmount?.();
+        const root = byId("page-import_export");
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Import / Export failed to load. Refresh the page and try again.</div>';
+        console.error("Import / Export failed to load", error);
+      }
+      return;
+    }
+
+    if (tab === "logs") {
+      try {
+        await ensurePageModule("logs", "/assets/js/logs.js", "LogsPage");
+        if (!isCurrentNavigation()) return;
+        await window.LogsPage.mount(byId("page-logs"));
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        window.LogsPage?.unmount?.();
+        const root = byId("page-logs");
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Logs failed to load. Refresh the page and try again.</div>';
+      }
+      return;
+    }
+
+    if (tab === "capture_compare") {
+      try {
+        const root = byId("page-capture_compare");
+        if (root && !root.children.length) root.innerHTML = '<div class="cw-page-loading" role="status">Loading Capture Compare...</div>';
+        await ensurePageModule("capture-compare", "/assets/js/capture-compare/index.js", "CaptureComparePage");
+        if (!isCurrentNavigation()) return;
+        await window.CaptureComparePage.mount(root);
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        window.CaptureComparePage?.unmount?.();
+        const root = byId("page-capture_compare");
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Capture Compare failed to load. <a href="#snapshots">Back to Captures</a></div>';
+        console.error("Capture Compare failed to load", error);
+      }
+      return;
+    }
+
+    if (tab === "events") {
+      try {
+        const root = byId("page-events");
+        if (root && !root.children.length) {
+          root.innerHTML = '<div class="cw-page-loading" role="status">Loading events…</div>';
+        }
+        await ensurePageModule("events", "/assets/js/events/page.js", "EventsPage");
+        if (!isCurrentNavigation()) return;
+        await window.EventsPage.mount(byId("page-events"));
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        window.EventsPage?.unmount?.();
+        const root = byId("page-events");
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Events failed to load. Refresh the page and try again.</div>';
+        console.error("Events failed to load", error);
+      }
+      return;
+    }
+
+    if (tab === "analyzer") {
+      try {
+        await ensurePageModule("analyzer", "/assets/js/analyzer/index.js", "Analyzer");
+        if (!isCurrentNavigation()) return;
+        await window.Analyzer.mount(byId("page-analyzer"));
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        const root = byId("page-analyzer");
+        window.Analyzer?.unmount?.();
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Analyzer failed to load. Refresh the page and try again.</div>';
+        console.error("Analyzer failed to load", error);
+      }
+      return;
+    }
+
+    if (tab === "editor") {
+      const root = byId("page-editor");
+      if (root && !root.querySelector(".cw-root")) {
+        root.setAttribute("aria-busy", "true");
+        root.innerHTML = `<div class="cw-root cw-editor-skeleton">
+          <div class="cw-topline cw-page-hero cw-page-hero-editor" data-hero-icon="edit_note">
+            <div class="cw-head-copy cw-page-hero-copy"><div class="cw-page-hero-kicker">EDITOR</div><div class="cw-title-row"><div><div class="cw-title cw-page-hero-title">Editor</div><div class="cw-sub cw-page-hero-sub">Edit your current state or playlist endpoints</div></div></div></div>
+            <div class="cw-editor-hero-summary cw-page-hero-actions"><div class="cw-editor-hero-seg"><strong role="status">Loading Editor...</strong><span>Please wait</span></div></div>
+          </div>
+          <div class="cw-wrap" aria-hidden="true"><div class="cw-main">
+            <div class="cw-controls cw-page-toolbar"><span class="cw-skeleton-bar cw-skeleton-search"></span><span class="cw-skeleton-bar cw-skeleton-action"></span><span class="cw-skeleton-bar cw-skeleton-action"></span></div>
+            <div class="cw-table-wrap cw-page-table"><div class="cw-skeleton-table-head"><span class="cw-skeleton-bar"></span></div>${'<div class="cw-skeleton-table-row"><span class="cw-skeleton-bar"></span><span class="cw-skeleton-bar"></span><span class="cw-skeleton-bar"></span></div>'.repeat(6)}</div>
+          </div><aside class="cw-side"><div class="ins-card cw-skeleton-sidebar cw-page-panel">${'<div><span class="cw-skeleton-bar cw-skeleton-label"></span><span class="cw-skeleton-bar cw-skeleton-field"></span></div>'.repeat(5)}</div></aside></div>
+        </div>`;
+      }
+      try {
+        await Promise.all([
+          ensurePageModule("editor-datetime", "/assets/js/editor/datetime.js", "CrossWatchEditorDateTime"),
+          ensurePageModule("editor-search", "/assets/js/editor/search.js", "CrossWatchEditorSearch"),
+          ensurePageModule("editor-rows", "/assets/js/editor/rows.js", "CrossWatchEditorRows"),
+          ensurePageModule("editor-sources", "/assets/js/editor/sources.js", "CrossWatchEditorSources"),
+          ensurePageModule("editor-importers", "/assets/js/editor/importers.js", "CrossWatchEditorImporters"),
+          ensurePageModule("editor-persistence", "/assets/js/editor/persistence.js", "CrossWatchEditorPersistence"),
+          ensurePageModule("editor-table", "/assets/js/editor/table.js", "CrossWatchEditorTable"),
+          ensurePageModule("editor-chrome", "/assets/js/editor/chrome.js", "CrossWatchEditorChrome"),
+          ensurePageModule("editor-row-editor", "/assets/js/editor/row-editor.js", "CrossWatchEditorRowEditor"),
+          ensurePageModule("editor-table-controller", "/assets/js/editor/table-controller.js", "CrossWatchEditorTableController"),
+          ensurePageModule("editor-file-utils", "/assets/js/editor/file-utils.js", "CrossWatchEditorFileUtils"),
+          ensurePageModule("editor-load-controller", "/assets/js/editor/load-controller.js", "CrossWatchEditorLoadController"),
+          ensurePageModule("editor-extra-editors", "/assets/js/editor/extra-editors.js", "CrossWatchEditorExtraEditors"),
+          ensurePageModule("editor-metadata-replacer", "/assets/js/editor/metadata-replacer.js", "CrossWatchEditorMetadataReplacer"),
+          ensurePageModule("editor-send-modal", "/assets/js/editor/send-modal.js", "CrossWatchEditorSendModal"),
+        ]);
+        if (!isCurrentNavigation()) return;
         await ensurePageModule("editor", "/assets/js/editor.js", "Editor");
       } catch (e) {
         console.warn("Editor load failed:", e);
+        if (!isCurrentNavigation()) return;
+        if (root) {
+          root.removeAttribute("aria-busy");
+          root.innerHTML = '<div class="cw-editor-loading" data-editor-load-error><h1>Editor</h1><p role="alert">Could not load the Editor. Please try again.</p><button type="button" class="btn">Try again</button></div>';
+          root.querySelector("button").addEventListener("click", () => showTab("editor"));
+        }
       }
       if (!isCurrentNavigation()) return;
       return;
@@ -1255,20 +1249,24 @@
 
   window.addEventListener("cw:overview-profile-changed", () => {
     try { window.CW?.Cache?.invalidate?.(["status"]); } catch {}
-    queueSafe(() => { refreshStatus(true); });
+    queueSafe(() => { refreshStatus(true, false); });
     const current = normalizeRouteTab(state.currentTab || document.documentElement?.dataset?.tab || document.body?.dataset?.tab || "main");
     const tab = allowedRouteTab(current);
     if (tab !== current) Promise.resolve(showTab(tab)).catch(() => {});
   });
 
+  window.addEventListener("sync-complete", () => {
+    try { window.CW?.Cache?.invalidate?.(["status"]); } catch {}
+    queueSafe(() => { refreshStatus(true, false); });
+  });
+
   window.addEventListener("load", () => {
-    if (mainBootLoadRefreshDone) return;
-    mainBootLoadRefreshDone = true;
+    if (mainRefreshStarted) return;
     if (authSetupPending()) return;
     const tab = String(state.currentTab || document.documentElement?.dataset?.tab || document.body?.dataset?.tab || "main").toLowerCase();
     if (tab !== "main") return;
     queueSafe(() => {
-      hardRefreshMain().catch(() => {});
+      if (!mainRefreshStarted) hardRefreshMain().catch(() => {});
     });
   }, { once: true });
 
@@ -1280,9 +1278,11 @@
 
     const start = () => {
       if (scrobblerInit) return;
-      if (window.Scrobbler?.init) window.Scrobbler.init({ mountId: mount.id });
-      else if (window.Scrobbler?.mount) window.Scrobbler.mount(mount, window._cfgCache || {});
+      let boot;
+      if (window.Scrobbler?.init) boot = window.Scrobbler.init({ mountId: mount.id });
+      else if (window.Scrobbler?.mount) boot = window.Scrobbler.mount(mount, window._cfgCache || {});
       else return;
+      Promise.resolve(boot).catch((err) => console.warn("[scrobbler] init failed", err));
       scrobblerInit = true;
     };
 
@@ -1310,7 +1310,7 @@
     if (String(e?.detail?.pane || "").toLowerCase() !== "scrobbler") return;
     try { window.loadConfig?.(); } catch {}
     if (scrobblerInit) {
-      try { window.Scrobbler?.refresh?.(); } catch {}
+      try { Promise.resolve(window.Scrobbler?.refresh?.()).catch((err) => console.warn("[scrobbler] refresh failed", err)); } catch {}
       return;
     }
     try { ensureScrobbler(); setTimeout(ensureScrobbler, 200); } catch {}
@@ -1353,19 +1353,82 @@
   function pairCanRun(pair) {
     if (!pair || pair.enabled === false) return false;
     const features = pair.features || {};
-    const keys = ["watchlist", "ratings", "history", "progress", "playlists"];
+    const keys = ["watchlist", "ratings", "history", "progress", "playlists", "collection"];
     if (!pair.features) return true;
     return keys.some((key) => featureEnabled(features[key]));
+  }
+
+  const SYNC_FEATURE_DOT_CLASSES = {
+    watchlist: "wl",
+    ratings: "rt",
+    history: "hi",
+    progress: "pr",
+    playlists: "pl",
+    collection: "co",
+  };
+
+  const SYNC_FEATURE_LABELS = {
+    watchlist: "Watchlist",
+    ratings: "Ratings",
+    history: "History",
+    progress: "Progress",
+    playlists: "Playlists",
+    collection: "Collections",
+  };
+
+  function syncFeatureOrder() {
+    return ["watchlist", "ratings", "history", "progress", "playlists", "collection"];
+  }
+
+  function syncFeatureLabel(key) {
+    const k = String(key || "").trim().toLowerCase();
+    return SYNC_FEATURE_LABELS[k] || k || "?";
+  }
+
+  function enabledPairFeatures(pair) {
+    const features = pair?.features || {};
+    return syncFeatureOrder().filter((key) => SYNC_FEATURE_DOT_CLASSES[key] && featureEnabled(features[key]));
+  }
+
+  function syncFeatureDotsHTML(pair) {
+    const enabled = enabledPairFeatures(pair);
+    if (!enabled.length) return "";
+    const label = enabled.map(syncFeatureLabel).join(", ");
+    const dots = enabled
+      .map((key) => {
+        const cls = SYNC_FEATURE_DOT_CLASSES[key];
+        const tip = `${syncFeatureLabel(key)} enabled`;
+        return `<span class="cw-sync-feature-dot ${cls}" title="${escapeHtml(tip)}" aria-hidden="true"></span>`;
+      })
+      .join("");
+    return `<span class="cw-sync-menu-features" role="img" aria-label="${escapeHtml(label)}">${dots}</span>`;
+  }
+
+  function syncMenuInstanceLabel(provider, instance) {
+    const id = String(instance || "default").trim() || "default";
+    const label = String(META.instanceLabel?.(provider, id) || id).trim();
+    if (id.toLowerCase() === "default") return label === "Default instance" || label.toLowerCase() === "default" ? "" : label;
+    if (label !== id) return label;
+    const numbered = id.match(/(?:^|[-_])P(\d+)$/i);
+    return numbered ? `P${numbered[1].padStart(2, "0")}` : id;
+  }
+
+  function syncMenuProviderHTML(provider, instance) {
+    const brand = META.brandInfo?.(provider) || {};
+    const name = brand.label || providerLabel(provider);
+    const detail = syncMenuInstanceLabel(provider, instance);
+    return `<span class="cw-sync-provider" style="--sync-brand:${escapeHtml(brand.tone?.solid || "var(--accent)")}" title="${escapeHtml(detail ? `${name} · ${detail}` : name)}">${brand.icon ? `<img src="${escapeHtml(brand.icon)}" width="16" height="16" alt="" aria-hidden="true">` : ""}<span class="cw-sync-provider-name">${escapeHtml(name)}</span>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</span>`;
   }
 
   function pairTitle(pair) {
     const source = providerLabel(pair.source);
     const target = providerLabel(pair.target);
-    const sourceInst = String(pair.source_instance || "").trim();
-    const targetInst = String(pair.target_instance || "").trim();
-    const sourceLabel = sourceInst && sourceInst.toLowerCase() !== "default" ? `${source} · ${sourceInst}` : source;
-    const targetLabel = targetInst && targetInst.toLowerCase() !== "default" ? `${target} · ${targetInst}` : target;
-    return `${sourceLabel} → ${targetLabel}`;
+    const sourceInst = syncMenuInstanceLabel(pair.source, pair.source_instance);
+    const targetInst = syncMenuInstanceLabel(pair.target, pair.target_instance);
+    const sourceLabel = sourceInst ? `${source} · ${sourceInst}` : source;
+    const targetLabel = targetInst ? `${target} · ${targetInst}` : target;
+    const arrow = String(pair.mode || "").trim().toLowerCase() === "two-way" ? "↔" : "→";
+    return `${sourceLabel} ${arrow} ${targetLabel}`;
   }
 
   function clampMenuToViewport(menu, margin = 10) {
@@ -1462,10 +1525,16 @@
     const menu = byId("cw-sync-menu");
     if (!menu) return;
     menu.innerHTML = "";
-    menu.appendChild(buildSyncMenuButton("Sync all", () => {
+    const syncAll = buildSyncMenuButton("Sync all", () => {
       cwCloseSyncMenu();
       runSync();
-    }));
+    }, "cw-sync-menu-all");
+    const syncIcon = document.createElement("span");
+    syncIcon.className = "material-symbols-rounded";
+    syncIcon.setAttribute("aria-hidden", "true");
+    syncIcon.textContent = "sync";
+    syncAll.prepend(syncIcon);
+    menu.appendChild(syncAll);
 
     const auth = window.CW?.AuthState?.read?.();
     let pairs = await _getPairsFresh(auth?.isManaged === true);
@@ -1485,18 +1554,31 @@
     }
 
     runnable.forEach((pair) => {
+      const row = document.createElement("div");
+      row.className = "cw-sync-menu-row";
+      row.setAttribute("role", "none");
       const button = document.createElement("button");
       const mode = String(pair.mode || "").toLowerCase();
       const modeLabel = mode === "two-way" ? "two-way" : (mode === "one-way" ? "one-way" : "");
       button.type = "button";
       button.className = "cw-menu-item";
       button.setAttribute("role", "menuitem");
-      button.innerHTML = `<span class="cw-sync-menu-title">${escapeHtml(pairTitle(pair))}</span>${modeLabel ? `<span class="cw-sync-menu-meta">${escapeHtml(modeLabel)}</span>` : ""}`;
+      button.setAttribute("aria-label", `Sync: ${pairTitle(pair)}`);
+      button.innerHTML = `<span class="cw-sync-menu-main"><span class="cw-sync-menu-title">${syncMenuProviderHTML(pair.source, pair.source_instance)}<span class="cw-sync-menu-arrow" aria-hidden="true">${mode === "two-way" ? "↔" : "→"}</span>${syncMenuProviderHTML(pair.target, pair.target_instance)}</span>${syncFeatureDotsHTML(pair)}</span>${modeLabel ? `<span class="cw-sync-menu-meta">${escapeHtml(modeLabel)}</span>` : ""}`;
       button.addEventListener("click", () => {
         cwCloseSyncMenu();
         runSync({ pair_id: String(pair.id || "").trim() });
       });
-      menu.appendChild(button);
+      const review = buildSyncMenuButton("", () => {
+        cwCloseSyncMenu();
+        location.hash = `interactive_sync?pair=${encodeURIComponent(String(pair.id || "").trim())}`;
+      });
+      review.className = "cw-sync-menu-review";
+      review.title = "Interactive Sync";
+      review.setAttribute("aria-label", `Interactive Sync: ${pairTitle(pair)}`);
+      review.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">fact_check</span>';
+      row.append(button, review);
+      menu.appendChild(row);
     });
   }
 
@@ -1528,7 +1610,8 @@
     };
     window.__cwSyncMenuOutside = (event) => {
       const target = event?.target;
-      if (!target || target === btn || menu.contains(target)) return;
+      const liveBtn = byId("run-menu");
+      if (!target || liveBtn?.contains?.(target) || menu.contains(target)) return;
       cwCloseSyncMenu();
     };
     window.__cwSyncMenuEsc = (event) => {
@@ -1568,8 +1651,11 @@
   }
 
   async function runSync(opts) {
-    if (!!UI.summary?.running || window.syncBar?.isRunning?.()) return cancelSync();
-    if (state.busy) return;
+    if (!!UI.summary?.running || window.syncBar?.isRunning?.()) {
+      if (opts?.startOnly) return { ok: false, error: "A sync is already running" };
+      return cancelSync();
+    }
+    if (state.busy) return { ok: false, error: "CrossWatch is busy. Try again shortly" };
     try { cwCloseSyncMenu(); } catch {}
 
     let pairId = "";
@@ -1600,7 +1686,7 @@
         setSyncHeader("sync-bad", `Failed to start${payload?.error ? ` – ${payload.error}` : ""}`);
         resetSyncButtons(pairId);
         window.UX?.updateTimeline?.({ start: false, pre: false, post: false, done: false });
-        return;
+        return { ...payload, ok: false, error: payload?.error || payload?.message || "Failed to start sync" };
       }
 
       if (payload.skipped) {
@@ -1610,12 +1696,14 @@
         setSyncHeader("sync-warn", message);
         resetSyncButtons(pairId);
         window.UX?.updateTimeline?.({ start: false, pre: false, post: false, done: false });
-        return;
+        return payload;
       }
+      return payload;
     } catch {
       setSyncHeader("sync-bad", "Failed to reach server");
       resetSyncButtons(pairId);
       window.UX?.updateTimeline?.({ start: false, pre: false, post: false, done: false });
+      return { ok: false, error: "Failed to reach server" };
     } finally {
       setBusy(false);
       recomputeRunDisabled();
@@ -1634,7 +1722,7 @@
         state.cancelPending = false;
         setSyncHeader("sync-warn", payload?.error ? `Cancel failed – ${payload.error}` : "Cancel failed");
       } else {
-        setSyncHeader("sync-warn", "Cancelling — finishing the current step…");
+        setSyncHeader("sync-warn", "Cancelling — stopping after the current batch…");
       }
     } catch {
       state.cancelPending = false;
@@ -1679,45 +1767,13 @@
     (byId("btn-sync") || document.querySelector('[data-action="sync"], .btn-sync'))?.addEventListener("click", () => setStatsExpanded(false));
   }
 
-  async function fetchJSON() {
-    if (window.Insights?.fetchJSON) return window.Insights.fetchJSON.apply(this, arguments);
-    return null;
-  }
-
-  function scheduleInsights() {
-    return window.Insights?.scheduleInsights?.apply(this, arguments);
-  }
-
   async function refreshInsights() {
     return window.Insights?.refreshInsights?.apply(this, arguments);
-  }
-
-  function renderSparkline() {
-    return window.Insights?.renderSparkline?.apply(this, arguments);
-  }
-
-  function animateNumber() {
-    return window.Insights?.animateNumber?.apply(this, arguments);
-  }
-
-  function animateChart() {
-    return window.Insights?.animateChart?.apply(this, arguments);
   }
 
   async function refreshStats(force = false) {
     if (window.Insights?.refreshStats) return window.Insights.refreshStats(force);
     return null;
-  }
-
-  function _setBarValues(now, week, month) {
-    [
-      [".bar.week", week],
-      [".bar.month", month],
-      [".bar.now", now],
-    ].forEach(([selector, value]) => {
-      const el = document.querySelector(selector);
-      if (el) el.dataset.v = String(value);
-    });
   }
 
   function _initStatsTooltip() {
@@ -1726,13 +1782,13 @@
     if (!chart || !tip) return;
 
     [
-      [document.querySelector(".bar.week"), "Last Week"],
-      [document.querySelector(".bar.month"), "Last Month"],
-      [document.querySelector(".bar.now"), "Now"],
-    ].forEach(([el, label]) => {
+      [document.querySelector(".bar.week"), "Last Week", "added"],
+      [document.querySelector(".bar.month"), "Last Month", "added"],
+      [document.querySelector(".bar.now"), "Now", "items"],
+    ].forEach(([el, label, unit]) => {
       if (!el) return;
       const show = (x, y) => {
-        tip.textContent = `${label}: ${el.dataset.v || "0"} items`;
+        tip.textContent = `${label}: ${el.dataset.v || "0"} ${unit}`;
         tip.style.left = `${x}px`;
         tip.style.top = `${y}px`;
         tip.hidden = false;
@@ -1904,7 +1960,11 @@
     btn.classList.toggle("loading", !!busy);
   }
 
-  window.openAbout = () => window.ModalRegistry.open("about");
+  window.openAbout = window.openAbout || (async (props = {}) => {
+    const v = encodeURIComponent(String(window.__CW_VERSION__ || window.CW_ASSET_VERSION || Date.now()));
+    const mod = await import(`/assets/js/modals/about.js?v=${v}`);
+    return mod.openAboutModal?.(props);
+  });
   window.cxEnsureCfgModal = window.cxEnsureCfgModal || function () {};
   window.wireSecretTouch = window.wireSecretTouch || function wireSecretTouch(id) {
     const el = byId(id);
@@ -1925,32 +1985,6 @@
     el.dataset.clear = "";
   };
 
-
-  function isPlaceholder(value, placeholder) {
-    return String(value || "").trim().toUpperCase() === String(placeholder || "").trim().toUpperCase();
-  }
-
-  function isSettingsVisible() {
-    const page = byId("page-settings");
-    return !!(page && !page.classList.contains("hidden"));
-  }
-
-  function setBtnBusy(id, busy) {
-    const el = byId(id);
-    if (!el) return;
-    el.disabled = !!busy;
-    el.classList.toggle("opacity-50", !!busy);
-  }
-
-  function flashBtnOK(btnEl) {
-    if (!btnEl) return;
-    btnEl.disabled = true;
-    btnEl.classList.add("copied");
-    setTimeout(() => {
-      btnEl.classList.remove("copied");
-      btnEl.disabled = false;
-    }, 700);
-  }
 
   function normalizePairPayload(data, editingId = "") {
     const src = String(data?.source || "").trim();
@@ -1976,6 +2010,7 @@
         },
         history: basic(features.history),
         playlists: basic(features.playlists),
+        collection: basic(features.collection),
       },
     };
   }
@@ -1989,6 +2024,7 @@
       const list = await _getPairsFresh(!!force);
       window.cx = window.cx || {};
       window.cx.pairs = Array.isArray(list) ? list : [];
+      document.dispatchEvent(new Event("cw:sync-data-changed"));
       renderConnectionsSafe();
       return window.cx.pairs;
     } catch (e) {
@@ -2078,8 +2114,6 @@ CW.checkForUpdate = checkForUpdate;
     const authPendingAtReady = authSetupPending();
     try { fixFormLabels(); } catch {}
     try { wireDetailsToStats(); } catch {}
-    try { scheduleInsights(); } catch {}
-    try { refreshInsights(); } catch {}
     try { _initStatsTooltip(); } catch {}
     try {
       const route = readRouteHash();
@@ -2101,7 +2135,7 @@ CW.checkForUpdate = checkForUpdate;
           const tab = String(state.currentTab || document.documentElement?.dataset?.tab || document.body?.dataset?.tab || "main").toLowerCase();
           if (tab !== "main") return;
           queueSafe(() => {
-            hardRefreshMain().catch(() => {});
+            if (!mainRefreshStarted) hardRefreshMain().catch(() => {});
           });
         });
     }

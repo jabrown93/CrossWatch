@@ -3,19 +3,66 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.app_version import user_agent as http_user_agent
+from cw_platform.trakt_http import pace_session
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .trakt._common import (
     build_headers,
     load_dropped_show_tokens as trakt_load_dropped_show_tokens,
+    tag_dropped_shows as trakt_tag_dropped_shows,
     normalize as trakt_normalize,
     key_of as trakt_key_of,
 )
 from ._log import log as cw_log
 
+
+def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
+    attempted: list[str] = []
+    for it in items or []:
+        try:
+            k = str(it.get("_cw_event_key") or "").strip() if isinstance(it, Mapping) and it.get("_cw_rewatch_sync") is True else ""
+            if not k:
+                k = str(key_of(it) or "").strip()
+        except Exception:
+            k = ""
+        if k:
+            attempted.append(k)
+
+    unresolved_keys: set[str] = set()
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                if isinstance(u.get("key"), str) and u.get("key"):
+                    unresolved_keys.add(str(u.get("key")))
+                    continue
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                unresolved_keys.add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                try:
+                    k = str(obj.get("_cw_event_key") or "").strip() if obj.get("_cw_rewatch_sync") is True else ""
+                    if not k:
+                        k = str(key_of(obj) or "").strip()
+                except Exception:
+                    k = ""
+                if k:
+                    unresolved_keys.add(k)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in attempted:
+        if k in unresolved_keys or k in seen:
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
 
 try:
     from ..auth._auth_TRAKT import PROVIDER as AUTH_TRAKT  # token refresh hook
@@ -36,6 +83,10 @@ try:
 except Exception:
     feat_progress = None
 try:
+    from .trakt import _collection as feat_collection
+except Exception:
+    feat_collection = None
+try:
     from .trakt import _playlists as feat_playlists
 except Exception:
     feat_playlists = None
@@ -48,7 +99,6 @@ from ._mod_common import (
     label_trakt,
     SimpleRateLimiter,
     make_snapshot_progress,
-    _confirmed_keys,
 )
 
 try:  # type: ignore[name-defined]
@@ -56,10 +106,10 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.5"
+__VERSION__ = "1.8"
 __all__ = ["get_manifest", "TRAKTModule", "OPS"]
 
-os.environ.setdefault("CW_TRAKT_UA", f"CrossWatch TRAKT/{__VERSION__}")
+os.environ.setdefault("CW_TRAKT_UA", http_user_agent("TRAKT", override_env="CW_TRAKT_UA"))
 
 
 class TRAKTError(RuntimeError):
@@ -75,10 +125,13 @@ _PROVIDER = "TRAKT"
 _PLAYLIST_CAPABILITIES: dict[str, Any] = {
     "read": True,
     "create": True,
+    "rename": True,
+    "delete": True,
     "add": True,
     "remove": True,
     "reorder": True,
     "smart": False,
+    "discovery": True,
     "media_types": ["movies", "shows", "seasons", "episodes"],
 }
 
@@ -106,6 +159,8 @@ if feat_ratings:
     _FEATURES["ratings"] = feat_ratings
 if feat_progress:
     _FEATURES["progress"] = feat_progress
+if feat_collection:
+    _FEATURES["collection"] = feat_collection
 
 
 def _features_flags() -> dict[str, bool]:
@@ -114,6 +169,7 @@ def _features_flags() -> dict[str, bool]:
         "ratings": "ratings" in _FEATURES,
         "history": "history" in _FEATURES,
         "progress": "progress" in _FEATURES,
+        "collection": "collection" in _FEATURES,
         "playlists": feat_playlists is not None,
     }
 
@@ -154,6 +210,12 @@ def get_manifest() -> Mapping[str, Any]:
                     "stop_scrobble": {"marks_watched_percent": 80, "comparison": "above"},
                 },
             },
+            "collection": {
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "upsert": True,
+                "remove": True,
+                "media_updates": True,
+            },
             "playlists": _PLAYLIST_CAPABILITIES,
         },
     }
@@ -165,18 +227,22 @@ class TRAKTConfig:
     access_token: str
     timeout: float = 15.0
     max_retries: int = 3
-    rate_get_per_sec: float = 3.33
+    rate_get_per_sec: float = 1.66
     rate_post_per_sec: float = 1.0
     watchlist_batch_size: int = 100
-    ratings_per_page: int = 100
+    ratings_per_page: int = 250
     ratings_max_pages: int = 50
     ratings_chunk_size: int = 100
-    history_per_page: int = 100
+    history_per_page: int = 250
+    progress_per_page: int = 250
     history_max_pages: int = 10000
     history_chunk_size: int = 100
     history_number_fallback: bool = False
     history_collection: bool = False
     history_collection_types: list[str] | None = None
+    collection_batch_size: int = 100
+    collection_use_etag: bool = True
+    collection_shadow_ttl_hours: int = 168
 
 
 class TRAKTClient:
@@ -186,6 +252,7 @@ class TRAKTClient:
         self.cfg = cfg
         self.raw_cfg = raw_cfg
         self.session: HitSession = build_session("TRAKT", ctx, feature_label=label_trakt)
+        pace_session(self.session)
 
         try:
             self.session._rate_limiter = SimpleRateLimiter(
@@ -242,7 +309,9 @@ class TRAKTClient:
             src_p = str(os.getenv("CW_PAIR_SRC") or "").upper().strip()
             dst_p = str(os.getenv("CW_PAIR_DST") or "").upper().strip()
             inst = "default"
-            if src_p == "TRAKT":
+            if "_cw_provider_instance" in self.raw_cfg:
+                inst = str(self.raw_cfg["_cw_provider_instance"] or "default").strip() or "default"
+            elif src_p == "TRAKT":
                 inst = str(os.getenv("CW_PAIR_SRC_INSTANCE") or "default").strip() or "default"
             elif dst_p == "TRAKT":
                 inst = str(os.getenv("CW_PAIR_DST_INSTANCE") or "default").strip() or "default"
@@ -343,7 +412,7 @@ class TRAKTModule:
                 f = 0.0
             return f
 
-        rate_get = _rate("get_per_sec", 3.33)
+        rate_get = _rate("get_per_sec", 1.66)
         rate_post = _rate("post_per_sec", 1.0)
 
         self.cfg = TRAKTConfig(
@@ -354,15 +423,19 @@ class TRAKTModule:
             rate_get_per_sec=rate_get,
             rate_post_per_sec=rate_post,
             watchlist_batch_size=int(t.get("watchlist_batch_size", 100) or 100),
-            ratings_per_page=int(t.get("ratings_per_page", 100) or 100),
+            ratings_per_page=int(t.get("ratings_per_page", 250) or 250),
             ratings_max_pages=int(t.get("ratings_max_pages", 50) or 50),
             ratings_chunk_size=int(t.get("ratings_chunk_size", 100) or 100),
-            history_per_page=int(t.get("history_per_page", 100) or 100),
+            history_per_page=int(t.get("history_per_page", 250) or 250),
+            progress_per_page=int(t.get("progress_per_page", 250) or 250),
             history_max_pages=int(t.get("history_max_pages", 10000) or 10000),
             history_chunk_size=int(t.get("history_chunk_size", 100) or 100),
             history_number_fallback=bool(t.get("history_number_fallback")),
             history_collection=bool(t.get("history_collection")),
             history_collection_types=types or None,
+            collection_batch_size=int(t.get("collection_batch_size", t.get("watchlist_batch_size", 100)) or 100),
+            collection_use_etag=bool(t.get("collection_use_etag", True)),
+            collection_shadow_ttl_hours=int(t.get("collection_shadow_ttl_hours", 168) or 168),
         )
         if not self.cfg.client_id or not self.cfg.access_token:
             raise TRAKTAuthError("Missing Trakt client_id/access_token")
@@ -393,6 +466,7 @@ class TRAKTModule:
             "ratings": True,
             "history": True,
             "progress": True,
+            "collection": True,
             "playlists": True,
         }
         present = _features_flags()
@@ -493,6 +567,7 @@ class TRAKTModule:
             "ratings": (core_ok if (enabled.get("ratings") and "ratings" in _FEATURES) else False),
             "history": (core_ok if (enabled.get("history") and "history" in _FEATURES) else False),
             "progress": (core_ok if (enabled.get("progress") and "progress" in _FEATURES) else False),
+            "collection": (core_ok if (enabled.get("collection") and "collection" in _FEATURES) else False),
             "playlists": (core_ok if enabled.get("playlists") else False),
         }
 
@@ -559,6 +634,9 @@ class TRAKTModule:
         except Exception as e:
             _warn("common", "dropped_load_failed", error=str(e))
             return set()
+
+    def tag_dropped_shows(self, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        return trakt_tag_dropped_shows(self, items)
 
     def feature_names(self) -> tuple[str, ...]:
         return tuple(k for k, v in self.supported_features().items() if v and k in _FEATURES)
@@ -724,6 +802,12 @@ class _TraktOPS:
                     "stop_scrobble": {"marks_watched_percent": 80, "comparison": "above"},
                 },
             },
+            "collection": {
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "upsert": True,
+                "remove": True,
+                "media_updates": True,
+            },
             "playlists": _PLAYLIST_CAPABILITIES,
         }
 
@@ -814,6 +898,9 @@ class _TraktOPS:
     def dropped_show_tokens(self, cfg: Mapping[str, Any]) -> set[str]:
         return self._adapter(cfg).dropped_show_tokens()
 
+    def tag_dropped_shows(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        return self._adapter(cfg).tag_dropped_shows(items)
+
     def _pl(self) -> Any:
         if feat_playlists is None:
             raise TRAKTError("Trakt playlists feature is unavailable")
@@ -847,6 +934,27 @@ class _TraktOPS:
         dry_run: bool = False,
     ):
         return self._pl().create(self._playlist_adapter(cfg, instance), name, media_type=media_type, dry_run=dry_run)
+
+    def rename_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        name: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().rename(self._playlist_adapter(cfg, instance), playlist_id, name, dry_run=dry_run)
+
+    def delete_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._pl().delete(self._playlist_adapter(cfg, instance), playlist_id, dry_run=dry_run)
 
     def add_playlist_items(
         self,

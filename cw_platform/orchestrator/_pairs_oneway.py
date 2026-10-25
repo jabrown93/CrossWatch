@@ -2,6 +2,13 @@
 # One-way synchronization logic for data pairs.
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+
+from ..path_matching import PathAliases, rekey_by_path
+
+from ._episode_groups import HistoryGroups, note_identity_conflicts
+
+from ._pairs_utils import pair_endpoint_config, pair_feature_libraries
+from ._scope import provider_call
 from collections.abc import Mapping
 from typing import Any
 
@@ -10,6 +17,8 @@ import re
 import datetime as _dt
 
 from ._progress_completion import fcfg_for_progress_target
+from ..run_control import cancel_requested
+from ..interactive_reads import read_once
 
 
 def load_feature_state(state_store: Any, feature: str) -> dict[str, Any]:
@@ -24,12 +33,12 @@ def load_feature_state(state_store: Any, feature: str) -> dict[str, Any]:
     return {}
 
 
-def _emit_item_failures(emit, provider, feature, pair, keys, key2item, bb_res) -> None:
+def _emit_item_failures(emit, provider, feature, pair, keys, key2item, bb_res, instance: str | None = None) -> None:
     try:
         prom = set((bb_res or {}).get("promoted_keys") or [])
         all_keys = [k for k in (keys or [])]
         total = len(all_keys)
-        unresolved_reasons = load_unresolved_map(provider, feature, cross_features=False)
+        unresolved_reasons = load_unresolved_map(provider, feature, cross_features=False, instance=instance)
 
         def _reason_for_key(k: str) -> str:
             from_state = unresolved_reasons.get(k) if isinstance(unresolved_reasons, dict) else None
@@ -58,6 +67,7 @@ def _emit_item_failures(emit, provider, feature, pair, keys, key2item, bb_res) -
         emit(
             "archive:item_failures",
             provider=provider,
+            destination_instance=instance,
             feature=feature,
             pair=pair,
             op="add",
@@ -71,7 +81,7 @@ def _emit_item_failures(emit, provider, feature, pair, keys, key2item, bb_res) -
         pass
 
 
-def _emit_item_resolutions(emit, provider, feature, pair, keys, key2item) -> None:
+def _emit_item_resolutions(emit, provider, feature, pair, keys, key2item, instance: str | None = None) -> None:
     try:
         all_keys = [k for k in (keys or []) if k]
         if not all_keys:
@@ -80,6 +90,7 @@ def _emit_item_resolutions(emit, provider, feature, pair, keys, key2item) -> Non
         emit(
             "archive:item_resolutions",
             provider=provider,
+            destination_instance=instance,
             feature=feature,
             pair=pair,
             op="add",
@@ -127,6 +138,19 @@ def compute_effective_add(
     }
 
 
+def current_attempt_unresolved_keys(
+    attempted_keys,
+    unresolved_before,
+    unresolved_after,
+    provider_unresolved_keys,
+) -> set[str]:
+    attempted = {str(k) for k in (attempted_keys or []) if k}
+    before = {str(k) for k in (unresolved_before or set()) if k}
+    after = {str(k) for k in (unresolved_after or set()) if k}
+    provider = {str(k) for k in (provider_unresolved_keys or set()) if k}
+    return attempted & ((after - before) | provider)
+
+
 def compute_effective_remove(
     *,
     attempted_keys,
@@ -165,11 +189,6 @@ def compute_effective_remove(
     }
 
 
-def is_remove_retry_reason(reason) -> bool:
-    r = str(reason or "").strip().lower()
-    return r.startswith("apply:remove") or r.startswith("two:apply:remove") or r.startswith("provider_down:remove")
-
-
 def resolve_baseline_writes(baseline_keys, key2item, result) -> list:
     dest_map = (result or {}).get("confirmed_destinations")
     dest_map = dest_map if isinstance(dest_map, Mapping) else {}
@@ -200,10 +219,12 @@ def select_baseline_keys(success_keys, result) -> list:
 
 from ..provider_instances import normalize_instance_id
 
-from ..id_map import minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids
-from ..history_events import history_sync_key, minimal_history_item
+from ..collection_media import media_update as _collection_media_update
+from ..id_map import migrate_media_index, minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids, _norm_type, part_fragment as _part_fragment
+from ..history_events import has_history_watch, history_sync_key, minimal_history_item
 from ..anime_mapping.service import (
     anime_mapping_pair_feature_options as _anime_pair_feature_options,
+    anime_only_adds as _anime_only_adds,
     config_with_pair_feature_options as _anime_config_with_pair_feature_options,
     enrich_index_for_pair as _anime_enrich_index_for_pair,
 )
@@ -224,13 +245,17 @@ from ._snapshots import (
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
-from ._unresolved import load_unresolved_keys, load_unresolved_map, load_unresolved_pending, record_unresolved, clear_unresolved
-from ._planner import diff, diff_ratings, diff_progress, _pick_rating
+from ._unresolved import load_unresolved_keys, load_unresolved_map, load_unresolved_pending, record_unresolved, clear_unresolved, clear_matched_history_retries, is_remove_retry_reason
+from ._planner import diff, diff_ratings, diff_progress, _pick_rating, _pick_rated_at, _ts_epoch
 from ._phantoms import PhantomGuard
-from ._tombstones import clear_items_for_feature
+from ._tombstones import clear_items_for_feature, media_tombstone_tokens
 
 
 from ._pairs_utils import (
+    ratings_step_for,
+    ratings_zero_for,
+    collection_media_updates_for,
+    declared_types_for,
     config_with_pair_libraries as _config_with_pair_libraries,
     _supports_feature,
     _resolve_flags,
@@ -240,16 +265,21 @@ from ._pairs_utils import (
     _apply_verify_after_write_supported,
     manual_policy as _manual_policy,
     merge_manual_adds as _merge_manual_adds,
+    manual_corrections as _manual_corrections,
     filter_manual_block as _filter_manual_block,
 )
 from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_delete
 from ._pairs_blocklist import apply_blocklist
+from ._specials import filter_specials_index, specials_excluded
+from ._dropped import apply_dropped_tags, matches_dropped_show as _matches_dropped_show, preview_dropped_tags, provider_dropped_mode, reads_dropped, tags_dropped, with_written
+from .. import library_presence as _library_presence
 from ._history_rewatches import (
     collapse_history_latest,
     config_with_history_rewatches,
     filter_history_events,
-    history_event_diff,
-    history_event_present,
+    compare_history_events,
+    history_event_matches,
+    history_timestamp_tolerance_seconds,
     history_rewatch_pair_enabled,
     history_rewatches_requested,
 )
@@ -332,14 +362,11 @@ def _rekey_index_to_match_other_keys(
 
 
 def _provider_ignore_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
-    try:
-        blk = cfg.get(str(provider_key or "").strip().lower()) or {}
-        if not isinstance(blk, Mapping):
-            return False
-        key = f"{str(feature or '').strip().lower()}_ignore_dropped_shows"
-        return bool(blk.get(key, False))
-    except Exception:
-        return False
+    return provider_dropped_mode(cfg, provider_key, feature) == "ignore"
+
+
+def _provider_tag_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
+    return provider_dropped_mode(cfg, provider_key, feature) == "tag"
 
 
 def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
@@ -347,7 +374,7 @@ def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
     if not callable(getter):
         return set()
     try:
-        raw = getter(cfg)
+        raw = provider_call(lambda view: read_once(["dropped", ops.name()], lambda: getter(view)), cfg)
         if isinstance(raw, set):
             return {str(x) for x in raw if str(x).strip()}
         if isinstance(raw, (list, tuple)):
@@ -355,35 +382,6 @@ def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
         return set()
     except Exception:
         return set()
-
-
-def _show_level_tokens(item: Mapping[str, Any]) -> set[str]:
-    ids = item.get("show_ids") if isinstance(item.get("show_ids"), Mapping) else None
-    if not ids:
-        ids = item.get("ids") if isinstance(item.get("ids"), Mapping) else None
-    out: set[str] = set()
-    try:
-        if str(item.get("type") or "").lower() == "show":
-            ck = _ck(item)
-            if ck:
-                out.add(str(ck))
-    except Exception:
-        pass
-    if isinstance(ids, Mapping):
-        for k, v in ids.items():
-            if v is None:
-                continue
-            sv = str(v).strip()
-            if not sv:
-                continue
-            out.add(f"{str(k).lower()}:{sv.lower()}")
-    return out
-
-
-def _matches_dropped_show(item: Mapping[str, Any], dropped_tokens: set[str]) -> bool:
-    if not dropped_tokens or not isinstance(item, Mapping):
-        return False
-    return bool(_show_level_tokens(item) & dropped_tokens)
 
 
 def _filter_index_for_dropped_shows(idx: dict[str, Any], dropped_tokens: set[str]) -> tuple[dict[str, Any], int]:
@@ -598,16 +596,14 @@ def _effective_library_whitelist(
     feature: str,
     fcfg: Mapping[str, Any],
 ) -> list[str]:
-    if feature not in ("history", "ratings", "progress"):
+    if feature not in ("history", "ratings", "progress", "collection"):
         return []
 
     libs: list[str] = []
 
     lib_cfg = fcfg.get("libraries")
     if isinstance(lib_cfg, dict):
-        per = lib_cfg.get(provider_name.upper()) or lib_cfg.get(provider_name.lower())
-        if isinstance(per, (list, tuple)):
-            libs = [str(x).strip() for x in per if str(x).strip()]
+        libs = pair_feature_libraries(fcfg, provider_name, cfg.get("_cw_provider_instance"))
     elif isinstance(lib_cfg, (list, tuple)):
         libs = [str(x).strip() for x in lib_cfg if str(x).strip()]
 
@@ -681,7 +677,7 @@ def _bucket_ts(ts: int, bucket_sec: int) -> int:
     return (int(ts) // b) * b
 
 # Feature-specific filters
-def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
+def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any], allowed_types: set[str] | None = None) -> dict[str, Any]:
     alias = {"movies":"movie","movie":"movie","shows":"show","show":"show","anime":"show","animes":"show",
              "episodes":"episode","episode":"episode","ep":"episode","eps":"episode"}
     types_raw = [str(t).strip().lower() for t in (fcfg.get("types") or []) if isinstance(t, (str, bytes))]
@@ -693,6 +689,8 @@ def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[
                        str(v.get("type","")).strip().lower().rstrip("s"))
         if types and vt not in types:
             return False
+        if allowed_types is not None and vt not in allowed_types:
+            return False
         if from_date:
             ra = (v.get("rated_at") or v.get("ratedAt") or "").strip()
             if not ra:
@@ -702,6 +700,48 @@ def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[
         return True
 
     return {k: v for k, v in idx.items() if _keep(v)}
+
+
+def _media_type_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
+    alias = {
+        "movies": "movie",
+        "movie": "movie",
+        "shows": "show",
+        "show": "show",
+        "series": "show",
+        "tv": "show",
+        "anime": "show",
+        "animes": "show",
+        "seasons": "season",
+        "season": "season",
+        "episodes": "episode",
+        "episode": "episode",
+        "ep": "episode",
+        "eps": "episode",
+    }
+    raw = fcfg.get("types")
+    if isinstance(raw, (str, bytes)):
+        raw_values = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        raw_values = list(raw)
+    else:
+        raw_values = ["movies"]
+    types_raw = [str(t).strip().lower() for t in raw_values if isinstance(t, (str, bytes))]
+    if "all" in types_raw:
+        types = {"movie", "show", "season", "episode"}
+    else:
+        types = {alias.get(t, t.rstrip("s")) for t in types_raw if t}
+    if not types:
+        types = {"movie"}
+
+    def _keep(v: Any) -> bool:
+        if not isinstance(v, Mapping):
+            return False
+        raw = str(v.get("type", "")).strip().lower()
+        vt = alias.get(raw, raw.rstrip("s"))
+        return vt in types
+
+    return {k: v for k, v in (idx or {}).items() if _keep(v)}
 
 # One-way sync core
 def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
@@ -714,6 +754,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     health_map: Mapping[str, Any],
 ) -> dict[str, Any]:
     cfg, emit, dbg = ctx.config, ctx.emit, ctx.dbg
+    history_tolerance = history_timestamp_tolerance_seconds(cfg)
     src_inst = normalize_instance_id(os.getenv("CW_PAIR_SRC_INSTANCE"))
     dst_inst = normalize_instance_id(os.getenv("CW_PAIR_DST_INSTANCE"))
     sync_cfg = (cfg.get("sync") or {})
@@ -801,9 +842,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     def _cross_feature_unresolved(feature_name: str) -> bool:
         return str(feature_name or "").strip().lower() == "history"
 
-    def _pause_for(pname: str) -> int:
+    def _pause_for(pname: str, inst: str) -> int:
         base = int(getattr(ctx, "apply_chunk_pause_ms", 0) or 0)
-        inst = src_inst if pname == src else (dst_inst if pname == dst else "default")
         rem = _rate_remaining(health_map.get(f"{pname}#{inst}") or health_map.get(pname))
         if rem is not None and rem < 10:
             emit("rate:slow", provider=pname, remaining=rem, base_ms=base, extra_ms=1000)
@@ -817,15 +857,16 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             pass
 
     coord_aliases: _HistoryCoordinateAliases = _HistoryCoordinateAliases.disabled()
+    path_aliases = PathAliases((), False)
 
     def _typed_tokens(it: Mapping[str, Any]) -> set[str]:
-        typ = str(it.get("type") or "").strip().lower()
+        typ = _norm_type(it.get("type"))
         show_ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else {}
         ids_raw = it.get("ids") if isinstance(it.get("ids"), Mapping) else {}
         show_ids = dict(show_ids_raw or {})
         ids = dict(ids_raw or {})
 
-        toks: set[str] = set(coord_aliases.tokens(it))
+        toks: set[str] = set(coord_aliases.tokens(it)) | path_aliases.tokens(it)
 
         if typ == "episode":
             if show_ids:
@@ -836,7 +877,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                     show_v = show_ids.get(k)
                     if show_v is not None and str(show_v).lower() == str(v).lower():
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}#episode")
             try:
                 season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
                 episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
@@ -858,7 +899,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 for k, v in ids.items():
                     if v is None or str(v) == "":
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}#episode")
 
         elif typ == "season":
             try:
@@ -878,7 +919,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             for k, v in ids.items():
                 if v is None or str(v) == "":
                     continue
-                toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                suffix = "#show" if str(k).lower() == "tmdb" and typ in ("show", "anime") else _part_fragment(it)
+                toks.add(f"{str(k).lower()}:{str(v).lower()}{suffix}")
 
         return toks
 
@@ -890,7 +932,12 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     def _sync_minimal(it: Mapping[str, Any], fallback_key: str | None = None) -> dict[str, Any]:
         if feature == "history":
             return minimal_history_item(it, fallback_key, event_mode=history_event_mode)
-        return _minimal(it)
+        out = _minimal(it)
+        if feature == "collection":
+            collected_at = it.get("collected_at")
+            if collected_at not in (None, ""):
+                out["collected_at"] = str(collected_at)
+        return out
 
     def _find_history_event_in_idx(idx: Mapping[str, Any], it: Mapping[str, Any], fallback_key: str | None = None) -> Mapping[str, Any] | None:
         if feature != "history" or not history_event_mode:
@@ -899,11 +946,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         direct = idx.get(sk) if sk else None
         if isinstance(direct, Mapping):
             return direct
-        bucket_sec = _history_bucket_sec(src, dst, feature)
-        for dk, dv in (idx or {}).items():
-            if isinstance(dv, Mapping) and history_event_present(it, sk, {str(dk): dv}, _typed_tokens, bucket_sec=bucket_sec):
-                return dv
-        return None
+        matches = history_event_matches({sk: it}, idx, _typed_tokens, tolerance_seconds=history_tolerance)
+        return idx.get(matches[sk]) if sk in matches else None
 
     def _show_level_tokens(it: Mapping[str, Any]) -> set[str]:
         ids_raw = it.get("show_ids") if isinstance(it.get("show_ids"), Mapping) else it.get("ids")
@@ -961,12 +1005,17 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         if ck and ck in idx:
             v = idx.get(ck)
             return v if isinstance(v, Mapping) else None
+        is_episode = _norm_type(it.get("type")) == "episode"
         for tok in _typed_tokens(it):
             dk = alias.get(tok)
             if not dk:
                 continue
             v = idx.get(dk)
-            return v if isinstance(v, Mapping) else None
+            if not isinstance(v, Mapping):
+                return None
+            if (_norm_type(v.get("type")) == "episode") != is_episode:
+                continue
+            return v
         if feature == "history" and str(it.get("type") or "").strip().lower() == "show":
             target = _show_level_tokens(it)
             if target:
@@ -1027,6 +1076,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
         return out
 
+    src_cfg = pair_endpoint_config(provider_cfg, src, src_inst)
+    dst_cfg = pair_endpoint_config(provider_cfg, dst, dst_inst)
     pair_providers = {src: src_ops, dst: dst_ops}
 
     def _on_snapshot(name: str, idx: Mapping[str, Any]) -> None:
@@ -1034,41 +1085,71 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             return
         prepare_source_snapshot(
             dst_ops,
-            config=provider_cfg,
+            config=dst_cfg,
             feature=feature,
             items=idx,
             dbg=dbg,
         )
 
-    snaps = build_snapshots_for_feature(
-        feature=feature,
-        config=provider_cfg,
-        providers=pair_providers,
-        snap_cache=ctx.snap_cache,
-        snap_ttl_sec=ctx.snap_ttl_sec,
-        dbg=dbg,
-        emit_info=ctx.emit_info,
-        build_order=[src, dst],
-        on_snapshot=_on_snapshot,
-    )
+    if src == dst:
+        src_cur = build_snapshots_for_feature(
+            feature=feature, config=src_cfg, providers={src: src_ops},
+            snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
+            dbg=dbg, emit_info=ctx.emit_info, on_snapshot=_on_snapshot,
+        ).get(src) or {}
+        dst_cur = build_snapshots_for_feature(
+            feature=feature, config=dst_cfg, providers={dst: dst_ops},
+            snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
+            dbg=dbg, emit_info=ctx.emit_info,
+        ).get(dst) or {}
+    else:
+        snaps = build_snapshots_for_feature(
+            feature=feature,
+            config=provider_cfg,
+            providers=pair_providers,
+            snap_cache=ctx.snap_cache,
+            snap_ttl_sec=ctx.snap_ttl_sec,
+            dbg=dbg,
+            emit_info=ctx.emit_info,
+            build_order=[src, dst],
+            on_snapshot=_on_snapshot,
+        )
 
-    src_cur = snaps.get(src) or {}
-    dst_cur = snaps.get(dst) or {}
+        src_cur = snaps.get(src) or {}
+        dst_cur = snaps.get(dst) or {}
+    cancelled = bool(cancel_requested())
 
     prev_state = load_feature_state(ctx.state_store, feature)
-    manual_adds, manual_blocks = _manual_policy(prev_state, src, feature)
+    manual_adds, manual_blocks = _manual_policy(prev_state, src, feature, src_inst)
     prev_provs = (prev_state.get("providers") or {})
 
     def _prev_items(pmap: Mapping[str, Any], prov: str, inst: str, feat: str) -> dict[str, Any]:
         try:
-            pblk = pmap.get(prov) or {}
+            pkey = str(prov or "").upper()
+            pblk = pmap.get(pkey) or pmap.get(str(prov or "")) or {}
+            if not isinstance(pblk, Mapping):
+                for pk, pv in (pmap or {}).items():
+                    if str(pk or "").upper() == pkey and isinstance(pv, Mapping):
+                        pblk = pv
+                        break
             if not isinstance(pblk, Mapping):
                 return {}
             if inst != "default":
                 insts = pblk.get("instances") or {}
-                if not isinstance(insts, Mapping):
+                if isinstance(insts, Mapping):
+                    pblk2 = insts.get(inst) or {}
+                    if not isinstance(pblk2, Mapping):
+                        want_inst = normalize_instance_id(inst)
+                        for ik, iv in insts.items():
+                            if normalize_instance_id(ik) == want_inst and isinstance(iv, Mapping):
+                                pblk2 = iv
+                                break
+                    if isinstance(pblk2, Mapping) and pblk2:
+                        pblk = pblk2
+                    else:
+                        return {}
+                else:
                     return {}
-                pblk = insts.get(inst) or {}
                 if not isinstance(pblk, Mapping):
                     return {}
             fblk = pblk.get(feat) or {}
@@ -1078,7 +1159,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             if not isinstance(base, Mapping):
                 return {}
             items = base.get("items") or {}
-            return dict(items) if isinstance(items, Mapping) else {}
+            return migrate_media_index(items)
         except Exception:
             return {}
 
@@ -1092,9 +1173,9 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     if drop_guard:
         prev_cp_src = prev_checkpoint(prev_state, src, feature, src_inst)
-        now_cp_src = module_checkpoint(src_ops, provider_cfg, feature)
+        now_cp_src = module_checkpoint(src_ops, src_cfg, feature)
         eff_src, src_suspect, src_reason = coerce_suspect_snapshot(
-            config=cfg,
+            config=src_cfg,
             provider=src, ops=src_ops,
             prev_idx=prev_src, cur_idx=src_cur, feature=feature,
             suspect_min_prev=suspect_min_prev, suspect_shrink_ratio=suspect_ratio,
@@ -1105,9 +1186,9 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             dbg("snapshot.guard", provider=src, feature=feature, reason=src_reason)
 
         prev_cp_dst = prev_checkpoint(prev_state, dst, feature, dst_inst)
-        now_cp_dst = module_checkpoint(dst_ops, provider_cfg, feature)
+        now_cp_dst = module_checkpoint(dst_ops, dst_cfg, feature)
         eff_dst, dst_suspect, dst_reason = coerce_suspect_snapshot(
-            config=cfg,
+            config=dst_cfg,
             provider=dst, ops=dst_ops,
             prev_idx=prev_dst, cur_idx=dst_cur, feature=feature,
             suspect_min_prev=suspect_min_prev, suspect_shrink_ratio=suspect_ratio,
@@ -1120,29 +1201,60 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         eff_src, eff_dst = dict(src_cur), dict(dst_cur)
         src_suspect = False
         dst_suspect = False
-        now_cp_src = module_checkpoint(src_ops, provider_cfg, feature)
-        now_cp_dst = module_checkpoint(dst_ops, provider_cfg, feature)
+        now_cp_src = module_checkpoint(src_ops, src_cfg, feature)
+        now_cp_dst = module_checkpoint(dst_ops, dst_cfg, feature)
 
-    libs_src: list[str] = _effective_library_whitelist(cfg, src, feature, fcfg)
-    libs_dst: list[str] = _effective_library_whitelist(cfg, dst, feature, fcfg)
+    libs_src: list[str] = _effective_library_whitelist(src_cfg, src, feature, fcfg)
+    libs_dst: list[str] = _effective_library_whitelist(dst_cfg, dst, feature, fcfg)
 
     allow_unknown_src = (str(src).upper() == "PLEX" and feature == "history") or str(src).upper() == "KODI"
     allow_unknown_dst = (str(dst).upper() == "PLEX" and feature == "history") or str(dst).upper() == "KODI"
+    allow_unknown_prev_src = allow_unknown_src or feature == "collection"
+    allow_unknown_prev_dst = allow_unknown_dst or feature == "collection"
+    allow_unknown_eff_src = allow_unknown_src or feature == "collection"
+    allow_unknown_eff_dst = allow_unknown_dst or feature == "collection"
 
     if libs_src:
-        prev_src = _filter_index_by_libraries(prev_src, libs_src, allow_unknown=allow_unknown_src)
+        prev_src = _filter_index_by_libraries(prev_src, libs_src, allow_unknown=allow_unknown_prev_src)
         src_cur  = _filter_index_by_libraries(src_cur,  libs_src, allow_unknown=allow_unknown_src)
-        eff_src  = _filter_index_by_libraries(eff_src,  libs_src, allow_unknown=allow_unknown_src)
+        eff_src  = _filter_index_by_libraries(eff_src,  libs_src, allow_unknown=allow_unknown_eff_src)
 
     if libs_dst:
-        prev_dst = _filter_index_by_libraries(prev_dst, libs_dst, allow_unknown=allow_unknown_dst)
+        prev_dst = _filter_index_by_libraries(prev_dst, libs_dst, allow_unknown=allow_unknown_prev_dst)
         dst_cur  = _filter_index_by_libraries(dst_cur,  libs_dst, allow_unknown=allow_unknown_dst)
-        eff_dst  = _filter_index_by_libraries(eff_dst,  libs_dst, allow_unknown=allow_unknown_dst)
+        eff_dst  = _filter_index_by_libraries(eff_dst,  libs_dst, allow_unknown=allow_unknown_eff_dst)
+
+    if feature == "collection":
+        prev_src = _media_type_filter_index(prev_src, fcfg)
+        src_cur = _media_type_filter_index(src_cur, fcfg)
+        eff_src = _media_type_filter_index(eff_src, fcfg)
+        prev_dst = _media_type_filter_index(prev_dst, fcfg)
+        dst_cur = _media_type_filter_index(dst_cur, fcfg)
+        eff_dst = _media_type_filter_index(eff_dst, fcfg)
+
+    specials_prev_src: dict[str, Any] = {}
+    specials_cur_src: dict[str, Any] = {}
+    specials_eff_src: dict[str, Any] = {}
+    specials_prev_dst: dict[str, Any] = {}
+    specials_cur_dst: dict[str, Any] = {}
+    specials_eff_dst: dict[str, Any] = {}
+    if specials_excluded(feature, fcfg):
+        prev_src, specials_prev_src = filter_specials_index(prev_src)
+        src_cur, specials_cur_src = filter_specials_index(src_cur)
+        eff_src, specials_eff_src = filter_specials_index(eff_src)
+        prev_dst, specials_prev_dst = filter_specials_index(prev_dst)
+        dst_cur, specials_cur_dst = filter_specials_index(dst_cur)
+        eff_dst, specials_eff_dst = filter_specials_index(eff_dst)
+        if specials_cur_src or specials_cur_dst:
+            emit("debug", msg="specials.filtered", feature=feature, src=src, dst=dst, source=len(specials_cur_src), target=len(specials_cur_dst))
 
     src_dropped_tokens: set[str] = set()
     dst_dropped_tokens: set[str] = set()
-    if src in ("TRAKT", "MDBLIST", "SIMKL") and _provider_ignore_dropped_enabled(cfg, src, feature):
-        src_dropped_tokens = _load_provider_dropped_tokens(src_ops, cfg)
+    src_tags_dropped = reads_dropped(src_ops) and tags_dropped(dst_ops) and _provider_tag_dropped_enabled(src_cfg, src, feature)
+    if src_tags_dropped:
+        src_dropped_tokens = _load_provider_dropped_tokens(src_ops, src_cfg)
+    elif reads_dropped(src_ops) and _provider_ignore_dropped_enabled(src_cfg, src, feature):
+        src_dropped_tokens = _load_provider_dropped_tokens(src_ops, src_cfg)
         if src_dropped_tokens:
             prev_src, prev_filtered = _filter_index_for_dropped_shows(prev_src, src_dropped_tokens)
             src_cur, cur_filtered = _filter_index_for_dropped_shows(src_cur, src_dropped_tokens)
@@ -1150,14 +1262,16 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             if prev_filtered or cur_filtered or eff_filtered:
                 emit("debug", msg="provider.dropped.filtered", provider=src, feature=feature, scope="source", prev=prev_filtered, current=cur_filtered, effective=eff_filtered)
 
-    if dst in ("TRAKT", "MDBLIST", "SIMKL") and _provider_ignore_dropped_enabled(cfg, dst, feature):
-        dst_dropped_tokens = _load_provider_dropped_tokens(dst_ops, cfg)
+    if reads_dropped(dst_ops) and _provider_ignore_dropped_enabled(dst_cfg, dst, feature):
+        dst_dropped_tokens = _load_provider_dropped_tokens(dst_ops, dst_cfg)
 
-    dst_sem = _index_semantics(dst_ops, feature, cfg=ctx.config, provider=dst)
-    src_sem = _index_semantics(src_ops, feature, cfg=ctx.config, provider=src)
+    dst_sem = _index_semantics(dst_ops, feature, cfg=dst_cfg, provider=dst)
+    src_sem = _index_semantics(src_ops, feature, cfg=src_cfg, provider=src)
 
     dst_full = (dict(prev_dst) | dict(dst_cur)) if dst_sem == "delta" else dict(eff_dst)
     src_idx = (dict(prev_src) | dict(src_cur)) if src_sem == "delta" else dict(eff_src)
+    specials_keep_dst = (specials_prev_dst | specials_cur_dst) if dst_sem == "delta" else specials_eff_dst
+    specials_keep_src = (specials_prev_src | specials_cur_src) if src_sem == "delta" else specials_eff_src
 
     # Keep metadata when the provider index is presence-only.
     dst_full = _enrich_index_payload(dst_full, prev_dst, feature)
@@ -1189,6 +1303,17 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             prev_src = collapse_history_latest(prev_src)
             prev_dst = collapse_history_latest(prev_dst)
 
+    groups = HistoryGroups(ctx, feature, [(src, src_inst), (dst, dst_inst)], [src_idx, dst_full],
+                           fcfg=fcfg, blocks=[manual_blocks, set()],
+                           blocked="Grouped rewatches are not supported. Disable History rewatches for this pair." if history_event_mode else
+                           "A provider is unavailable or its snapshot is incomplete." if src_down or dst_down or src_suspect or dst_suspect else "")
+    src_idx, dst_full = groups.strip(0, src_idx), groups.strip(1, dst_full)
+    src_cur, dst_cur = groups.strip(0, src_cur), groups.strip(1, dst_cur)
+    prev_src, prev_dst = groups.strip(0, prev_src), groups.strip(1, prev_dst)
+    note_identity_conflicts(ctx, feature, [src_idx, dst_full], [manual_adds, {}], [manual_blocks, set()],
+                            announce=not (ctx.dry_run or sync_cfg.get("dry_run", False)))
+
+    path_aliases = PathAliases((dict(prev_src) | src_idx, dict(prev_dst) | dst_full), bool(cfg.get("_cw_path_matching")) and not history_event_mode)
     coord_aliases = _build_history_coordinate_aliases(cfg, feature, (src_idx, dst_full))
     if coord_aliases.enabled:
         dbg("anime_mapping.history_coords", feature=feature, src=src, dst=dst, **coord_aliases.stats())
@@ -1202,7 +1327,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         try:
             _view_hook = getattr(dst_ops, "destination_comparison_view", None)
             if callable(_view_hook):
-                _view = _view_hook(provider_cfg, feature=feature, index=dst_full)
+                _view = _view_hook(dst_cfg, feature=feature, index=dst_full)
                 if isinstance(_view, Mapping) and _view:
                     if len(_view) != len(dst_full) or set(_view) != set(dst_full):
                         dbg("destination_comparison_view", feature=feature, dst=dst, before=len(dst_full), after=len(_view))
@@ -1212,21 +1337,55 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         dst_full = _hydrate_missing_fields(dst_full, src_idx, feature)
         dst_full = _rekey_to_src_keyspace(dst_full, src_idx)
 
+    if cfg.get("_cw_path_matching") and not history_event_mode:
+        dst_full = rekey_by_path(dst_full, src_idx)
+
     remove_mode = str(fcfg.get("remove_mode") or (sync_cfg.get("one_way_remove_mode") or "source_deletes")).strip().lower()
     if remove_mode not in ("source_deletes", "mirror"):
         remove_mode = "source_deletes"
 
     mirror_removes: list[dict[str, Any]] = []
+    matched_history_keys: set[str] = set()
     updates: list[dict[str, Any]] = []
     if feature == "ratings":
-        src_idx  = _ratings_filter_index(src_idx,  fcfg)
-        dst_full = _ratings_filter_index(dst_full, fcfg)
+        dst_types = declared_types_for(dst_ops, "ratings")
+        src_idx  = _ratings_filter_index(src_idx,  fcfg, dst_types)
+        dst_full = _ratings_filter_index(dst_full, fcfg, dst_types)
         if manual_adds:
-            src_idx = _merge_manual_adds(src_idx, manual_adds)
-        adds, mirror_removes = diff_ratings(src_idx, dst_full)
+            src_idx = _ratings_filter_index(_merge_manual_adds(src_idx, manual_adds), {}, dst_types)
+        ratings_step = max(ratings_step_for(src_ops), ratings_step_for(dst_ops))
+        if ratings_step < 1.0:
+            dbg("ratings.step", feature=feature, src=src, dst=dst, step=ratings_step)
+        adds, mirror_removes = diff_ratings(src_idx, dst_full, step=ratings_step,
+                                          allow_zero=ratings_zero_for(src_ops) and ratings_zero_for(dst_ops))
         dst_alias_tmp = _alias_index(dst_full)
         updates = [it for it in adds if _present(dst_full, dst_alias_tmp, it)]
         adds = [it for it in adds if not _present(dst_full, dst_alias_tmp, it)]
+
+        def _dst_rating_entry(it: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            entry = (dst_full or {}).get(_ck(it))
+            if isinstance(entry, Mapping):
+                return entry
+            for tok in _typed_tokens(it):
+                key = dst_alias_tmp.get(tok)
+                entry = (dst_full or {}).get(key) if key else None
+                if isinstance(entry, Mapping):
+                    return entry
+            return None
+
+        def _dst_rating_is_newer(it: Mapping[str, Any]) -> bool:
+            entry = _dst_rating_entry(it)
+            if entry is None:
+                return False
+            ts_src = _ts_epoch(_pick_rated_at(it))
+            ts_dst = _ts_epoch(_pick_rated_at(entry))
+            return ts_src is not None and ts_dst is not None and ts_dst > ts_src
+
+        if updates:
+            kept = [it for it in updates if not _dst_rating_is_newer(it)]
+            if len(kept) != len(updates):
+                dbg("ratings.destination_newer", feature=feature, dst=dst, skipped=len(updates) - len(kept))
+            updates = kept
 
     elif feature == "progress":
         if manual_adds:
@@ -1283,24 +1442,26 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         if feature == "history" and history_event_mode:
             src_idx = filter_history_events(src_idx, event_mode=True)
             dst_full = filter_history_events(dst_full, event_mode=True)
-            adds, mirror_removes = history_event_diff(
+            adds, mirror_removes, history_matches = compare_history_events(
                 src_idx,
                 dst_full,
                 typed_tokens=_typed_tokens,
-                bucket_sec=_history_bucket_sec(src, dst, feature),
+                tolerance_seconds=history_tolerance,
             )
+            matched_history_keys = set(history_matches)
         elif feature == "history" and not history_event_mode:
             src_idx = {
                 k: dict(v) for k, v in src_idx.items()
-                if isinstance(v, Mapping) and (v.get("watched_at") or v.get("last_watched_at"))
+                if has_history_watch(v)
             }
             if _history_upsert_supported(dst_ops, feature):
                 history_update_idx = dst_canonical if dst_canonical else dst_full
                 dst_alias_tmp = _alias_index(history_update_idx)
                 seen_history_updates: set[str] = set()
                 manual_history_adds = manual_adds if isinstance(manual_adds, Mapping) else {}
+                corrected_keys = _manual_corrections(prev_state, src, feature, src_inst)
                 for _sk, sv in manual_history_adds.items():
-                    if not isinstance(sv, Mapping):
+                    if not isinstance(sv, Mapping) or _sk in corrected_keys:
                         continue
                     dv = _find_in_idx(history_update_idx, dst_alias_tmp, sv)
                     if not isinstance(dv, Mapping):
@@ -1353,7 +1514,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 if tsb is None:
                     # Skip synthetic entries (e.g. season keys with no watched_at)
                     # — they exist for dst key-matching only and have no watch event to propagate.
-                    if not (sv.get("watched_at") or sv.get("last_watched_at")):
+                    if not has_history_watch(sv):
                         continue
                     if str(sk) not in (dst_full or {}):
                         adds.append(_minimal(sv))
@@ -1380,9 +1541,19 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 mirror_removes.append(_minimal(dv))
         elif not (feature == "history" and history_event_mode):
             adds, mirror_removes = diff(src_idx, dst_full)
+            if feature == "collection":
+                src_alias_tmp = _alias_index(src_idx)
+                dst_alias_tmp = _alias_index(dst_full)
+                adds = [_sync_minimal(_find_in_idx(src_idx, src_alias_tmp, it) or it) for it in adds]
+                mirror_removes = [_sync_minimal(_find_in_idx(dst_full, dst_alias_tmp, it) or it) for it in mirror_removes]
 
     src_alias = _alias_index(src_idx)
     dst_alias = _alias_index(dst_full)
+
+    try:
+        unresolved_known = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
+    except Exception:
+        unresolved_known = set()
 
     if adds:
         # Progress uses upsert semantics (update resume position)
@@ -1395,12 +1566,26 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 ck = _ck(it) or ""
                 if ck and _history_ts_from_key(ck) is None and _present(dst_full, dst_alias, it):
                     if _coord_only_present(dst_full, dst_alias, it):
+                        if _sync_key(it) in unresolved_known:
+                            pruned.append(it)
+                            continue
                         coord_pruned += 1
                     continue
                 pruned.append(it)
             if coord_pruned:
                 dbg("anime_mapping.coord_pruned", feature=feature, src=src, dst=dst, adds=coord_pruned)
             adds = pruned
+
+    if feature == "collection" and bool((fcfg or {}).get("media_updates")) and collection_media_updates_for(dst_ops):
+        for sv in (src_idx or {}).values():
+            if not isinstance(sv, Mapping) or not (sv.get("media_info") or sv.get("format")):
+                continue
+            dv = _find_in_idx(dst_full, dst_alias, sv)
+            upd = _collection_media_update(sv, dv) if dv else None
+            if upd:
+                updates.append(upd)
+        if updates:
+            dbg("collection.media_updates", src=src, dst=dst, count=len(updates))
 
     removes: list[dict[str, Any]] = []
 
@@ -1475,7 +1660,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             retry_removes: list[dict[str, Any]] = []
             stale_pending: list[str] = []
             try:
-                pending = load_unresolved_pending(dst, feature)
+                pending = load_unresolved_pending(dst, feature, instance=dst_cfg.get("_cw_provider_instance"))
             except Exception:
                 pending = []
             for rec in pending or []:
@@ -1503,13 +1688,15 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 retry_removes.append(_sync_minimal(dv))
             if stale_pending and not bool(ctx.dry_run or sync_cfg.get("dry_run", False)):
                 try:
-                    clear_unresolved(dst, feature, stale_pending)
+                    clear_unresolved(dst, feature, stale_pending, instance=dst_cfg.get("_cw_provider_instance"))
                 except Exception:
                     pass
             if retry_removes:
                 removes = list(removes) + retry_removes
                 emit("debug", msg="unresolved.remove_retry", feature=feature, dst=dst, count=len(retry_removes))
 
+    adds = groups.ordinary(1, adds) + groups.adds[1]
+    updates, removes = groups.ordinary(1, updates), groups.ordinary(1, removes)
     if not allow_adds:
         adds = []
         updates = []
@@ -1530,23 +1717,29 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         emit=emit, dbg=dbg, dst_name=dst, feature=feature,
     )
 
-    pair_key = "-".join(sorted([src, dst]))
+    blocked_total = 0
+    pair_key = str(getattr(ctx.state_store, "pair_scope", None) or "-".join(sorted([src, dst]))).upper()
     if feature != "watchlist":
+        before_blocklist = len(adds)
         adds = apply_blocklist(
             ctx.state_store,
             adds,
             dst=dst,
+            instance=dst_cfg.get("_cw_provider_instance"),
             feature=feature,
             pair_key=pair_key,
             cross_feature_unresolved=_cross_feature_unresolved(feature),
             ignore_pair_tomb=(str(feature or "").lower() == "history"),
+            tomb_ttl_seconds=max(1, int(sync_cfg.get("tombstone_ttl_days", 30))) * 86400,
+            now=getattr(getattr(ctx, "interactive", None), "planned_at", None),
             emit=emit,
         )
+        blocked_total += max(0, before_blocklist - len(adds))
 
     manual_blocked = 0
     if manual_blocks:
         b_adds, b_upd, b_rem = len(adds), len(updates), len(removes)
-        adds = _filter_manual_block(adds, manual_blocks)
+        adds = groups.unblocked(adds, manual_blocks)
         updates = _filter_manual_block(updates, manual_blocks)
         removes = _filter_manual_block(removes, manual_blocks)
         manual_blocked = (b_adds - len(adds)) + (b_upd - len(updates)) + (b_rem - len(removes))
@@ -1561,11 +1754,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 blocked_keys=int(len(manual_blocks)),
             )
             ctx.stats_manual_blocked = int(getattr(ctx, "stats_manual_blocked", 0) or 0) + int(manual_blocked)
-
-    try:
-        unresolved_known = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-    except Exception:
-        unresolved_known = set()
+        blocked_total += int(manual_blocked)
 
     if unresolved_known:
         try:
@@ -1575,6 +1764,21 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         if retried:
             emit("debug", msg="unresolved.retry", feature=feature, dst=dst, retried=retried)
             
+    if dst in {"ANILIST", "KITSU", "MYANIMELIST"}:
+        adds, anime_only_skipped = _anime_only_adds(adds, provider_cfg, anime_pair_opts, feature, target=dst)
+        if anime_only_skipped:
+            emit("debug", msg="anime_mapping.anime_only_filtered", feature=feature, dst=dst, skipped=anime_only_skipped)
+
+    library_skipped: list[tuple[Any, str]] = []
+    if adds and not dst_down and _library_presence.requested(feature, fcfg) and _library_presence.supported(dst_ops, feature):
+        known_alias = _alias_index(dst_full) if feature == "progress" else {}
+        adds, library_skipped, presence_error = _library_presence.split_absent(
+            dst_ops, dst_cfg, feature, adds, call=provider_call,
+            known=(lambda it: _present(dst_full, known_alias, it)) if feature == "progress" else None,
+        )
+        emit("debug", msg="library_only.filtered", feature=feature, dst=dst,
+             kept=len(adds), skipped=len(library_skipped), error=presence_error or None)
+
     emit("one:plan", src=src, dst=dst, feature=feature,
         adds=len(adds), removes=len(removes), updates=len(updates),
         src_count=len(src_idx), dst_count=len(dst_full))
@@ -1586,6 +1790,32 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     guard = PhantomGuard(src, dst, feature, ttl_days=ttl_days, enabled=use_phantoms)
     if use_phantoms and adds:
         adds, _blocked = guard.filter_adds(adds, _sync_key, _sync_minimal, emit, ctx.state_store, pair_key)
+        blocked_total += int(_blocked or 0)
+
+    review = getattr(ctx, "interactive", None)
+    if review is not None:
+        planned_adds = list(adds)
+        review_args = dict(source=src, source_instance=src_inst, before=dst_full, down=dst_down)
+        review.excluded(feature, dst, dst_inst, "add", library_skipped, **review_args)
+        adds = review.filter(feature, dst, dst_inst, "add", adds, **review_args)
+        updates = review.filter(feature, dst, dst_inst, "update", updates, **review_args)
+        removes = review.filter(feature, dst, dst_inst, "remove", removes, **review_args)
+        if review.preview:
+            if src_tags_dropped and not src_down:
+                planned_target = dict(groups.restore(1, dst_full))
+                for n, it in enumerate(planned_adds):
+                    planned_target.setdefault(_sync_key(it) or f"planned:{n}", it)
+                preview_dropped_tags(
+                    review=review, src=src, src_inst=src_inst, dst=dst, dst_inst=dst_inst, src_cfg=src_cfg,
+                    dst_ops=dst_ops, feature=feature, source=groups.restore(0, src_idx), source_tokens=src_dropped_tokens,
+                    target=planned_target, down=dst_down,
+                    target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
+                )
+            return {"blocked": blocked_total, "manual_excluded": int(manual_blocked),
+                    "library_skipped": len(library_skipped), "cancelled": cancelled}
+
+    src_idx, dst_full = groups.restore(0, src_idx), groups.restore(1, dst_full)
+    dst_canonical = groups.restore(1, dst_canonical)
 
     attempted_keys: list[str] = []
     key2item: dict[str, Any] = {}
@@ -1642,17 +1872,24 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     dry_run_flag = bool(ctx.dry_run or sync_cfg.get("dry_run", False))
     verify_after_write = bool(sync_cfg.get("verify_after_write", False))
     post_apply_add_res: dict[str, Any] | None = None
+    cancelled = cancelled or bool(cancel_requested())
 
-    if updates:
+    if matched_history_keys and not (cancelled or dry_run_flag or src_down or dst_down or src_suspect or dst_suspect):
+        resolved = clear_matched_history_retries(dst, matched_history_keys, instance=dst_cfg.get("_cw_provider_instance"))
+        if resolved:
+            resolved_items = {key: src_idx[event_key] for key, event_key in resolved.items()}
+            _emit_item_resolutions(emit, dst, feature, pair_key, resolved, resolved_items, instance=dst_cfg.get("_cw_provider_instance"))
+
+    if updates and not cancelled:
         if dst_down:
-            record_unresolved(dst, feature, updates, hint="provider_down:update")
+            record_unresolved(dst, feature, updates, hint="provider_down:update", instance=dst_cfg.get("_cw_provider_instance"))
             emit("writes:skipped", dst=dst, feature=feature, reason="provider_down", op="update", count=len(updates))
             unresolved_new_total += len(updates)
         else:
-            unresolved_before = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_before = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
             upd_res = apply_update(
                 dst_ops=dst_ops,
-                cfg=provider_cfg,
+                cfg=dst_cfg,
                 dst_name=dst,
                 feature=feature,
                 items=updates,
@@ -1660,9 +1897,9 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 emit=emit,
                 dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, dst),
-                chunk_pause_ms=_pause_for(dst),
+                chunk_pause_ms=_pause_for(dst, dst_inst),
             )
-            unresolved_after = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_after = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
             res_update = {
                 "attempted": int((upd_res or {}).get("attempted", 0)),
                 "confirmed": int((upd_res or {}).get("confirmed", (upd_res or {}).get("count", 0)) or 0),
@@ -1692,18 +1929,19 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                         dst_full[k] = v
                 if keys_to_write:
                     _bust_snapshot(dst)
+            cancelled = bool((upd_res or {}).get("cancelled")) or bool(cancel_requested())
 
-    if adds:
+    if adds and not cancelled:
         if dst_down:
-            record_unresolved(dst, feature, adds, hint="provider_down:add")
+            record_unresolved(dst, feature, adds, hint="provider_down:add", instance=dst_cfg.get("_cw_provider_instance"))
             emit("writes:skipped", dst=dst, feature=feature, reason="provider_down", op="add", count=len(adds))
             unresolved_new_total += len(adds)
         else:
-            unresolved_before = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
-            _ = set(load_blackbox_keys(dst, feature) or [])
+            unresolved_before = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
+            _ = set(load_blackbox_keys(dst, feature, instance=dst_cfg.get("_cw_provider_instance")) or [])
             add_res = apply_add(
                 dst_ops=dst_ops,
-                cfg=provider_cfg,
+                cfg=dst_cfg,
                 dst_name=dst,
                 feature=feature,
                 items=adds,
@@ -1711,9 +1949,9 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 emit=emit,
                 dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, dst),
-                chunk_pause_ms=_pause_for(dst),
+                chunk_pause_ms=_pause_for(dst, dst_inst),
             )
-            unresolved_after = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+            unresolved_after = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
             res_add = {
                 "attempted": int((add_res or {}).get("attempted", 0)),
                 "confirmed": int((add_res or {}).get("confirmed", (add_res or {}).get("count", 0)) or 0),
@@ -1732,7 +1970,12 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             prov_unresolved_set: set[str] = set(prov_unresolved_keys)
 
             new_unresolved = (unresolved_after - unresolved_before) | (prov_unresolved_set - unresolved_before)
-            still_unresolved = set(attempted_keys) & (unresolved_after | prov_unresolved_set)
+            still_unresolved = current_attempt_unresolved_keys(
+                attempted_keys,
+                unresolved_before,
+                unresolved_after,
+                prov_unresolved_set,
+            )
                         
             prov_confirmed_keys_raw = (add_res or {}).get("confirmed_keys")
             prov_skipped_keys_raw = (add_res or {}).get("skipped_keys")
@@ -1756,7 +1999,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
            
             if verify_after_write and _apply_verify_after_write_supported(dst_ops):
                 try:
-                    unresolved_again = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature)) or [])
+                    unresolved_again = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
                     confirmed_keys = [k for k in confirmed_keys if k not in unresolved_again]
                 except Exception:
                     pass
@@ -1766,7 +2009,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
             if not dry_run_flag and not new_unresolved and prov_confirmed == 0 and adds and not have_exact_keys:
                 try:
-                    record_unresolved(dst, feature, adds, hint="apply:add:no_confirmations_fallback")
+                    record_unresolved(dst, feature, adds, hint="apply:add:no_confirmations_fallback", instance=dst_cfg.get("_cw_provider_instance"))
                     new_unresolved = set(attempted_keys)
                     still_unresolved = set(attempted_keys)
                     confirmed_keys = []
@@ -1812,24 +2055,23 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             try:
                 if failed_keys and not ambiguous_partial and not dry_run_flag:
                     _bb = record_attempts(dst, feature, failed_keys, reason="apply:add:failed", op="add",
-                        pair=pair_key, cfg=cfg)
+                        pair=pair_key, cfg=cfg, instance=dst_cfg.get("_cw_provider_instance"))
                     promoted_keys = {str(x) for x in ((_bb or {}).get("promoted_keys") or []) if x}
                     failed_items = [key2item[k] for k in failed_keys if k in key2item and k not in promoted_keys]
                     if failed_items:
-                        record_unresolved(dst, feature, failed_items, hint="apply:add:failed")
+                        record_unresolved(dst, feature, failed_items, hint="apply:add:failed", instance=dst_cfg.get("_cw_provider_instance"))
                     if promoted_keys:
-                        clear_unresolved(dst, feature, promoted_keys)
-                        unresolved_new_total = max(0, unresolved_new_total - len(promoted_keys & set(still_unresolved)))
+                        clear_unresolved(dst, feature, promoted_keys, instance=dst_cfg.get("_cw_provider_instance"))
                         
-                    _emit_item_failures(emit, dst, feature, pair_key, failed_keys, key2item, _bb)
+                    _emit_item_failures(emit, dst, feature, pair_key, failed_keys, key2item, _bb, instance=dst_cfg.get("_cw_provider_instance"))
                             
                 if success_keys and not ambiguous_partial and not dry_run_flag:
-                    record_success(dst, feature, success_keys, pair=pair_key, cfg=cfg)
-                    clear_unresolved(dst, feature, success_keys)
+                    record_success(dst, feature, success_keys, pair=pair_key, cfg=cfg, instance=dst_cfg.get("_cw_provider_instance"))
+                    clear_unresolved(dst, feature, success_keys, instance=dst_cfg.get("_cw_provider_instance"))
                     unresolved_new_total = max(0, unresolved_new_total - len(set(success_keys) & set(still_unresolved)))
                     resolved_keys = [k for k in success_keys if k in unresolved_before]
                     if resolved_keys:
-                        _emit_item_resolutions(emit, dst, feature, pair_key, resolved_keys, key2item)
+                        _emit_item_resolutions(emit, dst, feature, pair_key, resolved_keys, key2item, instance=dst_cfg.get("_cw_provider_instance"))
                     clear_items_for_feature(
                         ctx.state_store,
                         dbg,
@@ -1850,12 +2092,13 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                         dst_canonical[dk] = item
                 _bust_snapshot(dst)
             post_apply_add_res = add_res
+            cancelled = bool((add_res or {}).get("cancelled")) or bool(cancel_requested())
 
     removed_count = 0
     rem_keys_attempted: list[str] = []
     res_remove: dict[str, Any] = {"attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0}
     rem_key2item: dict[str, dict[str, Any]] = {}
-    if removes:
+    if removes and not cancelled:
         try:
             for it in removes:
                 k = _sync_key(_sync_minimal(it))
@@ -1866,7 +2109,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             rem_keys_attempted = []
 
         if dst_down:
-            record_unresolved(dst, feature, removes, hint="provider_down:remove")
+            record_unresolved(dst, feature, removes, hint="provider_down:remove", instance=dst_cfg.get("_cw_provider_instance"))
             res_remove = {
                 "attempted": len(rem_keys_attempted),
                 "confirmed": 0,
@@ -1878,7 +2121,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         else:
             rem_res = apply_remove(
                 dst_ops=dst_ops,
-                cfg=provider_cfg,
+                cfg=dst_cfg,
                 dst_name=dst,
                 feature=feature,
                 items=removes,
@@ -1886,7 +2129,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 emit=emit,
                 dbg=dbg,
                 chunk_size=effective_chunk_size(ctx, dst),
-                chunk_pause_ms=_pause_for(dst),
+                chunk_pause_ms=_pause_for(dst, dst_inst),
             )
             _rem_decision = compute_effective_remove(
                 attempted_keys=rem_keys_attempted,
@@ -1923,14 +2166,10 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                         if not it:
                             continue
                         try:
-                            removed_tokens.add(k)
                             if feature == "history" and history_event_mode:
-                                continue
-                            ids = (it.get("ids") or {})
-                            for idk, idv in (ids or {}).items():
-                                if idv is None or str(idv) == "":
-                                    continue
-                                removed_tokens.add(f"{str(idk).lower()}:{str(idv).lower()}")
+                                removed_tokens.add(k)
+                            else:
+                                removed_tokens.update(media_tombstone_tokens(it, k))
                         except Exception:
                             continue
 
@@ -1942,6 +2181,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                          added=len(removed_tokens), scope="pair")
                 except Exception:
                     pass
+            cancelled = bool((rem_res or {}).get("cancelled")) or bool(cancel_requested())
             if not dry_run_flag and removed_count:
                 for k in rem_success_keys:
                     if k in dst_full:
@@ -1957,7 +2197,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                                 dst_canonical.pop(ck0, None)
                 _bust_snapshot(dst)
                 try:
-                    clear_unresolved(dst, feature, rem_success_keys)
+                    clear_unresolved(dst, feature, rem_success_keys, instance=dst_cfg.get("_cw_provider_instance"))
                 except Exception:
                     pass
             if not dry_run_flag and rem_failed_keys:
@@ -1966,12 +2206,32 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                         dst,
                         feature,
                         [rem_key2item[k] for k in rem_failed_keys if k in rem_key2item],
-                        hint="apply:remove:unconfirmed",
+                        hint="apply:remove:unconfirmed", instance=dst_cfg.get("_cw_provider_instance"),
                     )
                 except Exception:
                     pass
 
-    if (not dry_run_flag) and (not dst_down) and needs_post_apply_refresh(post_apply_add_res):
+    def _merge_collection_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+        out = dict(base or {})
+        for k, v in (extra or {}).items():
+            if k in ("ids", "show_ids"):
+                continue
+            if out.get(k) in (None, "") and v not in (None, ""):
+                out[k] = v
+
+        for fld in ("ids", "show_ids"):
+            b = out.get(fld) if isinstance(out.get(fld), Mapping) else {}
+            e = extra.get(fld) if isinstance(extra.get(fld), Mapping) else {}
+            if b or e:
+                merged: dict[str, Any] = dict(b or {})
+                for kk, vv in (e or {}).items():
+                    if merged.get(kk) in (None, "") and vv not in (None, ""):
+                        merged[kk] = vv
+                if merged:
+                    out[fld] = merged
+        return out
+
+    if (not cancelled) and (not dry_run_flag) and (not dst_down) and needs_post_apply_refresh(post_apply_add_res):
         _r = post_apply_add_res or {}
         emit("post_apply_refresh:start", provider=dst, instance=dst_inst, feature=feature,
              reason="accepted_not_live_confirmed",
@@ -1980,7 +2240,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
              presence_confirmed_keys=len(_r.get("presence_confirmed_keys") or []))
         try:
             refreshed = refresh_destination_after_apply(
-                ops=dst_ops, config=provider_cfg, feature=feature, provider=dst, snap_cache=ctx.snap_cache,
+                ops=dst_ops, config=dst_cfg, feature=feature, provider=dst, snap_cache=ctx.snap_cache,
             )
         except Exception:
             refreshed = None
@@ -1989,7 +2249,10 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             for rk, rv in refreshed.items():
                 if rk not in dst_full:
                     base_update += 1
-                dst_full[rk] = rv
+                if feature == "collection" and isinstance(dst_full.get(rk), Mapping) and isinstance(rv, Mapping):
+                    dst_full[rk] = _merge_collection_payload(dst_full[rk], rv)
+                else:
+                    dst_full[rk] = rv
                 if feature == "history" and not history_event_mode:
                     dst_canonical[rk] = rv
         tk = str(os.environ.get("CW_PLEX_TRACE_KEY", "") or "").strip().lower()
@@ -1998,7 +2261,15 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
              refreshed_count=len(refreshed or {}), first_keys=list(refreshed or {})[:10],
              contains_trace_key=contains_trace, baseline_update_count=base_update)
 
-    if getattr(ctx, "write_state_json", True):
+    if src_tags_dropped and not (cancelled or src_down or dst_down):
+        apply_dropped_tags(
+            src=src, dst=dst, src_cfg=src_cfg, dst_ops=dst_ops, dst_cfg=dst_cfg, feature=feature,
+            source=src_idx, source_tokens=src_dropped_tokens, target=with_written(dst_full, adds, post_apply_add_res, _sync_key),
+            target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
+            dry_run=dry_run_flag, emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst,
+        )
+
+    if (not cancelled) and getattr(ctx, "write_state_json", True):
         try:
             provs_block: dict[str, Any] = {}
 
@@ -2091,8 +2362,10 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 dbg("baseline.provider_native", feature=feature, dst=dst,
                     canonical=len(dst_commit), comparison=len(dst_full))
 
-            _commit_baseline(provs_block, src, src_inst, feature, src_idx)
-            _commit_baseline(provs_block, dst, dst_inst, feature, dst_commit)
+            if review is not None and review.retain_deferred(feature, src, src_inst, src_idx, prev_src, _sync_key):
+                now_cp_src = prev_checkpoint(prev_state, src, feature, src_inst)
+            _commit_baseline(provs_block, src, src_inst, feature, specials_keep_src | src_idx)
+            _commit_baseline(provs_block, dst, dst_inst, feature, specials_keep_dst | dst_commit)
             _commit_checkpoint(provs_block, src, src_inst, feature, now_cp_src)
             _commit_checkpoint(provs_block, dst, dst_inst, feature, now_cp_dst)
 
@@ -2103,8 +2376,11 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 (str(dst).upper(), str(dst_inst or "default"), str(feature).lower()): _ensure_pf(provs_block, dst, dst_inst, feature),
             }
             ctx.state_store.save_feature_blocks(blocks, last_sync_epoch=last_sync_epoch)
+            if not dry_run_flag:
+                groups.commit([src_idx, dst_commit])
         except Exception:
-            pass
+            if getattr(ctx.state_store, "pair_scope", None):
+                raise
 
     emit("feature:done", src=src, dst=dst, feature=feature)
 
@@ -2123,7 +2399,11 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         "errors": int((res_update or {}).get("errors", 0)) + int((res_add or {}).get("errors", 0)) + int((res_remove or {}).get("errors", 0)),
         "skipped_exact": int((res_update or {}).get("skipped_exact", 0)) + int((res_add or {}).get("skipped_exact", 0)),
         "skipped_inferred": int((res_update or {}).get("skipped_inferred", 0)) + int((res_add or {}).get("skipped_inferred", 0)),
+        "blocked": int(blocked_total),
+        "manual_excluded": int(manual_blocked),
+        "library_skipped": len(library_skipped),
         "res_add": res_add,
         "res_update": res_update,
         "res_remove": res_remove,
+        "cancelled": bool(cancelled or cancel_requested()),
     }

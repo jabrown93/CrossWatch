@@ -2,31 +2,77 @@
 # CrossWatch - Main orchestration logic for data pair synchronization.
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+
+from ..path_matching import pair_enabled
 from collections.abc import Mapping
 from typing import Any
 from contextlib import contextmanager
 import copy
 import os
+import re
+import traceback
+from pathlib import Path
 
 from ._pairs_utils import (
     inject_ctx_into_provider,
+    pair_feature_libraries,
     health_status,
     health_feature_ok,
     supports_feature,
 )
 from ._pairs_metrics import ApiMetrics, persist_api_totals
-from ..provider_instances import build_pair_config_view, build_provider_config_view, normalize_instance_id
+from ..provider_instances import _config_key_for, build_pair_config_view, build_provider_config_view, normalize_instance_id
 from ._pairs_oneway import run_one_way_feature
 from ._pairs_twoway import run_two_way_feature
 from ._pairs_playlists import run_playlist_mappings
 from ..run_control import SyncCancelled, cancel_requested
 from ..value_coercion import coerce_bool
+from ..pair_scope import pair_feature_scope
+from ..log_context import log_pair_id
+from ..connection_status import identity as connection_identity, record_health
+from ..interactive_reads import read_once, replaying
+
+_SAFE_ERROR_REASON = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,79}")
+_SOURCE_ROOTS = ("providers", "cw_platform", "services", "api")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def error_detail(exc: BaseException) -> str:
+    parts = [type(exc).__name__]
+    try:
+        if str(type(exc).__module__).split(".")[0] in _SOURCE_ROOTS:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, str) and _SAFE_ERROR_REASON.fullmatch(reason):
+                parts.append(reason)
+            status = getattr(exc, "status_code", None)
+            if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+                parts.append(f"HTTP {status}")
+    except Exception:
+        del parts[1:]
+    try:
+        frames = traceback.extract_tb(exc.__traceback__)
+        if frames:
+            path = Path(frames[-1].filename)
+            name = path.name
+            if path.is_absolute():
+                try:
+                    name = path.resolve().relative_to(_REPO_ROOT).as_posix()
+                except (ValueError, OSError):
+                    pass
+            parts.append(f"{name}:{frames[-1].lineno}")
+    except Exception:
+        pass
+    return " · ".join(parts)[:300]
+
 
 def _deep_merge_provider_overrides(dst: dict[str, Any], src: Mapping[str, Any]) -> None:
     for k, v in (src or {}).items():
         kk = str(k)
         if kk == "strict_id_matching":
             dst["strict_id_matching"] = coerce_bool(v)
+            continue
+        if kk == "targeted_lookup":
+            dst["targeted_lookup"] = coerce_bool(v, True)
             continue
         cur = dst.get(kk)
         if isinstance(cur, dict) and isinstance(v, Mapping):
@@ -42,7 +88,6 @@ def _config_with_pair_feature_options(
     feature: str,
 ) -> dict[str, Any]:
     feature_key = str(feature or "").strip().lower()
-    lib_cfg = fcfg.get("libraries")
     overrides: dict[str, list[str]] = {}
     provider_keys: list[str] = []
     for provider in providers:
@@ -52,16 +97,14 @@ def _config_with_pair_feature_options(
         provider_key = name.lower()
         if provider_key not in provider_keys:
             provider_keys.append(provider_key)
-        if isinstance(lib_cfg, Mapping):
-            raw = lib_cfg.get(name) or lib_cfg.get(provider_key)
-            if isinstance(raw, (list, tuple)):
-                values = [str(value).strip() for value in raw if str(value).strip()]
-                if values:
-                    overrides[provider_key] = values
+        values = pair_feature_libraries(fcfg, name, cfg.get("_cw_provider_instance"))
+        if values:
+            overrides[provider_key] = values
 
     has_replay = feature_key == "progress" and "replay_enabled" in fcfg
     has_tolerance = feature_key == "progress" and "timestamp_tolerance_seconds" in fcfg
-    if not provider_keys or (not overrides and not has_replay and not has_tolerance):
+    has_media_info = feature_key == "collection" and "media_info" in fcfg
+    if not provider_keys or (not overrides and not has_replay and not has_tolerance and not has_media_info):
         return cfg
 
     out = copy.deepcopy(cfg)
@@ -84,6 +127,8 @@ def _config_with_pair_feature_options(
             except (TypeError, ValueError):
                 tolerance = 30
             feature_cfg["timestamp_tolerance_seconds"] = max(0, min(300, tolerance))
+        if has_media_info:
+            feature_cfg["media_info"] = coerce_bool(fcfg.get("media_info", False))
     return out
 
 
@@ -95,28 +140,32 @@ def _config_with_pair_progress_options(
     return _config_with_pair_feature_options(cfg, fcfg, providers, "progress")
 
 
-from ._blackbox import prune_blackbox as _bb_prune
-
-
-def _bb_prune_once(cfg: Mapping[str, Any]) -> None:
+try:
+    from ._blackbox import prune_once as _bb_prune_once  # type: ignore[attr-defined]
+except Exception:
     try:
-        bb_cfg = ((cfg.get("sync") or {}).get("blackbox") or {})
-        cooldown = int(bb_cfg.get("cooldown_days", 30))
-        _bb_prune(cooldown_days=cooldown)
-    except Exception:
-        pass
+        from ._blackbox import prune_blackbox as _bb_prune  # type: ignore[attr-defined]
+
+        def _bb_prune_once(cfg: Mapping[str, Any]) -> None:
+            try:
+                bb_cfg = ((cfg.get("sync") or {}).get("blackbox") or {})
+                cooldown = int(bb_cfg.get("cooldown_days", 30))
+                _bb_prune(cooldown_days=cooldown)
+            except Exception:
+                pass
+    except Exception:  # last resort: no-op
+        def _bb_prune_once(cfg: Mapping[str, Any]) -> None:  # type: ignore[unused-arg]
+            return
 
 
-def _collect_health_for_run(ctx) -> dict[str, Any]:
+def _collect_health_for_run(ctx, pairs: list[Mapping[str, Any]]) -> dict[str, Any]:
     emit = ctx.emit
     provs = ctx.providers or {}
 
     cfg: Mapping[str, Any] = ctx.config or {}
     needed: set[tuple[str, str]] = set()
 
-    for p in (cfg.get("pairs") or []):
-        if not p.get("enabled", True):
-            continue
+    for p in pairs:
         s = str(p.get("source") or "").upper().strip()
         t = str(p.get("target") or "").upper().strip()
         si = normalize_instance_id(p.get("source_instance"))
@@ -167,9 +216,39 @@ def _collect_health_for_run(ctx) -> dict[str, Any]:
             inject_ctx_into_provider(ops, ctx)
             try:
                 h = ops.health(cfg_view, emit=emit) or {}
+            except SyncCancelled:
+                h = {"ok": False, "status": "cancelled", "details": "health cancelled"}
+                health_map[f"{str(name).upper()}#{normalize_instance_id(inst)}"] = h
+                emit(
+                    "health",
+                    provider=name,
+                    instance=normalize_instance_id(inst),
+                    status="cancelled",
+                    ok=False,
+                    latency_ms=None,
+                    details=h.get("details"),
+                    features={},
+                    api={},
+                )
+                break
             except TypeError:
                 try:
                     h = ops.health(cfg_view) or {}
+                except SyncCancelled:
+                    h = {"ok": False, "status": "cancelled", "details": "health cancelled"}
+                    health_map[f"{str(name).upper()}#{normalize_instance_id(inst)}"] = h
+                    emit(
+                        "health",
+                        provider=name,
+                        instance=normalize_instance_id(inst),
+                        status="cancelled",
+                        ok=False,
+                        latency_ms=None,
+                        details=h.get("details"),
+                        features={},
+                        api={},
+                    )
+                    break
                 except Exception as e:
                     h = {"ok": False, "status": "down", "details": f"health exception: {e}"}
             except Exception as e:
@@ -177,6 +256,7 @@ def _collect_health_for_run(ctx) -> dict[str, Any]:
 
         health_key = f"{str(name).upper()}#{normalize_instance_id(inst)}"
         health_map[health_key] = h
+        record_health(name, cfg_view, h)
         emit(
             "health",
             provider=name,
@@ -202,6 +282,27 @@ def _collect_health_for_run(ctx) -> dict[str, Any]:
     return health_map
 
 
+def _refresh_accounts_after_run(ctx, pairs: list[Mapping[str, Any]]) -> None:
+    refreshed: set[str] = set()
+    for pair in pairs:
+        for side in ("source", "target"):
+            name = str(pair.get(side) or "").upper().strip()
+            refresh = getattr((ctx.providers or {}).get(name), "refresh_account", None)
+            if not callable(refresh):
+                continue
+            instance = normalize_instance_id(pair.get(f"{side}_instance"))
+            cfg = build_provider_config_view(ctx.config or {}, name, instance)
+            key = connection_identity(name, cfg)
+            if key in refreshed:
+                continue
+            refreshed.add(key)
+            try:
+                ok = bool(refresh(cfg))
+                ctx.emit("account:refresh", provider=name, instance=instance, ok=ok)
+            except Exception as exc:
+                ctx.emit("account:refresh", provider=name, instance=instance, ok=False, error=type(exc).__name__)
+
+
 def _feature_list_for_pair(pair: Mapping[str, Any]) -> list[str]:
     selector = str(pair.get("feature") or "").strip().lower()
     fmap = dict(pair.get("features") or {})
@@ -219,13 +320,35 @@ def _feature_list_for_pair(pair: Mapping[str, Any]) -> list[str]:
             else:
                 out.append(str(fname))
 
-        if "history" in out and "watchlist" in out:
-            hi, wi = out.index("history"), out.index("watchlist")
-            if hi > wi:
-                out.remove("history")
-                out.insert(wi, "history")
+        for later_feature in ("watchlist", "ratings"):
+            if "history" in out and later_feature in out:
+                hi, following = out.index("history"), out.index(later_feature)
+                if hi > following:
+                    out.remove("history")
+                    out.insert(following, "history")
         return out
     return ["history", "watchlist", "ratings", "progress", "playlists"]
+
+
+def _pair_scope_ids(ctx) -> set[str]:
+    raw = getattr(ctx, "pair_scope_ids", None) or []
+    if isinstance(raw, (str, bytes)):
+        raw = [raw]
+    return {str(x).strip() for x in raw if str(x).strip()}
+
+
+def _pairs_for_run(ctx, cfg: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    scope = _pair_scope_ids(ctx)
+    out: list[Mapping[str, Any]] = []
+    for pair in cfg.get("pairs") or []:
+        if not isinstance(pair, Mapping):
+            continue
+        if not coerce_bool(pair.get("enabled", True), True):
+            continue
+        if scope and str(pair.get("id") or "").strip() not in scope:
+            continue
+        out.append(pair)
+    return out
 
 
 
@@ -253,8 +376,8 @@ def _pair_scope_key(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode
 
 
 @contextmanager
-def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str, feature: str):
-    key = _pair_scope_key(pair, i=i, src=src, dst=dst, mode=mode)
+def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str, feature: str, scope: str | None = None):
+    key = scope or _pair_scope_key(pair, i=i, src=src, dst=dst, mode=mode)
     src_inst = normalize_instance_id(pair.get("source_instance"))
     dst_inst = normalize_instance_id(pair.get("target_instance"))
     new = {
@@ -271,6 +394,7 @@ def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str,
     }
 
     old = {k: os.environ.get(k) for k in new.keys()}
+    log_token = log_pair_id.set(str(pair.get('id') or ''))
     try:
         for k, v in new.items():
             if v is None:
@@ -279,6 +403,7 @@ def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str,
                 os.environ[k] = str(v)
         yield
     finally:
+        log_pair_id.reset(log_token)
         for k, v in old.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -286,6 +411,8 @@ def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str,
                 os.environ[k] = v
 
 def run_pairs(ctx) -> dict[str, Any]:
+    review = getattr(ctx, "interactive", None)
+    preview = review is not None and review.preview
     for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
         if str(os.environ.get(k, "")).strip().lower() == "unscoped":
             os.environ.pop(k, None)
@@ -300,23 +427,26 @@ def run_pairs(ctx) -> dict[str, Any]:
     emit = ctx.emit
 
     _event_rec = None
-    try:
-        from ..event_archive import RunRecorder as _RunRecorder
-        import time as _t
-        _rid = str(os.environ.get("CW_RUN_ID") or int(_t.time()))
-        _event_rec = _RunRecorder(ctx.emit, run_id=_rid)
-        ctx.emit = _event_rec.emit
-        emit = ctx.emit
-    except Exception:
-        _event_rec = None
+    if not preview:
+        try:
+            from ..event_archive import RunRecorder as _RunRecorder
+            import time as _t
+            _rid = str(os.environ.get("CW_RUN_ID") or int(_t.time()))
+            _event_rec = _RunRecorder(ctx.emit, run_id=_rid)
+            ctx.emit = _event_rec.emit
+            emit = ctx.emit
+        except Exception:
+            _event_rec = None
 
     try:
         ttl_days = int(sync_cfg.get("tombstone_ttl_days", 30))
-        ctx.tomb_prune(max(1, ttl_days) * 24 * 3600)
+        if not preview:
+            ctx.tomb_prune(max(1, ttl_days) * 24 * 3600)
     except Exception:
         pass
 
-    health_map = _collect_health_for_run(ctx)
+    pairs = _pairs_for_run(ctx, cfg)
+    health_map = read_once("health", lambda: _collect_health_for_run(ctx, pairs), scoped=False)
 
     emit(
         "run:start",
@@ -332,10 +462,10 @@ def run_pairs(ctx) -> dict[str, Any]:
     skipped_total = 0
     skipped_exact_total = 0
     skipped_inferred_total = 0
+    blocked_total = 0
     errors_total = 0
     attempted_add_duplicate_keys_total = 0
 
-    pairs = [p for p in (cfg.get("pairs") or []) if coerce_bool(p.get("enabled", True), True)]
     provs = ctx.providers or {}
 
     features_ran: set[str] = set()
@@ -349,7 +479,11 @@ def run_pairs(ctx) -> dict[str, Any]:
         dst = str(pair.get("target") or "").upper().strip()
         src_inst = normalize_instance_id(pair.get("source_instance"))
         dst_inst = normalize_instance_id(pair.get("target_instance"))
+        if src == dst and src_inst == dst_inst:
+            emit("pair:skip", pair_id=str(pair.get("id") or ""), src=src, dst=dst, reason="same_provider_instance")
+            continue
         pair_cfg_view = build_pair_config_view(cfg, src, src_inst, dst, dst_inst)
+        pair_cfg_view["_cw_path_matching"] = pair_enabled(pair)
         pair_prov = pair.get("providers") or {}
         if isinstance(pair_prov, dict) and pair_prov:
             for pk, pv in pair_prov.items():
@@ -375,6 +509,7 @@ def run_pairs(ctx) -> dict[str, Any]:
         if not features:
             emit(
                 "run:pair:skip",
+                pair_id=str(pair.get('id') or ''),
                 src=src,
                 dst=dst,
                 mode=mode,
@@ -387,6 +522,7 @@ def run_pairs(ctx) -> dict[str, Any]:
 
         emit(
             "run:pair",
+            pair_id=str(pair.get('id') or ''),
             i=i,
             n=len(pairs),
             src=src,
@@ -400,13 +536,14 @@ def run_pairs(ctx) -> dict[str, Any]:
         sops = provs.get(src)
         dops = provs.get(dst)
         if not sops or not dops:
+            emit('pair:skip', pair_id=str(pair.get('id') or ''), src=src, dst=dst, reason='missing_provider_ops')
             emit_info(f"[!] Missing provider ops for {src}→{dst}")
             continue
 
         ss = health_status(health_map.get(f"{src}#{src_inst}") or health_map.get(src) or {})
         sd = health_status(health_map.get(f"{dst}#{dst_inst}") or health_map.get(dst) or {})
         if ss == "auth_failed" or sd == "auth_failed":
-            emit("pair:skip", src=src, dst=dst, reason="auth_failed", src_status=ss, dst_status=sd)
+            emit("pair:skip", pair_id=str(pair.get('id') or ''), src=src, dst=dst, reason="auth_failed", src_status=ss, dst_status=sd)
             continue
 
         injected = False
@@ -419,9 +556,28 @@ def run_pairs(ctx) -> dict[str, Any]:
             if isinstance(fcfg, dict) and not coerce_bool(fcfg.get("enable", True), True):
                 continue
 
-            with _pair_env(pair, i=i, src=src, dst=dst, mode=mode, feature=feature):
+            scope = pair_feature_scope(cfg, pair, feature, i)
+            with _pair_env(pair, i=i, src=src, dst=dst, mode=mode, feature=feature, scope=scope):
                 prev_cfg = ctx.config
-                ctx.config = _config_with_pair_feature_options(pair_cfg_view, fcfg, (src, dst), feature)
+                prev_store = ctx.state_store
+                ctx.state_store = prev_store.for_pair(scope, pair_id=str(pair.get("id") or ""))
+                ctx.config = {**_config_with_pair_feature_options(pair_cfg_view, fcfg, (src, dst), feature), "_cw_pair_scope": scope,
+                              "_cw_path_matching": pair_enabled(pair) and feature in {"history", "ratings", "progress"}}
+                if src == dst:
+                    endpoint_blocks = {}
+                    for instance in (src_inst, dst_inst):
+                        endpoint_cfg = build_provider_config_view(cfg, src, instance)
+                        endpoint_cfg["_cw_provider_instance"] = instance
+                        config_key = _config_key_for(cfg, src)
+                        block = endpoint_cfg.setdefault(config_key, {})
+                        override = next((value for key, value in pair_prov.items() if str(key).strip().upper() == src), {}) if isinstance(pair_prov, Mapping) else {}
+                        if isinstance(override, Mapping):
+                            _deep_merge_provider_overrides(block, override)
+                        elif override is not None and src in {"PLEX", "JELLYFIN", "EMBY"}:
+                            block["strict_id_matching"] = coerce_bool(override)
+                        endpoint_cfg = _config_with_pair_feature_options(endpoint_cfg, fcfg, (src, dst), feature)
+                        endpoint_blocks[instance] = endpoint_cfg[config_key]
+                    ctx.config["_cw_pair_instance_blocks"] = {src: endpoint_blocks}
                 try:
                     if not injected:
                         inject_ctx_into_provider(sops, ctx)
@@ -459,6 +615,7 @@ def run_pairs(ctx) -> dict[str, Any]:
                             updated_total += int(res.get("updated", 0))
                             unresolved_total += int(res.get("unresolved", 0))
                             skipped_total += int(res.get("skipped", 0))
+                            blocked_total += int(res.get("blocked", 0))
                             errors_total += int(res.get("errors", 0))
                         elif mode == "two-way":
                             res = run_two_way_feature(ctx, src, dst, feature=feature, fcfg=fcfg, health_map=health_map)
@@ -477,6 +634,7 @@ def run_pairs(ctx) -> dict[str, Any]:
                                 + int(res.get("skipped_to_A", 0))
                                 + int(res.get("skipped_to_B", 0))
                             )
+                            blocked_total += int(res.get("blocked", 0))
                             errors_total += (
                                 int(res.get("errors", 0))
                                 + int(res.get("errors_to_A", 0))
@@ -492,21 +650,38 @@ def run_pairs(ctx) -> dict[str, Any]:
                             skipped_total += int(res.get("skipped", 0))
                             skipped_exact_total += int(res.get("skipped_exact", 0))
                             skipped_inferred_total += int(res.get("skipped_inferred", 0))
+                            blocked_total += int(res.get("blocked", 0))
                             attempted_add_duplicate_keys_total += int(res.get("attempted_add_duplicate_keys", 0))
                             errors_total += int(res.get("errors", 0))
+
+                        if review is not None and not preview and review.on_result is not None:
+                            review.on_result(feature, src, dst, src_inst, dst_inst, mode, res)
+
+                        if isinstance(res, Mapping) and coerce_bool(res.get("cancelled"), False):
+                            emit("feature:cancelled", src=src, dst=dst, feature=feature)
+                            cancelled = True
+                            break
 
                     except SyncCancelled:
                         emit("feature:cancelled", src=src, dst=dst, feature=feature)
                         cancelled = True
                     except Exception as e:
-                        import traceback as _tb
-                        emit("feature:error", src=src, dst=dst, feature=feature, error=str(e), traceback=_tb.format_exc())
+                        emit("feature:error", src=src, dst=dst, feature=feature, error=str(e), detail=error_detail(e), traceback=traceback.format_exc())
                         errors_total += 1
                         continue
                 finally:
                     ctx.config = prev_cfg
+                    ctx.state_store = prev_store
     if not cancelled and cancel_requested():
         cancelled = True
+
+    if preview:
+        ctx.emit = metrics._orig_emit
+        return {"ok": not errors_total and not cancelled, "errors": errors_total,
+                "blocked": blocked_total, "cancelled": cancelled, "pairs": len(pairs)}
+
+    if not cancelled and not replaying():
+        _refresh_accounts_after_run(ctx, pairs)
 
     if "watchlist" in features_ran:
         try:
@@ -552,6 +727,7 @@ def run_pairs(ctx) -> dict[str, Any]:
                     "skipped_inferred": skipped_inferred_total,
                     "attempted_add_duplicate_keys": attempted_add_duplicate_keys_total,
                     "unresolved": unresolved_total,
+                    "blocked": blocked_total,
                     "errors": errors_total,
                 },
             }
@@ -571,7 +747,7 @@ def run_pairs(ctx) -> dict[str, Any]:
         emit(
             "debug",
             msg="state.persisted",
-            providers=len((ctx.providers or {})),
+            loaded_adapters=len((ctx.providers or {})),
             wall=(len(wall) if isinstance(wall, dict) else 0),
         )
     except Exception:
@@ -606,6 +782,7 @@ def run_pairs(ctx) -> dict[str, Any]:
         skipped_inferred=skipped_inferred_total,
         attempted_add_duplicate_keys=attempted_add_duplicate_keys_total,
         unresolved=unresolved_total,
+        blocked=blocked_total,
         errors=errors_total,
         pairs=len(pairs),
         cancelled=cancelled,
@@ -625,6 +802,7 @@ def run_pairs(ctx) -> dict[str, Any]:
         "removed": removed_total,
         "skipped": skipped_total,
         "unresolved": unresolved_total,
+        "blocked": blocked_total,
         "errors": errors_total,
         "pairs": len(pairs),
         "cancelled": cancelled,

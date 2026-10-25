@@ -17,7 +17,6 @@ EXCLUSIONS_FILE = ROOT / "tests" / "data" / "env_lock_exclusions.txt"
 SCANNED = [
     "ui_frontend.py",
     "assets/js/modals/tls/index.js",
-    "assets/js/playback_progress.js",
     *sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "providers" / "auth").glob("_auth_*.py")),
 ]
 

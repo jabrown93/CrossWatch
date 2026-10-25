@@ -8,9 +8,12 @@ from cw_platform.provider_instances import get_provider_block, normalize_instanc
 
 
 DEFAULT_INSTANCE_ID = "default"
-ROUTE_PROVIDERS = {"plex", "emby", "jellyfin", "kodi", "scrob"}
-ROUTE_SINKS = {"trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "scrob"}
-ROUTE_RATING_SINKS = {"trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "scrob"}
+ROUTE_PROVIDERS = {"plex", "emby", "jellyfin", "kodi", "scrob", "stremio"}
+ROUTE_SINGLE_ACCOUNT_PROVIDERS = {"stremio"}
+ROUTE_PROFILE_NAME_PROVIDERS = {"kodi"}
+ROUTE_SINKS = {"myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob"}
+ROUTE_MEDIA_SINKS = {"plex", "jellyfin", "emby", "kodi"}
+ROUTE_RATING_SINKS = {"kitsu", "myanimelist", "trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob"}
 ROUTE_OPTION_STATES = {"inherit", "on", "off"}
 ROUTE_RATINGS_MODES = {"off", "custom"}
 ROUTE_SCROBBLE_POLICY_RANGES = {
@@ -22,7 +25,40 @@ ROUTE_SCROBBLE_POLICY_KEYS = set(ROUTE_SCROBBLE_POLICY_RANGES)
 ROUTE_WATCH_POLICY_RANGES = {
     "pause_debounce_seconds": (0, 3600),
     "suppress_start_at": (0, 100),
+    "poll_seconds": (5, 60),
+    "idle_poll_seconds": (5, 120),
 }
+ROUTE_POLL_KEYS = ("poll_seconds", "idle_poll_seconds")
+ROUTE_POLL_PROVIDERS = {"emby", "jellyfin", "kodi", "scrob"}
+ROUTE_WATCH_BOOLEAN_KEYS = {"unresolved_user_fallback", "anime_mapping", "simkl_rewatches", "plexkodiconnect_support"}
+ROUTE_WATCH_STRICT_BOOLEAN_KEYS = {"simkl_rewatches", "plexkodiconnect_support"}
+
+
+def same_scrobble_endpoint(provider: Any, provider_instance: Any, sink: Any, sink_instance: Any) -> bool:
+    source = str(provider or "").strip().lower()
+    return bool(source) and source == str(sink or "").strip().lower() and normalize_instance_id(provider_instance) == normalize_instance_id(sink_instance)
+
+
+def route_is_self_target(route: dict[str, Any]) -> bool:
+    return same_scrobble_endpoint(route.get("provider"), route.get("provider_instance"), route.get("sink"), route.get("sink_instance"))
+
+
+def scrobble_sink_config(cfg: dict[str, Any], provider: str, instance: Any) -> dict[str, Any]:
+    inst = normalize_instance_id(instance)
+    captured = cfg.get("_cw_scrobble_sink") or {}
+    if captured.get("provider") == provider and captured.get("instance") == inst:
+        block = _deep_clone(captured.get("config") or {})
+    else:
+        original = cfg.get("_cw_scrobble_provider_configs") or {}
+        base = {**cfg, **original}
+        block = _deep_clone(get_provider_block(base, provider, inst))
+    block.pop("instances", None)
+    if inst == "default" and provider in {"jellyfin", "emby"}:
+        auth = (cfg.get("auth") or {}).get(provider) or {}
+        for field in ("server", "access_token", "user_id"):
+            if field not in block and auth.get(field) is not None:
+                block[field] = _deep_clone(auth[field])
+    return {**cfg, provider: block}
 
 
 def _deep_clone(v: Any) -> Any:
@@ -99,7 +135,7 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
 
     watch_raw = raw.get("watch")
     watch_src: dict[str, Any] = watch_raw if isinstance(watch_raw, dict) else {}
-    watch: dict[str, int] = {}
+    watch: dict[str, Any] = {}
     for key, (min_val, max_val) in ROUTE_WATCH_POLICY_RANGES.items():
         if key not in watch_src:
             continue
@@ -112,8 +148,11 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
             continue
         if min_val <= val <= max_val:
             watch[key] = val
+    for key in ROUTE_WATCH_BOOLEAN_KEYS:
+        if key in watch_src:
+            watch[key] = watch_src.get(key) is True if key in ROUTE_WATCH_STRICT_BOOLEAN_KEYS else bool(watch_src.get(key))
 
-    return {
+    out: dict[str, Any] = {
         "auto_remove_watchlist": auto_remove,
         "ratings": {
             "mode": ratings_mode,
@@ -124,6 +163,26 @@ def normalize_route_options(options: Any) -> dict[str, Any]:
         "scrobble": scrobble,
         "watch": watch,
     }
+    destination_raw = raw.get("destination")
+    if isinstance(destination_raw, dict):
+        libraries_raw = destination_raw.get("libraries")
+        libraries: list[str] = []
+        for value in libraries_raw if isinstance(libraries_raw, list) else []:
+            text = str(value if value is not None else "").strip()
+            if text and text not in libraries:
+                libraries.append(text)
+        destination: dict[str, Any] = {"libraries": libraries}
+        if "update_all_copies" in destination_raw:
+            destination["update_all_copies"] = destination_raw.get("update_all_copies") is not False
+        out["destination"] = destination
+    return out
+
+
+def route_options_has_watch_key(options: Any, key: str) -> bool:
+    if not isinstance(options, dict):
+        return False
+    watch = options.get("watch")
+    return isinstance(watch, dict) and key in watch
 
 
 def normalize_route(route: dict[str, Any], fallback_id: str) -> dict[str, Any]:
@@ -146,7 +205,15 @@ def normalize_route(route: dict[str, Any], fallback_id: str) -> dict[str, Any]:
     filters = r.get("filters")
     if not isinstance(filters, dict):
         filters = {}
-    options = normalize_route_options(r.get("options"))
+    raw_options = r.get("options")
+    options = normalize_route_options(raw_options)
+    if prov == "plex" and not route_options_has_watch_key(raw_options, "unresolved_user_fallback"):
+        options["watch"]["unresolved_user_fallback"] = True
+    if prov not in ROUTE_POLL_PROVIDERS:
+        for key in ROUTE_POLL_KEYS:
+            options["watch"].pop(key, None)
+    if sink not in ROUTE_MEDIA_SINKS:
+        options.pop("destination", None)
     profile_id = normalize_user_profile_id(r.get("profile_id") or r.get("profileId"))
 
     out = {
@@ -196,13 +263,107 @@ def route_assigned_profile_id(cfg: dict[str, Any], route: dict[str, Any]) -> str
         return normalize_user_profile_id(raw)
 
 
+def _loose_profile_name(value: Any) -> str:
+    from cw_platform.account_match import normalize_media_account_name
+
+    return normalize_media_account_name(value)
+
+
+def _exact_profile_name(value: Any) -> str:
+    from cw_platform.account_match import exact_media_account_name
+
+    return exact_media_account_name(value)
+
+
+def route_profile_accepts(cfg: dict[str, Any], name: Any) -> bool | None:
+    watch = ((cfg or {}).get("scrobble") or {}).get("watch") if isinstance(cfg, dict) else None
+    if not isinstance(watch, dict):
+        return None
+    if str(watch.get("route_provider") or "").strip().lower() not in ROUTE_PROFILE_NAME_PROVIDERS:
+        return None
+    profile_id = normalize_user_profile_id(watch.get("route_profile_id"))
+    if not profile_id:
+        return None
+    try:
+        from cw_platform.provider_instances import list_user_profiles
+
+        labels = {normalize_user_profile_id(row.get("id")): str(row.get("label") or "").strip() for row in list_user_profiles(cfg)}
+    except Exception:
+        return None
+    label = labels.get(profile_id) or ""
+    if not label:
+        return None
+    wanted = _exact_profile_name(name)
+    if not wanted:
+        return False
+    exact = _exact_profile_name(label)
+    others = [other for other in labels.values() if other]
+    if sum(1 for other in others if _exact_profile_name(other) == exact) > 1:
+        return False
+    loose = _loose_profile_name(label)
+    if not loose or sum(1 for other in others if _loose_profile_name(other) == loose) > 1:
+        return wanted == exact
+    return _loose_profile_name(name) == loose
+
+
+def route_profile_signature(cfg: dict[str, Any]) -> list[str]:
+    watch = ((cfg or {}).get("scrobble") or {}).get("watch") if isinstance(cfg, dict) else None
+    if not isinstance(watch, dict):
+        return []
+    if str(watch.get("route_provider") or "").strip().lower() not in ROUTE_PROFILE_NAME_PROVIDERS:
+        return []
+    profile_id = normalize_user_profile_id(watch.get("route_profile_id"))
+    if not profile_id:
+        return []
+    try:
+        from cw_platform.provider_instances import list_user_profiles
+
+        rows = list_user_profiles(cfg)
+    except Exception:
+        return [profile_id]
+    return [profile_id, *sorted(f"{normalize_user_profile_id(row.get('id'))}={str(row.get('label') or '').strip()}" for row in rows)]
+
+
 def route_needs_account_filter(cfg: dict[str, Any], route: dict[str, Any]) -> bool:
     if not route_assigned_profile_id(cfg, route):
+        return False
+    provider = str((route or {}).get("provider") or "").strip().lower()
+    if provider in ROUTE_SINGLE_ACCOUNT_PROVIDERS or provider in ROUTE_PROFILE_NAME_PROVIDERS:
         return False
     filters = (route or {}).get("filters")
     raw = filters.get("username_whitelist") if isinstance(filters, dict) else None
     values = raw if isinstance(raw, list) else ([raw] if raw else [])
     return not any(str(value or "").strip() for value in values)
+
+
+def group_poll_seconds(cfg: dict[str, Any], provider: Any, provider_instance: Any, key: str = "poll_seconds") -> int | None:
+    prov = str(provider or "").strip().lower()
+    if prov not in ROUTE_POLL_PROVIDERS:
+        return None
+    inst = normalize_instance_id(provider_instance)
+    values: list[int] = []
+    for route in normalize_routes(cfg):
+        if not route.get("enabled") or route.get("provider") != prov or route.get("provider_instance") != inst:
+            continue
+        if not route.get("sink") or route_is_self_target(route):
+            continue
+        val = ((route.get("options") or {}).get("watch") or {}).get(key)
+        if isinstance(val, int):
+            values.append(val)
+    return min(values) if values else None
+
+
+def watch_poll_seconds(cfg: Any, default: float, key: str = "poll_seconds") -> float:
+    watch = ((cfg.get("scrobble") or {}).get("watch") or {}) if isinstance(cfg, dict) else {}
+    raw = watch.get(key) if isinstance(watch, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        val = float(raw)
+    except Exception:
+        return default
+    low, high = ROUTE_WATCH_POLICY_RANGES[key]
+    return val if low <= val <= high else default
 
 
 def find_route(cfg: dict[str, Any], route_id: str | None) -> dict[str, Any] | None:
@@ -242,10 +403,16 @@ def build_route_cfg(cfg: dict[str, Any], route: dict[str, Any]) -> dict[str, Any
     out: dict[str, Any] = _deep_clone(cfg) if isinstance(cfg, dict) else {}
     w = _watch_cfg(out)
 
+    if r["sink"]:
+        out["_cw_scrobble_sink"] = {
+            "provider": r["sink"], "instance": r["sink_instance"],
+            "config": _deep_clone(scrobble_sink_config(cfg, r["sink"], r["sink_instance"])[r["sink"]]),
+        }
+
     if r["provider"]:
         out[r["provider"]] = _provider_view(out, r["provider"], r["provider_instance"])
-    if r["sink"]:
-        out[r["sink"]] = _provider_view(out, r["sink"], r["sink_instance"])
+    if r["sink"] and r["sink"] != r["provider"]:
+        out[r["sink"]] = _provider_view(cfg, r["sink"], r["sink_instance"])
     ratings = (r.get("options") or {}).get("ratings")
     rating_targets = ratings.get("targets") if isinstance(ratings, dict) else []
     for target in rating_targets if isinstance(rating_targets, list) else []:
@@ -255,6 +422,7 @@ def build_route_cfg(cfg: dict[str, Any], route: dict[str, Any]) -> dict[str, Any
 
     w["filters"] = _deep_clone(r.get("filters") or {})
     w["route_id"] = r["id"]
+    w["route_enabled"] = r["enabled"]
     w["route_profile_id"] = route_assigned_profile_id(out, r)
     w["route_effective_profile_id"] = route_profile_id(out, r)
     w["route_provider"] = r["provider"]

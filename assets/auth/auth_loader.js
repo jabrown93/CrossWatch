@@ -17,8 +17,14 @@
     floppy: "/assets/auth/auth.floppy.js",
     tmdb: "/assets/auth/auth.tmdb.js",
     tautulli: "/assets/auth/auth.tautulli.js",
+    tracearr: "/assets/auth/auth.tracearr.js",
+    kitsu: "/assets/auth/auth.kitsu.js",
     anilist: "/assets/auth/auth.anilist.js",
+    myanimelist: "/assets/auth/auth.myanimelist.js",
+    wetrakr: "/assets/auth/auth.wetrakr.js",
     punchplay: "/assets/auth/auth.punchplay.js",
+    bingebase: "/assets/auth/auth.bingebase.js",
+    flicklist: "/assets/auth/auth.flicklist.js",
     scrob: "/assets/auth/auth.scrob.js",
   };
 
@@ -37,8 +43,14 @@
     "sec-floppy": "floppy",
     "sec-tmdb-sync": "tmdb",
     "sec-tautulli": "tautulli",
+    "sec-tracearr": "tracearr",
+    "sec-kitsu": "kitsu",
     "sec-anilist": "anilist",
+    "sec-myanimelist": "myanimelist",
+    "sec-wetrakr": "wetrakr",
     "sec-punchplay": "punchplay",
+    "sec-bingebase": "bingebase",
+    "sec-flicklist": "flicklist",
     "sec-scrob": "scrob",
   };
 

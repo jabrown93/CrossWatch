@@ -17,6 +17,7 @@
   const WALL_PREVIEW_CACHE_KEY = "cw.wall.preview.v2";
   const WALL_PREVIEW_MIGRATION_KEY = "cw.wallPreviewMigrated.v1";
   const WALL_PREVIEW_REFRESH_TTL_MS = 60 * 1000;
+  const WALL_PREVIEW_FETCH_TIMEOUT_MS = 30 * 1000;
   const DEFAULT_INSTANCE = "default";
 
   const migrateWallPreviewCache = () => {
@@ -35,8 +36,15 @@
 
   const json = async (url, opt) => {
     if (authSetupPending()) throw new Error("auth setup pending");
-    if (window.CW?.API?.j && !opt) return window.CW.API.j(url);
-    const res = await fetch(url, { cache: "no-store", ...(opt || {}) });
+    if (window.CW?.API?.j && !opt) return window.CW.API.j(url, {}, WALL_PREVIEW_FETCH_TIMEOUT_MS);
+    const controller = !opt?.signal && typeof AbortController === "function" ? new AbortController() : null;
+    const timer = controller ? window.setTimeout(() => controller.abort("timeout"), WALL_PREVIEW_FETCH_TIMEOUT_MS) : 0;
+    let res;
+    try {
+      res = await fetch(url, { cache: "no-store", ...(opt || {}), signal: opt?.signal || controller?.signal });
+    } finally {
+      if (timer) window.clearTimeout(timer);
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   };
@@ -62,6 +70,22 @@
   const providerKey = (value) => providerMeta().keyOf?.(value) || String(value || "").trim().toUpperCase();
   const providerLabel = (value) => providerMeta().label?.(value) || providerKey(value) || String(value || "");
   const providerShortLabel = (value) => providerMeta().shortLabel?.(value) || providerLabel(value);
+  const providerBrandInfo = (value) => {
+    const meta = providerMeta();
+    const key = providerKey(value);
+    const info = meta.brandInfo?.(key);
+    if (info) return info;
+    return {
+      key,
+      label: providerLabel(key),
+      shortLabel: providerShortLabel(key),
+      cls: "",
+      icon: meta.logoPath?.(key) || "",
+      logIcon: meta.logLogoPath?.(key) || "",
+      tone: meta.tone?.(key) || null,
+    };
+  };
+  const providerLogoPath = (name) => providerBrandInfo(name).icon || "";
   const providerInstanceLabel = (provider, instance) => {
     const label = providerLabel(provider);
     const inst = String(instance || DEFAULT_INSTANCE).trim() || DEFAULT_INSTANCE;
@@ -73,14 +97,6 @@
     if (raw === "crosswatch_only" || raw === "cw_only") return "CROSSWATCH";
     if (raw.endsWith("_only")) return providerKey(raw.slice(0, -5));
     return "";
-  };
-  const PILL_CLASS_BY_PROVIDER = {
-    PLEX: "p-px",
-    SIMKL: "p-sk",
-    TRAKT: "p-tr",
-    ANILIST: "p-al",
-    JELLYFIN: "p-sk",
-    CROSSWATCH: "p-sk",
   };
 
   const readHidden = () => {
@@ -106,14 +122,26 @@
     }
   };
 
-  const writeWallCache = (items, lastSyncEpoch, total = null) => {
+  const writeWallCache = (items, lastSyncEpoch, total = null, version = "") => {
     try {
-      localStorage.setItem(wallCacheKey(), JSON.stringify({ items, last_sync_epoch: lastSyncEpoch || 0, total }));
+      localStorage.setItem(wallCacheKey(), JSON.stringify({ items, last_sync_epoch: lastSyncEpoch || 0, total, version }));
     } catch {}
   };
 
   const clearWallCache = () => {
     try { localStorage.removeItem(wallCacheKey()); } catch {}
+  };
+  const clearAllWallCaches = () => {
+    try {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i) || "";
+        if (key.startsWith(`${WALL_PREVIEW_CACHE_KEY}.`)) keys.push(key);
+      }
+      for (const key of keys) localStorage.removeItem(key);
+    } catch {
+      clearWallCache();
+    }
   };
 
   const hasRenderedWall = (row = document.getElementById("poster-row")) => !!(row?.childElementCount && !row.classList.contains("hidden"));
@@ -172,6 +200,11 @@
       const item = window.__cwWallPreviewItems?.get?.(key);
       if (!item) return;
       event.preventDefault();
+      const modal = window.CW?.ProfileMediaModal;
+      if (modal?.canOpen?.(item)) {
+        void modal.open(item);
+        return;
+      }
       void openPreviewDrawer(item);
     }, true);
     row.addEventListener("wheel", (e) => {
@@ -196,7 +229,9 @@
   }
 
   function seasonNumber(item) {
-    return asNumber(item?.season_number ?? item?.episode?.season_number ?? item?.episode?.season ?? item?.season);
+    const raw = item?.season_number ?? item?.episode?.season_number ?? item?.episode?.season ?? item?.season;
+    const n = raw === null || raw === undefined || raw === "" ? NaN : Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : -1;
   }
 
   function episodeNumber(item) {
@@ -208,14 +243,14 @@
     if (explicit) return explicit;
     const season = seasonNumber(item);
     const episode = episodeNumber(item);
-    return season && episode ? `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}` : "";
+    return season >= 0 && episode ? `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}` : "";
   }
 
   function episodeStillUrl(item, size = "w300") {
     const tmdb = tmdbIdOf(item);
     const season = seasonNumber(item);
     const episode = episodeNumber(item);
-    if (!tmdb || !season || !episode || artTypeOf(item) !== "tv") return "";
+    if (!tmdb || season < 0 || !episode || artTypeOf(item) !== "tv") return "";
     return `/art/tmdb/tv/${encodeURIComponent(String(tmdb))}?kind=still&season=${encodeURIComponent(String(season))}&episode=${encodeURIComponent(String(episode))}&size=${encodeURIComponent(size)}${artEvidenceOf(item)}`;
   }
 
@@ -271,9 +306,14 @@
     window.setTimeout(start, 900);
   }
 
-  const providerLogoPath = (name) => window.CW?.ProviderMeta?.logoPath?.(name) || "";
   const esc = (value) => String(value ?? "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[m]));
   let activePreviewDrawerKey = "";
+
+  const pillMarkup = (pill) => {
+    const cls = String(pill?.cls || "p-sk").replace(/[^a-z0-9_-]+/gi, "");
+    const style = pill?.rgb ? ` style="--pill-rgb:${esc(pill.rgb)}"` : "";
+    return `<div class="pill ${cls}"${style}>${esc(pill?.text || "-")}</div>`;
+  };
 
   function countLabel(total, noun) {
     const n = Number(total || 0);
@@ -505,12 +545,34 @@
     window.dispatchEvent(new CustomEvent("cw:watchlist-widget-state", { detail: { empty: true, count: 0 } }));
   };
 
+  function renderCachedPreview({ preserveIfSame = true } = {}) {
+    const card = document.getElementById("placeholder-card");
+    const msg = document.getElementById("wall-msg");
+    const row = document.getElementById("poster-row");
+    if (!card || !msg || !row) return false;
+    if (!isOnMain() || profileWatchlistWidgetHidden()) return false;
+    const cached = readWallCache();
+    if (!cached?.items?.length) return false;
+    card.classList.remove("hidden");
+    return renderWall(row, msg, cached.items, cached.last_sync_epoch || 0, {
+      preserveIfSame,
+      total: cached.total ?? null,
+    });
+  }
+
   function pillFor(status) {
     const raw = String(status || "").toLowerCase().trim();
     if (raw === "deleted") return { text: "DELETED", cls: "p-del" };
     if (raw === "both") return { text: "SYNCED", cls: "p-syn" };
     const provider = providerFromStatus(raw);
-    if (provider) return { text: providerShortLabel(provider).toUpperCase(), cls: PILL_CLASS_BY_PROVIDER[provider] || "p-sk" };
+    if (provider) {
+      const brand = providerBrandInfo(provider);
+      return {
+        text: (brand.shortLabel || providerShortLabel(provider)).toUpperCase(),
+        cls: "p-provider",
+        rgb: brand.tone?.rgb || "",
+      };
+    }
     return { text: "-", cls: "p-sk" };
   }
 
@@ -561,12 +623,15 @@
   }
 
   function providerIconMarkup(name) {
-    const src = providerLogoPath(name);
-    const label = providerLabel(name);
-    const shortLabel = providerShortLabel(name);
-    const shell = `display:inline-flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid rgba(255,255,255,.09);background:rgba(7,11,18,.38);box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 8px 20px rgba(0,0,0,.18);backdrop-filter:blur(10px) saturate(120%);-webkit-backdrop-filter:blur(10px) saturate(120%);`;
+    const brand = providerBrandInfo(name);
+    const src = brand.icon || "";
+    const label = brand.label || providerLabel(name);
+    const shortLabel = brand.shortLabel || providerShortLabel(name);
+    const rgb = esc(brand.tone?.rgb || "255,255,255");
+    const isSquare = /\.png(?:[?#]|$)/i.test(src);
+    const shell = `display:inline-flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid rgba(${rgb},.22);background:rgba(${rgb},.11);box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 8px 20px rgba(0,0,0,.18);backdrop-filter:blur(10px) saturate(120%);-webkit-backdrop-filter:blur(10px) saturate(120%);`;
     return src
-      ? `<span style="${shell}width:28px;height:28px;padding:0 5px;"><img src="${esc(src)}" alt="${esc(label)} logo" style="display:block;width:auto;height:16px;max-width:20px;object-fit:contain;filter:brightness(1.05)"></span>`
+      ? `<span style="${shell}width:28px;height:28px;padding:0 5px;"><img src="${esc(src)}" alt="${esc(label)} logo" style="display:block;width:auto;height:${isSquare ? "19px" : "16px"};max-width:${isSquare ? "19px" : "20px"};object-fit:contain;filter:brightness(1.05)"></span>`
       : `<span aria-label="${esc(label)}" style="${shell}min-width:28px;height:28px;padding:0 7px;font-size:11px;font-weight:800;line-height:1;color:rgba(245,248,255,.88);">${esc(shortLabel)}</span>`;
   }
 
@@ -677,13 +742,12 @@
       const currentProviders = providersForItem(item).slice(0, 5);
       const routeTitle = sourceRouteTitle(item);
       const synced = String(source).toLowerCase() === "both";
-      overlay.className = `ovr wl-status ${synced ? "is-synced" : "is-provider"}`;
+      const iconsHtml = currentProviders.length ? currentProviders.map(providerIconMarkup).join("") : "";
+      overlay.className = `ovr wl-status ${synced ? "is-synced" : "is-provider"}${iconsHtml ? " has-icons" : ""}`;
       if (routeTitle) {
         overlay.setAttribute("aria-label", routeTitle);
       }
-      overlay.innerHTML = synced
-        ? `<div class="pill ${pill.cls}">${pill.text}</div>`
-        : currentProviders.length ? currentProviders.map(providerIconMarkup).join("") : `<div class="pill ${pill.cls}">${pill.text}</div>`;
+      overlay.innerHTML = `<span class="wl-status-pill">${pillMarkup(pill)}</span><span class="wl-status-icons">${iconsHtml}</span>`;
       link.appendChild(overlay);
 
       if (synced) {
@@ -744,18 +808,24 @@
     const myReq = ++wallReqSeq;
     const refreshVersion = window.__cwWallPreviewDirtyVersion;
     const renderedWall = hasRenderedWall(row);
+    const cached = readWallCache();
     if (!renderedWall) {
-      msg.textContent = "Loading...";
-      msg.classList.remove("is-empty");
-      msg.classList.remove("hidden");
-      row.closest(".wall-wrap")?.classList.remove("is-empty");
-      row.classList.add("hidden");
+      if (cached?.items?.length) {
+        renderCachedPreview({ preserveIfSame: true });
+      } else {
+        msg.textContent = "Loading...";
+        msg.classList.remove("is-empty");
+        msg.classList.remove("hidden");
+        row.closest(".wall-wrap")?.classList.remove("is-empty");
+        row.classList.add("hidden");
+      }
     }
 
     const limit = Number.isFinite(window.MAX_WALL_POSTERS) ? Math.max(1, Number(window.MAX_WALL_POSTERS)) : 20;
     const params = new URLSearchParams({ both_only: "0", active_only: "1", limit: String(limit) });
     const userProfile = overviewProfileId();
     if (userProfile) params.set("user_profile", userProfile);
+    if (cached?.version) params.set("known_version", cached.version);
     const wallDataPromise = json(`/api/state/wall?${params.toString()}`)
       .then((data) => ({ data }), (error) => ({ error }));
 
@@ -777,6 +847,10 @@
       if (myReq !== wallReqSeq) return false;
       if (!isOnMain()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
       if (profileWatchlistWidgetHidden()) { hidePreviewCard(card, row, msg, { preserve: true }); return false; }
+      if (data?.not_modified && cached?.items?.length) {
+        markPreviewClean(refreshVersion);
+        return renderWall(row, msg, cached.items, cached.last_sync_epoch || 0, { preserveIfSame: true, total: cached.total ?? null });
+      }
       if (data?.missing_tmdb_key) { clearWallCache(); hidePreviewCard(card, row, msg); return false; }
       if (!data?.ok) { msg.textContent = data?.error || "No state data found."; return false; }
 
@@ -789,12 +863,11 @@
         markPreviewClean(refreshVersion);
         return true;
       }
-      writeWallCache(items, data.last_sync_epoch || 0, data?.total ?? items.length);
+      writeWallCache(items, data.last_sync_epoch || 0, data?.total ?? items.length, data?.version || "");
       renderWall(row, msg, items, data.last_sync_epoch || 0, { preserveIfSame: true, total: data?.total ?? items.length });
       markPreviewClean(refreshVersion);
       return true;
     } catch {
-      const cached = readWallCache();
       if (cached?.items?.length) {
         return renderWall(row, msg, cached.items, cached.last_sync_epoch || 0, { total: cached.total ?? null });
       }
@@ -910,8 +983,10 @@
       card.classList.remove("hidden");
       const rendered = hasRenderedWall(row);
       if (msg && !window.wallLoaded && !rendered) {
-        msg.textContent = "Loading...";
-        msg.classList.remove("hidden");
+        if (!renderCachedPreview({ preserveIfSame: true })) {
+          msg.textContent = "Loading...";
+          msg.classList.remove("hidden");
+        }
       }
 
       if ((!window.wallLoaded || previewNeedsRefresh()) && !window.__wallLoading) {
@@ -933,6 +1008,29 @@
     return true;
   }
 
+  function clearWatchlistPreview() {
+    clearAllWallCaches();
+    wallReqSeq += 1;
+    previewBusy = false;
+    window.__wallLoading = false;
+    window.wallLoaded = false;
+    window.__cwWallPreviewDirty = true;
+    window.__cwWallPreviewDirtyVersion += 1;
+    window.__cwWallPreviewLoadedAt = 0;
+    window._lastSyncEpoch = null;
+    window.__wallRenderSignature = "";
+    const card = document.getElementById("placeholder-card");
+    const row = document.getElementById("poster-row");
+    const msg = document.getElementById("wall-msg");
+    if (card && row && msg && isOnMain() && !profileWatchlistWidgetHidden()) {
+      card.classList.remove("hidden");
+      setWallEmpty(row, msg, "No items to show yet.");
+      return true;
+    }
+    try { window.dispatchEvent(new CustomEvent("cw:watchlist-widget-state", { detail: { empty: true, count: 0 } })); } catch {}
+    return false;
+  }
+
   window.addEventListener("storage", (event) => {
     if (event.key !== "wl_hidden") return;
     updatePreviewVisibility();
@@ -941,6 +1039,7 @@
   window.addEventListener("sync-complete", markWatchlistPreviewDirty);
   window.addEventListener("watchlist:refresh", markWatchlistPreviewDirty);
   window.addEventListener("cw:overview-profile-changed", markWatchlistPreviewDirty);
+  window.addEventListener("cw:sync-state-cleared", clearWatchlistPreview);
 
   const WatchlistPreview = {
     updateEdges,
@@ -952,6 +1051,7 @@
     gridArtUrl,
     applyWidgetView,
     prewarmWallImages,
+    renderCachedPreview,
     loadWall,
     updateWatchlistPreview,
     hasTmdbKey,
@@ -959,6 +1059,7 @@
     isWatchlistPreviewAllowed,
     updatePreviewVisibility,
     markWatchlistPreviewDirty,
+    clearWatchlistPreview,
   };
 
   (window.CW ||= {}).WatchlistPreview = WatchlistPreview;

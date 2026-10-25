@@ -1,0 +1,273 @@
+# services/interactive_sync_mapping.py
+# CrossWatch - Destination catalog suggestions for interactive mapping
+# Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
+from __future__ import annotations
+
+import re
+
+import requests
+from fastapi import HTTPException
+
+from cw_platform.id_map import coalesce_ids, ID_KEYS
+from cw_platform.trakt_http import paced_request as trakt_paced_request
+from services.interactive_sync_catalogs import destination_rows, provider_block, search_catalogs
+
+
+def _check_rate_limit(response):
+    if response.status_code == 429:
+        raise HTTPException(429, "The search provider rate limit was reached.",
+                            headers={"Retry-After": str(response.headers.get("Retry-After") or "60")})
+
+
+def _candidate_ids(item, source):
+    raw = item.get("ids")
+    ids = dict(raw) if isinstance(raw, dict) else {}
+    if ids.get("simkl_id"):
+        ids["simkl"] = ids["simkl_id"]
+    for key in ID_KEYS:
+        value = item.get(key) or item.get(key + "id") or item.get(key + "_id")
+        if value:
+            ids[key] = value
+    if source == "TMDB":
+        ids["tmdb"] = item.get("id")
+    elif source == "MDBLIST" and str(item.get("id") or "").startswith("tt"):
+        ids["imdb"] = item["id"]
+    return coalesce_ids({key: value for key, value in ids.items() if key in ID_KEYS})
+
+
+def _mdblist_metadata(client, cfg, instance, entity, body):
+    from providers.sync.mdblist._auth import request_with_auth
+
+    rows = body if isinstance(body, list) else (body.get("search") or body.get("results") or []) if isinstance(body, dict) else []
+    if not isinstance(rows, list):
+        return body
+    rows = [dict(item) for item in rows[:20] if isinstance(item, dict)]
+    groups = {}
+    for item in rows:
+        ids = _candidate_ids(item, "MDBLIST")
+        if ids.get("tmdb") and ids.get("imdb"):
+            continue
+        namespace = next((key for key in ("mdblist", "imdb", "tmdb") if ids.get(key)), None)
+        if namespace:
+            groups.setdefault(namespace, {}).setdefault(ids[namespace], []).append(item)
+    for namespace, targets in groups.items():
+        try:
+            response = request_with_auth(client, "POST", f"https://api.mdblist.com/{namespace}/{entity}/",
+                                         cfg=cfg, instance_id=instance, timeout=10, max_retries=0,
+                                         json={"ids": list(targets)})
+            _check_rate_limit(response)
+            if response.status_code >= 400:
+                continue
+            details = response.json()
+            if not isinstance(details, list):
+                continue
+            by_id = {}
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                ids = _candidate_ids(detail, "MDBLIST")
+                if ids.get(namespace) in targets:
+                    by_id.setdefault(ids[namespace], []).append(ids)
+            for identity, items in targets.items():
+                matches = by_id.get(identity, [])
+                if len(matches) != 1:
+                    continue
+                resolved = matches[0]
+                for item in items:
+                    original = _candidate_ids(item, "MDBLIST")
+                    if any(original[key] != resolved[key] for key in original.keys() & resolved.keys()):
+                        continue
+                    item["ids"] = {**original, **resolved}
+        except HTTPException:
+            raise
+        except Exception:
+            continue
+    return rows
+
+
+def _simkl_headers(block, instance):
+    from providers.auth._auth_SIMKL import ensure_fresh
+
+    try:
+        token = ensure_fresh(instance)
+    except Exception:
+        token = ""
+    token = token or str(block.get("access_token") or "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _trakt_headers(key, block, instance):
+    import time
+
+    from cw_platform.app_version import user_agent
+    from cw_platform.config_base import load_config
+    from cw_platform.provider_instances import get_instance_block
+
+    headers = {"Content-Type": "application/json", "trakt-api-key": key, "trakt-api-version": "2",
+               "User-Agent": user_agent("WebUI", override_env="CW_TRAKT_UA")}
+    token = str(block.get("access_token") or "").strip()
+    try:
+        expires_at = int(block.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if token and 0 < expires_at <= int(time.time()) + 120:
+        token = ""
+        try:
+            from providers.auth._auth_TRAKT import PROVIDER
+
+            if PROVIDER.refresh(None, instance_id=instance).get("ok"):
+                token = str(get_instance_block(load_config(), "trakt", instance).get("access_token") or "").strip()
+        except Exception:
+            token = ""
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _simkl_anime_parts(client, key, simkl_id, headers=None):
+    from providers.sync.simkl._common import simkl_api_params
+
+    response = client.get(f"https://api.simkl.com/anime/episodes/{simkl_id}", params=simkl_api_params(key),
+                          headers=headers or {}, timeout=10)
+    _check_rate_limit(response)
+    if response.status_code >= 400:
+        raise HTTPException(502, f"SIMKL part lookup returned HTTP {response.status_code}. Try again.")
+    episodes = response.json()
+    episodes = [episode for episode in episodes if isinstance(episode, dict) and episode.get("type") == "episode"
+                and isinstance(episode.get("episode"), int) and episode["episode"] > 0] if isinstance(episodes, list) else []
+    if len(episodes) < 2:
+        return []
+    return [dict(number=episode["episode"], title=str(episode.get("title") or "")[:300],
+                 year=int(str(episode.get("date") or "")[:4]) if str(episode.get("date") or "")[:4].isdigit() else None)
+            for episode in sorted(episodes, key=lambda episode: episode["episode"])]
+
+
+def anime_parts(cfg, row, simkl_id):
+    from cw_platform.simkl_http import pace_session
+
+    if str(row["provider"]).upper() != "SIMKL" or not str(simkl_id).isdigit():
+        raise HTTPException(400, "Parts are only available for SIMKL anime movies.")
+    block = provider_block(cfg, "SIMKL", row.get("instance") or "default")
+    key = block.get("api_key") or block.get("client_id")
+    if not key:
+        raise HTTPException(409, "Configure SIMKL search credentials for this destination instance.")
+    try:
+        with requests.Session() as client:
+            pace_session(client)
+            parts = _simkl_anime_parts(client, key, str(simkl_id), _simkl_headers(block, row.get("instance") or "default"))
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(502, "SIMKL part lookup is unavailable. Try again.") from error
+    return dict(ok=True, parts=parts)
+
+
+def search_candidates(cfg, row, query, *, catalog="destination"):
+    provider = str(row["provider"]).upper()
+    instance = row.get("instance") or "default"
+    entity = "movie" if row["item"].get("type") == "movie" else "show"
+    catalogs = search_catalogs(cfg, row)["catalogs"]
+    if not isinstance(catalogs, list) or catalog not in {option["id"] for option in catalogs}:
+        raise HTTPException(409, "Search is not available for this configured destination and catalog.")
+    source = provider if catalog in {"destination", "plex_library"} else "TMDB"
+    block = provider_block(cfg, provider, instance)
+    extra = []
+    body = {}
+    try:
+        with requests.Session() as client:
+            if catalog == "plex_library":
+                from services.interactive_sync_catalogs import plex_library_rows
+                body = plex_library_rows(cfg, row, block, query, entity)
+                response = None
+            elif source == "MDBLIST":
+                from providers.sync.mdblist._auth import request_with_auth
+
+                response = request_with_auth(client, "GET", f"https://api.mdblist.com/search/{entity}",
+                                             cfg=cfg, instance_id=instance, timeout=10, max_retries=0,
+                                             params={"query": query, "limit": 20})
+            elif source == "SIMKL":
+                from cw_platform.simkl_http import pace_session
+                from providers.sync.simkl._common import simkl_api_params
+
+                pace_session(client)
+
+                key = block.get("api_key") or block.get("client_id")
+                if not key:
+                    raise HTTPException(409, "Configure SIMKL search credentials for this destination instance.")
+                headers = _simkl_headers(block, instance)
+                response = client.get(f"https://api.simkl.com/search/{'movie' if entity == 'movie' else 'tv'}",
+                                      params=simkl_api_params(key, q=query, limit=20), headers=headers, timeout=10)
+                _check_rate_limit(response)
+                anime = client.get("https://api.simkl.com/search/anime", params=simkl_api_params(key, q=query, limit=20),
+                                   headers=headers, timeout=10)
+                _check_rate_limit(anime)
+                if anime.status_code >= 400 and entity == "show":
+                    raise HTTPException(502, f"SIMKL anime search returned HTTP {anime.status_code}. Try again.")
+                extra = anime.json() if anime.status_code < 400 else []
+                if entity == "movie" and isinstance(extra, list):
+                    extra = [row for row in extra if isinstance(row, dict) and row.get("type") == "movie"]
+            elif source == "TRAKT":
+                key = block.get("client_id")
+                if not key:
+                    raise HTTPException(409, "Configure Trakt search credentials for this destination instance.")
+                response = trakt_paced_request(client.get, "GET", f"https://api.trakt.tv/search/{entity}",
+                                               params={"query": query, "limit": 20},
+                                               headers=_trakt_headers(key, block, instance), timeout=10)
+            elif source == "TMDB":
+                key = block.get("api_key") if catalog == "destination" else (cfg.get("tmdb") or {}).get("api_key")
+                if not key:
+                    raise HTTPException(409, "Add a TMDb API key in metadata settings to search this catalog.")
+                response = client.get(f"https://api.themoviedb.org/3/search/{'movie' if entity == 'movie' else 'tv'}",
+                                      params={"api_key": key, "query": query, "include_adult": False,
+                                              "language": row.get("metadata_language") or "en-US"}, timeout=10)
+            else:
+                body = destination_rows(client, cfg, row, block, query, entity)
+                response = None
+            if response is not None:
+                _check_rate_limit(response)
+            if response is not None and response.status_code >= 400:
+                raise HTTPException(502, f"{source} search returned HTTP {response.status_code}. Try again or use manual IDs.")
+            if response is not None:
+                body = response.json()
+            if source == "MDBLIST":
+                body = _mdblist_metadata(client, cfg, instance, entity, body)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(502, f"{source} search is unavailable. Try again or use manual IDs.") from error
+    rows = body if isinstance(body, list) else (body.get("search") or body.get("results") or []) if isinstance(body, dict) else []
+    if not isinstance(rows, list):
+        raise HTTPException(502, f"{source} returned an unreadable search response.")
+    rows = rows[:20] + (extra[:20] if isinstance(extra, list) else [])
+    results = []
+    seen = set()
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        item = raw.get(entity)
+        if not isinstance(item, dict):
+            item = raw
+        if source == "SIMKL" and entity == "show" and item.get("endpoint_type") == "anime" and item.get("type") == "movie":
+            continue
+        ids = _candidate_ids(item, source)
+        title = str(item.get("title_en") or item.get("title") or item.get("name") or "")[:300]
+        identity = tuple(sorted(ids.items()))
+        if not ids or not title or identity in seen:
+            continue
+        seen.add(identity)
+        year = str(item.get("year") or item.get("release_date") or item.get("first_air_date") or "")[:4]
+        titles = [title]
+        if source == "TMDB":
+            titles.append(str(item.get("original_title" if entity == "movie" else "original_name") or ""))
+        normalized_query = re.sub(r"\W+", "", query).casefold()
+        exact = bool(normalized_query) and any(re.sub(r"\W+", "", name).casefold() == normalized_query for name in titles if name)
+        results.append(dict(title=title, year=int(year) if year.isdigit() else None, ids=ids,
+                            type=entity, exact_title=exact))
+        if source == "SIMKL" and entity == "movie" and item.get("endpoint_type") == "anime":
+            results[-1].update(simkl_bucket="anime", anime_type="movie")
+        if source == "MDBLIST" and not ids.get("tmdb"):
+            results[-1]["mapping_unavailable"] = "TMDb ID could not be retrieved. Try searching again or enter a verified TMDb ID manually."
+    results.sort(key=lambda item: not item["exact_title"])
+    return dict(ok=True, catalog=source, destination=provider, results=results[:20],
+                note="Review the match and episode numbering before saving."
+                if catalog in {"destination", "plex_library"} else "TMDb metadata suggestions; destination availability has not been checked.")

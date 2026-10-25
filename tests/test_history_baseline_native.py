@@ -197,6 +197,63 @@ def _baseline(orch: Orchestrator, provider: str, feature: str) -> dict[str, Any]
     return dict((block.get("baseline") or {}).get("items") or {})
 
 
+@pytest.mark.parametrize("rewatches", [False, True])
+def test_tautulli_history_import_converges_on_second_run(
+    config_base: Any, monkeypatch: pytest.MonkeyPatch, rewatches: bool
+) -> None:
+    from providers.sync import _mod_TAUTULLI
+
+    class TautulliSource(HistoryOps):
+        def capabilities(self) -> Mapping[str, Any]:
+            return _mod_TAUTULLI.OPS.capabilities()
+
+        def build_index(self, cfg: Mapping[str, Any], *, feature: str) -> Mapping[str, dict[str, Any]]:
+            return _mod_TAUTULLI.OPS.build_index(
+                {**cfg, "tautulli": {"server_url": "http://tautulli.test", "api_key": "test"}},
+                feature=feature,
+            )
+
+    def call(_client: Any, cmd: str, **params: Any) -> Mapping[str, Any]:
+        assert cmd == "get_history"
+        assert params["grouping"] == 1
+        assert params["include_activity"] == 0
+        return {
+            "data": [
+                {
+                    "media_type": "movie",
+                    "guid": "com.plexapp.agents.themoviedb://550",
+                    "row_id": row_id,
+                    "reference_id": row_id - 1,
+                    "group_count": 2,
+                    "group_ids": f"{row_id - 1},{row_id}",
+                    "started": stopped - 3600,
+                    "date": stopped - 1800,
+                    "stopped": stopped,
+                    "watched_status": 1,
+                }
+                for row_id, stopped in [(20, 1704153600), (10, 1704067200)]
+            ],
+            "recordsFiltered": 2,
+        }
+
+    monkeypatch.setattr(_mod_TAUTULLI.TAUTULLIClient, "call", call)
+    src = TautulliSource("SRC", {})
+    dst = HistoryOps("DST", {}, history_rewatches=True)
+
+    orch = _run(monkeypatch, src, dst, "history", rewatches=rewatches)
+
+    assert len(dst.add_calls) == 1
+    assert sorted(item["watched_at"] for item in dst.add_calls[0]) == (
+        ["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"] if rewatches else ["2024-01-02T00:00:00Z"]
+    )
+    assert _baseline(orch, "SRC", "history").keys() == _baseline(orch, "DST", "history").keys()
+
+    orch.run()
+
+    assert len(dst.add_calls) == 1
+    assert dst.remove_calls == []
+
+
 def test_same_key_history_pair_converges_and_stays_native(
     config_base: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -217,6 +274,87 @@ def test_same_key_history_pair_converges_and_stays_native(
 
     orch.run()
     assert len(dst.add_calls) == 1
+
+
+def test_promoted_failed_add_still_counts_as_run_unresolved(
+    config_base: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ok_item = {"type": "movie", "title": "OK", "ids": {"tmdb": "1"}, "watched_at": WATCHED}
+    bad_item = {"type": "movie", "title": "Bad", "ids": {"tmdb": "2"}, "watched_at": WATCHED}
+    ok_key = canonical_key(ok_item)
+    bad_key = canonical_key(bad_item)
+
+    class MixedOps(HistoryOps):
+        def add(
+            self,
+            cfg: Mapping[str, Any],
+            items: Iterable[Mapping[str, Any]],
+            *,
+            feature: str,
+            dry_run: bool = False,
+        ) -> dict[str, Any]:
+            batch = [dict(x) for x in items]
+            self.add_calls.append(batch)
+            self.index[ok_key] = dict(ok_item)
+            return {
+                "ok": False,
+                "count": 1,
+                "confirmed_keys": [ok_key],
+                "unresolved_keys": [bad_key],
+                "unresolved": [{"status": "failed", "reason": "write_failed", "item": bad_item, "key": bad_key}],
+            }
+
+    src = HistoryOps("SRC", {ok_key: ok_item, bad_key: bad_item})
+    dst = MixedOps("DST", {})
+    monkeypatch.setattr(
+        "cw_platform.orchestrator.facade.load_sync_providers",
+        lambda: {"SRC": src, "DST": dst},
+    )
+    monkeypatch.setattr(
+        "cw_platform.orchestrator._snapshots.provider_configured",
+        lambda _cfg, _name: True,
+    )
+    monkeypatch.setattr("cw_platform.orchestrator._pairs_blocklist.load_blackbox_keys", lambda *_a, **_k: set())
+    monkeypatch.setattr("cw_platform.orchestrator._pairs_blocklist.load_unresolved_keys", lambda *_a, **_k: {bad_key})
+    monkeypatch.setattr("cw_platform.orchestrator._pairs_oneway.load_unresolved_keys", lambda *_a, **_k: {bad_key})
+    monkeypatch.setattr(
+        "cw_platform.orchestrator._pairs_oneway.record_attempts",
+        lambda *_a, **_k: {"ok": True, "count": 1, "promoted": 1, "promoted_keys": [bad_key]},
+    )
+    cleared: list[list[str]] = []
+    monkeypatch.setattr(
+        "cw_platform.orchestrator._pairs_oneway.clear_unresolved",
+        lambda _dst, _feature, keys: cleared.append(list(keys)) or {"ok": True},
+    )
+
+    summary = Orchestrator(_cfg("history")).run()
+
+    assert summary["added"] == 1
+    assert summary["unresolved"] == 1
+    assert [bad_key] in cleared
+
+
+def test_collection_baselines_preserve_collected_at(
+    config_base: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = {
+        "type": "movie",
+        "title": "Collected Movie",
+        "year": 2026,
+        "ids": {"tmdb": "101"},
+        "collected_at": "2026-05-14T08:50:05Z",
+    }
+    key = _event_key(item)
+    src = HistoryOps("SRC", {key: dict(item)}, feature="collection")
+    dst = HistoryOps("DST", {}, feature="collection")
+
+    orch = _run(monkeypatch, src, dst, "collection")
+
+    assert len(dst.add_calls) == 1
+    src_baseline = _baseline(orch, "SRC", "collection")
+    dst_baseline = _baseline(orch, "DST", "collection")
+    assert src_baseline[key]["collected_at"] == "2026-05-14T08:50:05Z"
+    assert dst_baseline[key]["collected_at"] == "2026-05-14T08:50:05Z"
 
 
 def test_translated_history_pair_keeps_each_baseline_provider_native(
@@ -317,7 +455,7 @@ def test_manual_history_date_change_updates_upsert_destination(
     dst_event = {**_simkl_event(), "watched_at": old_watched}
     key = _event_key(src_event)
 
-    def manual_policy(_state, provider, _feature):
+    def manual_policy(_state, provider, _feature, _instance="default"):
         if provider == "SRC":
             return {key: manual_event}, set()
         return {}, set()

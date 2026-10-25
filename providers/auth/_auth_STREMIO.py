@@ -8,15 +8,16 @@ from typing import Any, cast
 
 import requests
 
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.config_base import _decrypt_secret
-from cw_platform.provider_instances import ensure_instance_block, get_provider_block, normalize_instance_id
+from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
 
 __VERSION__ = "0.1"
 
 API_BASE = "https://api.strem.io/api"
-UA = "CrossWatch/1.0 (Stremio)"
+UA = http_user_agent("Stremio", override_env="CW_STREMIO_UA")
 
 
 class StremioAuthError(RuntimeError):
@@ -29,7 +30,7 @@ class StremioAuthError(RuntimeError):
 
 
 def _block(cfg: Mapping[str, Any], instance_id: Any = None) -> dict[str, Any]:
-    return get_provider_block(cfg or {}, "stremio", instance_id)
+    return resolve_provider_block(cfg or {}, "stremio", instance_id)
 
 
 def auth_key_value(block: Mapping[str, Any] | None) -> str:
@@ -270,7 +271,14 @@ def html() -> str:
     #sec-stremio .msg{margin-left:auto;padding:8px 12px;border-radius:12px;border:1px solid rgba(0,255,170,.18);background:rgba(0,255,170,.08);color:#b9ffd7;font-weight:600}
     #sec-stremio .msg.warn{border-color:rgba(255,210,0,.18);background:rgba(255,210,0,.08);color:#ffe9a6}
     #sec-stremio .msg.hidden{display:none}
-    #sec-stremio #stremio_connect{background:linear-gradient(135deg,#722cfe,#16b6ff);border-color:rgba(114,44,254,.45);box-shadow:0 0 14px rgba(114,44,254,.32);color:#fff}
+    #sec-stremio #stremio_connect,#sec-stremio .stremio-addon-primary{background:linear-gradient(135deg,#722cfe,#16b6ff);border-color:rgba(114,44,254,.45);box-shadow:0 0 14px rgba(114,44,254,.32);color:#fff}
+    #sec-stremio .stremio-addon{display:flex;flex-direction:column;gap:12px}
+    #sec-stremio .stremio-addon [hidden]{display:none !important}
+    #sec-stremio .stremio-addon-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    #sec-stremio .stremio-addon-row .grow{flex:1 1 260px;min-width:0}
+    #sec-stremio .stremio-addon-row a.btn{text-decoration:none}
+    #sec-stremio .stremio-addon .msg{margin-left:0}
+    #sec-stremio .stremio-addon .btn.danger{background:#a8182e;border-color:rgba(255,107,107,.4)}
   </style>
   <div class="head" data-toggle-section="sec-stremio">
     <span class="chev"></span><strong>Stremio</strong>
@@ -286,6 +294,7 @@ def html() -> str:
         </div>
         <div class="cw-subtiles" style="margin-top:2px">
           <button type="button" class="cw-subtile active" data-sub="auth">Authentication</button>
+          <button type="button" class="cw-subtile" data-sub="scrobble">Scrobbling</button>
         </div>
         <div class="cw-subpanels">
           <div class="cw-subpanel active" data-sub="auth">
@@ -303,6 +312,31 @@ def html() -> str:
               <button id="stremio_connect" class="btn" type="button">Connect Stremio</button>
               <button id="stremio_disconnect" type="button" hidden aria-hidden="true" tabindex="-1"></button>
               <div id="stremio_msg" class="msg ok hidden" role="status" aria-live="polite"></div>
+            </div>
+          </div>
+          <div class="cw-subpanel" data-sub="scrobble">
+            <div class="stremio-addon">
+              <div class="muted">Stremio 5 Desktop and Stremio Web can report what you play to an add-on. Install the CrossWatch add-on in Stremio, then add a Watcher route with Stremio as the source. This is early access in Stremio and does not need the account login above.</div>
+              <div id="stremio_addon_off" class="stremio-addon-row">
+                <button id="stremio_addon_enable" class="btn stremio-addon-primary" type="button">Turn on scrobble add-on</button>
+              </div>
+              <div id="stremio_addon_on" class="stremio-addon" hidden>
+                <div>
+                  <label for="stremio_addon_url">Add-on URL</label>
+                  <div class="stremio-addon-row">
+                    <input id="stremio_addon_url" class="grow" readonly autocomplete="off" spellcheck="false">
+                    <button id="stremio_addon_copy" class="btn" type="button">Copy</button>
+                    <a id="stremio_addon_install" class="btn stremio-addon-primary" href="#" rel="noopener noreferrer">Install in Stremio</a>
+                    <a id="stremio_addon_web" class="btn" href="#" target="_blank" rel="noopener noreferrer">Open in Stremio Web</a>
+                  </div>
+                </div>
+                <div id="stremio_addon_warn" class="msg warn" role="status" hidden>Stremio only installs add-ons served over HTTPS. Open CrossWatch through an HTTPS address, for example a reverse proxy, and copy the URL from there.</div>
+                <div id="stremio_addon_info" class="muted"></div>
+                <div class="stremio-addon-row">
+                  <button id="stremio_addon_regen" class="btn" type="button">New URL</button>
+                  <button id="stremio_addon_disable" class="btn danger" type="button">Turn off</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

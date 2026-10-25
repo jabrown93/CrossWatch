@@ -63,10 +63,10 @@ def test_generic_override_reaches_any_path(config_base: Path, monkeypatch: pytes
     assert load_config()["plex"]["server_url"] == "http://plex.internal:32400"
 
 
-def test_api_key_creates_missing_section(config_base: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generic_override_creates_missing_section(config_base: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from cw_platform.config_base import load_config
 
-    monkeypatch.setenv("CW_API_KEY", "machine-key")
+    monkeypatch.setenv("CW_CFG__security__api_key", "machine-key")
     assert load_config()["security"]["api_key"] == "machine-key"
 
 
@@ -86,7 +86,7 @@ def test_save_omits_env_path_absent_from_disk(
 ) -> None:
     from cw_platform.config_base import load_config, save_config
 
-    monkeypatch.setenv("CW_API_KEY", "machine-key")
+    monkeypatch.setenv("CW_CFG__security__api_key", "machine-key")
     save_config(load_config())
     assert "api_key" not in _raw_cfg(config_base).get("security", {})
 

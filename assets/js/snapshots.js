@@ -1,4 +1,4 @@
-/* captures.js - Provider captures (watchlist/ratings/history/progress) */
+/* captures.js - Provider captures (watchlist/ratings/history/progress/collection) */
 /* CrossWatch - Captures/Snapshots page UI logic */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (function () {
@@ -119,6 +119,12 @@ const toast = (msg, ok = true) => {
     if (s && String(s.path || "") === p) return s;
   }
   return null;
+}
+
+function _stampEpoch(stamp) {
+  const m = String(stamp || "").match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (!m) return 0;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
 }
 
 function _diffScope() {
@@ -404,7 +410,7 @@ function bundleKey(s) {
       </div>
       <div class="ss-wrap">
         <div class="ss-col">
-          <div class="ss-card ss-accent">
+          <div class="ss-card ss-accent cw-page-panel">
             <div class="ss-card-head">
               <div class="ss-headcopy">
                 <h3>Create capture</h3>
@@ -446,14 +452,14 @@ function bundleKey(s) {
           </div>
         </div>
         <div class="ss-center-col">
-          <div class="ss-card ss-browser-card ss-lockable">
+          <div class="ss-card ss-browser-card ss-lockable cw-page-panel">
             <div class="ss-card-head ss-list-head">
               <div class="ss-headcopy">
                 <h3>Capture browser</h3>
                 <div class="ss-headsub">Tick a row to load it for restore and select it for compare and tools. Clicking a row loads it too.</div>
               </div>
             </div>
-            <div class="ss-toolbar">
+            <div class="ss-toolbar cw-page-toolbar">
               <div class="ss-filterbar">
                 <div id="ss-filter-provider-wrap" class="ss-filtermini"><select id="ss-filter-provider" class="input"></select></div>
                 <div id="ss-filter-feature-wrap" class="ss-filtermini"><select id="ss-filter-feature" class="input"></select></div>
@@ -464,10 +470,20 @@ function bundleKey(s) {
             </div>
             <div id="ss-list" class="ss-list"></div>
             <div id="ss-list-footer" class="ss-row" style="justify-content:space-between;margin:10px 0 14px"></div>
+            <div id="ss-bulk" class="ss-bulk" hidden>
+              <span class="ss-bulk-count"><strong data-ss-count>0</strong><span>selected</span></span>
+              <button class="ss-bulk-btn" type="button" data-ss-bulk="visible"><span class="material-symbols-rounded" aria-hidden="true">select_all</span>Visible</button>
+              <button class="ss-bulk-btn" type="button" data-ss-bulk="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>
+              <span class="ss-bulk-actions">
+                <button class="ss-bulk-btn" type="button" data-ss-bulk="compare" title="Compare two captures"><span class="material-symbols-rounded" aria-hidden="true">compare_arrows</span>Compare</button>
+                <button class="ss-bulk-btn" type="button" data-ss-bulk="export"><span class="material-symbols-rounded" aria-hidden="true">download</span>Export</button>
+                <button class="ss-bulk-btn danger" type="button" data-ss-bulk="delete"><span class="material-symbols-rounded" aria-hidden="true">delete</span>Delete</button>
+              </span>
+            </div>
           </div>
         </div>
         <div class="ss-col">
-          <div class="ss-card ss-lockable" data-coll="restore">
+          <div class="ss-card ss-lockable cw-page-panel" data-coll="restore">
             <div class="ss-card-head">
               <div class="ss-headcopy">
                 <h3>Restore capture</h3>
@@ -489,7 +505,7 @@ function bundleKey(s) {
             <div id="ss-restore-progress" class="ss-progress hidden"><div class="ss-pbar"></div><div class="ss-plabel">Working...</div></div>
             <div id="ss-restore-out" class="ss-small ss-muted" style="margin-top:10px"></div>
           </div>
-          <div class="ss-card ss-lockable" data-coll="compare">
+          <div class="ss-card ss-lockable cw-page-panel" data-coll="compare">
             <div class="ss-card-head">
               <div class="ss-headcopy">
                 <h3>Compare captures</h3>
@@ -505,7 +521,7 @@ function bundleKey(s) {
               <div id="ss-diff-out" class="ss-muted ss-small"></div>
             </div>
           </div>
-          <div class="ss-card ss-lockable" data-coll="tools">
+          <div class="ss-card ss-lockable cw-page-panel" data-coll="tools">
             <div class="ss-card-head">
               <div class="ss-headcopy">
                 <h3>Tools</h3>
@@ -605,6 +621,12 @@ function bundleKey(s) {
     $("#ss-export-selected", page)?.addEventListener("click", () => onExportSelected());
     $("#ss-cleanup-old", page)?.addEventListener("click", () => onCleanupOldCaptures());
     $("#ss-view-details", page)?.addEventListener("click", () => onViewDetails());
+    const bulkBar = $("#ss-bulk", page);
+    if (bulkBar && bulkBar.parentElement !== page) page.appendChild(bulkBar);
+    bulkBar?.addEventListener("click", (ev) => {
+      const btn = ev.target?.closest?.("[data-ss-bulk]");
+      if (btn && !btn.disabled) onCaptureBulk(btn.dataset.ssBulk);
+    });
     $("#ss-restore-inst", page)?.addEventListener("change", () => { resetRestoreConfirm(); updateRestoreAvailability(); });
     $("#ss-restore-mode", page)?.addEventListener("change", () => updateRestoreModeUI());
     $$("[data-restore-mode]", page).forEach((btn) => btn.addEventListener("click", () => {
@@ -623,7 +645,7 @@ function bundleKey(s) {
   }
 
   function summaryCard(icon, label, value, sub, stat) {
-    return `<div class="ss-summary-card" data-stat="${escapeHtml(stat)}"><div class="ss-summary-icon"><span class="material-symbols-rounded">${escapeHtml(icon)}</span></div><div class="ss-summary-copy"><div class="ss-summary-label">${escapeHtml(label)}</div><div class="ss-summary-value"><strong>${escapeHtml(value)}</strong></div><div class="ss-summary-sub">${escapeHtml(sub)}</div></div></div>`;
+    return `<div class="ss-summary-card cw-page-panel" data-stat="${escapeHtml(stat)}"><div class="ss-summary-icon"><span class="material-symbols-rounded">${escapeHtml(icon)}</span></div><div class="ss-summary-copy"><div class="ss-summary-label">${escapeHtml(label)}</div><div class="ss-summary-value"><strong>${escapeHtml(value)}</strong></div><div class="ss-summary-sub">${escapeHtml(sub)}</div></div></div>`;
   }
 
   function setProgress(sel, on, label, tone) {
@@ -915,6 +937,61 @@ function bundleKey(s) {
     set("#ss-export-selected", selected.length > 0, "Select at least one capture");
     set("#ss-delete", selected.length > 0, "Select or load a capture");
     set("#ss-view-details", !!state.selectedSnap || selected.length > 0, "Select or load a capture");
+    syncCaptureBulkBar(page);
+  }
+
+  function syncCaptureBulkBar(page) {
+    const bar = $("#ss-bulk", page);
+    if (!bar) return;
+    const picks = Array.isArray(state.diffPick) ? state.diffPick.filter(Boolean) : [];
+    bar.hidden = picks.length === 0;
+    const label = $("[data-ss-count]", bar);
+    if (label) label.textContent = String(picks.length);
+    const compare = compareSelectionState();
+    $$("[data-ss-bulk]", bar).forEach((btn) => {
+      const isCompare = btn.dataset.ssBulk === "compare";
+      btn.disabled = !!state.busy || (isCompare && !compare.ok);
+      if (isCompare) btn.title = compare.reason || "Compare two captures";
+    });
+  }
+
+  function applyCapturePicks(picks) {
+    state.diffPick = picks;
+    if (picks.length !== 2) state.diffResult = null;
+    renderList();
+    renderDiffPicked();
+    renderDiff();
+    updateDiffAvailability();
+  }
+
+  function onCaptureBulk(action) {
+    const page = document.getElementById("page-snapshots");
+    if (!page || state.busy) return;
+    if (action === "visible") {
+      const picks = Array.isArray(state.diffPick) ? state.diffPick.filter(Boolean) : [];
+      $$("#ss-list tr[data-path]", page).forEach((row) => {
+        const path = row.dataset.path;
+        if (path && !picks.includes(path)) picks.push(path);
+      });
+      applyCapturePicks(picks);
+      return;
+    }
+    if (action === "none") {
+      state.selectedPath = "";
+      state.selectedSnap = null;
+      applyCapturePicks([]);
+      renderSelected();
+      updateRestoreAvailability();
+      return;
+    }
+    if (action === "compare") {
+      if (!compareSelectionState().ok) return;
+      page.querySelector('.ss-card[data-coll="compare"]')?.scrollIntoView({ behavior: "smooth", block: "start" });
+      void onDiffRun();
+      return;
+    }
+    if (action === "export") void onExportSelected();
+    if (action === "delete") void onDeleteSelected();
   }
 
   function wireDiffControls() {
@@ -1134,7 +1211,7 @@ async function onDiffRun() {
   if (!page) return;
   const { a, b, ok } = diffSelection();
   if (!ok) return toast("Pick two captures from the same provider and instance", false);
-  if (!window.openCaptureCompare) return toast("Capture Compare modal not available", false);
+  if (!window.openCaptureCompare) return toast("Capture Compare page not available", false);
   window.openCaptureCompare({ aPath: a, bPath: b });
 }
 
@@ -1284,7 +1361,7 @@ repopDiffSelects();
     const feats = (p && p.features) ? p.features : {};
     const fSel = $("#ss-feature", page);
 
-    const featureOptions = ["all", "watchlist", "ratings", "history", "progress"];
+    const featureOptions = ["all", "watchlist", "ratings", "history", "progress", "collection"];
 
     if (fSel) {
       const cur = String(fSel.value || "");
@@ -1433,7 +1510,7 @@ repopDiffSelects();
     }
 
     list.innerHTML = `
-      <div class="ss-table-wrap">
+      <div class="ss-table-wrap cw-page-table">
         <table class="ss-table">
           <thead>
             <tr>
@@ -1492,13 +1569,13 @@ repopDiffSelects();
       item.className = `${child ? "child " : ""}${state.selectedPath === path ? "active " : ""}${checked ? "checked" : ""}`;
       item.dataset.path = path;
       item.innerHTML = `
-        <td class="ss-col-check"><span class="ss-pickcell">${abTag ? `<span class="ss-ab ${abTag === "A" ? "a" : "b"}" data-act="diffremove" title="Unselect capture">${abTag}</span>` : ""}<input class="ss-chk" type="checkbox" name="ss-diffpick" title="Select capture" data-act="diffpick" ${checked ? "checked" : ""} /></span></td>
-        <td class="ss-col-provider"><span class="ss-badge ok" data-provider="${escapeHtml(String(s.provider || "").toLowerCase())}">${escapeHtml((s.provider || "-").toUpperCase())}</span></td>
-        <td class="ss-col-feature" title="${escapeHtml(featureLabel)}"><span class="ss-feature-cell"><span class="ss-feature-label">${escapeHtml(featureLabel)}</span>${extra}</span></td>
-        <td class="ss-col-type">${escapeHtml(snapTypeLabel(s))}</td>
-        <td class="ss-col-label ${s.label ? "" : "ss-row-muted"}">${escapeHtml(String(label).slice(0, 60))}</td>
-        <td class="ss-col-created">${escapeHtml(snapCreatedText(s))}</td>
-        <td class="ss-col-profile">${escapeHtml(snapInstance(s))}</td>
+        <td class="ss-col-check"><label class="ss-pickcell">${abTag ? `<span class="ss-ab ${abTag === "A" ? "a" : "b"}" data-act="diffremove" title="Unselect capture">${abTag}</span>` : ""}<input class="ss-chk" type="checkbox" name="ss-diffpick" title="Select capture" aria-label="Select capture" data-act="diffpick" ${checked ? "checked" : ""} /></label></td>
+        <td data-label="Provider" class="ss-col-provider"><span class="ss-badge ok" data-provider="${escapeHtml(String(s.provider || "").toLowerCase())}">${escapeHtml((s.provider || "-").toUpperCase())}</span></td>
+        <td data-label="Feature" class="ss-col-feature" title="${escapeHtml(featureLabel)}"><span class="ss-feature-cell"><span class="ss-feature-label">${escapeHtml(featureLabel)}</span>${extra}</span></td>
+        <td data-label="Type" class="ss-col-type">${escapeHtml(snapTypeLabel(s))}</td>
+        <td data-label="Label" class="ss-col-label ${s.label ? "" : "ss-row-muted"}">${escapeHtml(String(label).slice(0, 60))}</td>
+        <td data-label="Created" class="ss-col-created">${escapeHtml(snapCreatedText(s))}</td>
+        <td data-label="Profile" class="ss-col-profile">${escapeHtml(snapInstance(s))}</td>
         <td class="ss-col-menu"><span class="material-symbols-rounded">chevron_right</span></td>
       `;
 

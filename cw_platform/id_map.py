@@ -23,13 +23,14 @@ ID_KEYS: tuple[str, ...] = (
     "plex",
     "jellyfin",
     "mdblist",
+    "wetrakr",
     "emby",
     "guid",
     "slug",
 )
 KEY_PRIORITY: tuple[str, ...] = (
-    "imdb",
     "tmdb",
+    "imdb",
     "tvdb",
     "trakt",
     "mal",
@@ -37,6 +38,7 @@ KEY_PRIORITY: tuple[str, ...] = (
     "kitsu",
     "anidb",
     "simkl",
+    "wetrakr",
     "plex",
     "guid",
     "slug",
@@ -51,6 +53,7 @@ _CAPTURE_PROVIDER_TO_IDKEY: dict[str, str] = {
     "JELLYFIN": "jellyfin",
     "EMBY": "emby",
     "ANILIST": "anilist",
+    "WETRAKR": "wetrakr",
 }
 
 def _capture_prefer_id_key() -> str | None:
@@ -71,10 +74,16 @@ __all__ = [
     "merge_ids",
     "coalesce_ids",
     "canonical_key",
+    "migrate_media_key",
+    "migrate_media_index",
+    "migrate_media_records",
     "keys_for_item",
+    "typed_keys_for_item",
     "unified_keys_from_ids",
     "any_key_overlap",
     "minimal",
+    "movie_part",
+    "part_fragment",
     "has_external_ids",
     "preferred_id_key",
 ]
@@ -103,6 +112,9 @@ def _norm_type(t: Any) -> str:
     return x or "movie"
 
 
+_NUMERIC_ID_KEYS = frozenset({"tmdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb", "plex", "jellyfin", "emby"})
+
+
 def _normalize_id(key: str, val: Any) -> str | None:
     k = (key or "").lower().strip()
     s = _norm_str(val)
@@ -114,12 +126,16 @@ def _normalize_id(key: str, val: Any) -> str | None:
     if k == "mdblist":
         return s.lower()
 
-    if k in ("tmdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb", "plex", "jellyfin", "emby"):
+    if k in _NUMERIC_ID_KEYS:
+        if s.isdigit():
+            return s
         digits = re.sub(r"\D+", "", s)
         return digits or None
 
     if k == "imdb":
         s = s.lower()
+        if s.startswith("tt") and s[2:].isdigit():
+            return s
         m = re.search(r"(tt\d+)", s)
         if m:
             return m.group(1)
@@ -184,34 +200,32 @@ def ids_from_jellyfin_providerids(provider_ids: Mapping[str, Any] | None) -> dic
 def coalesce_ids(*many: Mapping[str, Any]) -> dict[str, str]:
     out: dict[str, str] = {}
     for ids in many:
-        if not isinstance(ids, Mapping):
+        if not ids:
+            continue
+        if type(ids) is not dict and not isinstance(ids, Mapping):
             continue
         for k in ID_KEYS:
-            n = _normalize_id(k, ids.get(k))
+            v = ids.get(k)
+            if v is None or v == "":
+                continue
+            n = _normalize_id(k, v)
             if n:
                 out[k] = n
     return out
 
 
-def ids_from_jellyfin_providerids(provider_ids: Mapping[str, Any]) -> dict[str, str]:
-    """Normalize Jellyfin ProviderIds dict (e.g. {"Imdb": "tt123", "Tmdb": "550"})."""
-    out: dict[str, str] = {}
-    for raw_key, raw_val in provider_ids.items():
-        key = raw_key.lower().strip()
-        if key not in ID_KEYS:
-            continue
-        norm = _normalize_id(key, raw_val)
-        if norm:
-            out[key] = norm
-    return out
-
-
 def ids_from(item: Mapping[str, Any]) -> dict[str, str]:
-    base = item.get("ids") if isinstance(item.get("ids"), Mapping) else {}
-    top = {k: item.get(k) for k in ID_KEYS if item.get(k) is not None}
-    guid_val = item.get("guid") or (base.get("guid") if isinstance(base, Mapping) else None)
+    base = item.get("ids")
+    if type(base) is not dict and not isinstance(base, Mapping):
+        base = {}
+    top: dict[str, Any] = {}
+    for k in ID_KEYS:
+        v = item.get(k)
+        if v is not None:
+            top[k] = v
+    guid_val = item.get("guid") or base.get("guid")
     from_guid = ids_from_guid(str(guid_val)) if guid_val else {}
-    return coalesce_ids(top, base or {}, from_guid)
+    return coalesce_ids(top, base, from_guid)
 
 
 def merge_ids(old: Mapping[str, Any] | None, new: Mapping[str, Any] | None) -> dict[str, str]:
@@ -285,6 +299,20 @@ def _se_fragment(item: Mapping[str, Any]) -> str | None:
     return f"#s{str(s).zfill(2)}e{str(e).zfill(2)}"
 
 
+def movie_part(item: Mapping[str, Any]) -> int | None:
+    if _norm_type(item.get("type")) != "movie":
+        return None
+    part = item.get("part")
+    if isinstance(part, bool) or not isinstance(part, int) or part < 1:
+        return None
+    return part
+
+
+def part_fragment(item: Mapping[str, Any]) -> str:
+    part = movie_part(item)
+    return f"#part:{part}" if part else ""
+
+
 def canonical_key(item: Mapping[str, Any]) -> str:
     typ = _norm_type(item.get("type"))
     if typ in ("season", "episode"):
@@ -294,9 +322,45 @@ def canonical_key(item: Mapping[str, Any]) -> str:
             return f"{show_id}{frag}".lower()
     idkey = _best_id_key(ids_from(item))
     if idkey:
-        return idkey
+        if typ in ("show", "anime") and idkey.startswith("tmdb:"):
+            return f"{idkey}#show"
+        return f"{idkey}{part_fragment(item)}"
     ty = _title_year_key(item)
-    return ty or "unknown:"
+    return f"{ty}{part_fragment(item)}" if ty else "unknown:"
+
+
+def migrate_media_key(key: str, item: Mapping[str, Any]) -> str:
+    base, sep, event = str(key or "").partition("@")
+    if _norm_type(item.get("type")) in ("show", "anime"):
+        tmdb = ids_from(item).get("tmdb")
+        if tmdb and base.lower() == f"tmdb:{tmdb}":
+            return f"{base}#show{sep}{event}"
+    return str(key or "") or canonical_key(item)
+
+
+def migrate_media_index(index: Any) -> dict[str, Any]:
+    if not isinstance(index, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in index.items():
+        previous = str(key)
+        current = migrate_media_key(previous, value) if isinstance(value, Mapping) else previous
+        if current not in out or current == previous:
+            out[current] = value
+    return out
+
+
+def migrate_media_records(records: Any, *fields: str) -> dict[str, Any]:
+    if not isinstance(records, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key, record in records.items():
+        previous = str(key)
+        item = next((record[f] for f in fields if isinstance(record, Mapping) and isinstance(record.get(f), Mapping)), None)
+        current = migrate_media_key(previous, item) if item is not None else previous
+        if current not in out or current == previous:
+            out[current] = record
+    return out
 
 
 def unified_keys_from_ids(idmap: Mapping[str, Any]) -> set[str]:
@@ -319,7 +383,15 @@ def keys_for_item(item: Mapping[str, Any]) -> set[str]:
         frag = _se_fragment(item)
         if sid and frag:
             out.add(f"{sid}{frag}".lower())
-    return out
+    frag = part_fragment(item)
+    return {f"{key}{frag}" for key in out} if frag else out
+
+
+def typed_keys_for_item(item: Mapping[str, Any]) -> set[str]:
+    keys = keys_for_item(item)
+    if _norm_type(item.get("type")) not in ("show", "anime"):
+        return keys
+    return {f"{key}#show" if key.startswith("tmdb:") and "#" not in key else key for key in keys}
 
 
 def any_key_overlap(a: Iterable[str], b: Iterable[str]) -> bool:
@@ -349,9 +421,16 @@ def minimal(item: Mapping[str, Any]) -> dict[str, Any]:
         "duration_ms",
         "progress_at",
         "progress_at_source",
+        "collected_at",
+        "format",
+        "media_info",
+        "media_paths",
     ):
         if opt in item:
             out[opt] = item.get(opt)
+    part = movie_part(item)
+    if part:
+        out["part"] = part
 
     # Preserve provider-specific raw history ids
     for opt in (
@@ -367,6 +446,8 @@ def minimal(item: Mapping[str, Any]) -> dict[str, Any]:
         "rewatch_status",
         "simkl_bucket",
         "anime_type",
+        "watch_status",
+        "_cw_watched_state",
         "_simkl_episode_number",
         "_floppy_consumption_id",
         "consumption_id",
@@ -376,8 +457,20 @@ def minimal(item: Mapping[str, Any]) -> dict[str, Any]:
         "_scrob_media_id",
         "_scrob_list_id",
         "_scrob_list_item_id",
+        "_flicklist_fldb",
+        "_flicklist_history_id",
+        "_wetrakr_history_id",
+        "_wetrakr_watched_at_unknown",
+        "_flicklist_playback_id",
+        "_flicklist_list_id",
+        "_stremio_record_id",
+        "_stremio_record_namespace",
+        "_stremio_drop_reason",
+        "_stremio_watched_at_fallback",
+        "_stremio_watched_at_source",
         "_floppy_season",
         "_floppy_episode",
+        "_floppy_tmdb_id",
         "_cw_event_key",
         "_cw_rewatch_sync",
         "_cw_anime_map",

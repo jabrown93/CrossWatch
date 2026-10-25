@@ -4,8 +4,10 @@
 from __future__ import annotations
 from collections.abc import Sequence, Mapping
 from typing import Any, Callable, cast
+from ._scope import provider_call
 from . import _unresolved as _unresolved_mod
-from ..run_control import cancel_requested
+from ..run_control import SyncCancelled, cancel_requested
+from ..interactive_reads import replaying
 record_unresolved = cast(Callable[..., dict[str, Any]], getattr(_unresolved_mod, "record_unresolved"))
 
 _UNRESOLVED_EXAMPLE_CAP = 25
@@ -21,6 +23,24 @@ _PASSTHROUGH_KEY_LISTS = (
 )
 
 _PASSTHROUGH_KEY_MAPS = ("confirmed_destinations",)
+
+# Fork: one attempt. A write that errored or timed out may still have landed,
+# and replaying it duplicates non-idempotent entries (e.g. Trakt history plays).
+def _retry(fn: Callable[[], Any], *, attempts: int = 1, base_sleep: float = 0.5, on_retry: Callable[[int, Exception], None] | None = None) -> Any:
+    last = None
+    for i in range(attempts):
+        try: return fn()
+        except SyncCancelled:
+            raise
+        except Exception as e:
+            last = e
+            if on_retry is not None:
+                try:
+                    on_retry(i + 1, e)
+                except Exception:
+                    pass
+            __import__("time").sleep(base_sleep * (2 ** i))
+    raise last  # type: ignore
 
 
 def _ui_spotlight_items(
@@ -108,6 +128,65 @@ def _ui_spotlight_items(
             break
     return out
 
+
+def _dedupe_unresolved_rows(rows: Sequence[Any], *, feature: str) -> list[Mapping[str, Any]]:
+    out: dict[str, Mapping[str, Any]] = {}
+    priority: dict[str, int] = {}
+
+    def _unwrap(row: Mapping[str, Any]) -> Mapping[str, Any]:
+        item = row.get("item")
+        return item if isinstance(item, Mapping) else row
+
+    def _key(row: Mapping[str, Any]) -> str:
+        explicit = str(row.get("key") or "").strip()
+        if explicit:
+            return explicit
+        item = _unwrap(row)
+        if str(feature or "").lower() == "history":
+            try:
+                from ..history_events import history_sync_key as _hkey  # type: ignore
+
+                event_mode = item.get("_cw_rewatch_sync") is True
+                key = str(_hkey(item, item.get("_cw_event_key") or row.get("_cw_event_key"), event_mode=event_mode) or "").strip()
+                if key:
+                    return key
+            except Exception:
+                pass
+        try:
+            from ..id_map import canonical_key as _ckey  # type: ignore
+
+            key = str(_ckey(item) or "").strip()
+            if key:
+                return key
+        except Exception:
+            pass
+        return repr(sorted((str(k), repr(v)) for k, v in item.items()))
+
+    def _score(row: Mapping[str, Any]) -> int:
+        item = _unwrap(row)
+        typ = str(item.get("type") or "").strip().lower()
+        reason = str(row.get("hint") or row.get("reason") or row.get("error") or "").strip().lower()
+        if typ and typ in reason:
+            return 3
+        if typ == "episode" and "episodes" in reason:
+            return 3
+        if typ == "show" and "shows" in reason:
+            return 3
+        if reason:
+            return 2
+        return 1
+
+    for raw in rows or []:
+        if not isinstance(raw, Mapping):
+            continue
+        key = _key(raw)
+        score = _score(raw)
+        if key not in out or score >= priority.get(key, 0):
+            out[key] = raw
+            priority[key] = score
+    return list(out.values())
+
+
 def _normalize(
     res: dict[str, Any] | None,
     items: Sequence[Mapping[str, Any]],
@@ -116,6 +195,7 @@ def _normalize(
     dst: str,
     feature: str,
     emit,
+    instance: str | None = None,
 ) -> dict[str, Any]:
     res = dict(res or {})
     attempted = len(items)
@@ -132,6 +212,8 @@ def _normalize(
             confirmed = 0
 
     unresolved_list = res.get("unresolved") or []
+    if isinstance(unresolved_list, list) and unresolved_list:
+        unresolved_list = _dedupe_unresolved_rows(unresolved_list, feature=feature)
     unresolved_keys: list[str] = []
 
     try:
@@ -200,6 +282,7 @@ def _normalize(
         emit(
             "apply:unresolved",
             provider=dst,
+            destination_instance=instance,
             feature=feature,
             count=_total,
             items=unresolved_details,
@@ -234,6 +317,11 @@ def _normalize(
                     item_u, _ = _unwrap(raw)
                     if not isinstance(item_u, Mapping):
                         continue
+                    if feature == "history" and item_u.get("_cw_rewatch_sync") is True and _history_event_key:
+                        key = _history_event_key(item_u, item_u.get("_cw_event_key"))
+                        if key:
+                            unresolved_keys.append(key)
+                            continue
                     if _ckey:
                         try:
                             k = _ckey(item_u) or ""
@@ -261,9 +349,9 @@ def _normalize(
                 to_store.append(d)
 
             if to_store:
-                record_unresolved(dst, feature, to_store, hint=f"{tag}:provider_unresolved")
+                record_unresolved(dst, feature, to_store, hint=f"{tag}:provider_unresolved", instance=instance)
             elif int(confirmed or 0) == 0 and items:
-                record_unresolved(dst, feature, [dict(it) for it in items], hint=f"{tag}:fallback_unresolved")
+                record_unresolved(dst, feature, [dict(it) for it in items], hint=f"{tag}:fallback_unresolved", instance=instance)
         except Exception:
             pass
 
@@ -309,7 +397,7 @@ def _normalize(
                     dst,
                     feature,
                     [dict(it) for it in leftover],
-                    hint=f"{tag}:unaccounted",
+                    hint=f"{tag}:unaccounted", instance=instance,
                 )
             except Exception:
                 pass
@@ -364,6 +452,8 @@ def _apply_chunked(
     dbg,
     chunk_size: int,
     chunk_pause_ms: int,
+    instance: str | None = None,
+    finalize: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
     total = len(items)
     if total == 0:
@@ -372,9 +462,20 @@ def _apply_chunked(
         emit(f"{tag}:cancelled", dst=dst, feature=feature, done=0, total=total)
         return {"ok": True, "attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0, "count": 0, "cancelled": True}
     csize = int(chunk_size or 0)
+
+    def _on_retry(attempt: int, exc: Exception) -> None:
+        emit(f"{tag}:retry", dst=dst, feature=feature, attempt=attempt, error=f"{type(exc).__name__}: {str(exc)[:160]}")
+
     if csize <= 0 or total <= csize:
-        raw = call(items)
-        return _normalize(raw, items, tag, dst=dst, feature=feature, emit=emit)
+        try:
+            raw = _retry(lambda: call(items), on_retry=_on_retry)
+        except SyncCancelled:
+            emit(f"{tag}:cancelled", dst=dst, feature=feature, done=0, total=total)
+            return {"ok": True, "attempted": 0, "confirmed": 0, "skipped": 0, "unresolved": 0, "errors": 0, "count": 0, "cancelled": True}
+        if finalize is not None:
+            raw = dict(raw or {})
+            finalize([raw])
+        return _normalize(raw, items, tag, dst=dst, feature=feature, emit=emit, instance=instance)
 
     done = 0
     agg: dict[str, Any] = {
@@ -392,14 +493,8 @@ def _apply_chunked(
         "unresolved_keys": [],
         "errors": 0,
     }
-    for i in range(0, total, csize):
-        if cancel_requested():
-            agg["cancelled"] = True
-            emit(f"{tag}:cancelled", dst=dst, feature=feature, done=done, total=total)
-            break
-        chunk = items[i : i + csize]
-        raw = call(chunk)
-        res = _normalize(raw, chunk, tag, dst=dst, feature=feature, emit=emit)
+    def merge(chunk, raw):
+        res = _normalize(raw, chunk, tag, dst=dst, feature=feature, emit=emit, instance=instance)
         agg["ok"] = agg["ok"] and res["ok"]
         agg["attempted"] += res["attempted"]
         agg["confirmed"] += res["confirmed"]
@@ -431,14 +526,38 @@ def _apply_chunked(
         basis = str(res.get("skip_basis") or "provider_keys")
         if agg.get("skip_basis") != basis:
             agg["skip_basis"] = "mixed"
+        return res
+
+    pending: list[tuple[Sequence[Mapping[str, Any]], dict[str, Any]]] = []
+    for i in range(0, total, csize):
+        if cancel_requested():
+            agg["cancelled"] = True
+            emit(f"{tag}:cancelled", dst=dst, feature=feature, done=done, total=total)
+            break
+        chunk = items[i : i + csize]
+        try:
+            raw = _retry(lambda: call(chunk), on_retry=_on_retry)
+        except SyncCancelled:
+            agg["cancelled"] = True
+            emit(f"{tag}:cancelled", dst=dst, feature=feature, done=done, total=total)
+            break
+        if finalize is not None:
+            res = dict(raw or {})
+            pending.append((chunk, res))
+        else:
+            res = merge(chunk, raw)
         done += len(chunk)
-        emit(f"{tag}:progress", dst=dst, feature=feature, done=done, total=total, ok=res["ok"])
+        emit(f"{tag}:progress", dst=dst, feature=feature, done=done, total=total, ok=bool(res.get("ok", True)))
         pause = int(chunk_pause_ms or 0)
-        if pause:
+        if pause and not cancel_requested():
             try:
                 __import__("time").sleep(pause / 1000.0)
             except Exception:
                 pass
+    if finalize is not None and pending:
+        finalize([raw for _, raw in pending])
+        for chunk, raw in pending:
+            merge(chunk, raw)
     agg["count"] = agg["confirmed"]
     return agg
 
@@ -450,64 +569,40 @@ def _mark_dry_run(res: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
-def _apply_op(
-    verb: str,
-    *,
-    dst_ops,
-    cfg,
-    dst_name: str,
-    feature: str,
-    items: Sequence[Mapping[str, Any]],
-    dry_run: bool,
-    emit,
-    dbg,
-    chunk_size: int,
-    chunk_pause_ms: int,
-    payload_key: str,
-    call: Callable[[Sequence[Mapping[str, Any]]], dict[str, Any] | None],
-) -> dict[str, Any]:
-    tag = f"apply:{verb}"
-    emit(f"{tag}:start", dst=dst_name, feature=feature, count=len(items))
-    res = _apply_chunked(
-        tag,
-        dst=dst_name,
-        feature=feature,
-        items=items,
-        call=call,
-        emit=emit,
-        dbg=dbg,
-        chunk_size=chunk_size,
-        chunk_pause_ms=chunk_pause_ms,
-    )
+def _accepted_unverified(res: Mapping[str, Any], dry_run: bool) -> int:
     if dry_run:
-        _mark_dry_run(res)
-    _conf = int(res.get("confirmed", 0))
-    payload: dict[str, Any] = {
-        "dst": dst_name,
-        "feature": feature,
-        "count": _conf,
-        "attempted": int(res.get("attempted", 0)),
-        payload_key: _conf,
-        "dry_run": bool(dry_run),
-        "skipped": int(res.get("skipped", 0)),
-        "skipped_exact": int(res.get("skipped_exact", 0)),
-        "skipped_inferred": int(res.get("skipped_inferred", 0)),
-        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
-        "unresolved": int(res.get("unresolved", 0)),
-        "errors": int(res.get("errors", 0)),
-    }
-    emit(f"{tag}:done", **payload)
-    try:
-        spotlight = _ui_spotlight_items(
-            items,
-            cast(Sequence[str], res.get("confirmed_keys") or []),
-            fallback_count=_conf,
-        )
-        if spotlight:
-            emit("ui:spotlight", feature=feature, action=verb, items=spotlight, count=len(spotlight))
-    except Exception:
-        pass
-    return res
+        return 0
+    if "accepted_not_seen_live_keys" in res:
+        return len(res.get("accepted_not_seen_live_keys") or [])
+    if replaying():
+        observed = set(res.get("presence_confirmed_keys") or []) | set(res.get("live_confirmed_keys") or [])
+        return max(0, int(res.get("confirmed", 0)) - len(observed))
+    return 0
+
+def _add_batch_finalizer(
+    dst_ops: Any, cfg: Mapping[str, Any] | None, *, feature: str, dry_run: bool,
+) -> tuple[Mapping[str, Any] | None, Callable[[list[dict[str, Any]]], None] | None]:
+    hook = getattr(dst_ops, "finalize_add", None)
+    if dry_run or feature != "history" or not callable(hook):
+        return cfg, None
+    config = {**(cfg or {}), "_cw_defer_add_verification": True}
+
+    def finalize(results: list[dict[str, Any]]) -> None:
+        provider_call(hook, config, results, feature=feature)
+
+    return config, finalize
+
+
+_COLLECTION_WRITE_RANK = {"season": 1, "show": 2, "series": 2, "tv": 2}
+
+
+def _collection_write_order(items: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    def rank(item: Mapping[str, Any]) -> int:
+        typ = str(item.get("type") or "").strip().lower() if isinstance(item, Mapping) else ""
+        return _COLLECTION_WRITE_RANK.get(typ, 0)
+
+    return sorted(items, key=rank)
+
 
 def apply_add(
     *,
@@ -522,21 +617,54 @@ def apply_add(
     chunk_size: int,
     chunk_pause_ms: int,
 ) -> dict[str, Any]:
-    return _apply_op(
-        "add",
-        dst_ops=dst_ops,
-        cfg=cfg,
-        dst_name=dst_name,
+    if feature == "collection":
+        items = _collection_write_order(items)
+    emit("apply:add:start", dst=dst_name, feature=feature, count=len(items))
+    apply_cfg, finalize = _add_batch_finalizer(dst_ops, cfg, feature=feature, dry_run=dry_run)
+    res = _apply_chunked(
+        "apply:add",
+        dst=dst_name,
+        instance=(cfg or {}).get("_cw_provider_instance"),
         feature=feature,
         items=items,
-        dry_run=dry_run,
+        call=lambda ch: provider_call(dst_ops.add, apply_cfg, ch, feature=feature, dry_run=dry_run),
         emit=emit,
         dbg=dbg,
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
-        payload_key="added",
-        call=lambda ch: dst_ops.add(cfg, ch, feature=feature, dry_run=dry_run),
+        finalize=finalize,
     )
+    if dry_run:
+        _mark_dry_run(res)
+    _conf = int(res.get("confirmed", 0))
+    payload: dict[str, Any] = {
+        "dst": dst_name,
+        "destination_instance": (cfg or {}).get("_cw_provider_instance"),
+        "feature": feature,
+        "count": _conf,
+        "attempted": int(res.get("attempted", 0)),
+        "added": _conf,
+        "accepted_unverified": _accepted_unverified(res, dry_run),
+        "dry_run": bool(dry_run),
+        "skipped": int(res.get("skipped", 0)),
+        "skipped_exact": int(res.get("skipped_exact", 0)),
+        "skipped_inferred": int(res.get("skipped_inferred", 0)),
+        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
+        "unresolved": int(res.get("unresolved", 0)),
+        "errors": int(res.get("errors", 0)),
+    }
+    emit("apply:add:done", **payload)
+    try:
+        spotlight = _ui_spotlight_items(
+            items,
+            cast(Sequence[str], res.get("confirmed_keys") or []),
+            fallback_count=_conf,
+        )
+        if spotlight:
+            emit("ui:spotlight", feature=feature, action="add", items=spotlight, count=len(spotlight))
+    except Exception:
+        pass
+    return res
 
 def apply_update(
     *,
@@ -551,21 +679,52 @@ def apply_update(
     chunk_size: int,
     chunk_pause_ms: int,
 ) -> dict[str, Any]:
-    return _apply_op(
-        "update",
-        dst_ops=dst_ops,
-        cfg=cfg,
-        dst_name=dst_name,
+    emit("apply:update:start", dst=dst_name, feature=feature, count=len(items))
+    apply_cfg, finalize = _add_batch_finalizer(dst_ops, cfg, feature=feature, dry_run=dry_run)
+    res = _apply_chunked(
+        "apply:update",
+        dst=dst_name,
+        instance=(cfg or {}).get("_cw_provider_instance"),
         feature=feature,
         items=items,
-        dry_run=dry_run,
+        call=lambda ch: provider_call(dst_ops.add, apply_cfg, ch, feature=feature, dry_run=dry_run),
         emit=emit,
         dbg=dbg,
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
-        payload_key="updated",
-        call=lambda ch: dst_ops.add(cfg, ch, feature=feature, dry_run=dry_run),
+        finalize=finalize,
     )
+    if dry_run:
+        _mark_dry_run(res)
+    _conf = int(res.get("confirmed", 0))
+    payload: dict[str, Any] = {
+        "dst": dst_name,
+        "destination_instance": (cfg or {}).get("_cw_provider_instance"),
+        "feature": feature,
+        "count": _conf,
+        "attempted": int(res.get("attempted", 0)),
+        "updated": _conf,
+        "accepted_unverified": _accepted_unverified(res, dry_run),
+        "dry_run": bool(dry_run),
+        "skipped": int(res.get("skipped", 0)),
+        "skipped_exact": int(res.get("skipped_exact", 0)),
+        "skipped_inferred": int(res.get("skipped_inferred", 0)),
+        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
+        "unresolved": int(res.get("unresolved", 0)),
+        "errors": int(res.get("errors", 0)),
+    }
+    emit("apply:update:done", **payload)
+    try:
+        spotlight = _ui_spotlight_items(
+            items,
+            cast(Sequence[str], res.get("confirmed_keys") or []),
+            fallback_count=_conf,
+        )
+        if spotlight:
+            emit("ui:spotlight", feature=feature, action="update", items=spotlight, count=len(spotlight))
+    except Exception:
+        pass
+    return res
 
 def apply_remove(
     *,
@@ -580,18 +739,50 @@ def apply_remove(
     chunk_size: int,
     chunk_pause_ms: int,
 ) -> dict[str, Any]:
-    return _apply_op(
-        "remove",
-        dst_ops=dst_ops,
-        cfg=cfg,
-        dst_name=dst_name,
+    emit("apply:remove:start", dst=dst_name, feature=feature, count=len(items))
+    order_items = getattr(dst_ops, "order_remove_items", None)
+    if callable(order_items) and not dry_run:
+        items = cast(Sequence[Mapping[str, Any]], provider_call(order_items, cfg, items, feature=feature))
+    res = _apply_chunked(
+        "apply:remove",
+        dst=dst_name,
+        instance=(cfg or {}).get("_cw_provider_instance"),
         feature=feature,
         items=items,
-        dry_run=dry_run,
+        call=lambda ch: provider_call(dst_ops.remove, cfg, ch, feature=feature, dry_run=dry_run),
         emit=emit,
         dbg=dbg,
         chunk_size=chunk_size,
         chunk_pause_ms=chunk_pause_ms,
-        payload_key="removed",
-        call=lambda ch: dst_ops.remove(cfg, ch, feature=feature, dry_run=dry_run),
     )
+    if dry_run:
+        _mark_dry_run(res)
+    _conf = int(res.get("confirmed", 0))
+    payload: dict[str, Any] = {
+        "dst": dst_name,
+        "destination_instance": (cfg or {}).get("_cw_provider_instance"),
+        "feature": feature,
+        "count": _conf,
+        "attempted": int(res.get("attempted", 0)),
+        "removed": _conf,
+        "accepted_unverified": _accepted_unverified(res, dry_run),
+        "dry_run": bool(dry_run),
+        "skipped": int(res.get("skipped", 0)),
+        "skipped_exact": int(res.get("skipped_exact", 0)),
+        "skipped_inferred": int(res.get("skipped_inferred", 0)),
+        "skip_basis": str(res.get("skip_basis") or "provider_keys"),
+        "unresolved": int(res.get("unresolved", 0)),
+        "errors": int(res.get("errors", 0)),
+    }
+    emit("apply:remove:done", **payload)
+    try:
+        spotlight = _ui_spotlight_items(
+            items,
+            cast(Sequence[str], res.get("confirmed_keys") or []),
+            fallback_count=_conf,
+        )
+        if spotlight:
+            emit("ui:spotlight", feature=feature, action="remove", items=spotlight, count=len(spotlight))
+    except Exception:
+        pass
+    return res

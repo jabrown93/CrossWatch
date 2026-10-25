@@ -3,6 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude
 from __future__ import annotations
 
+from ._path_matching import enrich_snapshot, path_presence
+
 import hashlib
 import json
 import os
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.value_coercion import coerce_bool
 
 from ._log import log as cw_log
@@ -40,9 +43,8 @@ def _error(event: str, **fields: Any) -> None:
 def _log(msg: str) -> None:
     _dbg(msg)
 
-__VERSION__ = "2.3"
-os.environ.setdefault("CW_PLEX_VERSION", __VERSION__)
-os.environ.setdefault("CW_PLEX_UA", f"CrossWatch/{__VERSION__} (Plex)")
+__VERSION__ = "2.7"
+os.environ.setdefault("CW_PLEX_UA", http_user_agent("Plex", override_env="CW_PLEX_UA"))
 __all__ = ["get_manifest", "PLEXModule", "PLEXClient", "PLEXError", "PLEXAuthError", "PLEXNotFound", "OPS"]
 
 try:
@@ -65,7 +67,7 @@ from .plex._common import (
     stable_client_id,
     set_client_id,
 )
-from .plex._utils import fetch_shared_server_token, resolve_user_scope
+from .plex._utils import _resolve_verify_from_cfg, fetch_shared_server_token, resolve_user_scope
 from cw_platform.id_map import canonical_key as _canonical_key
 from ._mod_common import (
     build_session,
@@ -75,10 +77,7 @@ from ._mod_common import (
     make_snapshot_progress,
 )
 
-try:  # type: ignore[name-defined]
-    ctx  # type: ignore
-except Exception:
-    ctx = None  # type: ignore
+ctx = globals().get("ctx")
 
 try:
     from .plex import _watchlist as feat_watchlist
@@ -109,6 +108,13 @@ except Exception as e:
         _warn("feature_import_failed", feature="progress", error=str(e))
 
 try:
+    from .plex import _collection as feat_collection
+except Exception as e:
+    feat_collection = None
+    if os.environ.get("CW_DEBUG") or os.environ.get("CW_PLEX_DEBUG"):
+        _warn("feature_import_failed", feature="collection", error=str(e))
+
+try:
     from .plex import _playlists as feat_playlists
 except Exception as e:
     feat_playlists = None
@@ -118,6 +124,10 @@ except Exception as e:
 _PLAYLIST_CAPABILITIES: dict[str, Any] = {
     "read": True,
     "create": True,
+    "create_empty": True,
+    "create_endpoint_types": ["playlist"],
+    "rename": True,
+    "delete": True,
     "add": True,
     "remove": True,
     "reorder": True,
@@ -229,6 +239,19 @@ def _split_keys(lst: Iterable[Mapping[str, Any]], unresolved: Any) -> tuple[list
     return attempted, sorted(ukeys), confirmed
 
 
+def _progress_skipped_keys(results: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in results or []:
+        if not isinstance(row, Mapping) or str(row.get("status") or "") != "skipped":
+            continue
+        key = str(row.get("key") or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 _PLEX_HISTORY_META_FIELDS = (
     "accepted_keys",
     "presence_confirmed_keys",
@@ -264,6 +287,11 @@ def _adapter_identity(cfg: Mapping[str, Any]) -> str:
             return str(v or "")
 
     behavior = {
+        "pair_scope": cfg.get("_cw_pair_scope"),
+        "path_matching": cfg.get("_cw_path_matching"),
+        "provider_instance": cfg.get("_cw_provider_instance"),
+        "readonly": cfg.get("_cw_readonly"),
+        "planned_at": cfg.get("_cw_interactive_planned_at"),
         "fallback_GUID": pl.get("fallback_GUID") if "fallback_GUID" in pl else pl.get("fallback_guid"),
         "history": pl.get("history") if isinstance(pl.get("history"), Mapping) else {},
         "progress": pl.get("progress") if isinstance(pl.get("progress"), Mapping) else {},
@@ -271,6 +299,7 @@ def _adapter_identity(cfg: Mapping[str, Any]) -> str:
         "scrobble": pl.get("scrobble") if isinstance(pl.get("scrobble"), Mapping) else {},
         "strict_id_matching": pl.get("strict_id_matching"),
         "timeout": pl.get("timeout"),
+        "verify_ssl": _resolve_verify_from_cfg(cfg, "https://"),
         "max_retries": pl.get("max_retries"),
         "history_workers": pl.get("history_workers"),
         "rating_workers": pl.get("rating_workers"),
@@ -317,7 +346,8 @@ def _plex_tv_session(token: str, client_id: str) -> requests.Session:
             "X-Plex-Client-Identifier": client_id,
             "X-Plex-Product": "CrossWatch",
             "X-Plex-Platform": "CrossWatch",
-            "X-Plex-Version": __VERSION__,
+            "X-Plex-Version": app_version(),
+            "User-Agent": http_user_agent("Plex", override_env="CW_PLEX_UA"),
             "Accept": "application/xml, application/json;q=0.9,*/*;q=0.8",
         }
     )
@@ -504,13 +534,18 @@ def get_manifest() -> Mapping[str, Any]:
         "version": __VERSION__,
         "type": "sync",
         "bidirectional": True,
-        "features": {"watchlist": True, "history": True, "ratings": True, "playlists": True, "progress": True},
+        "features": {"watchlist": True, "history": True, "ratings": True, "playlists": True, "progress": True, "collection": True},
         "requires": ["plexapi"],
         "capabilities": {
             "bidirectional": True,
             "provides_ids": True,
             "index_semantics": "present",
-            "history": {"index_semantics": "present", "observed_deletes": True},
+            "history": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": False, "account_gate": False},
+            },
             "watchlist": {"writes": "discover_first", "pms_fallback": True, "upsert": True, "remove": True},
             "ratings": {
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
@@ -519,7 +554,16 @@ def get_manifest() -> Mapping[str, Any]:
                 "from_date": False,
             },
             "progress": _PROGRESS_CAPABILITIES,
+            "collection": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "read": True,
+                "upsert": False,
+                "remove": False,
+            },
             "playlists": _PLAYLIST_CAPABILITIES,
+            "library_presence": {"features": ["history", "ratings", "progress"]},
         },
     }
 
@@ -562,6 +606,7 @@ class PLEXConfig:
     watchlist_allow_pms_fallback: bool = True
     watchlist_page_size: int = 100
     strict_id_matching: bool = False
+    verify_ssl: bool = True
 
 
 class PLEXClient:
@@ -570,6 +615,7 @@ class PLEXClient:
         self.server: PlexServer | None = None
         self._account: MyPlexAccount | None = None
         self.session = build_session("PLEX", ctx, feature_label=label_plex)
+        self.session.verify = cfg.verify_ssl
 
         # Token used for plex.tv and Discover/Metadata domains.
         # This is NOT always the same as the PMS resource token when switching Home users.
@@ -630,7 +676,8 @@ class PLEXClient:
             self.session.headers.setdefault("X-Plex-Client-Identifier", cid)
             self.session.headers.setdefault("X-Plex-Product", "CrossWatch")
             self.session.headers.setdefault("X-Plex-Platform", "CrossWatch")
-            self.session.headers.setdefault("X-Plex-Version", __VERSION__)
+            self.session.headers.setdefault("X-Plex-Version", app_version())
+            self.session.headers["User-Agent"] = http_user_agent("Plex", override_env="CW_PLEX_UA")
             self.session.headers.setdefault("Accept", "application/xml")
             self.session.headers["X-Plex-Token"] = connection_token
 
@@ -655,11 +702,10 @@ class PLEXClient:
                         pass
 
                 try:
-                    self.server = PlexServer(self.cfg.baseurl, connection_token, timeout=self.cfg.timeout)
-                    self.server._session = self.session  # type: ignore[attr-defined]
+                    self.server = PlexServer(self.cfg.baseurl, connection_token, session=self.session, timeout=self.cfg.timeout)
                     self._pms_baseurl = str(getattr(self.server, "baseurl", None) or self.cfg.baseurl or "")
                     if self._pms_baseurl and (pms_token or cloud_token):
-                        configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token or cloud_token), account_token=cloud_token)
+                        configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token or cloud_token), account_token=cloud_token, session=self.session)
                 except Exception as e:
                     _warn("pms_connect_failed", baseurl=str(self.cfg.baseurl or ""), error=str(e), mode="account_only")
                     self._post_connect_user_scope(str(pms_token or cloud_token))
@@ -679,7 +725,7 @@ class PLEXClient:
                 if pms_token:
                     self._apply_pms_token(pms_token)
                     if self._pms_baseurl:
-                        configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token), account_token=cloud_token)
+                        configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token), account_token=cloud_token, session=self.session)
 
                 self._post_connect_user_scope(str(pms_token or cloud_token))
                 _dbg(
@@ -704,7 +750,7 @@ class PLEXClient:
                     pms_token = res_tok
                     self._apply_pms_token(pms_token)
                 if self._pms_baseurl and (pms_token or cloud_token):
-                    configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token or cloud_token), account_token=cloud_token)
+                    configure_plex_context(baseurl=str(self._pms_baseurl), token=str(pms_token or cloud_token), account_token=cloud_token, session=self.session)
             except Exception as e:
                 _warn("pms_resource_connect_failed", error=str(e), mode="account_only")
                 self._post_connect_user_scope(str(pms_token or cloud_token))
@@ -900,7 +946,6 @@ class PLEXClient:
         try:
             user_token = _plex_tv_switch_user(token, client_id, user_id=user_id, pin=use_pin, timeout=float(self.cfg.timeout))
         except Exception as e:
-            hint = " (PIN?)" if use_pin else ""
             _warn("home_switch_failed", target=(picked.get("title") or target_username or user_id), hint=("PIN?" if use_pin else None), error=str(e))
             return False
 
@@ -964,7 +1009,7 @@ class PLEXClient:
         try:
             baseurl = str(getattr(srv, "baseurl", None) or self._pms_baseurl or self.cfg.baseurl or "")
             if baseurl:
-                configure_plex_context(baseurl=baseurl, token=pms_user_token)
+                configure_plex_context(baseurl=baseurl, token=pms_user_token, session=self.session)
         except Exception:
             pass
 
@@ -1063,7 +1108,7 @@ class PLEXClient:
         try:
             baseurl = str(getattr(srv, "baseurl", None) or self._pms_baseurl or self.cfg.baseurl or "")
             if baseurl:
-                configure_plex_context(baseurl=baseurl, token=pms_user_token)
+                configure_plex_context(baseurl=baseurl, token=pms_user_token, session=self.session)
         except Exception:
             pass
 
@@ -1107,7 +1152,7 @@ class PLEXClient:
             try:
                 baseurl = str(getattr(srv, "baseurl", None) or self._pms_baseurl or self.cfg.baseurl or "")
                 if baseurl:
-                    configure_plex_context(baseurl=baseurl, token=prev_token)
+                    configure_plex_context(baseurl=baseurl, token=prev_token, session=self.session)
             except Exception:
                 pass
         self.user_username = prev_uname
@@ -1159,6 +1204,7 @@ _FEATURES: dict[str, Any] = {
     "history": feat_history,
     "ratings": feat_ratings,
     "progress": feat_progress,
+    "collection": feat_collection,
 }
 
 
@@ -1168,6 +1214,7 @@ def _features_flags() -> dict[str, bool]:
         "history": "history" in _FEATURES and _FEATURES["history"] is not None,
         "ratings": "ratings" in _FEATURES and _FEATURES["ratings"] is not None,
         "progress": "progress" in _FEATURES and _FEATURES["progress"] is not None,
+        "collection": "collection" in _FEATURES and _FEATURES["collection"] is not None,
         "playlists": feat_playlists is not None,
     }
 
@@ -1175,6 +1222,7 @@ def _features_flags() -> dict[str, bool]:
 class PLEXModule:
     def __init__(self, cfg: Mapping[str, Any]):
         self.config = cfg
+        self.path_matching = coerce_bool(cfg.get("_cw_path_matching", False))
         plex_cfg = dict(cfg.get("plex") or {})
         pms = plex_cfg.get("pms") or {}
         baseurl = plex_cfg.get("baseurl") or plex_cfg.get("server_url") or pms.get("url") or pms.get("baseurl") or pms.get("server_url")
@@ -1197,9 +1245,10 @@ class PLEXModule:
             watchlist_allow_pms_fallback=coerce_bool(plex_cfg.get("watchlist_allow_pms_fallback", True), True),
             watchlist_page_size=int(plex_cfg.get("watchlist_page_size", 100)),
             strict_id_matching=coerce_bool(plex_cfg.get("strict_id_matching", False)),
+            verify_ssl=_resolve_verify_from_cfg(cfg, "https://"),
         )
 
-        configure_plex_context(baseurl=self.cfg.baseurl or "", token=(self.cfg.pms_token or self.cfg.token or ""))
+        configure_plex_context(baseurl=self.cfg.baseurl or "", token=(self.cfg.pms_token or self.cfg.token or ""), account_token=self.cfg.token or "")
 
         if self.cfg.client_id:
             cid = str(self.cfg.client_id)
@@ -1224,7 +1273,7 @@ class PLEXModule:
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
-        toggles = {"watchlist": True, "ratings": True, "history": True, "playlists": True, "progress": True}
+        toggles = {"watchlist": True, "ratings": True, "history": True, "playlists": True, "progress": True, "collection": True}
         present = _features_flags()
         return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
 
@@ -1259,7 +1308,7 @@ class PLEXModule:
         started = _t.perf_counter()
 
         wl_needed = bool(enabled.get("watchlist"))
-        lib_needed = any(enabled.get(k) for k in ("history", "ratings", "playlists"))
+        lib_needed = any(enabled.get(k) for k in ("history", "ratings", "playlists", "collection"))
 
         discover_ok = False
         discover_reason: str | None = None
@@ -1334,6 +1383,7 @@ class PLEXModule:
             "ratings": pms_ok if enabled.get("ratings") else False,
             "playlists": pms_ok if enabled.get("playlists") else False,
             "progress": pms_ok if enabled.get("progress") else False,
+            "collection": pms_ok if enabled.get("collection") else False,
         }
 
         checks: list[bool] = []
@@ -1370,7 +1420,7 @@ class PLEXModule:
         if wl_needed and not discover_ok:
             reasons.append(f"watchlist:{discover_reason or 'down'}")
         if lib_needed and not pms_ok:
-            missing = [f for f in ("history", "ratings", "playlists") if enabled.get(f)]
+            missing = [f for f in ("history", "ratings", "playlists", "collection") if enabled.get(f)]
             if missing:
                 reasons.append(f"{'+'.join(missing)}:{pms_reason or 'down'}")
         if reasons:
@@ -1405,7 +1455,7 @@ class PLEXModule:
             _info("index_skipped", feature=feature, reason="disabled_or_missing")
             return {}
         mod = _FEATURES.get(feature)
-        return mod.build_index(self, **kwargs) if mod else {}
+        return enrich_snapshot(self, mod.build_index(self, **kwargs) if mod else {}, "PLEX", feature)
 
     def add(
         self,
@@ -1429,13 +1479,19 @@ class PLEXModule:
         try:
             cnt, unresolved = mod.add(self, lst)
             _attempted, unresolved_keys, confirmed_keys = _split_keys(lst, unresolved)
+            results = list(getattr(self, "_progress_write_results", [])) if feature == "progress" else []
+            skipped_keys = _progress_skipped_keys(results)
+            if skipped_keys:
+                skipped_set = set(skipped_keys)
+                confirmed_keys = [k for k in confirmed_keys if k not in skipped_set]
             res: dict[str, Any] = {
                 "ok": True,
                 "count": int(cnt),
                 "unresolved": unresolved,
                 "confirmed_keys": confirmed_keys,
                 "unresolved_keys": unresolved_keys,
-                "results": list(getattr(self, "_progress_write_results", [])) if feature == "progress" else [],
+                "skipped_keys": skipped_keys,
+                "results": results,
             }
             if feature == "history":
                 hm = getattr(self, "_plex_history_write_meta", None)
@@ -1445,7 +1501,7 @@ class PLEXModule:
                             res[f] = hm[f]
             return res
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "count": 0, "errors": len(lst), "confirmed_keys": []}
 
     def remove(
         self,
@@ -1478,7 +1534,15 @@ class PLEXModule:
                 "results": list(getattr(self, "_progress_write_results", [])) if feature == "progress" else [],
             }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "count": 0, "errors": len(lst), "confirmed_keys": []}
+
+    def library_presence(self, feature: str, items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        from .plex import _presence
+
+        rows = list(items)
+        feature = (feature or "history").lower()
+        results = _presence.presence(self, rows, feature=feature)
+        return path_presence(self, rows, results, "PLEX", feature)
 
 
 class _PlexOPS:
@@ -1496,7 +1560,12 @@ class _PlexOPS:
             "bidirectional": True,
             "provides_ids": True,
             "index_semantics": "present",
-            "history": {"index_semantics": "present", "observed_deletes": True},
+            "history": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "event_history": True,
+                "rewatches": {"read": True, "write": False, "account_gate": False},
+            },
             "watchlist": {"writes": "discover_first", "pms_fallback": True, "upsert": True, "remove": True},
             "ratings": {
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
@@ -1505,7 +1574,16 @@ class _PlexOPS:
                 "from_date": False,
             },
             "progress": _PROGRESS_CAPABILITIES,
+            "collection": {
+                "index_semantics": "present",
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "read": True,
+                "upsert": False,
+                "remove": False,
+            },
             "playlists": _PLAYLIST_CAPABILITIES,
+            "library_presence": {"features": ["history", "ratings", "progress"]},
         }
 
     def index_semantics(self, cfg: Mapping[str, Any], *, feature: str) -> str | None:
@@ -1543,7 +1621,10 @@ class _PlexOPS:
         with _ADAPTER_LOCK:
             ent = _ADAPTER_CACHE.get(key)
             if ent is not None and (now - ent[1]) < _ADAPTER_TTL:
-                return ent[0]
+                mod = ent[0]
+                server = getattr(getattr(mod, "client", None), "server", None)
+                configure_plex_context(baseurl=mod.cfg.baseurl or "", token=getattr(server, "_token", None) or mod.cfg.pms_token or mod.cfg.token or "", account_token=mod.cfg.token or "", session=getattr(server, "_session", None) or getattr(getattr(mod, "client", None), "session", None))
+                return mod
         mod = PLEXModule(cfg)
         try:
             setattr(mod, "_cw_home_scope_sticky", True)
@@ -1581,6 +1662,15 @@ class _PlexOPS:
         dry_run: bool = False,
     ) -> dict[str, Any]:
         return self._adapter(cfg).remove(feature, items, dry_run=dry_run)
+
+    def library_presence(
+        self,
+        cfg: Mapping[str, Any],
+        items: Iterable[Mapping[str, Any]],
+        *,
+        feature: str,
+    ) -> list[dict[str, Any]]:
+        return self._adapter(cfg).library_presence(feature, items)
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
@@ -1625,6 +1715,27 @@ class _PlexOPS:
             items=list(items or []),
             dry_run=dry_run,
         )
+
+    def rename_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        name: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().rename(self._playlist_adapter(cfg, instance), playlist_id, name, dry_run=dry_run)
+
+    def delete_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._pl().delete(self._playlist_adapter(cfg, instance), playlist_id, dry_run=dry_run)
 
     def add_playlist_items(
         self,

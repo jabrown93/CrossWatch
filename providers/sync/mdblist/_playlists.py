@@ -3,6 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.interactive_reads import remember_resource, retained_read
+
 from typing import Any, Iterable, Mapping, Sequence
 
 from cw_platform.id_map import canonical_key, minimal as id_minimal
@@ -16,7 +18,7 @@ from cw_platform.playlists import (
 
 from .._log import log as cw_log
 from . import _watchlist as feat_watchlist
-from ._common import cfg_section, has_auth, mdblist_request
+from ._common import CursorPager, cfg_section, has_auth, mdblist_request
 from ._watchlist import _as_int, _as_str, _parse_rows_and_total
 
 BASE = "https://api.mdblist.com"
@@ -25,6 +27,7 @@ URL_LIST_ITEMS = f"{BASE}/lists/{{id}}/items"
 URL_LIST_ADD = f"{BASE}/lists/{{id}}/items/add"
 URL_LIST_REMOVE = f"{BASE}/lists/{{id}}/items/remove"
 URL_CREATE_LIST = f"{BASE}/lists/user/add"
+URL_DELETE_LIST = f"{BASE}/lists/{{id}}"
 URL_UPDATE_LIST = f"{BASE}/lists/{{id}}/update"
 URL_USER = f"{BASE}/user"
 
@@ -159,6 +162,10 @@ def _resource_from_list(adapter: Any, row: Mapping[str, Any]) -> PlaylistResourc
         can_reorder=False,
         media_types=media_types,
         extra={
+            "endpoint_type": "discovery" if dynamic else "playlist",
+            "source_kind": "discovery" if dynamic else "playlist",
+            "discovery": dynamic,
+            "virtual": dynamic,
             "dynamic": dynamic,
             "static": not dynamic,
             "mediatype": mediatype,
@@ -172,6 +179,7 @@ def _resource_from_list(adapter: Any, row: Mapping[str, Any]) -> PlaylistResourc
     )
 
 
+@retained_read
 def list_resources(adapter: Any) -> list[PlaylistResource]:
     if not has_auth(cfg_section(adapter)):
         return []
@@ -223,24 +231,22 @@ def get_snapshot(adapter: Any, playlist_id: Any) -> PlaylistSnapshot:
         )
 
     items: list[PlaylistItem] = []
-    offset = 0
-    limit = 1000
+    pager = CursorPager(1000, 1000)
     apikey = _apikey(adapter)
     pos = 0
-    while offset <= 1_000_000:
+    while True:
         r = mdblist_request(
             adapter,
             "GET",
             URL_LIST_ITEMS.format(id=lid),
-            params={"apikey": apikey, "limit": limit, "offset": offset, "unified": "true"},
+            params={"apikey": apikey, **pager.params(), "unified": "true"},
         )
         if not (200 <= r.status_code < 300):
             _warn("http_failed", op="get_snapshot", status=r.status_code, list_id=lid)
-            break
+            raise MDBListPlaylistError("MDBList playlist read failed")
         data = r.json() if (r.text or "").strip() else {}
+        more = pager.advance(data, r)
         rows, _total = _parse_rows_and_total(data)
-        if not rows:
-            break
         for row in rows:
             media = _normalize_row(row)
             rank = _as_int(row.get("rank"))
@@ -253,19 +259,8 @@ def get_snapshot(adapter: Any, playlist_id: Any) -> PlaylistSnapshot:
                 )
             )
             pos += 1
-        has_more = None
-        try:
-            hdr = r.headers.get("X-Has-More")
-            if hdr is not None:
-                has_more = str(hdr).strip().lower() in ("1", "true", "yes")
-        except Exception:
-            has_more = None
-        if has_more is None:
-            pag = data.get("pagination") if isinstance(data, Mapping) else None
-            has_more = bool(pag.get("has_more")) if isinstance(pag, Mapping) else (len(rows) >= limit)
-        if not has_more:
+        if not more:
             break
-        offset += len(rows)
 
     items.sort(key=lambda it: (it.position is None, it.position if it.position is not None else 0))
     _info("snapshot_done", list_id=lid, count=len(items))
@@ -323,6 +318,7 @@ def create(
     if res is None:
         raise MDBListPlaylistError("mdblist create list returned no id")
     _info("create_done", list_id=res.id, name=res.name)
+    remember_resource(list_resources, adapter, res)
     return res
 
 
@@ -350,6 +346,55 @@ def update_metadata(adapter: Any, playlist_id: Any, *, name: str | None = None, 
         _warn("update_failed", status=r.status_code, list_id=resource.id)
         raise MDBListPlaylistError(f"mdblist update list failed: http {r.status_code}")
     return {"ok": True, "updated": True}
+
+
+def rename(adapter: Any, playlist_id: Any, name: str, *, dry_run: bool = False) -> PlaylistResource:
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("playlist name required")
+    resource = _find_owned_resource(adapter, playlist_id)
+    if resource is None:
+        raise MDBListNotOwnedError("mdblist list is not owned by the authenticated user")
+    if resource.is_smart:
+        raise MDBListDynamicListError("cannot rename a dynamic mdblist list")
+    if not dry_run:
+        update_metadata(adapter, resource.id, name=nm)
+    return PlaylistResource(
+        provider=_PROVIDER,
+        id=resource.id,
+        name=nm,
+        instance=resource.instance,
+        kind=resource.kind,
+        can_read=resource.can_read,
+        can_add=resource.can_add,
+        can_remove=resource.can_remove,
+        can_reorder=resource.can_reorder,
+        media_types=resource.media_types,
+        extra=dict(resource.extra or {}),
+    )
+
+
+def delete(adapter: Any, playlist_id: Any, *, dry_run: bool = False) -> dict[str, Any]:
+    resource = _find_owned_resource(adapter, playlist_id)
+    if resource is None:
+        raise MDBListNotOwnedError("mdblist list is not owned by the authenticated user")
+    if resource.is_smart:
+        raise MDBListDynamicListError("cannot delete a dynamic mdblist list")
+    if dry_run:
+        return {"ok": True, "dry_run": True}
+    r = mdblist_request(
+        adapter,
+        "DELETE",
+        URL_DELETE_LIST.format(id=resource.id),
+        params={"apikey": _apikey(adapter)},
+    )
+    if r.status_code in (401, 403):
+        raise MDBListPlaylistError("mdblist delete list unauthorized")
+    if not (200 <= r.status_code < 300):
+        _warn("delete_failed", status=r.status_code, list_id=resource.id)
+        raise MDBListPlaylistError(f"mdblist delete list failed: http {r.status_code}")
+    _info("delete_done", list_id=resource.id)
+    return {"ok": True, "count": 1}
 
 
 def _guard_writable(resource: PlaylistResource | None) -> PlaylistResource:

@@ -2,6 +2,7 @@
 # JELLYFIN Module for history sync functions
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
+from cw_platform.interactive_reads import retained_read, replaying, accepted_result, history_states
 
 import json
 import os
@@ -24,7 +25,7 @@ from ._common import (
     _is_capture_mode,
 )
 from ._routes import items as items_route, played as played_route, user_data as user_data_route, user_params
-from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.id_map import KEY_PRIORITY, canonical_key, minimal as id_minimal
 
 def _unresolved_path() -> str:
     return str(state_file("jellyfin_history.unresolved.json"))
@@ -44,6 +45,67 @@ _dbg, _info, _warn = make_logger("history")
 # unresolved
 _UNRES_CACHE: dict[str, dict[str, Any]] = {}
 _UNRES_DIRTY: set[str] = set()
+
+
+def _scope_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _scope_fragment(event: Mapping[str, Any]) -> str:
+    typ = str(event.get("type") or "").strip().lower()
+    season = _scope_int(event.get("season"))
+    if season is None:
+        return ""
+    if typ == "season":
+        return f"#season:{season}"
+    episode = _scope_int(event.get("episode"))
+    if episode is None:
+        return ""
+    return f"#s{season:02d}e{episode:02d}"
+
+
+def _series_scope_key(event: Mapping[str, Any]) -> str:
+    title = str(event.get("series_title") or "").strip().lower()
+    if not title:
+        return ""
+    year = event.get("series_year")
+    year_part = "" if year in (None, "") else str(year)
+    return f"show|title:{title}|year:{year_part}{_scope_fragment(event)}"
+
+
+def _event_base_key(event: Mapping[str, Any], fallback: Mapping[str, Any]) -> str:
+    typ = str(event.get("type") or "").strip().lower()
+    if typ in ("episode", "season"):
+        show_ids = event.get("show_ids") if isinstance(event.get("show_ids"), Mapping) else None
+        if show_ids:
+            try:
+                key = canonical_key(event)
+            except Exception:
+                key = ""
+            if key and any(key.startswith(f"{prefix}:") for prefix in KEY_PRIORITY):
+                return key
+        scoped = _series_scope_key(event)
+        if scoped:
+            return scoped
+        try:
+            return canonical_key(fallback)
+        except Exception:
+            return "unknown:"
+    try:
+        key = canonical_key(event)
+    except Exception:
+        key = ""
+    if key and any(key.startswith(f"{prefix}:") for prefix in KEY_PRIORITY):
+        return key
+    try:
+        return canonical_key(fallback)
+    except Exception:
+        return "unknown:"
 
 
 def _unres_load() -> dict[str, Any]:
@@ -361,6 +423,38 @@ def _series_ids_for(http: Any, uid: str, series_id: str | None) -> dict[str, str
     return out
 
 
+def _series_meta_type(series_id: str | None) -> str:
+    body = _SERIES_META_CACHE.get(str(series_id or '').strip()) or {}
+    return str(body.get('Type') or '').strip() if isinstance(body, Mapping) else ''
+
+
+def _series_year_for(http: Any, uid: str, series_id: str | None) -> int | None:
+    sid = (str(series_id or '').strip()) or ''
+    if not sid:
+        return None
+    if sid not in _SERIES_META_CACHE:
+        _prefetch_series_meta(http, uid, [sid])
+    body = _SERIES_META_CACHE.get(sid) or {}
+    year = body.get('ProductionYear') if isinstance(body, Mapping) else None
+    try:
+        return int(year) if year is not None else None
+    except Exception:
+        return None
+
+
+def _episode_show_ids(http: Any, uid: str, row: Mapping[str, Any]) -> tuple[str, dict[str, str]]:
+    sid = str(row.get('SeriesId') or '').strip()
+    ids = _series_ids_for(http, uid, sid) if sid else {}
+    if ids:
+        return sid, ids
+    parent = str(row.get('ParentId') or '').strip()
+    if parent and parent != sid:
+        parent_ids = _series_ids_for(http, uid, parent)
+        if parent_ids and _series_meta_type(parent) == 'Series':
+            return parent, parent_ids
+    return sid, ids
+
+
 # low-level Jellyfin writes
 def _mark_played(http: Any, uid: str, item_id: str, *, date_played_iso: str | None) -> bool:
     try:
@@ -401,31 +495,34 @@ _ST_READBACK = "readback_mismatch"
 
 def _set_write_meta(adapter: Any, meta: Mapping[str, Any]) -> None:
     try:
+        if replaying():
+            keys = [row["key"] for row in meta.get("results", []) if row.get("status") == _ST_WRITTEN]
+            meta = accepted_result(dict(meta), keys)
         setattr(adapter, "_history_write_meta", dict(meta))
     except Exception:
         pass
 
 
-def _result_row(key: str, status: str, *, action: str, reason: str, iid: str | None = None, req_ts: int = 0, dst_ts: int = 0) -> dict[str, Any]:
+def _result_row(key: str, status: str, *, action: str, reason: str, iid: str | None = None, req_ts: int | None = None, dst_ts: int | None = None) -> dict[str, Any]:
     row: dict[str, Any] = {"key": key, "status": status, "action": action, "reason": reason}
     if iid:
         row["provider_item_id"] = str(iid)
-    if req_ts:
+    if req_ts is not None:
         row["requested_at"] = _epoch_to_iso_z(req_ts)
-    if dst_ts:
+    if dst_ts is not None:
         row["destination_at"] = _epoch_to_iso_z(dst_ts)
     return row
 
 
-def _dst_user_state(http: Any, uid: str, iid: str) -> tuple[bool, int]:
+def _dst_user_state(http: Any, uid: str, iid: str) -> tuple[bool, int | None]:
     # Delegate to batch variant to keep parsing consistent
-    return _dst_user_states(http, uid, [str(iid)]).get(str(iid), (False, 0))
+    return _dst_user_states(http, uid, [str(iid)]).get(str(iid), (False, None))
 
 
 
 
-def _dst_user_states(http: Any, uid: str, iids: Iterable[str]) -> dict[str, tuple[bool, int]]:
-    out: dict[str, tuple[bool, int]] = {}
+def _dst_user_states(http: Any, uid: str, iids: Iterable[str]) -> dict[str, tuple[bool, int | None]]:
+    out: dict[str, tuple[bool, int | None]] = {}
     ids: list[str] = []
     seen: set[str] = set()
     for x in iids or []:
@@ -460,12 +557,12 @@ def _dst_user_states(http: Any, uid: str, iids: Iterable[str]) -> dict[str, tupl
                     continue
                 ud = row.get('UserData') or {}
                 played = bool(ud.get('Played') or ud.get('IsPlayed'))
-                ts = 0
+                ts = None
                 for k in ('LastPlayedDate', 'DateLastPlayed', 'LastPlayed'):
                     v = ud.get(k) or row.get(k)
                     if v:
-                        ts = _parse_iso_to_epoch(v) or 0
-                        if ts:
+                        ts = _parse_iso_to_epoch(v)
+                        if ts is not None:
                             break
                 out[iid] = (played, ts)
         except Exception:
@@ -474,6 +571,7 @@ def _dst_user_states(http: Any, uid: str, iids: Iterable[str]) -> dict[str, tupl
 
 
 # event index (watched_at)
+@retained_read
 def build_index(
     adapter: Any,
     since: Any | None = None,
@@ -540,14 +638,22 @@ def build_index(
             params["ParentId"] = current_parent
 
         r = http.get(items_route(), params=user_params(uid, params))
-        body = r.json() or {}
-        rows = body.get("Items") or []
+        if getattr(r, "status_code", 0) != 200:
+            raise RuntimeError(f"jellyfin_history_http_{getattr(r, 'status_code', 0)}")
+        try:
+            body = r.json()
+        except Exception as exc:
+            raise ValueError("jellyfin_history_invalid_response") from exc
+        if not isinstance(body, Mapping) or not isinstance(body.get("Items"), list):
+            raise ValueError("jellyfin_history_invalid_response")
+        rows = body["Items"]
+        if any(not isinstance(row, Mapping) or not row.get("Id") for row in rows):
+            raise ValueError("jellyfin_history_invalid_row")
         raw_count = len(rows)
         signature = tuple(str(row.get("Id") or "") for row in rows if isinstance(row, Mapping))
         if rows and signature in seen_pages:
             _warn("pagination_repeated_page", source_library_id=current_parent, start_index=start)
-            rows = []
-            raw_count = 0
+            raise RuntimeError("jellyfin_history_repeated_page")
         seen_pages.add(signature)
         page += 1
         took_ms = int((time.monotonic() - t0) * 1000)
@@ -572,8 +678,8 @@ def build_index(
         for row in rows:
             ud = row.get("UserData") or {}
             lp = ud.get("LastPlayedDate") or row.get("DateLastPlayed") or None
-            ts = _parse_iso_to_epoch(lp) or 0
-            if not ts:
+            ts = _parse_iso_to_epoch(lp)
+            if ts is None:
                 continue
             if since_epoch and ts <= since_epoch:
                 rows = []
@@ -604,7 +710,7 @@ def build_index(
                     "watched": True,
                 }
             elif typ == "Episode":
-                show_ids = _series_ids_for(http, uid, row.get("SeriesId"))
+                series_id, show_ids = _episode_show_ids(http, uid, row)
                 s = m.get("season")
                 e = m.get("episode")
                 try:
@@ -625,6 +731,9 @@ def build_index(
                     "watched_at": watched_at,
                     "watched": True,
                 }
+                series_year = _series_year_for(http, uid, series_id)
+                if series_year is not None:
+                    event["series_year"] = series_year
             else:
                 continue
 
@@ -632,7 +741,7 @@ def build_index(
             if lib_id:
                 event["library_id"] = lib_id
 
-            base_key = canonical_key(m)
+            base_key = _event_base_key(event, m)
             event.setdefault("_cw_key", base_key)
             jf_iid = m.get("jellyfin_item_id")
             if jf_iid:
@@ -647,8 +756,10 @@ def build_index(
         start += raw_count
         if isinstance(limit, int) and limit > 0 and len(events) >= int(limit):
             break
-        total = int(body.get("TotalRecordCount") or 0)
-        if not rows or raw_count < page_size or (total and start >= total):
+        # Total counting is disabled: Jellyfin can report the page length as
+        # TotalRecordCount. Only an exhausted page (or the since cutoff) ends
+        # this library's scan.
+        if not rows or raw_count < page_size:
             scope_index += 1
             if scope_index >= len(query_parents):
                 break
@@ -771,13 +882,12 @@ def _try_resolve_iid(adapter: Any, m: Mapping[str, Any]) -> str | None:
         return None
 
 
-def _prepare_want(
-    base: Mapping[str, Any],
+def _want_item(
+    base_d: Mapping[str, Any],
     *,
     raw_key: str | None = None,
     raw_iid: str | None = None,
-) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
-    base_d: dict[str, Any] = dict(base or {})
+) -> dict[str, Any]:
     base_ids_raw = base_d.get("ids")
     base_ids = dict(base_ids_raw) if isinstance(base_ids_raw, Mapping) else {}
     has_ids = bool(base_ids) and any(v not in (None, "", 0) for v in base_ids.values())
@@ -790,19 +900,30 @@ def _prepare_want(
     if raw_iid:
         m["jellyfin_item_id"] = raw_iid
 
-    if has_ids:
-        for key in _COPY_OVER_KEYS:
-            if base_d.get(key) not in (None, ""):
-                m[key] = base_d[key]
+    for key in _COPY_OVER_KEYS:
+        if base_d.get(key) not in (None, ""):
+            m[key] = base_d[key]
 
+    if has_ids:
         ids = dict(nm.get("ids") or {})
         for k_id, v_id in base_ids.items():
-            if v_id not in (None, "", 0):
+            if str(k_id).strip().lower() != "jellyfin" and v_id not in (None, "", 0):
                 ids[k_id] = v_id
         if ids:
             m["ids"] = ids
 
     _coerce_anime_type(m)
+    return m
+
+
+def _prepare_want(
+    base: Mapping[str, Any],
+    *,
+    raw_key: str | None = None,
+    raw_iid: str | None = None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    base_d: dict[str, Any] = dict(base or {})
+    m = _want_item(base_d, raw_key=raw_key, raw_iid=raw_iid)
 
     key_opt: str | None
     if raw_key:
@@ -853,8 +974,11 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
         results.append(_result_row(str(u.get("key") or ""), _ST_RESOLVE_FAILED, action="resolve", reason=reason))
 
+    from ._id_lookup import prepare
+    prepare(adapter, "history", wants.values())
+
     for k, m in wants.items():
-        iid = m.get("jellyfin_item_id") or _try_resolve_iid(adapter, m)
+        iid = _try_resolve_iid(adapter, m)
         if iid:
             mids.append((k, str(iid)))
         else:
@@ -872,7 +996,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
         "skip_played_untimed": 0, "skip_missing_date": 0, "fail_mark": 0,
     }
 
-    def _confirm(k: str, status: str, *, action: str, reason: str, iid: str, req_ts: int, dst_ts: int = 0) -> None:
+    def _confirm(k: str, status: str, *, action: str, reason: str, iid: str, req_ts: int, dst_ts: int | None = None) -> None:
         confirmed_keys.append(k)
         results.append(_result_row(k, status, action=action, reason=reason, iid=iid, req_ts=req_ts, dst_ts=dst_ts))
 
@@ -886,13 +1010,17 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
     if total:
         _info("write_start", op="add", count=total)
 
+    review = history_states(build_index(adapter), "jellyfin", _parse_iso_to_epoch) if replaying() else {}
     processed = 0
     for chunk in chunked(mids, qlim):
-        states = _dst_user_states(http, uid, [iid for _, iid in chunk])
+        if replaying():
+            states = review
+        else:
+            states = _dst_user_states(http, uid, [iid for _, iid in chunk])
         pending_verify: list[tuple[str, str, int]] = []
         for k, iid in chunk:
-            src_ts = _parse_iso_to_epoch(wants[k].get("watched_at")) or 0
-            if not src_ts:
+            src_ts = _parse_iso_to_epoch(wants[k].get("watched_at"))
+            if src_ts is None:
                 unresolved.append({"item": id_minimal(wants[k]), "key": k, "hint": "missing_watched_at", "reason": "missing_watched_at"})
                 _freeze(wants[k], reason="missing_watched_at")
                 results.append(_result_row(k, _ST_MISSING_DATE, action="skip", reason="missing_watched_at", iid=iid))
@@ -902,9 +1030,9 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 continue
 
             src_iso = _epoch_to_iso_z(src_ts)
-            played, dst_ts = states.get(iid, (False, 0))
+            played, dst_ts = states.get(iid, (False, None))
 
-            if played and dst_ts and dst_ts >= (src_ts - tol):
+            if played and dst_ts is not None and dst_ts >= (src_ts - tol):
                 bb[k] = {"reason": "presence:existing_newer", "since": _now_iso_z(), "iid": iid}
                 stats["skip_newer"] += 1
                 status = _ST_ALREADY if abs(dst_ts - src_ts) <= tol else _ST_NEWER
@@ -913,7 +1041,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 sleep_ms(delay)
                 continue
 
-            if played and not dst_ts:
+            if played and dst_ts is None:
                 bb[k] = {"reason": "presence:existing_untimed", "since": _now_iso_z(), "iid": iid}
                 stats["skip_played_untimed"] += 1
                 _confirm(k, _ST_ALREADY, action="skip", reason="existing_untimed", iid=iid, req_ts=src_ts)
@@ -946,10 +1074,10 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 _dbg("write_progress", op="add", done=processed, total=total, ok=ok, unresolved=len(unresolved))
             sleep_ms(delay)
 
-        if pending_verify:
+        if pending_verify and not replaying():
             final = _dst_user_states(http, uid, [iid for _, iid, _ in pending_verify])
             for k, iid, req_ts in pending_verify:
-                played, _dst = final.get(iid, (False, 0))
+                played, _dst = final.get(iid, (False, None))
                 if played:
                     continue
                 confirmed_keys[:] = [c for c in confirmed_keys if c != k]
@@ -1013,10 +1141,13 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
 
     for k, m in wants.items():
         ent = shadow.get(k) or {}
-        iid = (m.get("jellyfin_item_id") or (ent.get("iid") if isinstance(ent, Mapping) else None))
-
+        iid = _try_resolve_iid(adapter, m)
         if not iid:
-            iid = _try_resolve_iid(adapter, m)
+            ent_iid = ent.get("iid") if isinstance(ent, Mapping) else None
+            if ent_iid:
+                hinted = dict(m)
+                hinted["jellyfin_item_id"] = str(ent_iid)
+                iid = _try_resolve_iid(adapter, hinted)
 
         if iid:
             mids.append((k, str(iid)))

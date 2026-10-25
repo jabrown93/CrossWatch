@@ -5,20 +5,6 @@
   const Editor = (NS.Editor ||= {});
 
   const REPLACEABLE_TYPES = ["movie", "show", "anime", "season", "episode"];
-  const EPISODE_ID_FIELDS = [
-    { key: "tvdb", label: "TVDB episode ID" },
-    { key: "tmdb", label: "TMDB episode ID" },
-    { key: "simkl", label: "SIMKL episode ID" },
-  ];
-  const PROVIDER_HISTORY_ID_FIELDS = [
-    "_trakt_history_id",
-    "history_id",
-    "_simkl_history_id",
-    "_plex_history_id",
-    "watched_id",
-    "play_id",
-  ];
-
   function rowType(row) {
     return String((row && row.type) || "").toLowerCase();
   }
@@ -33,257 +19,37 @@
     return t === "episode" || t === "season";
   }
 
-  function coordinateKeyFor(row, season, episode) {
-    const base = String((row && row.key) || "").split("#")[0].trim();
-    if (!base) return "";
-    if (rowType(row) === "season") return `${base}#season:${season}`;
-    const s = String(Math.max(0, season)).padStart(2, "0");
-    const e = String(Math.max(0, episode)).padStart(2, "0");
-    return `${base}#s${s}e${e}`;
-  }
-
-  function carryOverFields(row, drop) {
-    const src = (row && row.raw) || {};
-    const out = {};
-    for (const [k, v] of Object.entries(src)) {
-      if (drop.includes(k) || PROVIDER_HISTORY_ID_FIELDS.includes(k)) continue;
-      out[k] = JSON.parse(JSON.stringify(v === undefined ? null : v));
-    }
-    return out;
-  }
-
-  function correctedEpisodeItem(row, season, episode, watchedAt, extraIds) {
-    const isSeason = rowType(row) === "season";
-    const out = carryOverFields(row, ["ids", "season", "episode", "title"]);
-    out.type = isSeason ? "season" : "episode";
-    out.season = season;
-    if (isSeason) {
-      out.title = `Season ${season}`;
-    } else {
-      out.episode = episode;
-      out.title = `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
-      out.watched_at = watchedAt || null;
-    }
-    const ids = {};
-    for (const [k, v] of Object.entries(extraIds || {})) {
-      const val = String(v || "").trim();
-      if (val) ids[k] = val;
-    }
-    out.ids = ids;
-    return out;
-  }
-
-  function correctedMetadataItem(row, draft) {
-    const out = carryOverFields(row, [
-      "ids", "title", "year", "type",
-      "season", "episode", "series_title", "series_year", "show_ids",
-    ]);
-    const picked = (draft && draft.raw) || {};
-    out.type = picked.type || draft.type || "movie";
-    out.title = picked.title || draft.title || null;
-    out.year = picked.year != null ? picked.year : null;
-    out.ids = { ...(picked.ids || {}) };
-    return out;
-  }
-
   function openItemReplacer(row, anchor, ctx = {}) {
-    if (usesCoordinateReplacer(row)) return openEpisodeReplacer(row, anchor, ctx);
-    return openMetadataReplacer(row, anchor, ctx);
-  }
-
-  function openMetadataReplacer(row, anchor, ctx = {}) {
-    const draft = {
-      _rid: -1,
-      key: String(row.key || ""),
-      type: rowType(row),
-      title: String(row.title || ""),
-      year: String(row.year || ""),
-      imdb: "",
-      tmdb: "",
-      tvdb: "",
-      trakt: "",
-      simkl: "",
-      mal: "",
-      anilist: "",
-      raw: JSON.parse(JSON.stringify(row.raw || {})),
-      deleted: false,
-      episode: false,
-    };
-    const stub = () => document.createElement("input");
-    const refs = {
-      keyIn: stub(),
-      titleIn: stub(),
-      yearIn: stub(),
-      imdbIn: stub(),
-      tmdbIn: stub(),
-      tvdbIn: stub(),
-      traktIn: stub(),
-      simklIn: stub(),
-      typeBtn: document.createElement("button"),
-      onApplied: applied => {
-        const key = String(applied.key || "").trim();
-        if (!key) {
-          ctx.setStatusSticky?.("That result has no usable identifier.", 5000);
-          return;
-        }
-        if (key.toLowerCase() === String(row.key || "").trim().toLowerCase()) {
-          ctx.setStatusSticky?.("The corrected item is the same as the current one.", 5000);
-          return;
-        }
-        const corrected = correctedMetadataItem(row, applied);
-        const err = ctx.commitReplacement?.(row, corrected, key, "The corrected local item was updated.");
-        if (err) ctx.setStatusSticky?.(err, 5000);
-      },
-    };
-    openTitleSearchEditor(draft, anchor, refs, ctx);
-  }
-
-  function openEpisodeReplacer(row, anchor, ctx = {}) {
-    const isSeason = rowType(row) === "season";
-    const dt = window.CW && window.CW.Editor && window.CW.Editor.DateTime;
-    if (!dt) throw new Error("Editor module missing: DateTime");
-    ctx.openPopup(anchor, (pop, close) => {
-      ctx.appendPopupTitle(pop, isSeason ? "Replace season" : "Replace episode");
-
-      const raw = (row && row.raw) || {};
-      const curSeason = Number(raw.season || 0);
-      const curEpisode = Number(raw.episode || 0);
-      const seriesTitle = String(raw.series_title || row.title || "").trim() || "Unknown series";
-
-      const info = document.createElement("div");
-      info.className = "cw-search-meta";
-      info.textContent = isSeason
-        ? `${seriesTitle} - currently season ${curSeason}`
-        : `${seriesTitle} - currently S${String(curSeason).padStart(2, "0")}E${String(curEpisode).padStart(2, "0")}`;
-      pop.appendChild(info);
-
-      ctx.appendPopupTitle(pop, isSeason ? "Corrected season" : "Corrected episode", "10px");
-
-      const grid = document.createElement("div");
-      grid.className = "cw-datetime-grid";
-      grid.style.gridTemplateColumns = isSeason ? "minmax(0,1fr)" : "minmax(0,1fr) minmax(0,1fr)";
-
-      const seasonIn = document.createElement("input");
-      seasonIn.type = "number";
-      seasonIn.min = "0";
-      seasonIn.placeholder = "Season";
-      seasonIn.value = String(curSeason);
-
-      const episodeIn = document.createElement("input");
-      episodeIn.type = "number";
-      episodeIn.min = "0";
-      episodeIn.placeholder = "Episode";
-      episodeIn.value = String(curEpisode);
-
-      grid.appendChild(seasonIn);
-      if (!isSeason) grid.appendChild(episodeIn);
-      pop.appendChild(grid);
-
-      const dateInput = document.createElement("input");
-      dateInput.type = "date";
-      const timeInput = document.createElement("input");
-      timeInput.type = "time";
-      timeInput.step = 60;
-
-      if (!isSeason) {
-        ctx.appendPopupTitle(pop, "Watched at", "10px");
-        const whenGrid = document.createElement("div");
-        whenGrid.className = "cw-datetime-grid";
-        dt.fillDateTimeInputs?.(raw.watched_at, dateInput, timeInput);
-        whenGrid.appendChild(dateInput);
-        whenGrid.appendChild(timeInput);
-        pop.appendChild(whenGrid);
-      }
-
-      const advanced = document.createElement("details");
-      advanced.className = "cw-collapse";
-      advanced.style.marginTop = "10px";
-      const summary = document.createElement("summary");
-      summary.style.cursor = "pointer";
-      summary.style.fontWeight = "700";
-      summary.style.userSelect = "none";
-      summary.textContent = "Advanced";
-      advanced.appendChild(summary);
-
-      const advGrid = document.createElement("div");
-      advGrid.className = "cw-datetime-grid";
-      advGrid.style.marginTop = "8px";
-      const idInputs = {};
-      EPISODE_ID_FIELDS.forEach(field => {
-        const input = document.createElement("input");
-        input.type = "text";
-        input.placeholder = field.label;
-        idInputs[field.key] = input;
-        advGrid.appendChild(input);
-      });
-      advanced.appendChild(advGrid);
-      pop.appendChild(advanced);
-
-      const status = document.createElement("div");
-      status.className = "cw-search-status";
-      status.style.marginTop = "8px";
-      pop.appendChild(status);
-
-      const apply = () => {
-        const season = parseInt(seasonIn.value, 10);
-        const episode = isSeason ? 0 : parseInt(episodeIn.value, 10);
-        const seasonOk = Number.isFinite(season) && season >= 0;
-        const episodeOk = isSeason || (Number.isFinite(episode) && episode > 0);
-        if (!seasonOk || !episodeOk) {
-          status.textContent = isSeason
-            ? "Enter a valid corrected season."
-            : "Enter a valid corrected season and episode.";
-          return;
-        }
-        if (season === curSeason && (isSeason || episode === curEpisode)) {
-          status.textContent = isSeason
-            ? "The corrected season is the same as the current one."
-            : "The corrected episode is the same as the current one.";
-          return;
-        }
-        const key = coordinateKeyFor(row, season, episode);
-        if (!key) {
-          status.textContent = "This row has no usable series identifier.";
-          return;
-        }
-
-        const watchedAt = dt.dateTimeInputsToIso?.(dateInput.value, timeInput.value) || raw.watched_at || null;
-        const extraIds = {};
-        EPISODE_ID_FIELDS.forEach(field => {
-          extraIds[field.key] = idInputs[field.key].value;
-        });
-        const corrected = correctedEpisodeItem(row, season, episode, watchedAt, extraIds);
-        const err = ctx.commitReplacement?.(
-          row,
-          corrected,
-          key,
-          isSeason ? "The corrected local season was updated." : "The corrected local episode was updated."
-        );
-        if (err) {
-          status.textContent = err;
-          return;
-        }
-        close();
-      };
-
-      ctx.appendPopupActions(pop, [
-        { label: "Close", kind: "ghost", onClick: close },
-        { label: "Replace episode", kind: "primary", onClick: apply },
-      ]);
-
-      seasonIn.focus();
-    });
+    if (canReplaceRow(row, ctx)) return ctx.openMapping?.(row);
   }
 
   function openTitleSearchEditor(row, anchor, refs, ctx = {}) {
+    if (ctx.openMapping && canReplaceRow(row, ctx)) return ctx.openMapping(row);
     ctx.openPopup(anchor, (pop, close) => {
-      const title = document.createElement("div");
-      title.className = "cw-pop-title";
-      title.textContent = "Search metadata";
-      pop.appendChild(title);
+      pop.classList.add("cw-metadata-search-pop");
+
+      const head = document.createElement("div");
+      head.className = "cw-meta-search-head";
+      head.innerHTML = `
+        <span class="material-symbols-rounded cw-meta-search-head-icon" aria-hidden="true">search</span>
+        <div class="cw-meta-search-title">Search metadata</div>
+      `;
+      const headClose = document.createElement("button");
+      headClose.type = "button";
+      headClose.className = "cw-meta-search-close";
+      headClose.setAttribute("aria-label", "Close search metadata");
+      headClose.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">close</span>';
+      headClose.onclick = close;
+      head.appendChild(headClose);
+      pop.appendChild(head);
 
       const bar = document.createElement("div");
       bar.className = "cw-search-bar";
+
+      const titleField = document.createElement("label");
+      titleField.className = "cw-meta-search-field cw-meta-search-field-title";
+      titleField.htmlFor = "cw_meta_search_title";
+      titleField.appendChild(document.createTextNode("Title"));
 
       const qInput = document.createElement("input");
       qInput.type = "text";
@@ -291,7 +57,21 @@
       qInput.name = qInput.id;
       qInput.placeholder = "Title...";
       qInput.value = row.title || "";
-      bar.appendChild(qInput);
+      const qWrap = document.createElement("div");
+      qWrap.className = "cw-meta-search-input-wrap";
+      qWrap.appendChild(qInput);
+      const qIcon = document.createElement("span");
+      qIcon.className = "material-symbols-rounded cw-meta-search-inline-icon";
+      qIcon.setAttribute("aria-hidden", "true");
+      qIcon.textContent = "search";
+      qWrap.appendChild(qIcon);
+      titleField.appendChild(qWrap);
+      bar.appendChild(titleField);
+
+      const yearField = document.createElement("label");
+      yearField.className = "cw-meta-search-field";
+      yearField.htmlFor = "cw_meta_search_year";
+      yearField.appendChild(document.createTextNode("Year"));
 
       const yearInput = document.createElement("input");
       yearInput.type = "number";
@@ -299,21 +79,52 @@
       yearInput.name = yearInput.id;
       yearInput.placeholder = "Year";
       if (row.year) yearInput.value = row.year;
-      bar.appendChild(yearInput);
+      const yearWrap = document.createElement("div");
+      yearWrap.className = "cw-meta-search-input-wrap";
+      yearWrap.appendChild(yearInput);
+      const yearIcon = document.createElement("span");
+      yearIcon.className = "material-symbols-rounded cw-meta-search-inline-icon";
+      yearIcon.setAttribute("aria-hidden", "true");
+      yearIcon.textContent = "calendar_month";
+      yearWrap.appendChild(yearIcon);
+      yearField.appendChild(yearWrap);
+      bar.appendChild(yearField);
 
-      const typeSelect = document.createElement("select");
-      typeSelect.id = "cw_meta_search_type";
-      typeSelect.name = typeSelect.id;
-      [["movie", "Movie"], ["show", "Show"], ["anime", "Anime"]].forEach(([val, label]) => {
-        const opt = document.createElement("option");
-        opt.value = val;
-        opt.textContent = label;
-        typeSelect.appendChild(opt);
+      const typeOptions = [["all", "All"], ["movie", "Movie"], ["show", "TV Show"]];
+      let typeValue = row.type === "show" || row.type === "episode" ? "show" : row.type === "anime" ? "all" : "movie";
+
+      const typeField = document.createElement("div");
+      typeField.className = "cw-meta-search-field cw-meta-search-type-field";
+      const typeLabel = document.createElement("div");
+      typeLabel.className = "cw-meta-search-label";
+      typeLabel.textContent = "Type";
+      const typeSegment = document.createElement("div");
+      typeSegment.className = "cw-meta-type-segment";
+      typeSegment.setAttribute("role", "group");
+      typeSegment.setAttribute("aria-label", "Metadata type");
+      typeOptions.forEach(([val, label]) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "cw-meta-type-option";
+        btn.dataset.value = val;
+        btn.textContent = label;
+        btn.addEventListener("click", () => {
+          typeValue = val;
+          syncTypeSegment();
+        });
+        typeSegment.appendChild(btn);
       });
-      typeSelect.value = row.type === "anime" ? "anime" : row.type === "show" || row.type === "episode" ? "show" : "movie";
-      bar.appendChild(typeSelect);
+      typeField.append(typeLabel, typeSegment);
+      bar.appendChild(typeField);
 
       pop.appendChild(bar);
+
+      const footer = document.createElement("div");
+      footer.className = "cw-meta-search-footer";
+
+      const status = document.createElement("div");
+      status.className = "cw-search-status";
+      footer.appendChild(status);
 
       const actions = document.createElement("div");
       actions.className = "cw-pop-actions";
@@ -321,7 +132,7 @@
       const searchBtn = document.createElement("button");
       searchBtn.type = "button";
       searchBtn.className = "cw-pop-btn primary";
-      searchBtn.textContent = "Search";
+      searchBtn.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">search</span><span>Search</span>';
       actions.appendChild(searchBtn);
 
       const closeBtn = document.createElement("button");
@@ -331,15 +142,22 @@
       closeBtn.onclick = close;
       actions.appendChild(closeBtn);
 
-      pop.appendChild(actions);
-
-      const status = document.createElement("div");
-      status.className = "cw-search-status";
-      pop.appendChild(status);
+      footer.appendChild(actions);
+      pop.appendChild(footer);
 
       const resultsBox = document.createElement("div");
       resultsBox.className = "cw-search-results";
       pop.appendChild(resultsBox);
+
+      function syncTypeSegment() {
+        const selected = String(typeValue || "all");
+        typeSegment.querySelectorAll(".cw-meta-type-option").forEach(btn => {
+          const active = btn.dataset.value === selected;
+          btn.classList.toggle("active", active);
+          btn.setAttribute("aria-pressed", active ? "true" : "false");
+        });
+      }
+      syncTypeSegment();
 
       async function doSearch() {
         const q = (qInput.value || "").trim();
@@ -349,7 +167,7 @@
           resultsBox.innerHTML = "";
           return;
         }
-        const typ = String(typeSelect.value || "").toLowerCase();
+        const typ = String(typeValue || "").toLowerCase();
         const makeUrl = t => {
           let u = `/api/metadata/search?q=${encodeURIComponent(q)}&typ=${encodeURIComponent(t)}`;
           if (!Number.isNaN(yearVal)) u += `&year=${yearVal}`;
@@ -360,7 +178,7 @@
         resultsBox.innerHTML = "";
         try {
           let items = [];
-          if (typ === "anime") {
+          if (typ === "all") {
             const [showRes, movieRes] = await Promise.all([ctx.fetchJSON(makeUrl("show")), ctx.fetchJSON(makeUrl("movie"))]);
 
             const showOk = !!(showRes && showRes.ok !== false);
@@ -380,7 +198,7 @@
             const seen = new Set();
             items = items.filter(it => {
               const k = `${String(it.tmdb || "")}:${String(it.type || "")}`;
-              if (!k || seen.has(k)) return false;
+              if (seen.has(k)) return false;
               seen.add(k);
               return true;
             });
@@ -453,7 +271,7 @@
             if (item.year) bits.push(String(item.year));
             bits.push(item.type === "show" ? "TV" : "Movie");
             if (item.tmdb) bits.push(`TMDb ${item.tmdb}`);
-            meta.textContent = bits.join(" - ");
+            meta.textContent = bits.join(" • ");
             content.appendChild(meta);
 
             if (item.overview) {
@@ -478,11 +296,12 @@
                 refs.yearIn.value = row.year;
               }
 
-              const wantsAnime = String(typeSelect.value || "").toLowerCase() === "anime";
+              const selectedType = String(typeValue || "").toLowerCase();
+              const preserveAnime = String(row.type || "").toLowerCase() === "anime" && selectedType === "all";
               const pickedType = String(picked.type || "movie").toLowerCase();
 
-              const newType = wantsAnime ? "anime" : pickedType;
-              const resolveEntity = wantsAnime ? picked._resolve_entity || pickedType || "movie" : newType;
+              const newType = preserveAnime ? "anime" : pickedType;
+              const resolveEntity = picked._resolve_entity || newType;
 
               row.type = newType;
               row.raw.type = newType;
@@ -570,7 +389,7 @@
             resultsBox.appendChild(btn);
           });
 
-          status.textContent = `${items.length} result${items.length === 1 ? "" : "s"} found.`;
+          status.textContent = `${items.length} result${items.length === 1 ? "" : "s"} found`;
         } catch (err) {
           console.error("search failed", err);
           status.textContent = "Search failed.";
@@ -588,7 +407,7 @@
 
       if ((row.title || "").trim().length >= 3) doSearch();
       else status.textContent = "Enter a title and press Enter or Search.";
-    });
+    }, { closeOnOutside: false, trackAnchorOnScroll: true });
   }
 
   Editor.MetadataReplacer = {

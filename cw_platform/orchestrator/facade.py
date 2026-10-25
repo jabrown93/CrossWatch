@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from ._types import ConflictPolicy, InventoryOps
@@ -14,7 +14,13 @@ from ._state_store import StateStore
 from ._logging import Emitter
 from ._telemetry import Stats, maybe_emit_rate_warnings
 from ._pairs import run_pairs as _run_pairs
-from ._tombstones import prune as _tomb_prune
+from ._pairs_utils import release_ctx_from_providers as _release_ctx
+from ._tombstones import (
+    prune as _tomb_prune,
+    keys_for_feature as _tomb_keys_for_feature,
+    filter_with as _tomb_filter_with,
+    cascade_removals as _tomb_cascade,
+)
 from ._snapshots import (
     build_snapshots_for_feature as _build_snaps,
     allowed_providers_for_feature as _allowed_pf,
@@ -48,8 +54,10 @@ class Orchestrator:
 
     dry_run: bool = False
     only_feature: str | None = None
+    pair_scope_ids: Sequence[str] | None = None
     write_state_json: bool = True
     state_path: Path | None = None
+    interactive: Any = None
 
     files: StateStore | None = field(init=False, default=None)
     providers: dict[str, InventoryOps] = field(init=False, default_factory=dict)
@@ -123,7 +131,7 @@ class Orchestrator:
         from types import SimpleNamespace
 
         return SimpleNamespace(
-            config=self.cfg,
+            config={**self.cfg, "_cw_interactive_planned_at": self.interactive.planned_at} if self.interactive is not None else self.cfg,
             providers=self.providers,
             emit=self.emitter.emit,
             emit_info=self.emitter.info,
@@ -136,8 +144,10 @@ class Orchestrator:
             emit_rate_warnings=self.emit_rate_warnings,
             tomb_prune=self.prune_tombstones,
             only_feature=self.only_feature,
+            pair_scope_ids=list(self.pair_scope_ids or []),
             write_state_json=self.write_state_json,
             state_path=self.state_path,
+            interactive=self.interactive,
             snap_cache=self.snap_cache,
             snap_ttl_sec=self.snap_ttl_sec,
             apply_chunk_size=self.apply_chunk_size,
@@ -151,6 +161,7 @@ class Orchestrator:
         *,
         dry_run: bool = False,
         only_feature: str | None = None,
+        pair_scope_ids: Iterable[str] | None = None,
         write_state_json: bool = True,
         state_path: str | None = None,
         progress: Callable[[str], None] | bool | None = None,
@@ -158,6 +169,7 @@ class Orchestrator:
     ) -> dict[str, Any]:
         prev_cb = self.emitter.cb
         prev_on = self.on_progress
+        run_ctx: Any = None
         try:
             if progress is not None:
                 if callable(progress):
@@ -178,10 +190,17 @@ class Orchestrator:
 
             self.dry_run = bool(dry_run)
             self.only_feature = only_feature
+            self.pair_scope_ids = tuple(str(x).strip() for x in (pair_scope_ids or []) if str(x).strip()) or None
             self.write_state_json = bool(write_state_json)
             self.state_path = Path(state_path) if state_path else None
 
-            summary = _run_pairs(self.context)
+            run_ctx = self.context
+            from ..interactive_reads import use_review_reads
+            with use_review_reads(getattr(self.interactive, "reads", None), collecting=getattr(self.interactive, "collecting", False)):
+                summary = _run_pairs(run_ctx)
+
+            if self.interactive is not None and self.interactive.preview:
+                return summary
 
 
             if self.write_state_json:
@@ -219,6 +238,9 @@ class Orchestrator:
         finally:
             self.emitter.cb = prev_cb
             self.on_progress = prev_on
+            if run_ctx is not None:
+                _release_ctx(run_ctx)
+            self.snap_cache.clear()
 
     def run_pairs(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return self.run(*args, **kwargs)
@@ -232,6 +254,17 @@ class Orchestrator:
         state_path: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        pair_id = str((pair or {}).get("id") or (pair or {}).get("pair_id") or "").strip()
+        if pair_id:
+            only_feat = (pair or {}).get("feature")
+            return self.run(
+                dry_run=dry_run,
+                only_feature=only_feat,
+                pair_scope_ids=[pair_id],
+                write_state_json=write_state_json,
+                state_path=state_path,
+                **kwargs,
+            )
         saved = self.cfg
         try:
             cfg_copy = dict(saved)
@@ -368,7 +401,7 @@ class Orchestrator:
                 continue
             fmap = p.get("features") or {}
             
-            for name in ("watchlist", "ratings", "history", "progress", "playlists"):
+            for name in ("watchlist", "ratings", "history", "progress", "playlists", "collection"):
                 v = fmap.get(name)
                 if isinstance(v, bool):
                     if v:
@@ -415,7 +448,10 @@ class Orchestrator:
             except Exception:
                 snaps = {}
             for prov, idx in (snaps or {}).items():
-                items_min = {k: minimal(v) for k, v in (idx or {}).items()}
+                if str(feat).lower() == "collection":
+                    items_min = {k: dict(v) for k, v in (idx or {}).items() if isinstance(v, Mapping)}
+                else:
+                    items_min = {k: minimal(v) for k, v in (idx or {}).items()}
                 prov_name = str(prov).upper()
                 feat_name = str(feat).lower()
                 touched.add(prov_name)
@@ -431,7 +467,7 @@ class Orchestrator:
             self.state_store.set_last_sync_epoch(last_sync_epoch)
         self.dbg(
             "state.persisted",
-            providers=len(touched),
+            saved_state_providers=len(touched),
             wall=0,
         )
         return {"providers": {name: {} for name in sorted(touched)}, "last_sync_epoch": last_sync_epoch}
@@ -470,6 +506,13 @@ class Orchestrator:
         seen: set[str] = set()
         uniq: list[dict[str, Any]] = []
 
+        try:
+            from ..id_map import canonical_key  # type: ignore[no-redef]
+        except Exception:
+            def canonical_key(item: _MappingType[str, Any]) -> str:  # type: ignore[no-redef]
+                ids = item.get("ids", {})
+                return str(ids.get("imdb") or "")
+
         for it in wall:
             k = canonical_key(it)
             if k in seen:
@@ -485,7 +528,7 @@ class Orchestrator:
         self.state_store.set_last_sync_epoch(last_sync_epoch)
         self.dbg(
             "state.persisted",
-            providers=len(providers),
+            saved_state_providers=len(providers),
             wall=len(uniq),
         )
         return state

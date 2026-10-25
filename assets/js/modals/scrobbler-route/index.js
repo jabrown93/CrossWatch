@@ -1,9 +1,10 @@
 /* CrossWatch - Scrobbler Route Modal */
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const label = (v) => ({ plex: "Plex", jellyfin: "Jellyfin", emby: "Emby", kodi: "Kodi", trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", crosswatch: "CrossWatch", floppy: "Floppy", punchplay: "PunchPlay", scrob: "Scrob" }[String(v || "").toLowerCase()] || String(v || "").toUpperCase());
-const sources = ["plex", "jellyfin", "emby", "kodi", "scrob"];
-const sinks = ["crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "scrob"];
-const ratingSinks = ["crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "scrob"];
+const label = (v) => ({ plex: "Plex", jellyfin: "Jellyfin", emby: "Emby", kodi: "Kodi", trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", crosswatch: "CrossWatch", floppy: "Floppy", punchplay: "PunchPlay", bingebase: "BingeBase", flicklist: "FlickList", wetrakr: "WeTrakr", anilist: "AniList", myanimelist: "MyAnimeList", kitsu: "Kitsu", scrob: "Scrob", stremio: "Stremio" }[String(v || "").toLowerCase()] || String(v || "").toUpperCase());
+const sources = ["plex", "jellyfin", "emby", "kodi", "scrob", "stremio"];
+const sinks = ["myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob"];
+const ratingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob"];
+const mediaSinks = ["plex", "jellyfin", "emby", "kodi"];
 
 function flashCopied(btn) {
   if (!btn) return;
@@ -33,6 +34,7 @@ let clickHandler = null;
 let changeHandler = null;
 let userProfiles = [];
 let selectedUserProfileId = "";
+const destinationLibraries = new Map();
 
 function detachHandlers() {
   if (boundRoot?.__cwScrobblerRouteAbort) {
@@ -89,9 +91,9 @@ function allSourceProfiles(provider) {
   return (group?.profiles || []).filter((x) => x.eligible);
 }
 
-function allSinkProfiles(sink) {
+function allSinkProfiles(sink, source = draft?.provider || "", instance = draft?.provider_instance || "default") {
   const group = (props.overview?.destination_availability || []).find((x) => x.provider === sink);
-  return (group?.profiles || []).filter((x) => x.configured);
+  return (group?.profiles || []).filter((x) => x.configured && !(sink === source && normInst(x.instance) === normInst(instance)));
 }
 
 function sourceProviders(selected = "") {
@@ -100,11 +102,11 @@ function sourceProviders(selected = "") {
   return current && sources.includes(current) && !available.includes(current) ? [current, ...available] : available;
 }
 
-function sinkProviders(selected = "", source = "") {
+function sinkProviders(selected = "", source = "", instance = draft?.provider_instance || "default") {
   const self = String(source || "").toLowerCase();
-  const available = sinks.filter((p) => p !== self && allSinkProfiles(p).length);
+  const available = sinks.filter((p) => allSinkProfiles(p, self, instance).length);
   const current = String(selected || "").toLowerCase();
-  if (current === self) return available;
+  if (current === self && !allSinkProfiles(current, self, instance).length) return available;
   return current && sinks.includes(current) && !available.includes(current) ? [current, ...available] : available;
 }
 
@@ -113,6 +115,10 @@ function ratingSinkProviders(selected = [], source = "") {
   const available = sinkProviders("", self).filter((x) => ratingSinks.includes(x));
   const selectedList = [...selected].map((x) => String(x || "").toLowerCase()).filter((x) => ratingSinks.includes(x) && x !== self);
   return [...selectedList.filter((x) => !available.includes(x)), ...available];
+}
+
+function globalAnimeMappingEnabled() {
+  return !!props.overview?.source_state?.global_anime_mapping_enabled;
 }
 
 function nextId() {
@@ -124,14 +130,15 @@ function nextId() {
 
 function defaultRoute() {
   const srcProvider = sourceProviders()[0] || "";
-  const sink = sinkProviders("", srcProvider)[0] || "";
+  const srcInstance = allSourceProfiles(srcProvider)[0]?.instance || "";
+  const sink = sinkProviders("", srcProvider, srcInstance)[0] || "";
   return {
     id: nextId(),
     enabled: true,
     provider: srcProvider,
-    provider_instance: allSourceProfiles(srcProvider)[0]?.instance || "",
+    provider_instance: srcInstance,
     sink,
-    sink_instance: allSinkProfiles(sink)[0]?.instance || "",
+    sink_instance: allSinkProfiles(sink, srcProvider, srcInstance)[0]?.instance || "",
     filters: {},
     options: { auto_remove_watchlist: "inherit", ratings: { mode: "off", targets: [] }, scrobble: {}, watch: {} },
   };
@@ -149,7 +156,8 @@ function ensureDraft() {
 }
 
 function optionsForProfiles(provider, selected, kind) {
-  const list = kind === "source" ? allSourceProfiles(provider) : allSinkProfiles(provider);
+  const list = (kind === "source" ? allSourceProfiles(provider) : allSinkProfiles(provider))
+    .sort((a, b) => profileOptionLabel(a).localeCompare(profileOptionLabel(b), undefined, { sensitivity: "base", numeric: true }));
   const current = String(selected || "");
   const selectedExists = list.some((p) => p.instance === current);
   const missing = current && !selectedExists ? `<option value="${esc(current)}" selected disabled>${esc(profileLabel(provider, current, kind))} (not configured)</option>` : "";
@@ -159,7 +167,8 @@ function optionsForProfiles(provider, selected, kind) {
 
 function optionsForProviders(kind, selected, source = "") {
   const current = String(selected || "").toLowerCase();
-  const list = kind === "source" ? sourceProviders(current) : sinkProviders(current, source);
+  const list = (kind === "source" ? sourceProviders(current) : sinkProviders(current, source))
+    .sort((a, b) => label(a).localeCompare(label(b), undefined, { sensitivity: "base", numeric: true }));
   const configured = kind === "source" ? allSourceProfiles : allSinkProfiles;
   const empty = kind === "source" ? "No configured source provider" : "No configured destination provider";
   if (!list.length) return `<option value="">${empty}</option>`;
@@ -187,39 +196,27 @@ function profileName(instance) {
 }
 
 function userProfileField() {
-  if (!userProfiles.length) return "";
   const current = String(selectedUserProfileId || draft?.profile_id || "");
-  const options = userProfiles.map((p) => `<option value="${esc(p.id)}" ${p.id === current ? "selected" : ""}>${esc(p.label)}</option>`).join("");
-  return `<div class="scrm-profile-row">${fieldIcon("person", "Assigned profile", `<select class="input" id="scr-user-profile"><option value="">Unassigned</option>${options}</select>`)}</div>`;
+  if (!current) return "";
+  const profile = userProfiles.find((p) => p.id === current);
+  if (!profile || !profileCanOwnRoute(profile, draft || {})) return "";
+  return `<div class="scrm-profile-row">${fieldIcon("account_circle", "Assigned profile", `<div class="scrm-profile-display" aria-label="Assigned user profile"><span>${esc(profile.label)}</span></div>`)}</div>`;
 }
 
-function assignedInstance(profile, provider, kind) {
+function profileInstanceValues(profile, provider) {
   const key = String(provider || "").toUpperCase();
   const raw = profile?.instances?.[key];
-  const values = (Array.isArray(raw) ? raw : [raw]).map((x) => String(x || "").trim()).filter(Boolean);
-  if (!values.length) return "";
-  const configured = (kind === "source" ? allSourceProfiles(provider) : allSinkProfiles(provider)).map((p) => String(p.instance || ""));
-  return values.find((value) => configured.includes(value)) || "";
+  return (Array.isArray(raw) ? raw : [raw]).map((x) => String(x || "").trim()).filter(Boolean);
 }
 
-function applyUserProfile(profileId) {
-  const profile = userProfiles.find((row) => row.id === String(profileId || ""));
-  draft.profile_id = profile ? String(profile.id || "") : "";
-  if (!profile) return false;
-  const srcChoices = sources.filter((provider) => assignedInstance(profile, provider, "source"));
-  const sinkChoices = sinks.filter((provider) => provider !== draft.provider && assignedInstance(profile, provider, "sink"));
-  if (srcChoices.length) {
-    draft.provider = srcChoices.includes(draft.provider) ? draft.provider : srcChoices[0];
-    draft.provider_instance = assignedInstance(profile, draft.provider, "source") || draft.provider_instance;
-  }
-  if (draft.sink === draft.provider) draft.sink = "";
-  const nextSinkChoices = sinks.filter((provider) => provider !== draft.provider && assignedInstance(profile, provider, "sink"));
-  const choices = nextSinkChoices.length ? nextSinkChoices : sinkChoices;
-  if (choices.length) {
-    draft.sink = choices.includes(draft.sink) ? draft.sink : choices[0];
-    draft.sink_instance = assignedInstance(profile, draft.sink, "sink") || draft.sink_instance;
-  }
-  return true;
+function profileCanOwnRoute(profile, route) {
+  if (!profile || !route) return false;
+  const src = String(route.provider || "");
+  const sink = String(route.sink || "");
+  const srcInst = String(route.provider_instance || "default").trim() || "default";
+  const sinkInst = String(route.sink_instance || "default").trim() || "default";
+  if (!src || !sink) return false;
+  return profileInstanceValues(profile, src).includes(srcInst) && profileInstanceValues(profile, sink).includes(sinkInst);
 }
 
 function normInst(v) {
@@ -246,6 +243,32 @@ function providerIcon(provider) {
 
 function providerClass(provider) {
   return `provider-${esc(String(provider || "").toLowerCase())}`;
+}
+
+function cssUrl(value) {
+  return String(value || "").replace(/['"\\\n\r\f]/g, "");
+}
+
+function cssRgb(value, fallback = "95,141,255") {
+  const rgb = String(value || "").trim();
+  return /^(?:\d{1,3}\s*,\s*){2}\d{1,3}$/.test(rgb) ? rgb : fallback;
+}
+
+function providerRgb(provider) {
+  return cssRgb(window.CW?.ProviderMeta?.tone?.(provider)?.rgb);
+}
+
+function providerCardAttrs(provider) {
+  const src = cssUrl(logo(provider));
+  const styles = [`--scrm-provider-rgb:${providerRgb(provider)}`];
+  if (src) styles.push(`--scrm-provider-watermark:url('${esc(src)}')`);
+  const style = ` style="${styles.join(";")}"`;
+  return `class="scrm-provider-card ${providerClass(provider)}"${style}`;
+}
+
+function modalAttrs(provider) {
+  const rgb = providerRgb(provider);
+  return `class="cx-card scrm-modal ${providerClass(provider)}" style="--scrm-c1:${rgb};--scrm-c2:${rgb}"`;
 }
 
 function routeTitle(r) {
@@ -353,19 +376,19 @@ function routePanel(r) {
       </div>
       ${userProfileField()}
       <div class="scrm-route-grid">
-        <div class="scrm-provider-card ${providerClass(r.provider)}">
+        <div ${providerCardAttrs(r.provider)}>
           <div class="scrm-card-head"><span class="scrm-provider-mark">${providerIcon(r.provider)}</span><div><strong>Source</strong><small>${esc(label(r.provider))}</small></div></div>
           <div class="scrm-fields">
             ${fieldIcon("dns", "Provider", `<select class="input" id="scr-provider">${optionsForProviders("source", r.provider)}</select>`)}
-            ${fieldIcon("person", "Profile", `<select class="input" id="scr-provider-instance">${optionsForProfiles(r.provider, r.provider_instance, "source")}</select>`)}
+            ${fieldIcon("badge", "Profile", `<select class="input" id="scr-provider-instance">${optionsForProfiles(r.provider, r.provider_instance, "source")}</select>`)}
           </div>
         </div>
         <div class="scrm-route-arrow"><span class="material-symbols-rounded">arrow_forward</span></div>
-        <div class="scrm-provider-card ${providerClass(r.sink)}">
+        <div ${providerCardAttrs(r.sink)}>
           <div class="scrm-card-head"><span class="scrm-provider-mark">${providerIcon(r.sink)}</span><div><strong>Destination</strong><small>${esc(label(r.sink))}</small></div></div>
           <div class="scrm-fields">
             ${fieldIcon("gps_fixed", "Provider", `<select class="input" id="scr-sink">${optionsForProviders("sink", r.sink, r.provider)}</select>`)}
-            ${fieldIcon("person", "Profile", `<select class="input" id="scr-sink-instance">${optionsForProfiles(r.sink, r.sink_instance, "sink")}</select>`)}
+            ${fieldIcon("badge", "Profile", `<select class="input" id="scr-sink-instance">${optionsForProfiles(r.sink, r.sink_instance, "sink")}</select>`)}
           </div>
         </div>
       </div>
@@ -405,30 +428,107 @@ function filterRow(o) {
 
 function filtersPanel(r, f) {
   const isPlex = r.provider === "plex";
-  const rows = [filterRow({ title: "Username whitelist", subtitle: "Only events from these usernames will be scrobbled.", id: "scr-users", value: listText(f.username_whitelist), placeholder: "One username per line", addLabel: "username", actionAttr: "data-pick-user", actionIcon: "person_search", actionTitle: "Find users" })];
+  const isStremio = r.provider === "stremio";
+  const rows = isStremio ? [] : [filterRow({ title: "Username whitelist", subtitle: "Only events from these usernames will be scrobbled.", id: "scr-users", value: listText(f.username_whitelist), placeholder: "One username per line", addLabel: "username", actionAttr: "data-pick-user", actionIcon: "person_search", actionTitle: "Find users" })];
   if (isPlex) {
     rows.push(filterRow({ title: "Server UUID allowlist", subtitle: "Control which servers are allowed.", id: "scr-allow", value: listText(f.server_uuid_whitelist || (f.server_uuid ? [f.server_uuid] : [])), placeholder: "One server UUID per line", dot: "scrm-dot-allow", addLabel: "server UUID", actionAttr: `data-fetch-uuid="scr-allow"`, actionIcon: "search", actionTitle: "Fetch server UUID" }));
     rows.push(filterRow({ title: "Server UUID blocklist", subtitle: "Control which servers are blocked.", id: "scr-block", value: listText(f.server_uuid_blacklist), placeholder: "One server UUID per line", dot: "scrm-dot-block", addLabel: "server UUID", actionAttr: `data-fetch-uuid="scr-block"`, actionIcon: "search", actionTitle: "Fetch server UUID" }));
   }
-  const toggle = isPlex
-    ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">live_tv</span><span><strong>Ignore Plex Live TV &amp; DVR</strong><small>Skip scrobbles from live channels and DVR recordings.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-live" ${f.ignore_live_tv_dvr ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`
-    : "";
+  if (!isStremio) rows.push(filterRow({ title: "Ignored path prefixes", subtitle: "Skip media files under these placeholder folders.", id: "scr-ignore-paths", value: listText(f.ignored_path_prefixes), placeholder: "One path prefix per line", dot: "scrm-dot-block", addLabel: "path" }));
+  if (!isStremio) rows.push(filterRow({ title: "Ignored filename patterns", subtitle: "Skip media files whose filename contains these values.", id: "scr-ignore-patterns", value: listText(f.ignored_filename_patterns), placeholder: "{edition-Trailer}", dot: "scrm-dot-block", addLabel: "pattern" }));
+  if (!isStremio) rows.push(filterRow({ title: "Ignored editions", subtitle: "Skip media with these edition names.", id: "scr-ignore-editions", value: listText(f.ignored_editions), placeholder: "Trailer", dot: "scrm-dot-block", addLabel: "edition" }));
+  const toggles = [
+    isStremio ? "" : `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">movie_filter</span><span><strong>Ignore Agregarr placeholder trailers</strong><small>Skip files marked as Trailer editions or stored beside .comingsoon markers.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-ignore-agregarr" ${f.ignore_agregarr_trailers ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`,
+    `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">star</span><span><strong>Ignore specials (Season 0)</strong><small>Skip scrobbles for Season 0 / specials episodes.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-ignore-specials" ${f.ignore_specials ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`,
+  ];
+  if (isPlex) toggles.push(`<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">live_tv</span><span><strong>Ignore Plex Live TV &amp; DVR</strong><small>Skip scrobbles from live channels and DVR recordings.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-live" ${f.ignore_live_tv_dvr ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`);
   return `
     <section class="scrm-panel ${activeTab === "filters" ? "active" : ""}" data-panel="filters">
       <div class="scrm-journey scrm-journey-compact">
         <span class="material-symbols-rounded scrm-journey-icon">filter_alt</span>
-        <div><strong>Only scrobble the activity you want</strong><p>Leave filters empty to accept every matching event from this source profile.</p></div>
+        <div><strong>Only scrobble the activity you want</strong><p>${isStremio ? "The Stremio add-on reports one account, so there is no user filter." : "Leave filters empty to accept every matching event from this source profile."}</p></div>
         ${journeyHelp("scrobbler-filters")}
       </div>
       <div class="scrm-filter-rows">${rows.join("")}</div>
-      ${toggle}
+      ${toggles.join("")}
     </section>
   `;
 }
 
+function destinationKey(sink, instance) {
+  return `${String(sink || "").toLowerCase()}|${normInst(instance)}`;
+}
+
+function librariesPanel(r) {
+  if (!mediaSinks.includes(r.sink)) return "";
+  const dest = r.options.destination || {};
+  return `
+    <section class="scrm-panel ${activeTab === "libraries" ? "active" : ""}" data-panel="libraries">
+      <div class="scrm-journey scrm-journey-compact">
+        <span class="material-symbols-rounded scrm-journey-icon">video_library</span>
+        <div><strong>${esc(label(r.sink))} libraries</strong><p>Only update items in the selected libraries. Leave empty to use the Whitelist libraries of ${esc(label(r.sink))} connection.</p></div>
+      </div>
+      <div id="scr-destination-libraries"></div>
+      <label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">library_add_check</span><span><strong>Update all copies</strong><small>When the same title exists more than once, for example in a regular and a 4K library, update every copy instead of skipping.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-update-all-copies" ${dest.update_all_copies === false ? "" : "checked"}><span class="scrm-switch-track"></span></span></label>
+    </section>
+  `;
+}
+
+async function fetchDestinationLibraries(sink, instance) {
+  try {
+    const res = await fetch(`/api/${encodeURIComponent(sink)}/libraries?instance=${encodeURIComponent(instance || "default")}`, { cache: "no-store", credentials: "same-origin" });
+    const data = res.ok ? await res.json() : {};
+    return Array.isArray(data?.libraries) ? data.libraries : [];
+  } catch {
+    return [];
+  }
+}
+
+function mountDestinationTable() {
+  const host = root?.querySelector("#scr-destination-libraries");
+  const r = ensureDraft();
+  if (!host || !window.cwWhitelistTable || !mediaSinks.includes(r.sink)) return;
+  const key = destinationKey(r.sink, r.sink_instance);
+  const selected = () => new Set((ensureDraft().options.destination?.libraries || []).map(String));
+  window.cwWhitelistTable.mount({
+    host,
+    features: [{ key: "scr", label: "Scrobble", icon: "sensors", title: "Scrobbles from this route only update the selected libraries." }],
+    note: "Empty = use the connection History and Progress libraries.",
+    getLibs: () => destinationLibraries.get(key) || [],
+    isOn: (_feature, id) => selected().has(String(id)),
+    selectedIds: () => [...selected()],
+    setOn: (_feature, id, on) => {
+      const next = selected();
+      if (on) next.add(String(id));
+      else next.delete(String(id));
+      const current = ensureDraft();
+      current.options.destination = { ...(current.options.destination || {}), libraries: [...next] };
+    },
+    load: async () => { destinationLibraries.set(key, await fetchDestinationLibraries(r.sink, r.sink_instance)); },
+  });
+}
+
+function anilistMappingHint(animeGlobalOn) {
+  return animeGlobalOn
+    ? `<div class="scrm-journey scrm-journey-compact"><span class="material-symbols-rounded scrm-journey-icon">animation</span><div><strong>AniList uses Anime ID Mapping</strong><p>Only watched stops update AniList progress. Titles the anime mapping cannot place are skipped.</p></div></div>`
+    : `<div class="scrm-journey scrm-journey-compact"><span class="material-symbols-rounded scrm-journey-icon">warning</span><div><strong>AniList needs Anime ID Mapping</strong><p>Enable global Anime ID Mapping first. Without it nothing is sent to AniList.</p></div></div>`;
+}
+
 function optionsPanel(r) {
+  const unresolvedFallback = r.provider === "plex"
+    ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">person_alert</span><span><strong>Unresolved user fallback</strong><small>Use the configured Plex username when Plex omits the playback user and the session cannot be resolved.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-unresolved-user-fallback" ${r.options.watch?.unresolved_user_fallback ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`
+    : "";
+  const pkcSupport = r.provider === "plex"
+    ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">connected_tv</span><span><strong>PlexKodiConnect support</strong><small>Merge the split stop sessions PlexKodiConnect creates for the server owner, so the stop keeps its user and item.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-plexkodiconnect-support" ${r.options.watch?.plexkodiconnect_support === true ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`
+    : "";
+  const animeGlobalOn = globalAnimeMappingEnabled();
+  const animeMapping = ["crosswatch", "simkl"].includes(r.sink)
+    ? `<label class="scrm-toggle-row ${animeGlobalOn ? "" : "is-disabled"}"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">animation</span><span><strong>Anime ID Mapping</strong><small>${animeGlobalOn ? "Use local anime mappings for this route before sending watcher scrobbles." : "Enable global Anime ID Mapping first."}</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-anime-mapping" ${r.options.watch?.anime_mapping ? "checked" : ""} ${animeGlobalOn ? "" : "disabled"}><span class="scrm-switch-track"></span></span></label>`
+    : "";
+  const anilistHint = r.sink === "anilist" ? anilistMappingHint(animeGlobalOn) : "";
   return `
     <section class="scrm-panel ${activeTab === "options" ? "active" : ""}" data-panel="options">
+      ${anilistHint}
       <div class="scrm-journey scrm-journey-compact">
         <span class="material-symbols-rounded scrm-journey-icon">tune</span>
         <div><strong>Route-level behavior</strong><p>These settings apply to this route and override the global defaults.<br><b>Leave them at their defaults unless you know what you are doing.</b></p></div>
@@ -440,7 +540,13 @@ function optionsPanel(r) {
         ${field("Progress step (%)", `<input class="input" id="scr-progress-step" type="number" min="1" max="25" value="${esc(r.options.scrobble?.progress_step ?? "")}" placeholder="Global">`, "", "Minimum progress change required before sending another watching update. Leave this at the default, as it significantly affects API usage.")}
         ${field("Pause debounce (s)", `<input class="input" id="scr-watch-pause" type="number" min="0" max="3600" value="${esc(r.options.watch?.pause_debounce_seconds ?? "")}" placeholder="Global">`, "", "Seconds to ignore tiny pause/start flaps just after playback starts for this route.")}
         ${field("Suppress start (%)", `<input class="input" id="scr-watch-suppress" type="number" min="0" max="100" value="${esc(r.options.watch?.suppress_start_at ?? "")}" placeholder="Global">`, "", "Ignore new start events at or above this progress for this route.")}
+        ${["emby", "jellyfin", "kodi", "scrob"].includes(r.provider) ? field("Poll interval (s)", `<input class="input" id="scr-watch-poll" type="number" min="5" max="60" value="${esc(r.options.watch?.poll_seconds ?? "")}" placeholder="10">`, "", "Seconds between playback checks while something is playing, from 5 to 60. Higher values lower the load but delay pause and stop detection. Routes sharing this source use the lowest value set.") : ""}
+        ${["emby", "jellyfin", "kodi", "scrob"].includes(r.provider) ? field("Idle poll interval (s)", `<input class="input" id="scr-watch-idle-poll" type="number" min="5" max="120" value="${esc(r.options.watch?.idle_poll_seconds ?? "")}" placeholder="30">`, "", "Seconds between checks while nothing is playing, from 5 to 120. This decides how quickly a new playback is noticed. It never drops below the poll interval. Routes sharing this source use the lowest value set.") : ""}
       </div>
+      ${unresolvedFallback}
+      ${pkcSupport}
+      ${animeMapping}
+      ${r.sink === "simkl" ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">replay</span><span><strong>Track rewatches</strong><small>Allow repeat watches on this route. Requires SIMKL Pro or VIP. SIMKL applies a 48-hour gap per movie or episode. Your watched threshold still applies, with a minimum of 80%.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-simkl-rewatches" ${r.options.watch?.simkl_rewatches === true ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>` : ""}
     </section>
   `;
 }
@@ -452,7 +558,8 @@ function globalRatingTargets() {
 
 function ratingsPanel(r, ratings, ratingTargets) {
   if (r.provider !== "plex") return "";
-  const ratingSinkList = ratingSinkProviders(ratingTargets, r.provider);
+  const ratingSinkList = ratingSinkProviders(ratingTargets, r.provider)
+    .sort((a, b) => label(a).localeCompare(label(b), undefined, { sensitivity: "base", numeric: true }));
   const isOff = ratings.mode !== "custom";
   const globalTargets = globalRatingTargets();
   const globalWarn = globalTargets.length
@@ -484,9 +591,18 @@ function ratingsPanel(r, ratings, ratingTargets) {
   `;
 }
 
+function enableSelectedUnavailableRatingTargets() {
+  root?.querySelectorAll(".scrm-target.is-disabled input[data-rating-target]:checked").forEach((input) => {
+    input.disabled = false;
+    const target = input.closest(".scrm-target");
+    target?.classList.remove("is-disabled");
+    target?.classList.add("is-unconfigured");
+  });
+}
+
 function normalizeActiveTab(tab = activeTab) {
   const next = String(tab || "route");
-  return ["route", "filters", "options", "ratings"].includes(next) ? next : "route";
+  return ["route", "filters", "options", "libraries", "ratings"].includes(next) ? next : "route";
 }
 
 function currentActiveTab() {
@@ -524,12 +640,13 @@ function render(errors = []) {
   activeTab = normalizeActiveTab(root?.dataset.scrmTab || activeTab);
   const r = ensureDraft();
   if (r.provider !== "plex" && activeTab === "ratings") activeTab = "route";
+  if (!mediaSinks.includes(r.sink) && activeTab === "libraries") activeTab = "route";
   const f = r.filters || {};
   const ratings = r.options?.ratings || {};
   const ratingTargets = new Set(ratings.targets || []);
   const dup = props.mode !== "delete" && duplicateRoute(r);
   root.innerHTML = `
-    <div class="cx-card scrm-modal ${providerClass(r.provider)}">
+    <div ${modalAttrs(r.provider)}>
       <div class="cx-head scrm-head">
         <span class="scrm-head-logo">${providerIcon(r.provider)}</span>
         <div class="scrm-head-copy"><strong>${esc(routeTitle(r))}</strong><span>${esc(label(r.provider))} ${esc(profileLabel(r.provider, r.provider_instance, "source"))} to ${esc(label(r.sink))} ${esc(profileLabel(r.sink, r.sink_instance, "sink"))}</span></div>
@@ -539,14 +656,16 @@ function render(errors = []) {
         <div class="scrm-panel-shell" data-scrm-provider="${esc(r.provider)}">
           <nav class="cw-subtiles scrm-nav" aria-label="Route sections">
             ${navButton("route", "route", "Route", "Source and destination")}
-            ${navButton("filters", "filter_alt", "Filters", "Users and server IDs")}
+            ${navButton("filters", "filter_alt", "Filters", "Users and media")}
             ${navButton("options", "tune", "Options", "Watchlist and thresholds")}
+            ${mediaSinks.includes(r.sink) ? navButton("libraries", "video_library", "Libraries", "Destination scope") : ""}
             ${r.provider === "plex" ? navButton("ratings", "star", "Ratings", "Plex webhook") : ""}
           </nav>
           <div class="scrm-content">
             ${routePanel(r)}
             ${filtersPanel(r, f)}
             ${optionsPanel(r)}
+            ${librariesPanel(r)}
             ${ratingsPanel(r, ratings, ratingTargets)}
           </div>
           <div class="cw-connection-modal-footer scrm-footer">
@@ -562,6 +681,8 @@ function render(errors = []) {
     </div>
   `;
   ensureVisiblePanel();
+  enableSelectedUnavailableRatingTargets();
+  mountDestinationTable();
 }
 
 function collect() {
@@ -576,6 +697,11 @@ function collect() {
     server_uuid: allow[0] || "",
     server_uuid_whitelist: allow,
     server_uuid_blacklist: split(root.querySelector("#scr-block")?.value),
+    ignore_agregarr_trailers: !!root.querySelector("#scr-ignore-agregarr")?.checked,
+    ignore_specials: !!root.querySelector("#scr-ignore-specials")?.checked,
+    ignored_path_prefixes: split(root.querySelector("#scr-ignore-paths")?.value),
+    ignored_filename_patterns: split(root.querySelector("#scr-ignore-patterns")?.value),
+    ignored_editions: split(root.querySelector("#scr-ignore-editions")?.value),
   };
   if (provider === "plex") filters.ignore_live_tv_dvr = !!root.querySelector("#scr-live")?.checked;
   const scrobble = {};
@@ -590,7 +716,22 @@ function collect() {
   const suppress = root.querySelector("#scr-watch-suppress")?.value;
   if (pause !== "") watch.pause_debounce_seconds = Number(pause);
   if (suppress !== "") watch.suppress_start_at = Number(suppress);
+  const poll = root.querySelector("#scr-watch-poll")?.value ?? "";
+  if (poll !== "") watch.poll_seconds = Number(poll);
+  const idlePoll = root.querySelector("#scr-watch-idle-poll")?.value ?? "";
+  if (idlePoll !== "") watch.idle_poll_seconds = Number(idlePoll);
+  if (provider === "plex") watch.unresolved_user_fallback = !!root.querySelector("#scr-unresolved-user-fallback")?.checked;
+  if (provider === "plex") watch.plexkodiconnect_support = !!root.querySelector("#scr-plexkodiconnect-support")?.checked;
+  if (["crosswatch", "simkl"].includes(String(root.querySelector("#scr-sink")?.value || draft.sink || "").toLowerCase())) watch.anime_mapping = !!root.querySelector("#scr-anime-mapping")?.checked;
+  if (String(root.querySelector("#scr-sink")?.value || draft.sink || "").toLowerCase() === "simkl") watch.simkl_rewatches = !!root.querySelector("#scr-simkl-rewatches")?.checked;
   const ratingsMode = root.querySelector("#scr-ratings-mode")?.value || "off";
+  const sinkValue = String(sinkEl?.value || draft.sink || "").toLowerCase();
+  const previousDestination = draft?.options?.destination || {};
+  const copiesEl = root.querySelector("#scr-update-all-copies");
+  const destination = mediaSinks.includes(sinkValue) ? {
+    libraries: [...(previousDestination.libraries || [])],
+    update_all_copies: copiesEl ? !!copiesEl.checked : previousDestination.update_all_copies !== false,
+  } : null;
   return {
     id: draft.id,
     enabled: props.mode === "create" ? true : draft.enabled !== false,
@@ -598,12 +739,13 @@ function collect() {
     provider_instance: providerInstanceEl ? providerInstanceEl.value : draft.provider_instance || "",
     sink: sinkEl ? sinkEl.value : draft.sink || "",
     sink_instance: sinkInstanceEl ? sinkInstanceEl.value : draft.sink_instance || "",
-    profile_id: root.querySelector("#scr-user-profile")?.value || selectedUserProfileId || draft.profile_id || "",
+    profile_id: selectedUserProfileId || draft.profile_id || "",
     filters,
     options: {
       auto_remove_watchlist: root.querySelector("#scr-auto")?.value || "inherit",
       scrobble,
       watch,
+      ...(destination ? { destination } : {}),
       ratings: provider === "plex" ? {
         mode: ratingsMode,
         targets: [...root.querySelectorAll("[data-rating-target]:checked")].map((x) => x.dataset.ratingTarget),
@@ -621,6 +763,10 @@ function busy(flag) {
 async function save(regenerate = false) {
   if (saving) return;
   syncDraftFromDom();
+  if (draft.provider === draft.sink && normInst(draft.provider_instance) === normInst(draft.sink_instance)) {
+    render([{ message: "Source and destination must use different providers or profiles" }]);
+    return;
+  }
   if (duplicateRoute(ensureDraft())) {
     render();
     return;
@@ -715,6 +861,7 @@ export async function mount(shell, incoming = {}) {
   saving = false;
   confirmDelete = false;
   selectedUserProfileId = "";
+  destinationLibraries.clear();
   modalKey = String(props.mode === "create" ? "__new__" : (props.route?.id || "__new__"));
   activeTab = normalizeActiveTab("route");
   if (root) root.dataset.scrmTab = activeTab;
@@ -810,22 +957,18 @@ export async function mount(shell, incoming = {}) {
     }
     e.stopPropagation();
   };
+  const resetDestinationLibraries = (beforeKey) => {
+    if (destinationKey(draft.sink, draft.sink_instance) === beforeKey) return;
+    draft.options.destination = { ...(draft.options.destination || {}), libraries: [] };
+  };
   changeHandler = (e) => {
-    if (e.target.id === "scr-user-profile") {
-      const keepTab = currentActiveTab();
-      syncDraftFromDom();
-      const selected = String(e.target.value || "");
-      selectedUserProfileId = applyUserProfile(selected) ? selected : "";
-      render();
-      preserveVisiblePanel(keepTab);
-      return;
-    }
     if (["scr-provider", "scr-sink"].includes(e.target.id)) {
       const keepTab = currentActiveTab();
+      const beforeKey = destinationKey(ensureDraft().sink, ensureDraft().sink_instance);
       syncDraftFromDom();
       if (e.target.id === "scr-provider") {
         draft.provider_instance = allSourceProfiles(draft.provider)[0]?.instance || "";
-        if (draft.sink === draft.provider) draft.sink = sinkProviders("", draft.provider)[0] || "";
+        if (!allSinkProfiles(draft.sink).length) draft.sink = sinkProviders("", draft.provider)[0] || "";
         draft.sink_instance = allSinkProfiles(draft.sink)[0]?.instance || "";
         const keptTargets = (draft.options.ratings?.targets || []).filter((t) => t !== draft.provider);
         if (draft.options.ratings) draft.options.ratings.targets = keptTargets;
@@ -834,13 +977,20 @@ export async function mount(shell, incoming = {}) {
       if (e.target.id === "scr-sink") {
         draft.sink_instance = allSinkProfiles(draft.sink)[0]?.instance || "";
       }
+      resetDestinationLibraries(beforeKey);
       render();
       preserveVisiblePanel(keepTab);
       return;
     }
     if (["scr-provider-instance", "scr-sink-instance", "scr-ratings-mode"].includes(e.target.id)) {
       const keepTab = currentActiveTab();
+      const beforeKey = destinationKey(ensureDraft().sink, ensureDraft().sink_instance);
       syncDraftFromDom();
+      if (e.target.id === "scr-provider-instance" && draft.provider === draft.sink) {
+        if (!allSinkProfiles(draft.sink).length) draft.sink = sinkProviders("", draft.provider)[0] || "";
+        if (!allSinkProfiles(draft.sink).some((p) => normInst(p.instance) === normInst(draft.sink_instance))) draft.sink_instance = allSinkProfiles(draft.sink)[0]?.instance || "";
+      }
+      resetDestinationLibraries(beforeKey);
       render();
       preserveVisiblePanel(keepTab);
       return;

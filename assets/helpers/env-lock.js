@@ -14,7 +14,6 @@
     "app_auth.oidc.groups_claim": "CW_OIDC_GROUPS_CLAIM",
     "app_auth.oidc.allowed_groups": "CW_OIDC_ALLOWED_GROUPS",
     "app_auth.oidc.session_hours": "CW_OIDC_SESSION_HOURS",
-    "security.api_key": "CW_API_KEY",
   };
 
   const LOCKED_CLASS = "cw-env-locked";

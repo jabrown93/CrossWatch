@@ -1,0 +1,221 @@
+/* assets/js/modals/sync-topology/index.js */
+/* CrossWatch - Sync topology modal and findings */
+/* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
+
+import { connectionLabel, esc, featureName, findingConnections, mergeGraphs, nodeName, pairBadge, renderGraph, topologySummary } from "../../topology/graph.js";
+import { bindGraphViewport } from "../../topology/viewport.js";
+import { baselineCopy, saveBaseline } from "../../topology/baseline.js";
+
+const stateVersion = new URL(import.meta.url).searchParams.get("v") || window.__CW_VERSION__ || "";
+const { currentTopology } = await import(`../../topology/state.js?v=${encodeURIComponent(stateVersion)}`);
+
+const titles = { conflict: "Updates from multiple providers", loop: "Return route through additional pairs",
+  redundancy: "Potential redundant route", observation: "Consider simplifying your routes" };
+const icons = { conflict: "call_merge", loop: "sync", redundancy: "alt_route", observation: "lightbulb" };
+
+function findingCopy(finding, nodes) {
+  const paths = finding.paths;
+  const feature = featureName(finding.feature);
+  if (finding.reason === "two-way-sharing") return `${nodeName(nodes.get(finding.destination))} shares ${feature.toLowerCase()} with ${paths.length} providers through two-way pairs. Changes can travel in either direction. This is expected for these pairs.`;
+  if (finding.type === "conflict") return `${nodeName(nodes.get(finding.destination))} receives ${feature.toLowerCase()} updates from several providers. If they disagree about the same item, their updates may compete. Two-way pairs shown below also send changes back.`;
+  if (finding.type === "loop") return `${feature} can return to its starting provider through separately configured pairs, beyond a two-way pair's normal return path.`;
+  if (finding.type === "redundancy" && paths.length > 1) return `${feature} from ${nodeName(nodes.get(paths[0][0]))} can reach ${nodeName(nodes.get(paths[0].at(-1)))} through multiple paths.`;
+  if (finding.type === "redundancy") return `Multiple pairs carry ${feature.toLowerCase()} along the same route.`;
+  return `${feature} spans ${finding.nodes.length} provider instances. A central source may make these routes easier to maintain.`;
+}
+function findingAdvice(finding) {
+  if (finding.reason === "two-way-sharing") return ["ratings", "progress"].includes(finding.feature)
+    ? "Each linked provider can update these values. Different ratings or playback positions for the same item may compete. This note does not mean a conflict has occurred."
+    : "Two-way sync does not make the configured source authoritative. Keep these pairs if changes should flow both ways; use one-way pairs if only the source should send changes.";
+  if (finding.type === "conflict") return "Review which provider should supply this feature. This is a potential conflict, not evidence that values have been overwritten.";
+  if (finding.type === "loop") return "The example follows multiple pairs back to its starting provider. CrossWatch has safeguards, so this does not imply an infinite loop; the additional route may cause extra provider activity.";
+  if (finding.type === "redundancy") return "CrossWatch can process this configuration, but the additional route may cause unnecessary provider activity.";
+  return "This topology is valid. Keep the routes you need and consider consolidating pairs that serve the same purpose.";
+}
+
+let cleanup = null;
+export default {
+  mount(host, props = {}) {
+    cleanup?.();
+    host.classList.add("cw-topology-shell");
+    host.setAttribute("role", "dialog");
+    host.setAttribute("aria-modal", "true");
+    host.setAttribute("aria-labelledby", "topology-modal-title");
+    host.setAttribute("aria-describedby", "topology-modal-description");
+    let result = currentTopology(), selectedFeature = "all", selectedId = "", analyzedAt = new Date();
+    if (props.review && result.findings.length) {
+      selectedId = result.findings[0].id;
+      selectedFeature = result.findings[0].feature;
+    }
+    host.innerHTML = `<div class="topology-modal">
+      <header class="topology-modal-head"><span class="topology-heading-icon material-symbol" aria-hidden="true">share</span><div><h2 id="topology-modal-title">Sync topology</h2>
+        <p id="topology-modal-description">Visualize how media state moves between your connected providers.</p></div>
+        <button type="button" class="btn topology-close" aria-label="Close topology"><span class="material-symbol" aria-hidden="true">close</span></button></header>
+      <div class="topology-modal-body">
+        <div class="topology-content"><section class="topology-map" aria-label="Provider routes">
+          <div class="topology-map-heading"><div class="topology-map-context"><span class="material-symbol topology-context-icon" aria-hidden="true">stacks</span><span class="topology-map-label"></span><span class="topology-scope" hidden></span><button type="button" class="topology-clear" hidden>Clear highlight</button></div><div class="topology-features" role="group" aria-label="Synchronization feature"></div></div>
+          <div class="topology-graph" id="topology-graph" tabindex="0" role="region" aria-label="Synchronization topology graph" aria-describedby="topology-pan-hint"></div>
+          <div class="topology-map-footer"><div class="topology-legend"><span aria-label="One way" title="One way"><b aria-hidden="true">→</b><span class="topology-legend-label">One way</span></span><span aria-label="Two way" title="Two way"><b aria-hidden="true">↔</b><span class="topology-legend-label">Two way</span></span><span aria-label="Pair number" title="Pair number"><span class="topology-pair-badge" aria-hidden="true">#</span><span class="topology-legend-label">Pair number</span></span></div>
+          <div class="topology-zoom" role="group" aria-label="Graph zoom">
+            <button type="button" data-zoom="out" aria-label="Zoom out"><span class="material-symbol" aria-hidden="true">remove</span></button>
+            <input id="topology-zoom" type="range" min="50" max="250" step="10" value="100" aria-label="Topology zoom" aria-controls="topology-graph">
+            <button type="button" data-zoom="in" aria-label="Zoom in"><span class="material-symbol" aria-hidden="true">add</span></button>
+            <output for="topology-zoom">100%</output><button type="button" data-zoom="fit" aria-label="Reset zoom and fit graph">Fit</button>
+            <span class="topology-pan-hint" id="topology-pan-hint" hidden>Drag or use arrow keys to pan</span>
+          </div></div>
+          <details class="topology-route-details"><summary><span>Route details</span><small>Features and directions for each sync pair</small></summary><ul class="topology-route-list"></ul></details>
+        </section><section class="topology-findings" aria-labelledby="topology-findings-title"><div class="topology-findings-heading"><span class="topology-heading-icon material-symbol" aria-hidden="true">monitor_heart</span><div><h3 id="topology-findings-title">Findings &amp; notes</h3><p>Findings for the selected features. See Route details for the full route list.</p></div><span class="topology-finding-count" role="status"></span></div>
+          <div class="topology-health-stats" aria-label="Selected topology summary"></div>
+          <div class="topology-baseline">
+            <p class="topology-copy topology-baseline-status" role="status"></p>
+            <div class="topology-baseline-actions">
+              <button type="button" class="cw-page-button topology-acknowledge"><span class="material-symbol" aria-hidden="true">task_alt</span>Acknowledge current topology</button>
+              <button type="button" class="cw-page-button topology-reset"><span class="material-symbol" aria-hidden="true">restart_alt</span>Reset acknowledgement</button>
+            </div>
+            <details class="topology-accepted"><summary>Accepted findings</summary><ul></ul></details>
+          </div>
+          <div class="topology-finding-list"></div>
+          <div class="topology-analysis-footer"><span class="topology-analyzed-at"></span><button type="button" class="topology-refresh" aria-label="Reanalyze configured routes" title="Reanalyze configured routes"><span class="material-symbol" aria-hidden="true">refresh</span></button></div></section></div>
+        <p class="topology-footnote"><span class="material-symbol" aria-hidden="true">info</span>Analyzed locally from enabled pair features. Media filters, library scopes and sync safeguards can reduce actual overlap. No provider data is changed.</p>
+      </div></div>`;
+    const $ = selector => host.querySelector(selector);
+    $(".topology-close").addEventListener("click", () => window.cxCloseModal?.());
+    let displayedGraph = null, displayedFinding = null, saving = false, baselineError = "";
+    const viewport = bindGraphViewport($(".topology-graph"), $(".topology-zoom"));
+    let compactGraph = $(".topology-graph").clientWidth < 460;
+    const applyGraphAspect = () => {
+      const host = $(".topology-graph"), svg = host?.querySelector("svg");
+      const w = Number(svg?.getAttribute("width")), h = Number(svg?.getAttribute("height"));
+      if (!svg || !(w > 0) || !(h > 0)) host?.style.removeProperty("--topology-aspect");
+      else host.style.setProperty("--topology-aspect", `${w} / ${h}`);
+    };
+    const drawGraph = () => {
+      if (displayedGraph) $(".topology-graph").innerHTML = renderGraph(displayedGraph, displayedFinding, compactGraph);
+      applyGraphAspect();
+      viewport.update();
+    };
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      const compact = entry.contentRect.width < 460;
+      if (compact === compactGraph) return;
+      compactGraph = compact;
+      drawGraph();
+    });
+    resizeObserver.observe($(".topology-graph"));
+
+    function draw() {
+      const focused = document.activeElement;
+      const focusFeature = focused?.dataset?.feature;
+      const focusFinding = focused?.dataset?.finding;
+      const features = result.graphs.map(graph => graph.feature);
+      if (!features.includes(selectedFeature)) selectedFeature = "all";
+      const finding = result.findings.find(item => item.id === selectedId) || null;
+      if (!finding) selectedId = "";
+      const graph = mergeGraphs(result.graphs.filter(item => selectedFeature === "all" || item.feature === selectedFeature));
+      const nodes = new Map(graph.nodes.map(node => [node.id, node]));
+      const findings = result.findings.filter(item => selectedFeature === "all" || item.feature === selectedFeature);
+      $(".topology-features").innerHTML = ["all", ...features].map(feature => `<button type="button" data-feature="${esc(feature)}" aria-pressed="${feature === selectedFeature}">${feature === "all" ? "All" : esc(featureName(feature))}</button>`).join("");
+      $(".topology-map-context .topology-scope").textContent = result.profileLabel;
+      $(".topology-map-context .topology-scope").hidden = !result.profileLabel;
+      $(".topology-map-label").textContent = `${graph.nodes.length} provider ${graph.nodes.length === 1 ? "instance" : "instances"} · ${selectedFeature === "all" ? "All features" : featureName(selectedFeature)}`;
+      displayedGraph = graph;
+      displayedFinding = finding;
+      drawGraph();
+      $(".topology-clear").hidden = !finding;
+      $(".topology-route-list").innerHTML = graph.connections.map(connection => `<li>${pairBadge(connection)}<span>${esc(connectionLabel(connection, nodes))}<small>${connection.twoWay ? "Two-way pair" : "One-way pair"} · ${esc(connection.features.map(featureName).join(", "))}</small></span></li>`).join("");
+      const health = topologySummary(graph, findings, result.unsupportedPairs);
+      if (result.acknowledged) Object.assign(health, { status: "review", icon: "info", label: "Accepted" });
+      else if (result.baseline && ["healthy", "empty"].includes(health.status)) Object.assign(health, { status: "review", icon: "info", label: "Review" });
+      $(".topology-baseline").hidden = !result.baseline && !result.findings.some(item => !item.informational);
+      $(".topology-baseline-status").textContent = baselineError || [baselineCopy(result),
+        !result.baselineReady ? "Acknowledgement unavailable. Reanalyze to retry." : !result.acknowledged && selectedFeature !== "all" ? "Select All to acknowledge findings across all features in this scope." : ""
+      ].filter(Boolean).join(" ") || "Acceptance applies to all features in this scope. Analysis continues after acceptance.";
+      $(".topology-acknowledge").hidden = result.acknowledged || !result.findings.some(item => !item.informational);
+      $(".topology-acknowledge").disabled = saving || !result.baselineReady || selectedFeature !== "all" || !!result.unsupportedPairs;
+      $(".topology-reset").hidden = !result.baseline;
+      $(".topology-reset").disabled = saving;
+      $(".topology-accepted").hidden = !result.baseline;
+      $(".topology-accepted ul").innerHTML = (result.baseline?.findings || []).filter(item => !item.informational)
+        .map(item => `<li>${esc(featureName(item.feature))}: ${esc(titles[item.type] || item.type)}
+          ${(item.paths || []).map(path => `<div>${esc(path.map(id => JSON.parse(id).join(":")).join(" → "))}</div>`).join("")}</li>`).join("");
+      $(".topology-health-stats").innerHTML = `<div><span class="material-symbol" aria-hidden="true">hub</span><strong>${health.providers}</strong><small>Providers</small></div>
+        <div><span class="material-symbol" aria-hidden="true">link</span><strong>${health.twoWay}</strong><small>Two-way pairs</small></div>
+        <div><span class="material-symbol" aria-hidden="true">arrow_forward</span><strong>${health.oneWay}</strong><small>One-way pairs</small></div>
+        <div class="topology-health-status is-${health.status}"><span class="material-symbol" aria-hidden="true">${health.icon}</span><strong>${health.label}</strong><small>Route analysis</small></div>`;
+      $(".topology-analyzed-at").textContent = `Analyzed at ${analyzedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+      const onlyNotes = findings.length && findings.every(item => item.informational);
+      $(".topology-finding-count").textContent = `${findings.length} ${onlyNotes ? (findings.length === 1 ? "note" : "notes") : (findings.length === 1 ? "finding" : "findings")}`;
+      $(".topology-finding-list").innerHTML = `${result.unsupportedPairs ? '<div class="topology-capability-note">Some enabled features are unsupported or unavailable in provider metadata and are omitted. Review their pair settings.</div>' : ""}` + (findings.length ? findings.map(item => {
+        const active = item.id === selectedId;
+        const severity = item.informational ? "Info" : item.severity === "conflict" ? "Potential conflict" : item.severity === "warning" ? "Review" : "Observation";
+        const connections = findingConnections(item, graph);
+        const routes = item.destination
+          ? connections.map(connection => `<span class="topology-numbered-route">${pairBadge(connection)}<span><small>${connection.twoWay ? "Two-way pair" : "One-way pair"}</small>${esc(connectionLabel(connection, nodes))}</span></span>`).join("")
+          : item.paths.map((path, index) => `<span><small>${item.type === "redundancy" && item.paths.length > 1 ? (path.length === 2 ? "Direct" : "Indirect") : item.type === "loop" ? "Example return path" : `Route ${index + 1}`}</small>${esc(path.map(id => nodeName(nodes.get(id))).join(" → "))}</span>`).join("");
+        return `<button type="button" class="topology-finding ${active ? "is-selected" : ""}" data-finding="${esc(item.id)}" aria-pressed="${active}">
+          <span class="topology-finding-meta"><span>${esc(featureName(item.feature))}</span><span class="topology-severity is-${item.severity}">${severity}</span></span>
+          <span class="topology-finding-title"><span class="material-symbol" aria-hidden="true">${item.informational ? "sync_alt" : icons[item.type]}</span>${item.informational ? "Shared two-way updates" : titles[item.type]}</span>
+          <span class="topology-finding-copy">${esc(findingCopy(item, nodes))}</span>
+          ${!item.destination && connections.length ? `<span class="topology-finding-pairs"><span>Pairs</span>${connections.map(pairBadge).join("")}</span>` : ""}
+          <span class="topology-paths">${routes}</span>
+          ${active ? `<span class="topology-advice">${esc(findingAdvice(item))}</span>` : '<span class="topology-finding-hint"><span class="material-symbol" aria-hidden="true">auto_awesome</span><span><strong>Highlight routes</strong><small>Focus these routes on the graph</small></span><span class="material-symbol" aria-hidden="true">arrow_forward</span></span>'}</button>`;
+      }).join("") : `<div class="topology-empty"><span class="material-symbol topology-good" aria-hidden="true">${graph.nodes.length ? "check_circle" : "route"}</span><strong>${result.unsupportedPairs ? "No findings in available routes" : graph.nodes.length ? "Your routes look healthy" : "No active routes yet"}</strong><p>${graph.nodes.length ? "No conflicting writers, additional return routes or redundant paths found for this selection." : "Enable a supported feature in a sync pair to get started."}</p></div>`);
+      if (focusFeature) [...$(".topology-features").children].find(item => item.dataset.feature === focusFeature)?.focus({ preventScroll: true });
+      if (focusFinding) [...$(".topology-finding-list").querySelectorAll("button")].find(item => item.dataset.finding === focusFinding)?.focus({ preventScroll: true });
+    }
+    $(".topology-features").addEventListener("click", event => {
+      const button = event.target.closest("button[data-feature]");
+      if (!button) return;
+      selectedFeature = button.dataset.feature;
+      selectedId = "";
+      draw();
+      [...$(".topology-features").children].find(item => item.dataset.feature === selectedFeature)?.focus();
+    });
+    $(".topology-finding-list").addEventListener("click", event => {
+      const button = event.target.closest("button[data-finding]");
+      if (!button) return;
+      const id = button.dataset.finding;
+      selectedId = selectedId === id ? "" : id;
+      if (selectedId) selectedFeature = result.findings.find(item => item.id === selectedId).feature;
+      draw();
+      [...$(".topology-finding-list").querySelectorAll("button")].find(item => item.dataset.finding === id)?.focus({ preventScroll: true });
+    });
+    $(".topology-clear").addEventListener("click", () => {
+      selectedId = "";
+      draw();
+      $(".topology-graph").focus({ preventScroll: true });
+    });
+    const update = () => { result = currentTopology(); analyzedAt = new Date(); draw(); };
+    const accept = async reset => {
+      saving = true;
+      baselineError = "";
+      draw();
+      try { await saveBaseline(result, reset); }
+      catch (error) { baselineError = error.message; }
+      finally { saving = false; if (host.isConnected) update(); }
+    };
+    $(".topology-acknowledge").addEventListener("click", () => accept(false));
+    $(".topology-reset").addEventListener("click", () => accept(true));
+    $(".topology-refresh").addEventListener("click", () => {
+      baselineError = "";
+      document.dispatchEvent(new Event("cw:sync-data-changed"));
+    });
+    document.addEventListener("cw:topology-updated", update);
+    cleanup = () => {
+      viewport.dispose();
+      resizeObserver.disconnect();
+      document.removeEventListener("cw:topology-updated", update);
+      host.removeAttribute("role");
+      host.removeAttribute("aria-modal");
+      host.removeAttribute("aria-labelledby");
+      host.removeAttribute("aria-describedby");
+      requestAnimationFrame(() => {
+        const trigger = props.trigger?.isConnected ? props.trigger : document.querySelector('#sync-topology-health [data-action="view"]');
+        trigger?.focus({ preventScroll: true });
+      });
+      cleanup = null;
+    };
+    draw();
+    requestAnimationFrame(() => { if (host.isConnected) $(".topology-close")?.focus({ preventScroll: true }); });
+  },
+  unmount() { cleanup?.(); }
+};

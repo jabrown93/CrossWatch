@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import services.analyzer as A
+from cw_platform.pair_scope import pair_feature_scope
 
 
 WATCHED = "2024-01-01T00:00:00Z"
@@ -54,8 +55,11 @@ def _cfg(src="SIMKL", dst="TRAKT", src_inst="SIMKL-P01", dst_inst="TRAKT-P01", r
     return {"pairs": [pair]}
 
 
-def _write_alias(tmp_path: Path, items, *, scope="one-way:SIMKL#SIMKL-P01-TRAKT#TRAKT-P01:p1|SIMKL>TRAKT",
+def _write_alias(tmp_path: Path, items, *, scope=None,
                  name="trakt_history.pair_alias.one-way_SIMKL_SIMKL-P01-TRAKT_TRAKT-P01_p1.json"):
+    if scope is None:
+        cfg = _cfg()
+        scope = pair_feature_scope(cfg, cfg["pairs"][0], "history") + "|SIMKL>TRAKT"
     (tmp_path / name).write_text(json.dumps({"scope": scope, "items": items}), encoding="utf-8")
 
 
@@ -137,6 +141,18 @@ def test_alias_ignored_when_destination_record_absent(cws) -> None:
 
     assert stats["total"] == 1
     assert stats["synced"] == 0
+
+
+def test_rewatch_alias_requires_the_mapped_destination_even_if_original_exists(cws):
+    item = _episode(12971, 1, 40, series="Dragon Ball Z")
+    key = f"tmdb:12971#s01e40@{WATCHED_EPOCH}"
+    cfg = _cfg(rewatches=True)
+    _write_alias(cws, {key: {
+        "destination_key": "tmdb:12971#s02e01",
+        "destination_event_key": f"tmdb:12971#s02e01@{WATCHED_EPOCH}",
+        "watched_at": WATCHED,
+    }}, scope=pair_feature_scope(cfg, cfg["pairs"][0], "history") + "|SIMKL>TRAKT")
+    assert _synced(_state({key: item}, {key: item}), cfg)["synced"] == 0
 
 
 def test_alias_ignored_when_watched_at_differs_by_more_than_a_minute(cws) -> None:

@@ -3,29 +3,33 @@
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
 export const HELP_TEXT = {
+  "pair-path-matching": "Match by file path\nApplies only to this pair. When ID lookup fails, compare file-path endings between Plex, Jellyfin and Emby.\nSupports movies and episodes for history, ratings and progress, including with Strict ID matching enabled. Ambiguous paths and conflicting IDs are skipped.\nOff by default. The first lookup may take longer while the library catalogue is built.",
   "gl-dry": "Dry run\nPlan and log only; no writes. Reset states after testing (in maintenance).",
   "gl-verify": "Verify after write\nRe-check the destination after writes (when supported).",
   "gl-drop": "Drop guard\nProtects against sudden inventory drops by pausing delete plans.",
-  "gl-mass": "Allow mass delete\nIf off, blocks large delete plans (roughly >10%). Enable for first runs.\n It's either mass-delete or drop-guard or none; not both.",
-  "gl-oneway-remove": "Deletions based on Source\nWhen enabled there should always be a match between source and destination before deletion.\nWhen disabled it acts in mirror mode, meaning it will always follow source (destructive; use with care)",
+  "gl-mass": "Allow mass delete\nIf off, blocks large delete plans (roughly >10%). Enable for first runs.\nIt's either mass-delete or drop-guard or none; not both.",
+  "gl-oneway-remove": "Deletions based on Source\nWhen enabled, this pair only removes items after CrossWatch observed them disappear from the source.\nWhen disabled, this pair runs mirror mode and removes target items missing from the source (destructive; use with care).",
   "gl-observed": "Include observed deletes\nIf off, observed deletes are ignored and delta-delete providers are disabled (safer).",
   "gl-bb-enable": "Blackbox: Enabled\nAutomatic flapper protection and failure quarantine.",
   "gl-bb-pair": "Blackbox: Pair scoped\nKeep blackbox decisions per pair instead of global.",
-  "gl-bb-section": "Blackbox\nUnresolved is only a reporting state: items that fail to write are recorded, shown in diagnostics, and retried on every sync. Blackbox is the quarantine state and the only thing that stops an item from being planned again.",
-  "gl-bb-promote": "Promote after (failed writes)\nNumber of consecutive failed write attempts before an item is moved to the blackbox. Until then the item keeps being retried; unresolved alone never blocks it.",
-  "gl-section-main": "Globals\nThese are the overall safety and behavior settings for this connection. The defaults are good enough for most users, so only change them when you have a specific reason.",
+  "gl-bb-section": "Blackbox\nUnresolved is only a reporting state: items that fail to write are recorded, shown in diagnostics, and retried on every sync.\nBlackbox is the quarantine state and the only thing that stops an item from being planned again.",
+  "gl-bb-promote": "Promote after (failed writes)\nNumber of consecutive failed write attempts before an item is moved to the blackbox.\nUntil then the item keeps being retried; unresolved alone never blocks it.",
+  "gl-section-main": "General\nMatching and Pair safety apply to this connection. The remaining safety and runtime controls are shared application settings. The defaults are good enough for most users, so only change them when you have a specific reason.",
   "gl-section-advanced": "Advanced\nThese are extra retention and blackbox safety controls. The defaults are good enough for most users, so you usually do not need to change anything here.",
 
   "cx-wl-enable": "Watchlist: Enable\nCompare watchlists and write missing items to the target.",
   "cx-wl-add": "Watchlist: Add\nAdds missing items to the target watchlist.",
   "cx-wl-remove": "Watchlist: Remove\nRemoves items from the target.",
-  "cx-wl-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database to match anime for this watchlist pair. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-wl-library-only": "Watchlist: Only items in destination library\nSkip watchlist items that are not in the media server library.\nUseful for large tracker watchlists, where most titles are not in your library yet.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
+  "cx-wl-anime-map": "Use Anime ID Mapping\nUse the local Anime ID database to match anime for this watchlist pair.\nRequires global Anime ID Mapping to be enabled first.",
   "cx-wl-anime-only": "Anime-only sync\nOnly sync items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before falling back to a title search.",
   "cx-rt-enable": "Ratings: Enable\nCompare and write ratings to the target.",
   "cx-rt-add": "Ratings: Add / Update\nWrites ratings/updates to the target.",
   "cx-rt-remove": "Ratings: Remove\nClears ratings on the target (destructive and only for very specific needs).",
-  "cx-rt-anime-map": "Use Anime ID Mapping\nUse the local AniBridge ID database to match anime for this ratings pair. When enabled from here, global Anime ID Mapping is enabled too.",
-  "cx-hs-anime-map": "Anime episode mapping\nTranslate anime episode numbering when this history pair writes to an anime tracker, using the local AniBridge dataset. Requires a TMDB metadata key. Syncing from SIMKL to Trakt already maps episodes on its own and does not need this. When enabled from here, global Anime ID Mapping is enabled too.",
+  "cx-rt-anime-map": "Use Anime ID Mapping\nUse the local Anime ID database to match anime for this ratings pair.\nRequires global Anime ID Mapping to be enabled first.",
+  "cx-hs-source-status": "Use source watch status\nKeep dropped and on-hold status when adding watched episodes between SIMKL, AniList, MyAnimeList and Kitsu.\nStatus-only changes and titles with no watched episodes are not synced. Completed titles are not changed back to dropped or on hold.\nWhen off, normal destination progress rules determine the status. SIMKL may need one extra list read per history batch to protect completed titles.",
+  "cx-hs-anime-map": "Anime episode mapping\nTranslate anime episode numbering when this history pair writes to an anime tracker, using the local Anime ID database.\nRequires a TMDB metadata key and global Anime ID Mapping.\nThis can heavily increase API calls when additional anime ID and episode lookups are needed.",
+  "cx-pr-anime-map": "Anime episode mapping\nTranslate anime episode numbering before writing progress to SIMKL, using the local Anime ID database.\nRequires global Anime ID Mapping.\nThis can heavily increase API calls when additional anime ID and episode lookups are needed.",
   "cx-rt-anime-only": "Anime-only sync\nOnly sync ratings for items that Anime ID Mapping can confirm as anime. Non-anime and unmapped items are skipped before falling back to a title search.",
 
   "cx-hs-enable": "History: Enable\nCompare and write watch history to the target.",
@@ -33,9 +37,7 @@ export const HELP_TEXT = {
   "cx-hs-remove": "History: Remove\nRemoving history is discouraged (destructive and only for very specific needs).",
   "cx-hs-rewatches": "History: Rewatches\nSync separate play events when both providers support it. SIMKL requires Pro/VIP.",
   "cx-tr-hs-col": "Trakt: Add to library\nAlso add items to your Trakt library when writing history (if enabled).",
-  "cx-tr-hs-ignore-dropped": "Trakt: Ignore dropped shows\nWhen enabled, shows marked as dropped on Trakt are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
-  "cx-md-hs-ignore-dropped": "MDBList: Ignore dropped shows\nWhen enabled, shows marked as dropped on MDBList are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
-  "cx-sm-hs-ignore-dropped": "Simkl: Ignore dropped shows\nWhen enabled, shows marked as dropped on Simkl are skipped during history sync. This suppresses sync for those shows; it does not remove them elsewhere.",
+  "cx-hs-dropped": "Dropped shows\nSync normally: dropped shows sync like any other show.\nIgnore dropped: shows dropped on either provider are skipped during history sync. Nothing is removed elsewhere.\nSync + tag dropped: plays of dropped shows still sync, and the show is marked dropped on the other provider. One-way copies the source status to the target, two-way works both ways. SIMKL and WeTrakr keep completed shows as completed. Dropping a show on FlickList also clears its resume points. Un-dropping is not synced.",
 
   "cx-pr-enable": "Progress: Enable\nSync resume position (where you left off) between providers.",
   "cx-pr-add": "Progress: Add / Update\nWrite resume position to the target.",
@@ -45,15 +47,25 @@ export const HELP_TEXT = {
   "cx-pr-maxp": "Progress: Ignore near complete (%)\nOne-way defaults to the target recommendation. Two-way keeps one shared limit and shows per-target recommendations below.",
   "cx-pr-replay": "Replay watched items\nUnwatch the target, then apply resume progress.",
   "cx-pr-tolerance": "Timestamp tolerance\nProtect targets newer by more than this many seconds.",
+  "cx-pr-specials": "Progress: Specials (Season 0)\nInclude Season 0 / specials episodes. Disable to skip them on both sides of this pair.",
+  "cx-pr-library-only": "Progress: Only items in destination library\nSkip resume positions for movies and episodes that are not in the media server library.\nTitles the server already has a position for are always synced.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
+  "cx-hs-specials": "History: Specials (Season 0)\nInclude Season 0 / specials episodes. Disable to skip them on both sides of this pair.",
+  "cx-hs-library-only": "History: Only items in destination library\nSkip movies and episodes that are not in the media server library.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
+  "cx-co-media": "Collections: Read from media server\nReads resolution, HDR and audio from the media server and sends them with new collection items.\nAdds some extra load on the media server while reading the library.",
+  "cx-co-media-upd": "Collections: Update existing items\nWhen the media info of an item changes on the source (for example 1080p to 4K, or a new Atmos track), the item on the destination is updated too.\nOnly fills in or changes values, never clears them. Physical copies on the destination are left alone.\nThe first sync can update many items.",
+  "cx-rt-specials": "Ratings: Specials (Season 0)\nInclude Season 0 / specials seasons and episodes. Disable to skip them on both sides of this pair.",
+  "cx-rt-library-only": "Ratings: Only items in destination library\nSkip new ratings for movies and episodes that are not in the media server library.\nRating changes for titles you already rated are always synced.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
+
+  "floppy-anime-library": "Floppy: Send new anime to the Anime library\nNew anime shows are added to Floppy's Anime library instead of TV Shows.\nOnly applies to shows Floppy does not have yet. Shows already in Floppy stay in the library they are in.\nThis setting is per pair.",
 
   "cx-jf-wl-mode": "Jellyfin: Watchlist mode\nJellyfin has no native Watchlist. CrossWatch maps it to:\n• Favorites: sets the Favorite flag\n• Playlist: writes to a named playlist (episodes only; no shows)\n• Collections: writes to a named collection\nChanging mode does not move existing items.\nTip: Favorites or Collections are the most compatible.",
   "cx-em-wl-mode": "Emby: Watchlist mode\nEmby has no native Watchlist. CrossWatch maps it to:\n• Favorites: sets the Favorite flag\n• Playlist: writes to a named playlist (episodes only; no shows)\n• Collections: writes to a named collection\nChanging mode does not move existing items.\nTip: Favorites or Collections are the most compatible.",
 
-  "plx-fallback-guid": "Plex: Fallback GUID\nAlso searches Plex's database beyond your visible libraries (including hidden/old items) to recover older matches.\nWarning: enable only for a single run, it increases duration and resource usage.",
-  "plx-marked-watched": "Plex: Marked watched\nInclude items you manually marked as watched in Plex when syncing history.\nDisable if you only want actual play history.",
-  "plx-strict-ids": "Plex: Strict ID matching\nWhen enabled, CrossWatch only matches by IDs (Plex IDs + external IDs). Title/year searches are disabled.",
-  "jf-strict-ids": "Jellyfin: Strict ID matching\nWhen enabled, CrossWatch only matches by IDs (Jellyfin IDs + external IDs). Title/year searches are disabled.",
-  "em-strict-ids": "Emby: Strict ID matching\nWhen enabled, CrossWatch only matches by IDs (Emby IDs + external IDs). Title/year searches are disabled.",
+  "plx-marked-watched": "Plex: Marked watched\nApplies only to this pair. Include items you manually marked as watched in Plex when syncing history.\nDisable if you only want actual play history.",
+  "plx-strict-ids": "Plex: Strict ID matching\nWhen enabled, CrossWatch only matches by IDs (Plex IDs + external IDs). Title/year searches are disabled. The pair Match by file path option can separately enable a file-path fallback.",
+  "jf-strict-ids": "Jellyfin: Strict ID matching\nRequire Jellyfin or external IDs to confirm matches. Title searches and legacy full-path matching are disabled. The pair Match by file path option can separately enable a file-path fallback.\nEpisodes can match by series ID plus season and episode numbers.",
+  "jf-targeted-lookup": "Jellyfin: Targeted library lookup\nMatch through a cached movie and series ID catalogue, then fetch episodes only for matched series.\nThe catalogue checks for metadata changes on each sync that needs matching and refreshes fully every 24 hours.\nDisable to allow a full episode index. Title and path fallback require Strict ID matching to be off.",
+  "em-strict-ids": "Emby: Strict ID matching\nWhen enabled, CrossWatch only matches by IDs (Emby IDs + external IDs). Title/year searches are disabled. The pair Match by file path option can separately enable a file-path fallback.",
 };
 
 function normalizeHelpText(text) {
@@ -71,14 +83,7 @@ function formatHelpTip(text) {
   if (!lines.length) return "";
   const title = lines.shift();
   if (!lines.length) return title;
-  const body = lines.join(" ").replace(/\s+/g, " ").trim();
-  const sentences = body
-    .split(/(?<=[.!?])\s+/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-  const lead = sentences[0] || body;
-  const follow = sentences.slice(1).join(" ").trim();
-  return follow ? `${title}: ${lead}\n${follow}` : `${title}: ${lead}`;
+  return `${title}\n\n${lines.join("\n")}`;
 }
 
 export function injectHelpIcons(root, { QA } = {}) {

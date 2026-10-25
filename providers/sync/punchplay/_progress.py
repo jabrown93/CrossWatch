@@ -3,8 +3,9 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-import time
+import math
 import secrets
+import time
 from typing import Any, Iterable, Mapping
 
 from cw_platform.id_map import canonical_key, minimal as id_minimal
@@ -161,7 +162,19 @@ def _metadata_show_detail(adapter: Any, show_ids: Mapping[str, Any]) -> dict[str
     return out
 
 
-def _row_to_minimal(row: Mapping[str, Any], adapter: Any | None = None) -> dict[str, Any] | None:
+def _source_coords(row: Mapping[str, Any]) -> tuple[int, int] | None:
+    season = _as_int(row.get("sourceSeason"))
+    episode = _as_int(row.get("sourceEpisode"))
+    if season is None or episode is None or season < 0 or episode < 1:
+        return None
+    return season, episode
+
+
+def _row_to_minimal(
+    row: Mapping[str, Any],
+    adapter: Any | None = None,
+    source_coords: Mapping[int, tuple[int, int]] | None = None,
+) -> dict[str, Any] | None:
     typ = str(row.get("type") or "").strip().lower()
 
     if typ == "episode":
@@ -170,6 +183,7 @@ def _row_to_minimal(row: Mapping[str, Any], adapter: Any | None = None) -> dict[
         episode = _as_int(row.get("episode"))
         if not show_tmdb or season is None or episode is None:
             return None
+        season, episode = _source_coords(row) or (source_coords or {}).get(_as_int(row.get("id")) or 0) or (season, episode)
         out: dict[str, Any] = {
             "type": "episode",
             "show_ids": {"tmdb": str(show_tmdb)},
@@ -177,9 +191,6 @@ def _row_to_minimal(row: Mapping[str, Any], adapter: Any | None = None) -> dict[
             "season": season,
             "episode": episode,
         }
-        ep_tmdb = _as_int(row.get("tmdbId"))
-        if ep_tmdb:
-            out["ids"] = {"tmdb": str(ep_tmdb)}
         show_title = str(row.get("showTitle") or "").strip()
         if show_title:
             out["series_title"] = show_title
@@ -235,11 +246,17 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
     collected: dict[str, dict[str, Any]] = {}
     dropped: list[str] = []
     rows_seen = 0
+    source_coords: dict[int, tuple[int, int]] = {}
+    keys_by_entry_id: dict[int, str] = {}
 
     def collect(row: Mapping[str, Any], *, source: str) -> None:
         nonlocal rows_seen
         rows_seen += 1
-        minimal = _row_to_minimal(row, adapter)
+        entry_id = _as_int(row.get("id"))
+        coords = _source_coords(row)
+        if entry_id and coords:
+            source_coords[entry_id] = coords
+        minimal = _row_to_minimal(row, adapter, source_coords)
         if not minimal:
             reason = _drop_reason(row)
             dropped.append(reason)
@@ -262,6 +279,13 @@ def build_index(adapter: Any) -> dict[str, dict[str, Any]]:
             dropped.append("no_canonical_key")
             _warn(FEATURE, "index_row_dropped", source=source, reason="no_canonical_key", entry_id=row.get("id"))
             return
+        if entry_id:
+            previous_key = keys_by_entry_id.get(entry_id)
+            if previous_key and previous_key != key:
+                previous = collected.get(previous_key)
+                if previous and previous.get(PROGRESS_ID_FIELD) == str(entry_id):
+                    collected.pop(previous_key)
+            keys_by_entry_id[entry_id] = key
         collected[key] = minimal
 
     resp = punchplay_request(adapter, "GET", URL_IN_PROGRESS)
@@ -309,7 +333,7 @@ def _session_ids(item: Mapping[str, Any], key: str, *, device_id: str, instance:
     return out
 
 
-def _playback_payload(item: Mapping[str, Any]) -> dict[str, Any] | None:
+def _playback_payload(item: Mapping[str, Any], *, require_position: bool = True) -> dict[str, Any] | None:
     typ = str(item.get("type") or "").strip().lower()
     is_episode = typ == "episode"
 
@@ -351,14 +375,19 @@ def _playback_payload(item: Mapping[str, Any]) -> dict[str, Any] | None:
 
     pos_ms = _position_ms(item)
     dur_ms = _duration_ms_of(item)
-    if pos_ms is not None:
+    if pos_ms is not None and math.isfinite(pos_ms) and pos_ms >= 0:
         payload["position_seconds"] = round(pos_ms / 1000.0, 3)
-    if dur_ms:
+    if dur_ms and math.isfinite(dur_ms) and round(dur_ms / 1000.0, 3) > 0:
         payload["duration_seconds"] = round(dur_ms / 1000.0, 3)
 
     percent = _percent_of(item)
     if percent is not None:
         payload["progress"] = max(0.0, min(1.0, percent / 100.0))
+
+    if require_position and "position_seconds" not in payload and not (
+        "progress" in payload and "duration_seconds" in payload
+    ):
+        return None
 
     if item.get("anime") is True:
         payload["anime"] = True

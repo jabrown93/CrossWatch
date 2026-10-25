@@ -12,7 +12,8 @@ import requests
 
 from ._log import log as cw_log
 from ._mod_common import build_session
-from cw_platform.provider_instances import get_provider_block, normalize_instance_id
+from cw_platform.app_version import user_agent as http_user_agent
+from cw_platform.provider_instances import normalize_instance_id, resolve_provider_block
 from providers.auth._auth_SCROB import is_configured as auth_configured
 
 try:  # type: ignore[name-defined]
@@ -20,12 +21,11 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "0.1"
-os.environ.setdefault("CW_SCROB_VERSION", __VERSION__)
-os.environ.setdefault("CW_SCROB_UA", f"CrossWatch/{__VERSION__} (Scrob)")
+__VERSION__ = "0.3"
+os.environ.setdefault("CW_SCROB_UA", http_user_agent("Scrob", override_env="CW_SCROB_UA"))
 __all__ = ["get_manifest", "SCROBModule", "OPS"]
 
-FEATURES = {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False}
+FEATURES = {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False, "collection": True}
 
 CAPABILITIES: dict[str, Any] = {
     "bidirectional": True,
@@ -69,6 +69,14 @@ CAPABILITIES: dict[str, Any] = {
         "write_window_percent": {"min": 5, "max": 90},
         "notes": "Scrob only keeps continue-watching state between 5% and 90%.",
     },
+    "collection": {
+        "types": ["movie", "show", "season", "episode"],
+        "upsert": True,
+        "remove": True,
+        "observed_deletes": True,
+        "required_ids": ["tmdb"],
+        "notes": "Scrob collection source uses the personal export; show and season writes expand server-side.",
+    },
 }
 
 
@@ -91,7 +99,7 @@ def get_manifest() -> Mapping[str, Any]:
         "features": dict(FEATURES),
         "requires": [],
         "capabilities": dict(CAPABILITIES),
-        "description": "Self hosted Scrob tracker (watchlist, ratings, history, progress).",
+        "description": "Self hosted Scrob tracker (watchlist, ratings, history, progress, collection).",
     }
 
 
@@ -102,8 +110,8 @@ def _feature_label(method: str, url: str, kw: Mapping[str, Any]) -> str:
 
 class SCROBModule:
     def __init__(self, cfg: Mapping[str, Any], *, instance_id: Any = None):
-        self.instance_id = normalize_instance_id(instance_id)
-        block = get_provider_block(cfg or {}, "scrob", self.instance_id) or {}
+        self.instance_id = normalize_instance_id(instance_id if instance_id is not None else (cfg or {}).get("_cw_provider_instance"))
+        block = resolve_provider_block(cfg or {}, "scrob", self.instance_id) or {}
         if not auth_configured(block):
             _log("error", "missing config", instance=self.instance_id)
             raise RuntimeError("Scrob is not connected: server_url, api_key, username and password are required")
@@ -112,7 +120,7 @@ class SCROBModule:
         self.raw_cfg = self.config
         self.session: requests.Session = build_session("SCROB", ctx, feature_label=_feature_label)
         try:
-            self.session.headers.setdefault("User-Agent", os.environ.get("CW_SCROB_UA") or f"CrossWatch/{__VERSION__} (Scrob)")
+            self.session.headers["User-Agent"] = os.environ.get("CW_SCROB_UA") or http_user_agent("Scrob", override_env="CW_SCROB_UA")
             self.session.headers.setdefault("Accept", "application/json")
         except Exception:
             pass
@@ -160,6 +168,10 @@ class SCROBModule:
             from .scrob import _progress
 
             return _progress
+        if key == "collection":
+            from .scrob import _collection
+
+            return _collection
         return None
 
     def build_index(self, feature: str, **kwargs: Any) -> dict[str, dict[str, Any]]:
@@ -202,7 +214,7 @@ class _SCROBOPS:
         return dict(CAPABILITIES)
 
     def is_configured(self, cfg: Mapping[str, Any]) -> bool:
-        block = get_provider_block(cfg or {}, "scrob", None) or {}
+        block = resolve_provider_block(cfg or {}, "scrob", None) or {}
         if auth_configured(block):
             return True
         root = (cfg or {}).get("scrob")

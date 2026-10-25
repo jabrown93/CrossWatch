@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import json
+from copy import copy
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from cw_platform.history_events import history_sync_key, minimal_history_item
-from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.id_map import canonical_key
 
 from ._common import (
     _atomic_write,
@@ -20,14 +21,17 @@ from ._common import (
     _root,
     _snapshot_state,
     current_state_only,
-    latest_snapshot_file,
-    latest_state_file,
+    fallback_snapshot_file,
+    fallback_state_file,
     make_logger,
     may_persist,
+    merge_tracker_identity,
+    preserve_tracker_identity,
     pair_scoped,
     readonly,
     scoped_file,
     state_file_for_read,
+    tracker_minimal,
 )
 
 _dbg, _info, _warn, _error = make_logger("history")
@@ -47,11 +51,11 @@ def _history_key(adapter: Any, item: Mapping[str, Any], fallback_key: Any = None
 
 
 def _history_minimal(adapter: Any, item: Mapping[str, Any], fallback_key: Any = None) -> dict[str, Any]:
-    return minimal_history_item(item, fallback_key, event_mode=_rewatches_enabled(adapter))
+    return preserve_tracker_identity(minimal_history_item(item, fallback_key, event_mode=_rewatches_enabled(adapter)), item)
 
 
 def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
-    base = id_minimal(obj)
+    base = tracker_minimal(obj)
     out: dict[str, Any] = dict(base)
     if obj.get("watched") is not None:
         out["watched"] = bool(obj.get("watched"))
@@ -66,13 +70,14 @@ def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
             out["series_title"] = str(st)
         if obj.get("series_year") is not None:
             out["series_year"] = obj.get("series_year")
-        season = int(obj.get("season") or 0)
+        season_raw = obj.get("season")
+        season = None if season_raw is None or season_raw == "" else int(season_raw)
         episode = int(obj.get("episode") or 0)
-        if season:
+        if season is not None:
             out["season"] = season
         if episode:
             out["episode"] = episode
-        if season and episode:
+        if season is not None and episode:
             out["title"] = f"S{season:02d}E{episode:02d}"
         elif "title" in obj:
             out["title"] = obj.get("title")
@@ -109,15 +114,17 @@ def _load_state(adapter: Any) -> dict[str, Any]:
     read_path = state_file_for_read(root, "history", path)
     raw = _read_json(read_path)
     if raw is None:
-        alt = latest_state_file(root, "history")
+        alt = fallback_state_file(root, "history")
         if alt and alt != path:
             raw = _read_json(alt)
     if raw is None and current_state_only(adapter):
         return {"ts": 0, "items": {}}
     if raw is None:
-        snap = latest_snapshot_file(root, "history")
+        snap = fallback_snapshot_file(root, "history")
         if snap:
             raw = _read_json(snap)
+            if raw is not None:
+                _warn("state_restored_from_snapshot", snapshot=snap.name)
     if raw is None:
         return {"ts": 0, "items": {}}
 
@@ -237,6 +244,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             unresolved_src.append(obj)
             continue
         if existing is None or (str(existing.get("watched_at") or "") <= str(accepted.get("watched_at") or "")):
+            if isinstance(existing, Mapping):
+                accepted = merge_tracker_identity(existing, accepted)
             cur[key] = _history_minimal(adapter, accepted, key)
             changed += 1
 
@@ -257,7 +266,10 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
 
     _maybe_restore(adapter, "history", _save_state)
 
-    state = _load_state(adapter)
+    # Preserve every stored viewing, including those of unselected media.
+    reader = copy(adapter)
+    reader.config = {**getattr(adapter, "config", {}), "_cw_history_rewatches": True}
+    state = _load_state(reader)
     cur: dict[str, dict[str, Any]] = dict(state.get("items") or {})
     unresolved_src: list[Mapping[str, Any]] = []
     changed = 0
@@ -274,8 +286,12 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
         if not key:
             unresolved_src.append(obj)
             continue
-        if key in cur:
-            del cur[key]
+        matches = ([key] if key in cur else []) if _rewatches_enabled(adapter) else [
+            stored_key for stored_key, value in cur.items() if canonical_key(value) == key
+        ]
+        if matches:
+            for stored_key in matches:
+                del cur[stored_key]
             changed += 1
 
     if changed:

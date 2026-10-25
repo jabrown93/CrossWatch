@@ -124,8 +124,7 @@ def _to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
 
     media = str(row.get("media_type") or row.get("type") or "").strip().lower()
     if media in ("tv", "show", "series", "episode"):
-        season_raw = row.get("season") if row.get("season") is not None else row.get("season_number")
-        season = as_int(season_raw)
+        season = as_int(next((v for v in (row.get("season"), row.get("season_number")) if v is not None), None))
         episode = as_int(row.get("episode") or row.get("episode_number"))
         if season is None or episode is None:
             return None
@@ -167,7 +166,7 @@ def _fetch_all_items(adapter: Any) -> tuple[dict[str, dict[str, Any]], dict[str,
     out: dict[str, dict[str, Any]] = {}
     remote_ids: dict[str, str] = {}
     page = 1
-    per_page = int(getattr(adapter.cfg, "progress_per_page", 100) or 100)
+    per_page = int(getattr(adapter.cfg, "progress_per_page", 500) or 500)
     per_page = max(1, min(per_page, 500))
     max_pages = int(getattr(adapter.cfg, "progress_max_pages", 1000) or 1000)
     max_pages = max(1, max_pages)

@@ -11,7 +11,10 @@ from urllib.parse import urlencode
 
 import requests
 
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import CONFIG
+from cw_platform.trakt_http import paced_request as trakt_paced_request
+from cw_platform.id_map import migrate_media_index, migrate_media_key
 from cw_platform.local_db import watchlist_hide as sqlite_watchlist_hide
 from cw_platform.modules_registry import load_sync_ops, sync_provider_names
 from cw_platform.orchestrator._state_store import StateStore
@@ -154,9 +157,9 @@ def _iter_provider_instance_blocks(
 def _items_from_block(block: dict[str, Any]) -> dict[str, Any]:
     wl = (((block.get("watchlist") or {}).get("baseline") or {}).get("items") or {})
     if isinstance(wl, dict) and wl:
-        return wl
+        return migrate_media_index(wl)
     legacy = block.get("items") or {}
-    return legacy if isinstance(legacy, dict) else {}
+    return migrate_media_index(legacy)
 
 
 def _pick_best_item(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
@@ -255,15 +258,19 @@ def _as_pos_int(value: Any) -> int | None:
     return n if n > 0 else None
 
 
+def _as_season_int(value: Any) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
 def _season_number(item: dict[str, Any]) -> int | None:
     raw_episode = item.get("episode")
     episode: Mapping[str, Any] = raw_episode if isinstance(raw_episode, dict) else {}
-    return (
-        _as_pos_int(item.get("season_number"))
-        or _as_pos_int(episode.get("season_number"))
-        or _as_pos_int(episode.get("season"))
-        or _as_pos_int(item.get("season"))
-    )
+    candidates = (item.get("season_number"), episode.get("season_number"), episode.get("season"), item.get("season"))
+    return next((n for n in map(_as_season_int, candidates) if n is not None), None)
 
 
 def _episode_number(item: dict[str, Any]) -> int | None:
@@ -284,7 +291,7 @@ def _episode_label(item: dict[str, Any]) -> str:
         return explicit
     season = _season_number(item)
     episode = _episode_number(item)
-    return f"S{season:02d}E{episode:02d}" if season and episode else ""
+    return f"S{season:02d}E{episode:02d}" if season is not None and episode else ""
 
 
 def _rich_ids_score(item: dict[str, Any] | None) -> int:
@@ -298,11 +305,11 @@ def _rich_ids_score(item: dict[str, Any] | None) -> int:
 
 def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
     ids = dict((item or {}).get("ids") or {})
-    parts = [t for t in str(key or "").split(":") if t]
+    parts = [t for t in str(key or "").split("#", 1)[0].split(":") if t]
     if len(parts) >= 2:
         k = parts[-2].lower().strip()
         v = parts[-1].strip()
-        if k in {"tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "slug", "jellyfin", "emby", "anilist", "mal"} and v:
+        if k in {"tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "wetrakr", "slug", "jellyfin", "emby", "anilist", "mal"} and v:
             ids.setdefault(k, v)
     if "thetvdb" in ids and "tvdb" not in ids:
         ids["tvdb"] = ids.get("thetvdb")
@@ -317,6 +324,7 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
         "trakt",
         "simkl",
         "mdblist",
+        "wetrakr",
         "slug",
         "jellyfin",
         "emby",
@@ -332,11 +340,12 @@ def _ids_from_key_or_item(key: str, item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-_WATCHLIST_ALIAS_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "slug", "anilist", "mal")
+_WATCHLIST_ALIAS_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "wetrakr", "slug", "anilist", "mal")
 
 
 def _watchlist_alias_tokens(key: str, item: dict[str, Any]) -> set[str]:
     ids = _ids_from_key_or_item(key, item)
+    typ = _type_from_item_or_guess(item, key)
     out: set[str] = set()
     for name in _WATCHLIST_ALIAS_ID_KEYS:
         value = ids.get(name)
@@ -347,7 +356,7 @@ def _watchlist_alias_tokens(key: str, item: dict[str, Any]) -> set[str]:
             continue
         if name == "imdb" and text.isdigit():
             text = f"tt{text}"
-        out.add(f"{name}:{text}")
+        out.add(f"{name}:{text}#show" if name == "tmdb" and typ == "tv" else f"{name}:{text}")
     return out
 
 
@@ -387,7 +396,7 @@ def _group_watchlist_refs(
 
 def _preferred_watchlist_key(alias_keys: list[str], info: dict[str, Any], typ: str) -> str:
     ids = _ids_from_key_or_item("", info)
-    ordered = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "slug", "anilist", "mal")
+    ordered = _WATCHLIST_ALIAS_ID_KEYS
 
     for name in ordered:
         value = ids.get(name)
@@ -398,7 +407,7 @@ def _preferred_watchlist_key(alias_keys: list[str], info: dict[str, Any], typ: s
             continue
         if name == "imdb" and text.isdigit():
             text = f"tt{text}"
-        return f"{name}:{text}"
+        return f"{name}:{text}#show" if name == "tmdb" and _norm_type(typ) in {"tv", "anime"} else f"{name}:{text}"
 
     return alias_keys[0] if alias_keys else ""
 
@@ -408,6 +417,8 @@ def _type_from_item_or_guess(item: dict[str, Any], key: str) -> str:
     if typ == "movie":
         return "movie"
     if typ in {"tv", "show", "series", "anime"}:
+        return "tv"
+    if str(key or "").split("@", 1)[0].endswith("#show"):
         return "tv"
     ids = item.get("ids") or {}
     if ids.get("tvdb") or ids.get("thetvdb") or ids.get("anilist") or ids.get("mal"):
@@ -481,7 +492,7 @@ def _guid_variants_from_key_or_item(
     key: str,
     item: dict[str, Any] | None = None,
 ) -> list[str]:
-    prov, _, ident = (key or "").partition(":")
+    prov, _, ident = (key or "").split("#", 1)[0].partition(":")
     prov, ident = prov.lower().strip(), ident.strip()
     if not (prov and ident):
         ids = (item or {}).get("ids") or {}
@@ -536,15 +547,17 @@ def _jf_headers(cfg: dict[str, Any]) -> dict[str, str]:
         cfg.get("access_token") or cfg.get("api_key") or cfg.get("token") or ""
     ).strip()
     dev = (cfg.get("device_id") or "CrossWatch").strip() or "CrossWatch"
+    client = (
+        'MediaBrowser Client="CrossWatch", '
+        f'Device="WebUI", DeviceId="{dev}", Version="{app_version()}"'
+    )
     headers: dict[str, str] = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-Emby-Authorization": (
-            'MediaBrowser Client="CrossWatch", '
-            f'Device="WebUI", DeviceId="{dev}", Version="1.0.0"'
-        ),
+        "X-Emby-Authorization": client,
     }
     if token:
+        headers["Authorization"] = f'{client}, Token="{token}"'
         headers["X-Emby-Token"] = token
     return headers
 
@@ -617,7 +630,7 @@ def _delete_on_crosswatch_batch(items: list[dict[str, Any]], cfg: dict[str, Any]
     r = ops.remove(cfg, payload, feature="watchlist", dry_run=False) or {}
     if not isinstance(r, dict) or not r.get("ok"):
         raise RuntimeError(f"CROSSWATCH delete failed: {r.get('error')}")
-    if int(r.get("count", 0) or 0) < 1:
+    if int(r.get("count", 0) or 0) < 1 and not all(ops.watchlist_absent(cfg, payload)):
         raise RuntimeError("CROSSWATCH delete matched 0 items")
 
 
@@ -886,6 +899,7 @@ def _jf_lookup_by_provider_ids(
             headers,
             {
                 "Recursive": "true",
+                "CollapseBoxSetItems": "false",
                 "IncludeItemTypes": "Movie,Series",
                 "AnyProviderIdEquals": ",".join(f"{k}.{v}" for k, v in wanted.items()),
                 "Limit": 500,
@@ -936,10 +950,14 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
         if not group:
             continue
         alias_keys = sorted({key for key, _, _, _ in group})
-        key = alias_keys[0]
+        key = alias_keys[0] if alias_keys else ""
         candidates = [(prov, inst, it) for _key, prov, inst, it in group]
+        if not candidates:
+            continue
 
         sources = sorted({n for n, _, _ in candidates})
+        if not sources:
+            continue
 
         sources_by_provider: dict[str, list[str]] = {}
         info_best: dict[str, Any] = {}
@@ -982,7 +1000,7 @@ def build_watchlist(state: dict[str, Any], tmdb_ok: bool) -> list[dict[str, Any]
             if ids_.get("anilist") or ids_.get("mal") or pref in {"anilist", "mal"}:
                 typ = "anime"
             else:
-                typ = "tv" if ids_.get("tvdb") else "movie"
+                typ = "tv" if ids_.get("tvdb") or key.split("@", 1)[0].endswith("#show") else "movie"
 
         key = _preferred_watchlist_key(alias_keys, info, typ)
 
@@ -1062,13 +1080,15 @@ def _del_key_from_provider_items(
     def _del_from(block: dict[str, Any]) -> bool:
         hit = False
         wl = (((block.get("watchlist") or {}).get("baseline") or {}).get("items") or {})
-        if isinstance(wl, dict) and key in wl:
-            wl.pop(key, None)
-            hit = True
         legacy = block.get("items") or {}
-        if isinstance(legacy, dict) and key in legacy:
-            legacy.pop(key, None)
-            hit = True
+        for rows in (wl, legacy):
+            if not isinstance(rows, dict):
+                continue
+            for stored_key, item in list(rows.items()):
+                current = migrate_media_key(stored_key, item) if isinstance(item, Mapping) else stored_key
+                if current == key:
+                    rows.pop(stored_key, None)
+                    hit = True
         return hit
 
     p = providers[prov] or {}
@@ -1095,7 +1115,7 @@ def _delete_on_plex_single(
         raise RuntimeError("plexapi is not available")
 
     def _id_tokens_from_key(k: str) -> set[str]:
-        parts = [t.strip() for t in str(k or "").split(":") if t]
+        parts = [t.strip() for t in str(k or "").split("#", 1)[0].split(":") if t]
         if len(parts) == 2:
             t, v = parts[-2].lower(), parts[-1]
             if t == "imdb" and v.isdigit():
@@ -1146,6 +1166,11 @@ def _delete_on_plex_single(
     account = cast(Any, MyPlexAccount)(token=token)
 
     item = _find_item_in_state(state, key) or {}
+    target_type = _norm_type(item.get("type"))
+    if target_type == "anime":
+        target_type = "tv"
+    if not target_type and (key.startswith("tmdb:") or key.split("@", 1)[0].endswith("#show")):
+        target_type = _type_from_item_or_guess(item, key)
     guid, rk = _extract_plex_identifiers(item)
     variants = _guid_variants_from_key_or_item(key, item)
     if guid:
@@ -1161,6 +1186,9 @@ def _delete_on_plex_single(
     wl = account.watchlist(maxresults=100000)
 
     def matches(m: Any) -> bool:
+        candidate_type = _norm_type(getattr(m, "type", ""))
+        if target_type and candidate_type and ("tv" if candidate_type == "anime" else candidate_type) != target_type:
+            return False
         cand_tokens = _tokens_from_plex_obj(m)
         if targets_guid:
             cand_guids = {
@@ -1204,7 +1232,7 @@ _SIMKL_WL = "https://api.simkl.com/sync/watchlist/remove"
 
 def _simkl_headers(cfg: dict[str, Any]) -> dict[str, str]:
     return {
-        "User-Agent": "CrossWatch/WebUI",
+        "User-Agent": http_user_agent("WebUI", override_env="CW_SIMKL_UA"),
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Authorization": f"Bearer {cfg.get('access_token', '')}",
@@ -1217,7 +1245,10 @@ def _post_simkl_delete(
     hdr: dict[str, str],
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    r = requests.post(url, headers=hdr, json=payload, timeout=45)
+    from cw_platform.simkl_http import paced_request
+    from providers.sync.simkl._common import simkl_api_params_from_headers
+
+    r = paced_request(requests.post, "POST", url, headers=hdr, params=simkl_api_params_from_headers(hdr), json=payload, timeout=45)
     if not r.ok:
         raise RuntimeError(
             f"SIMKL delete {r.status_code} {getattr(r, 'text', '')}"
@@ -1275,7 +1306,7 @@ def _trakt_headers(cfg: dict[str, Any]) -> dict[str, str]:
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "CrossWatch/WebUI",
+        "User-Agent": http_user_agent("WebUI", override_env="CW_TRAKT_UA"),
         "trakt-api-version": "2",
         "trakt-api-key": (cfg.get("client_id") or "").strip(),
         "Authorization": f"Bearer {tok}" if tok else "",
@@ -1304,7 +1335,7 @@ def _delete_on_trakt_batch(
     payload = {k: v for k, v in payload.items() if v}
     if not payload:
         raise RuntimeError("TRAKT delete: no resolvable IDs")
-    r = requests.post(_TRAKT_REMOVE, headers=hdr, json=payload, timeout=45)
+    r = trakt_paced_request(requests.post, "POST", _TRAKT_REMOVE, headers=hdr, json=payload, timeout=45)
     if not r.ok:
         raise RuntimeError(
             f"TRAKT delete failed: {getattr(r, 'text', 'no response')}"

@@ -8,7 +8,9 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from cw_platform.id_map import canonical_key
 from cw_platform.provider_instances import build_provider_config_view, normalize_instance_id
+from providers.scrobble._episode_ids import episode_ids
 from providers.scrobble.scrobble import ScrobbleEvent, ScrobbleSink, mask_account
 from providers.sync._mod_CROSSWATCH import OPS as CROSSWATCH_OPS
 from services.activity import record_scrobble_event
@@ -43,11 +45,11 @@ def _log(msg: str, level: str = "INFO") -> None:
         return
     if BASE_LOG is not None:
         try:
-            BASE_LOG(str(msg), level=lvl, module="CW-SCROBBLE")
+            BASE_LOG(str(msg), level=lvl, module="CROSSWATCH-SINK")
             return
         except Exception:
             pass
-    print(f"[CW-SCROBBLE:{lvl}] {msg}")
+    print(f"[CROSSWATCH-SINK:{lvl}] {msg}")
 
 
 def _clamp(value: Any) -> float:
@@ -136,15 +138,19 @@ def _best_duration_ms(raw: Any) -> int | None:
     return walk(raw)
 
 
+_TRACKER_ID_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb", "mdblist", "plex", "jellyfin", "emby", "slug")
+_TRACKER_PASSTHROUGH_FIELDS = ("_cw_anime_map", "_anime_absolute", "_simkl_episode_number", "simkl_bucket", "anime_type")
+
+
 def _ids_for_movie(ev: ScrobbleEvent) -> dict[str, Any]:
     ids = ev.ids or {}
-    return {key: ids[key] for key in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "plex", "jellyfin", "emby", "slug") if ids.get(key)}
+    return {key: ids[key] for key in _TRACKER_ID_KEYS if ids.get(key)}
 
 
 def _show_ids(ev: ScrobbleEvent) -> dict[str, Any]:
     ids = ev.ids or {}
     out: dict[str, Any] = {}
-    for key in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mdblist", "plex", "jellyfin", "emby", "slug"):
+    for key in _TRACKER_ID_KEYS:
         show_key = f"{key}_show"
         if ids.get(show_key):
             out[key] = ids[show_key]
@@ -209,6 +215,8 @@ def _item_from_event(ev: ScrobbleEvent, cfg: Mapping[str, Any], progress: float)
         series_title = str(detail.get("title") or ev.title or "").strip()
         if not show_ids and series_title:
             show_ids = {"slug": _slug(series_title)}
+        if canonical_key({"type": "show", "ids": show_ids}) == "unknown:":
+            return None
         item = {
             "type": "episode",
             "title": f"S{season:02d}E{episode:02d}",
@@ -216,7 +224,7 @@ def _item_from_event(ev: ScrobbleEvent, cfg: Mapping[str, Any], progress: float)
             "year": detail.get("year") or ev.year,
             "season": season,
             "episode": episode,
-            "ids": {},
+            "ids": episode_ids(ev.ids or {}, show_ids),
             "show_ids": show_ids,
             "progress_percent": round(progress, 3),
             "progress_at": now,
@@ -225,6 +233,11 @@ def _item_from_event(ev: ScrobbleEvent, cfg: Mapping[str, Any], progress: float)
     if duration_ms and duration_ms > 0:
         item["duration_ms"] = duration_ms
         item["progress_ms"] = max(0, min(duration_ms, position_ms if position_ms is not None else round((progress / 100.0) * float(duration_ms))))
+    raw = ev.raw if isinstance(ev.raw, Mapping) else {}
+    for field in _TRACKER_PASSTHROUGH_FIELDS:
+        value = raw.get(field)
+        if value not in (None, ""):
+            item[field] = value
     return {k: v for k, v in item.items() if v not in (None, "", {}, [])}
 
 
@@ -263,7 +276,7 @@ class CrossWatchSink(ScrobbleSink):
             return True
         return (progress - previous) >= _progress_step(cfg)
 
-    def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> None:
+    def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
         cfg = cfg or (self._cfg_provider() if self._cfg_provider else None) or _cfg()
         if not isinstance(cfg, dict):
             cfg = {}
@@ -271,9 +284,9 @@ class CrossWatchSink(ScrobbleSink):
         try:
             if not CROSSWATCH_OPS.is_configured(view):
                 _log(f"CrossWatch tracker disabled for sink profile {self._instance_id}; skipping", "WARNING")
-                return
+                return {"ok": True, "log_status": "skipped", "reason": "not_configured"}
         except Exception:
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "configuration_unavailable"}
 
         action = str(ev.action or "").lower().strip()
         progress = _clamp(ev.progress)
@@ -281,7 +294,7 @@ class CrossWatchSink(ScrobbleSink):
         item = _item_from_event(ev, view, progress)
         if not item:
             _log("CrossWatch tracker sink skipped event without enough identity", "DEBUG")
-            return
+            return {"ok": True, "log_status": "skipped", "reason": "missing_media_identity"}
 
         src, src_inst = _route_source(cfg)
         if action == "start":
@@ -291,7 +304,7 @@ class CrossWatchSink(ScrobbleSink):
         complete = action == "stop" and progress >= watched_at
         if complete:
             if self._completed.get(media_key, -1.0) >= watched_at:
-                return
+                return {"ok": True, "log_status": "skipped", "reason": "session_completed"}
             item["watched_at"] = utc_now_iso()
             history = CROSSWATCH_OPS.add(view, [item], feature="history", dry_run=False) or {}
             cleanup = CROSSWATCH_OPS.remove(view, [item], feature="progress", dry_run=False) or {}
@@ -308,12 +321,20 @@ class CrossWatchSink(ScrobbleSink):
                 record_watch(ev, action="stop", source_provider=src, source_instance=src_inst, destination_provider="crosswatch", destination_instance=self._instance_id, status="fail", progress=progress, reason="crosswatch_history_failed")
             return
 
+        previous = self._p_sess.get((str(ev.session_key or "?"), self._media_key(ev)))
         if action in {"start", "pause", "stop"} and self._should_write_progress(ev, cfg, progress):
             result = CROSSWATCH_OPS.add(view, [item], feature="progress", dry_run=False) or {}
             if not result.get("ok"):
                 record_watch(ev, action="start", source_provider=src, source_instance=src_inst, destination_provider="crosswatch", destination_instance=self._instance_id, status="fail", progress=progress, reason="crosswatch_progress_failed")
                 return
-            _log(f"progress {action or 'update'} user='{mask_account(ev.account)}' p={progress:.1f}% media='{ev.title or '?'}'", "DEBUG")
+            _log(f"scrobble {action or 'update'} user='{mask_account(ev.account)}' p={progress:.1f}% media='{ev.title or '?'}'", "INFO")
+        elif action not in {"start", "pause", "stop"}:
+            return {"ok": True, "log_status": "skipped", "reason": "invalid_action"}
+        elif previous is None:
+            return {"ok": True, "log_status": "skipped", "reason": "no_progress"}
+        else:
+            return {"ok": True, "log_status": "skipped", "reason": "progress_step",
+                    "previous_progress": previous, "progress_step": _progress_step(cfg)}
 
 
 __all__ = ["CrossWatchSink"]

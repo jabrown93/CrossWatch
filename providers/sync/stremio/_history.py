@@ -12,7 +12,7 @@ from typing import Any
 
 import requests
 
-from cw_platform.id_map import minimal as id_minimal
+from cw_platform.id_map import ID_KEYS, coalesce_ids, minimal as id_minimal
 from providers.auth._auth_STREMIO import StremioAuthError
 from providers.sync._mod_common import build_op_result, unresolved_keys
 
@@ -21,21 +21,32 @@ from ._common import (
     datastore_get,
     datastore_put,
     default_record,
+    epoch_ms,
     imdb_ids_from_item,
     imdb_id,
+    ids_from_stremio_record,
+    is_capture_mode,
     iso_from_epoch_ms,
     item_from_episode,
     item_from_movie_record,
     library_records,
+    native_record_ids,
     now_iso,
     positive_int,
+    season_int,
+    read_drop_summary,
+    record_read_drop,
     record_id,
+    reset_read_drop_report,
     state_of,
+    stremio_id_namespace,
     stremio_id_for_item,
+    stremio_write_id_for_item,
     poster_url_from_item,
     tmdb_metadata_provider,
     video_id_for_episode,
 )
+from providers.sync._log import log as cw_log
 
 CINEMETA_BASE = "https://v3-cinemeta.strem.io"
 
@@ -96,6 +107,40 @@ def decode_watched_episodes(value: Any, video_ids: list[str]) -> set[str]:
     return {video_ids[i] for i, value in enumerate(watched_bits(value, video_ids)) if value}
 
 
+def watched_anchor(value: Any) -> tuple[str, int] | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        anchor_id, anchor_length, _packed = _parse_serialized(raw)
+    except Exception:
+        return None
+    return anchor_id, anchor_length
+
+
+def show_id_from_video_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    parts = raw.split(":")
+    if len(parts) < 3:
+        return ""
+    season = season_int(parts[-2])
+    episode = positive_int(parts[-1])
+    if season is None or not episode:
+        return ""
+    return ":".join(parts[:-2]).strip()
+
+
+def order_matches_anchor(value: Any, video_ids: list[str]) -> bool:
+    anchor = watched_anchor(value)
+    if anchor is None:
+        return False
+    anchor_id, anchor_length = anchor
+    try:
+        return video_ids.index(anchor_id) + 1 == anchor_length
+    except ValueError:
+        return False
+
+
 def set_episode_watched_value(value: Any, video_ids: list[str], video_id: str, watched: bool) -> str:
     bits = watched_bits(value, video_ids)
     index = video_ids.index(video_id)
@@ -120,6 +165,131 @@ def cinemeta_videos(adapter: Any, imdb: str) -> list[Mapping[str, Any]]:
     rows = [row for row in videos if isinstance(row, Mapping) and str(row.get("id") or "").strip()]
     cache[imdb] = rows
     return rows
+
+
+def _tmdb_season_rows(fetch: Any, tmdb_id: str, season_no: int, prefix: str) -> list[Mapping[str, Any]]:
+    base = "https://api.themoviedb.org/3"
+    try:
+        season_data = fetch(f"{base}/tv/{tmdb_id}/season/{season_no}", {"language": "en-US"})
+    except Exception:
+        return []
+    episodes = season_data.get("episodes") if isinstance(season_data, Mapping) else None
+    if not isinstance(episodes, list):
+        return []
+    rows: list[Mapping[str, Any]] = []
+    for episode_row in episodes:
+        if not isinstance(episode_row, Mapping):
+            continue
+        episode_no = positive_int(episode_row.get("episode_number"))
+        if not episode_no:
+            continue
+        rows.append(
+            {
+                "id": f"{prefix}:{season_no}:{episode_no}",
+                "season": season_no,
+                "episode": episode_no,
+                "title": str(episode_row.get("name") or "").strip(),
+                "thumbnail": "",
+            }
+        )
+    return rows
+
+
+def tmdb_native_video_orders(adapter: Any, tmdb_id: str, *, video_prefix: str | None = None) -> list[list[Mapping[str, Any]]]:
+    cache = getattr(adapter, "_stremio_tmdb_video_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(adapter, "_stremio_tmdb_video_cache", cache)
+    prefix = str(video_prefix or f"tmdb:{tmdb_id}").strip()
+    cache_key = f"{tmdb_id}|{prefix}"
+    if cache_key in cache:
+        return cache[cache_key]
+
+    provider = tmdb_metadata_provider(adapter)
+    if provider is None:
+        raise ValueError("tmdb_metadata_provider_missing")
+    fetch = getattr(provider, "_get", None)
+    if not callable(fetch):
+        raise ValueError("tmdb_metadata_provider_invalid")
+    detail = provider.fetch(entity="tv", ids={"tmdb": str(tmdb_id)}, need={"ids": True})
+    meta = detail.get("detail") if isinstance(detail, Mapping) else None
+    meta_map = meta if isinstance(meta, Mapping) else {}
+    seasons = positive_int(meta_map.get("number_of_seasons"))
+    if not seasons:
+        raise ValueError("tmdb_show_seasons_missing")
+
+    aired: list[Mapping[str, Any]] = []
+    for season_no in range(1, seasons + 1):
+        aired.extend(_tmdb_season_rows(fetch, tmdb_id, season_no, prefix))
+    if not aired:
+        raise ValueError("tmdb_episode_index_unavailable")
+
+    specials = _tmdb_season_rows(fetch, tmdb_id, 0, prefix)
+    orders = [aired] if not specials else [aired, specials + aired, aired + specials]
+    cache[cache_key] = orders
+    return orders
+
+
+def tmdb_native_videos(adapter: Any, tmdb_id: str, *, video_prefix: str | None = None) -> list[Mapping[str, Any]]:
+    return tmdb_native_video_orders(adapter, tmdb_id, video_prefix=video_prefix)[0]
+
+
+_TMDB_RESOLVABLE_ID_KEYS = ("tvdb", "imdb")
+
+
+def tmdb_id_for_native_ids(adapter: Any, ids: Mapping[str, Any], title: Any = None) -> str:
+    lookup = {key: str(ids.get(key) or "").strip() for key in _TMDB_RESOLVABLE_ID_KEYS if str(ids.get(key) or "").strip()}
+    if not lookup:
+        return ""
+    name = str(title or "").strip()
+    if name:
+        lookup["title"] = name
+    provider = tmdb_metadata_provider(adapter)
+    if provider is None:
+        raise ValueError("tmdb_metadata_provider_missing")
+    try:
+        detail = provider.fetch(entity="tv", ids=lookup, need={"ids": True})
+    except Exception:
+        detail = None
+    resolved = detail.get("ids") if isinstance(detail, Mapping) else None
+    return str((resolved or {}).get("tmdb") or "").strip() if isinstance(resolved, Mapping) else ""
+
+
+def _video_orders_for_show_id(adapter: Any, show_id: str, record: Mapping[str, Any]) -> tuple[list[list[Mapping[str, Any]]], bool]:
+    imdb = imdb_id(show_id)
+    if imdb:
+        return [cinemeta_videos(adapter, imdb)], False
+    ids = ids_from_stremio_record(record) if show_id == record_id(record) else ids_from_stremio_record({"_id": show_id, "type": record.get("type")})
+    tmdb = str(ids.get("tmdb") or "").strip()
+    if not tmdb:
+        tmdb = tmdb_id_for_native_ids(adapter, ids, record.get("name"))
+    if tmdb:
+        return tmdb_native_video_orders(adapter, tmdb, video_prefix=show_id), True
+    raise ValueError("native_episode_namespace_unsupported")
+
+
+def video_orders_for_series_record(adapter: Any, record: Mapping[str, Any], watched_value: Any = None) -> tuple[list[list[Mapping[str, Any]]], bool]:
+    anchor = watched_anchor(watched_value)
+    if anchor is not None:
+        anchor_show_id = show_id_from_video_id(anchor[0])
+        if anchor_show_id:
+            return _video_orders_for_show_id(adapter, anchor_show_id, record)
+    return _video_orders_for_show_id(adapter, record_id(record), record)
+
+
+def videos_for_series_record(adapter: Any, record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    orders, _reconstructed = video_orders_for_series_record(adapter, record)
+    return orders[0]
+
+
+def select_video_order(orders: list[list[Mapping[str, Any]]], watched_value: Any, *, require_anchor_match: bool) -> list[Mapping[str, Any]]:
+    for order in orders:
+        video_ids = [str(v.get("id") or "").strip() for v in order]
+        if order_matches_anchor(watched_value, video_ids):
+            return order
+    if require_anchor_match:
+        raise ValueError("native_episode_order_unverified")
+    return orders[0]
 
 
 def parse_movie_history_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -152,7 +322,7 @@ def _image_url(detail: Mapping[str, Any], kind: str) -> str:
 def _metadata_enriched(adapter: Any, item: Mapping[str, Any], typ: str) -> dict[str, Any]:
     out = dict(item)
     stremio_id = stremio_id_for_item(out)
-    if stremio_id:
+    if imdb_id(stremio_id):
         if not str(out.get("poster") or out.get("poster_url") or "").strip():
             out["poster"] = poster_url_from_item(out, stremio_id)
         return out
@@ -180,16 +350,15 @@ def _metadata_enriched(adapter: Any, item: Mapping[str, Any], typ: str) -> dict[
     ids: Mapping[str, Any] = ids_raw if isinstance(ids_raw, Mapping) else {}
     imdb = imdb_id(ids.get("imdb"))
     if imdb:
+        out_ids_raw = out.get("ids")
+        out_ids: Mapping[str, Any] = out_ids_raw if isinstance(out_ids_raw, Mapping) else {}
+        merged: dict[str, Any] = dict(out_ids)
+        merged["imdb"] = imdb
+        out["ids"] = merged
         if typ in {"episode", "episodes"}:
-            merged: dict[str, Any] = dict(show_ids)
-            merged["imdb"] = imdb
-            out["show_ids"] = merged
-        else:
-            out_ids_raw = out.get("ids")
-            out_ids: Mapping[str, Any] = out_ids_raw if isinstance(out_ids_raw, Mapping) else {}
-            merged = dict(out_ids)
-            merged["imdb"] = imdb
-            out["ids"] = merged
+            merged_show = dict(show_ids)
+            merged_show["imdb"] = imdb
+            out["show_ids"] = merged_show
     if not str(out.get("poster") or out.get("poster_url") or "").strip():
         poster = poster_url_from_item(out, imdb) or _image_url(detail, "poster")
         if poster:
@@ -197,25 +366,214 @@ def _metadata_enriched(adapter: Any, item: Mapping[str, Any], typ: str) -> dict[
     return out
 
 
+_RECONSTRUCTION_FAILURES = {
+    "tmdb_metadata_provider_missing",
+    "tmdb_metadata_provider_invalid",
+    "tmdb_show_seasons_missing",
+    "tmdb_episode_index_unavailable",
+}
+_TMDB_KEY_REASONS = {"bare_numeric_id_unverified", "native_episode_index_unavailable", "native_episode_order_unverified"}
+_UNKNOWN_ID_REASONS = {"unsupported_stremio_id", "native_episode_namespace_unsupported", "bare_numeric_id_mismatch"}
+_UNKNOWN_EPISODE_WATCHED_AT = "1970-01-01T00:00:01Z"
+_STORED_EPISODE_ESTIMATE_SOURCE = "stored_episode_estimate"
+
+
+def _series_watched_at(record: Mapping[str, Any]) -> tuple[str | None, str]:
+    state = state_of(record)
+    watched_at = iso_from_epoch_ms(state.get("lastWatched"))
+    if watched_at:
+        return watched_at, "show_last_watched"
+    watched_at = iso_from_epoch_ms(record.get("_mtime"))
+    if watched_at:
+        return watched_at, "show_record_mtime"
+    return None, ""
+
+
+def _baseline_items(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(k): dict(v) for k, v in value.items() if isinstance(v, Mapping)}
+
+
+def _load_stremio_history_baseline(adapter: Any) -> dict[str, dict[str, Any]]:
+    injected = getattr(adapter, "_stremio_history_baseline", None)
+    if isinstance(injected, Mapping):
+        return _baseline_items(injected)
+    if is_capture_mode():
+        return {}
+    if not isinstance(getattr(adapter, "config", None), Mapping):
+        return {}
+    try:
+        from pathlib import Path
+
+        from cw_platform.config_base import CONFIG_BASE
+        from cw_platform.orchestrator._state_store import StateStore
+        from cw_platform.provider_instances import normalize_instance_id
+
+        state = StateStore(Path(CONFIG_BASE()), pair_scope=adapter.config.get("_cw_pair_scope")).load_state_features({"history"}) or {}
+        providers = state.get("providers") if isinstance(state, Mapping) else None
+        providers = providers if isinstance(providers, Mapping) else {}
+        stremio = providers.get("STREMIO") or providers.get("stremio")
+        if not isinstance(stremio, Mapping):
+            return {}
+
+        instance_id = normalize_instance_id(getattr(adapter, "instance_id", "default"))
+        nodes: list[Mapping[str, Any]] = []
+        if instance_id != "default":
+            instances = stremio.get("instances")
+            if isinstance(instances, Mapping):
+                node = instances.get(instance_id) or instances.get(str(instance_id))
+                if not isinstance(node, Mapping):
+                    for raw_inst, raw_node in instances.items():
+                        if normalize_instance_id(raw_inst) == instance_id and isinstance(raw_node, Mapping):
+                            node = raw_node
+                            break
+                if isinstance(node, Mapping):
+                    nodes.append(node)
+        if instance_id == "default":
+            nodes.append(stremio)
+
+        for node in nodes:
+            history = node.get("history") if isinstance(node, Mapping) else None
+            history = history if isinstance(history, Mapping) else {}
+            baseline = history.get("baseline") if isinstance(history, Mapping) else None
+            baseline = baseline if isinstance(baseline, Mapping) else {}
+            items = baseline.get("items") if isinstance(baseline, Mapping) else None
+            found = _baseline_items(items)
+            if found:
+                return found
+    except Exception:
+        return {}
+    return {}
+
+
+def _episode_base_key(key: Any) -> str:
+    return str(key or "").split("@", 1)[0].strip()
+
+
+def _episode_fragment(item: Mapping[str, Any]) -> str | None:
+    season = season_int(item.get("season"))
+    episode = positive_int(item.get("episode"))
+    if season is None or not episode:
+        return None
+    return f"#s{season:02d}e{episode:02d}"
+
+
+def _episode_date_aliases(item: Mapping[str, Any], key: Any = None) -> set[str]:
+    aliases = {str(alias).strip().lower() for alias in (key, _episode_base_key(key)) if str(alias or "").strip()}
+    try:
+        canonical = canonical_item_key(item)
+        if canonical:
+            aliases.add(canonical.lower())
+    except Exception:
+        pass
+
+    fragment = _episode_fragment(item)
+    if not fragment:
+        return aliases
+    for source in (item.get("show_ids"), item.get("ids")):
+        if not isinstance(source, Mapping):
+            continue
+        ids = coalesce_ids(source)
+        for id_key in ID_KEYS:
+            value = ids.get(id_key)
+            if value:
+                aliases.add(f"{id_key}:{value}{fragment}".lower())
+    return aliases
+
+
+def _remember_previous_date(out: dict[str, str], alias: str, watched_at: str) -> None:
+    alias = str(alias or "").strip().lower()
+    if not alias:
+        return
+    existing = out.get(alias)
+    if existing is None or (epoch_ms(watched_at) or 0) < (epoch_ms(existing) or 0):
+        out[alias] = watched_at
+
+
+def _previous_episode_watched_dates(previous: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, item in (previous or {}).items():
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("type") or "").strip().lower() not in {"episode", "episodes"}:
+            continue
+        if item.get("watched") is False:
+            continue
+        watched_at = iso_from_epoch_ms(item.get("watched_at"))
+        if not watched_at or watched_at == _UNKNOWN_EPISODE_WATCHED_AT:
+            continue
+        for alias in _episode_date_aliases(item, key):
+            _remember_previous_date(out, alias, watched_at)
+    return out
+
+
+def _apply_episode_watched_at(item: dict[str, Any], key: str, record: Mapping[str, Any], previous_dates: Mapping[str, str]) -> None:
+    previous = next((previous_dates.get(alias) for alias in _episode_date_aliases(item, key) if previous_dates.get(alias)), None)
+    if previous:
+        item["watched_at"] = previous
+        item["_stremio_watched_at_source"] = _STORED_EPISODE_ESTIMATE_SOURCE
+        return
+
+    show_ts, ts_source = _series_watched_at(record)
+    if show_ts:
+        item["watched_at"] = show_ts
+        item["_stremio_watched_at_source"] = ts_source
+    else:
+        item["watched_at"] = _UNKNOWN_EPISODE_WATCHED_AT
+        item["_stremio_watched_at_fallback"] = "unknown_episode_watch_time"
+
+
+def _requires_for(record: Mapping[str, Any], reason: str | None) -> str | None:
+    reason_s = str(reason or "")
+    if reason_s in _TMDB_KEY_REASONS and stremio_id_namespace(record_id(record)) in {"tmdb", "tmdb_bare"}:
+        return "tmdb_api_key"
+    if reason_s in _UNKNOWN_ID_REASONS:
+        return "known_native_id"
+    return None
+
+
 def build_index(adapter: Any, **kwargs: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
+    previous_dates = _previous_episode_watched_dates(_load_stremio_history_baseline(adapter))
+    reset_read_drop_report(adapter, "history")
     for record in library_records(adapter, incremental=bool(kwargs.get("incremental"))):
         typ = str(record.get("type") or "").strip().lower()
         if typ == "movie":
+            state = state_of(record)
+            watched = (positive_int(state.get("timesWatched")) or 0) > 0 or (positive_int(state.get("flaggedWatched")) or 0) > 0
+            ids, drop_reason = native_record_ids(adapter, record)
+            if not ids:
+                if watched:
+                    record_read_drop(adapter, "history", record, drop_reason or "unsupported_stremio_id", requires_id=_requires_for(record, drop_reason))
+                continue
             item = parse_movie_history_record(record)
             if not item or not item.get("watched"):
                 continue
+            item = _metadata_enriched(adapter, item, "movie")
             out[canonical_item_key(item)] = item
         elif typ in {"series", "show"}:
-            show_id = imdb_id(record.get("_id"))
-            watched_value = state_of(record).get("watched")
-            if not show_id or not str(watched_value or "").strip():
+            show_id = record_id(record)
+            record_state = state_of(record)
+            watched_value = record_state.get("watched")
+            if not str(watched_value or "").strip():
+                continue
+            ids, drop_reason = native_record_ids(adapter, record)
+            if not ids:
+                record_read_drop(adapter, "history", record, drop_reason or "unsupported_stremio_id", requires_id=_requires_for(record, drop_reason))
                 continue
             try:
-                videos = cinemeta_videos(adapter, show_id)
+                orders, reconstructed = video_orders_for_series_record(adapter, record, watched_value)
+                videos = select_video_order(orders, watched_value, require_anchor_match=reconstructed)
                 video_ids = [str(v.get("id") or "").strip() for v in videos]
                 watched_ids = decode_watched_episodes(watched_value, video_ids)
-            except Exception:
+                if not watched_ids:
+                    raise ValueError("watched_anchor_unmatched")
+            except Exception as exc:
+                reason = str(exc) if isinstance(exc, ValueError) else ""
+                if not reason or reason in _RECONSTRUCTION_FAILURES:
+                    reason = "cinemeta_episode_index_unavailable" if stremio_id_namespace(show_id) == "imdb" else "native_episode_index_unavailable"
+                record_read_drop(adapter, "history", record, reason, requires_id=_requires_for(record, reason), detail=str(exc))
                 continue
             by_id = {str(v.get("id") or "").strip(): v for v in videos}
             for video_id in watched_ids:
@@ -223,11 +581,14 @@ def build_index(adapter: Any, **kwargs: Any) -> dict[str, dict[str, Any]]:
                 item = item_from_episode(show_id, video.get("season"), video.get("episode"), record, video)
                 if not item:
                     continue
+                item = _metadata_enriched(adapter, item, "episode")
                 item["watched"] = True
-                fallback_ts = iso_from_epoch_ms(record.get("_mtime"))
-                if fallback_ts:
-                    item["_stremio_changed_at"] = fallback_ts
-                out[canonical_item_key(item)] = item
+                key = canonical_item_key(item)
+                _apply_episode_watched_at(item, key, record, previous_dates)
+                out[key] = item
+    summary = read_drop_summary(adapter, "history")
+    if int(summary.get("dropped") or 0):
+        cw_log("STREMIO", "history", "warn", "index_rows_dropped", indexed=len(out), **summary)
     return out
 
 
@@ -235,12 +596,28 @@ def _history_ts(item: Mapping[str, Any]) -> str:
     return iso_from_epoch_ms(item.get("watched_at") or item.get("last_watched_at") or item.get("lastWatchedAt")) or now_iso()
 
 
-def _unresolved(item: Mapping[str, Any], reason: str) -> dict[str, Any]:
-    return {"status": "unresolved", "reason": reason, "item": id_minimal(item)}
+def _latest_history_ts(items: Iterable[Mapping[str, Any]]) -> str | None:
+    latest: tuple[int, str] | None = None
+    for item in items:
+        ts = _history_ts(item)
+        ms = epoch_ms(ts)
+        if ms is None:
+            continue
+        if latest is None or ms > latest[0]:
+            latest = (ms, ts)
+    return latest[1] if latest else None
+
+
+def _unresolved(item: Mapping[str, Any], reason: str, key: str | None = None) -> dict[str, Any]:
+    out = {"status": "unresolved", "reason": reason, "item": id_minimal(item)}
+    if key:
+        out["key"] = key
+        out["canonical_key"] = key
+    return out
 
 
 def _api_failure(item: Mapping[str, Any], key: str, exc: StremioAuthError, fallback: str) -> dict[str, Any]:
-    entry = {"status": "failed", "reason": str(getattr(exc, "reason", "") or fallback), "item": id_minimal(item), "canonical_key": key}
+    entry = {"status": "failed", "reason": str(getattr(exc, "reason", "") or fallback), "item": id_minimal(item), "key": key, "canonical_key": key}
     detail = str(getattr(exc, "detail", "") or "").replace("\n", " ").replace("\r", " ").strip()
     if detail:
         for token in ("authKey", "auth_key", "password"):
@@ -273,15 +650,26 @@ def _apply_movie(record: dict[str, Any], item: Mapping[str, Any], watched: bool)
 
 
 def _apply_episode(adapter: Any, record: dict[str, Any], item: Mapping[str, Any], watched: bool) -> str | None:
-    show_id = imdb_id(record.get("_id"))
-    if not show_id:
+    show_id = record_id(record)
+    if not show_id or not ids_from_stremio_record(record):
         return "stremio_id_missing"
-    videos = cinemeta_videos(adapter, show_id)
+    state = record.setdefault("state", {})
+    try:
+        orders, reconstructed = video_orders_for_series_record(adapter, record, state.get("watched"))
+        videos = select_video_order(orders, state.get("watched"), require_anchor_match=reconstructed and bool(str(state.get("watched") or "").strip()))
+    except ValueError as exc:
+        return str(exc) or "stremio_episode_unresolved"
+    except Exception:
+        return "stremio_episode_unresolved"
     video_ids = [str(v.get("id") or "").strip() for v in videos]
     video_id = video_id_for_episode(item, show_id)
     if not video_id or video_id not in video_ids:
+        season = season_int(item.get("season"))
+        episode = positive_int(item.get("episode"))
+        matched = next((str(v.get("id") or "").strip() for v in videos if season is not None and season_int(v.get("season")) == season and positive_int(v.get("episode")) == episode), "")
+        video_id = matched or video_id
+    if not video_id or video_id not in video_ids:
         return "stremio_episode_unresolved"
-    state = record.setdefault("state", {})
     _apply_poster(record, item)
     try:
         state["watched"] = set_episode_watched_value(state.get("watched"), video_ids, video_id, watched)
@@ -289,6 +677,21 @@ def _apply_episode(adapter: Any, record: dict[str, Any], item: Mapping[str, Any]
         return "stremio_watched_bitfield_malformed"
     record["_mtime"] = now_iso()
     return None
+
+
+def _apply_series_history_timestamp(record: dict[str, Any], items: Iterable[Mapping[str, Any]], watched: bool) -> None:
+    state = record.setdefault("state", {})
+    if watched:
+        latest = _latest_history_ts(items)
+        if latest:
+            state["lastWatched"] = latest
+            state["timesWatched"] = max(1, positive_int(state.get("timesWatched")) or 0)
+            state["flaggedWatched"] = 1
+        return
+    if not str(state.get("watched") or "").strip():
+        state["lastWatched"] = ""
+        state["timesWatched"] = 0
+        state["flaggedWatched"] = 0
 
 
 def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
@@ -309,9 +712,9 @@ def _write(adapter: Any, items: Iterable[Mapping[str, Any]], watched: bool, *, d
         key = canonical_item_key(item)
         typ = str(item.get("type") or id_minimal(item).get("type") or "").strip().lower()
         item = _metadata_enriched(adapter, item, typ)
-        stremio_id = stremio_id_for_item(item)
+        stremio_id = stremio_write_id_for_item(item)
         if not stremio_id or typ not in {"movie", "episode", "episodes"}:
-            entry = _unresolved(item, "stremio_id_missing")
+            entry = _unresolved(item, "stremio_id_missing", key)
             unresolved.append(entry)
             results.append(entry)
             continue
@@ -346,17 +749,19 @@ def _write(adapter: Any, items: Iterable[Mapping[str, Any]], watched: bool, *, d
                     if reason:
                         raise ValueError(reason)
                 except ValueError as exc:
-                    entry = _unresolved(item, str(exc) or "stremio_history_write_failed")
+                    entry = _unresolved(item, str(exc) or "stremio_history_write_failed", key)
                     unresolved.append(entry)
                     results.append(entry)
                     continue
                 except Exception:
-                    entry = {"status": "failed", "reason": "stremio_history_write_failed", "item": id_minimal(item), "canonical_key": key}
+                    entry = {"status": "failed", "reason": "stremio_history_write_failed", "item": id_minimal(item), "key": key, "canonical_key": key}
                     unresolved.append(entry)
                     results.append(entry)
                     continue
                 applied.append((key, item))
             if applied:
+                if item_type == "series":
+                    _apply_series_history_timestamp(record, [item for _key, item in applied], watched)
                 prepared.append((record, applied))
         pending = prepared
         if prepared:
@@ -375,7 +780,7 @@ def _write(adapter: Any, items: Iterable[Mapping[str, Any]], watched: bool, *, d
                         continue
                     except Exception:
                         for key, item in ops:
-                            entry = {"status": "failed", "reason": "stremio_history_write_failed", "item": id_minimal(item), "canonical_key": key}
+                            entry = {"status": "failed", "reason": "stremio_history_write_failed", "item": id_minimal(item), "key": key, "canonical_key": key}
                             unresolved.append(entry)
                             results.append(entry)
                         continue

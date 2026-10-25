@@ -10,9 +10,14 @@ import os
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from urllib.parse import urlsplit
 from cw_platform.run_control import consume_queue_stop
-from services.scheduler_webhooks import notify_scheduler_webhook
+from services.scheduler_webhooks import (
+    DEFAULT_WEBHOOKS,
+    normalize_scheduler_webhooks,
+    notify_scheduler_webhook,
+    payload_format_label,
+    scheduler_webhooks_configured,
+)
 
 try:
     from zoneinfo import ZoneInfo  # py39+
@@ -24,18 +29,6 @@ def _env_timezone_name() -> str:
     return tz
 
 # safety config defaults due to autostart and potential for misconfiguration
-DEFAULT_WEBHOOKS: dict[str, Any] = {
-    "enabled": False,
-    "url": "",
-    "base_url": "",
-    "start_url": "",
-    "success_url": "",
-    "failure_url": "",
-    "payload_format": "crosswatch",
-    "notifiarr_channel_id": "",
-    "timeout_seconds": 10,
-}
-
 DEFAULT_SCHEDULING: dict[str, Any] = {
     "enabled": False,
     "mode": "disabled",
@@ -43,7 +36,7 @@ DEFAULT_SCHEDULING: dict[str, Any] = {
     "daily_time": "03:30",
     "custom_interval_minutes": 60,
     "timezone": "",
-    "jitter_seconds": 0,
+    "jitter_seconds": 300,
     "webhooks": dict(DEFAULT_WEBHOOKS),
     "advanced": {
         "enabled": False,
@@ -91,8 +84,9 @@ def _as_now_in_tz(tz: Any | None) -> datetime:
 
 
 def _apply_jitter(dt_local: datetime, sch: dict[str, Any]) -> datetime:
+    raw_js = sch.get("jitter_seconds", DEFAULT_SCHEDULING.get("jitter_seconds", 0))
     try:
-        js = int(sch.get("jitter_seconds") or 0)
+        js = int(raw_js if raw_js is not None else 0)
     except Exception:
         js = 0
     if js <= 0:
@@ -134,45 +128,6 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if s in {"0", "false", "no", "off"}:
         return False
     return bool(default)
-
-
-def _normalize_scheduler_webhooks(value: Any) -> dict[str, Any]:
-    src = value if isinstance(value, dict) else {}
-    out = dict(DEFAULT_WEBHOOKS)
-    out["enabled"] = _as_bool(src.get("enabled"), False)
-    out["url"] = _http_url_or_blank(src.get("url") or src.get("default_url"))
-    out["base_url"] = _http_url_or_blank(src.get("base_url") or src.get("healthchecks_base_url"))
-    for key in ("start_url", "success_url", "failure_url"):
-        out[key] = _http_url_or_blank(src.get(key))
-    out["payload_format"] = _payload_format(src.get("payload_format") or src.get("format"))
-    out["notifiarr_channel_id"] = _digits_or_blank(src.get("notifiarr_channel_id") or src.get("notifiarrChannelId"))
-    out["timeout_seconds"] = _as_int(src.get("timeout_seconds"), 10, minimum=1, maximum=60)
-    return out
-
-
-def _http_url_or_blank(value: Any) -> str:
-    url = str(value or "").strip()
-    if not url:
-        return ""
-    try:
-        parts = urlsplit(url)
-    except Exception:
-        return ""
-    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
-        return ""
-    return url
-
-
-def _payload_format(value: Any) -> str:
-    text = str(value or "").strip().lower().replace("-", "_")
-    if text in {"notifiarr", "notifiarr_passthrough"}:
-        return "notifiarr"
-    return "crosswatch"
-
-
-def _digits_or_blank(value: Any) -> str:
-    text = str(value or "").strip()
-    return text if text.isdigit() else ""
 
 
 def _normalize_event_name(value: Any) -> str:
@@ -224,7 +179,7 @@ def merge_defaults(s: dict[str, Any]) -> dict[str, Any]:
             out["advanced"] = out_adv
     if not isinstance(out.get("advanced"), dict):
         out["advanced"] = dict(DEFAULT_SCHEDULING["advanced"])
-    out["webhooks"] = _normalize_scheduler_webhooks(out.get("webhooks"))
+    out["webhooks"] = normalize_scheduler_webhooks(out.get("webhooks"))
     return out
 
 def _align_next_hour_in_tz(now_tz: datetime) -> datetime:
@@ -364,7 +319,7 @@ def _normalize_capture_job(j: dict[str, Any]) -> dict[str, Any]:
             continue
     days2.sort()
     feature = str(j.get("feature") or "").strip().lower()
-    if feature not in {"watchlist", "ratings", "history", "progress", "all"}:
+    if feature not in {"watchlist", "ratings", "history", "progress", "collection", "all"}:
         feature = ""
     instance = str(j.get("instance") or j.get("instance_id") or j.get("profile") or "default").strip() or "default"
     return {
@@ -743,6 +698,7 @@ class SyncScheduler:
 
         self._status: dict[str, Any] = {
             "running": False,
+            "busy": False,
             "last_tick": 0,
             "last_run_ok": None,
             "last_run_at": 0,
@@ -797,18 +753,9 @@ class SyncScheduler:
             self._last_logged_webhook_state = "off"
             return
 
-        fmt = _payload_format(hooks.get("payload_format") or hooks.get("format"))
-        label = "Notifiarr Passthrough" if fmt == "notifiarr" else "CrossWatch JSON"
-        common_url = str(hooks.get("url") or hooks.get("default_url") or "").strip()
-        urls = [
-            common_url,
-            str(hooks.get("base_url") or hooks.get("healthchecks_base_url") or "").strip(),
-            str(hooks.get("start_url") or "").strip(),
-            str(hooks.get("success_url") or "").strip(),
-            str(hooks.get("failure_url") or "").strip(),
-        ]
-        configured = bool(common_url) if fmt == "notifiarr" else any(urls)
-        state = f"on:{fmt}:{int(configured)}"
+        label = payload_format_label(hooks.get("payload_format") or hooks.get("format"))
+        configured = scheduler_webhooks_configured(hooks)
+        state = f"on:{label}:{int(configured)}"
         if state == self._last_logged_webhook_state:
             return
         self._last_logged_webhook_state = state
@@ -1173,14 +1120,20 @@ class SyncScheduler:
                 err = "event_rule_failed"
                 ok = False
 
-            self._set_last_run_status(
-                ok,
-                err if err else ("" if ok else "event rule failed"),
-                last_pair_id=pair_id,
-                last_rule_id=str(rule.get("id") or ""),
-                last_event_source=str(event.get("source") or ""),
-                last_event_name=str(event.get("event") or ""),
-            )
+            with self._lock:
+                self._status["last_run_ok"] = ok
+                self._status["last_run_at"] = _now_ts()
+                self._status["last_error"] = err if err else ("" if ok else "event rule failed")
+                self._status["last_job_id"] = ""
+                self._status["last_pair_id"] = pair_id
+                self._status["last_capture_job_id"] = ""
+                self._status["last_capture_provider"] = ""
+                self._status["last_capture_feature"] = ""
+                self._status["last_backup_job_id"] = ""
+                self._status["last_backup_scope"] = ""
+                self._status["last_rule_id"] = str(rule.get("id") or "")
+                self._status["last_event_source"] = str(event.get("source") or "")
+                self._status["last_event_name"] = str(event.get("event") or "")
 
             if not ok:
                 skipped.append({"rule_id": str(rule.get("id") or ""), "reason": "run_failed"})
@@ -1377,46 +1330,6 @@ class SyncScheduler:
         due.sort(key=lambda x: (x[0], str(x[1].get("id") or "")))
         return due
 
-    def _wait_until_sync_free(self, busy_msg: str) -> bool:
-        """Poll every 2s until sync is free or stop is requested.
-
-        Returns True if a poke fired mid-wait (config changed), meaning the
-        caller should return early so due jobs get re-evaluated; returns
-        False once sync is free (or stop was requested).
-        """
-        waited = 0
-        while self.is_sync_running_fn() and not self._stop.is_set():
-            if waited == 0:
-                self._log(busy_msg, level="INFO")
-            waited += 1
-            self._sleep_or_poke(2.0)
-            if self._poke.is_set():
-                self._poke.clear()
-                return True
-        return False
-
-    def _set_last_run_status(self, ok: bool, error: str, **overrides: Any) -> None:
-        """Reset the last-run status fields under the scheduler lock.
-
-        Unset last_* keys default to "" per existing convention; pass
-        overrides (e.g. last_job_id=..., last_pair_id=...) to set the
-        identifiers relevant to this run.
-        """
-        with self._lock:
-            self._status["last_run_ok"] = ok
-            self._status["last_run_at"] = _now_ts()
-            self._status["last_error"] = error
-            self._status["last_job_id"] = overrides.get("last_job_id", "")
-            self._status["last_pair_id"] = overrides.get("last_pair_id", "")
-            self._status["last_capture_job_id"] = overrides.get("last_capture_job_id", "")
-            self._status["last_capture_provider"] = overrides.get("last_capture_provider", "")
-            self._status["last_capture_feature"] = overrides.get("last_capture_feature", "")
-            self._status["last_backup_job_id"] = overrides.get("last_backup_job_id", "")
-            self._status["last_backup_scope"] = overrides.get("last_backup_scope", "")
-            self._status["last_rule_id"] = overrides.get("last_rule_id", "")
-            self._status["last_event_source"] = overrides.get("last_event_source", "")
-            self._status["last_event_name"] = overrides.get("last_event_name", "")
-
     def _adv_run_due(self, sch: dict[str, Any], tz: Any | None) -> bool:
         due = self._adv_due_jobs(sch, tz)
         due_workflows = self._adv_due_workflows(sch, tz)
@@ -1445,8 +1358,16 @@ class SyncScheduler:
                 continue
 
             # Wait until sync is free
-            if self._wait_until_sync_free("advanced: sync is busy; waiting to run due job(s)"):
-                return True
+            waited = 0
+            while self.is_sync_running_fn() and not self._stop.is_set():
+                if waited == 0:
+                    self._log("advanced: sync is busy; waiting to run due job(s)", level="INFO")
+                waited += 1
+                self._sleep_or_poke(2.0)
+                if self._poke.is_set():
+                    self._poke.clear()
+                    # re-check due after config change
+                    return True
 
             payload = {
                 "source": "scheduler",
@@ -1464,12 +1385,20 @@ class SyncScheduler:
             else:
                 self._log(f"advanced: job {j['id']} ok", level="INFO")
 
-            self._set_last_run_status(
-                ok,
-                "" if ok else "advanced job failed",
-                last_job_id=j["id"],
-                last_pair_id=j["pair_id"] or "",
-            )
+            with self._lock:
+                self._status["last_run_ok"] = ok
+                self._status["last_run_at"] = _now_ts()
+                self._status["last_error"] = "" if ok else "advanced job failed"
+                self._status["last_job_id"] = j["id"]
+                self._status["last_pair_id"] = j["pair_id"] or ""
+                self._status["last_capture_job_id"] = ""
+                self._status["last_capture_provider"] = ""
+                self._status["last_capture_feature"] = ""
+                self._status["last_backup_job_id"] = ""
+                self._status["last_backup_scope"] = ""
+                self._status["last_rule_id"] = ""
+                self._status["last_event_source"] = ""
+                self._status["last_event_name"] = ""
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
             executed.add(j["id"])
@@ -1546,8 +1475,15 @@ class SyncScheduler:
             if self._stop.is_set():
                 break
 
-            if self._wait_until_sync_free("advanced capture: sync is busy; waiting to run due capture job(s)"):
-                return True
+            waited = 0
+            while self.is_sync_running_fn() and not self._stop.is_set():
+                if waited == 0:
+                    self._log("advanced capture: sync is busy; waiting to run due capture job(s)", level="INFO")
+                waited += 1
+                self._sleep_or_poke(2.0)
+                if self._poke.is_set():
+                    self._poke.clear()
+                    return True
 
             payload = {
                 "source": "scheduler",
@@ -1575,21 +1511,35 @@ class SyncScheduler:
             else:
                 self._log(f"advanced capture: job {j['id']} ok", level="INFO")
 
-            self._set_last_run_status(
-                ok,
-                "" if ok else "advanced capture job failed",
-                last_capture_job_id=j["id"],
-                last_capture_provider=j["provider"] or "",
-                last_capture_feature=j["feature"] or "",
-            )
+            with self._lock:
+                self._status["last_run_ok"] = ok
+                self._status["last_run_at"] = _now_ts()
+                self._status["last_error"] = "" if ok else "advanced capture job failed"
+                self._status["last_job_id"] = ""
+                self._status["last_pair_id"] = ""
+                self._status["last_capture_job_id"] = j["id"]
+                self._status["last_capture_provider"] = j["provider"] or ""
+                self._status["last_capture_feature"] = j["feature"] or ""
+                self._status["last_backup_job_id"] = ""
+                self._status["last_backup_scope"] = ""
+                self._status["last_rule_id"] = ""
+                self._status["last_event_source"] = ""
+                self._status["last_event_name"] = ""
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
         for _, j in due_backup:
             if self._stop.is_set():
                 break
 
-            if self._wait_until_sync_free("advanced backup: sync is busy; waiting to run due backup job(s)"):
-                return True
+            waited = 0
+            while self.is_sync_running_fn() and not self._stop.is_set():
+                if waited == 0:
+                    self._log("advanced backup: sync is busy; waiting to run due backup job(s)", level="INFO")
+                waited += 1
+                self._sleep_or_poke(2.0)
+                if self._poke.is_set():
+                    self._poke.clear()
+                    return True
 
             payload = {
                 "source": "scheduler",
@@ -1618,12 +1568,20 @@ class SyncScheduler:
             else:
                 self._log(f"advanced backup: job {j['id']} ok", level="INFO")
 
-            self._set_last_run_status(
-                ok,
-                "" if ok else "advanced backup job failed",
-                last_backup_job_id=j["id"],
-                last_backup_scope=j["scope"] or "",
-            )
+            with self._lock:
+                self._status["last_run_ok"] = ok
+                self._status["last_run_at"] = _now_ts()
+                self._status["last_error"] = "" if ok else "advanced backup job failed"
+                self._status["last_job_id"] = ""
+                self._status["last_pair_id"] = ""
+                self._status["last_capture_job_id"] = ""
+                self._status["last_capture_provider"] = ""
+                self._status["last_capture_feature"] = ""
+                self._status["last_backup_job_id"] = j["id"]
+                self._status["last_backup_scope"] = j["scope"] or ""
+                self._status["last_rule_id"] = ""
+                self._status["last_event_source"] = ""
+                self._status["last_event_name"] = ""
 
             self._adv_last_key[j["id"]] = f"{today}@{j.get('at')}"
         return ok_all
@@ -1634,7 +1592,20 @@ class SyncScheduler:
         ok = self._run_sync(payload)
         if not ok:
             self._notify_sync_start_rejected(payload, "standard run failed")
-        self._set_last_run_status(ok, "" if ok else "standard run failed")
+        with self._lock:
+            self._status["last_run_ok"] = ok
+            self._status["last_run_at"] = _now_ts()
+            self._status["last_error"] = "" if ok else "standard run failed"
+            self._status["last_job_id"] = ""
+            self._status["last_pair_id"] = ""
+            self._status["last_capture_job_id"] = ""
+            self._status["last_capture_provider"] = ""
+            self._status["last_capture_feature"] = ""
+            self._status["last_backup_job_id"] = ""
+            self._status["last_backup_scope"] = ""
+            self._status["last_rule_id"] = ""
+            self._status["last_event_source"] = ""
+            self._status["last_event_name"] = ""
         self._log("standard: run ok" if ok else "standard: run failed", level="INFO" if ok else "ERROR")
         return ok
 
@@ -1668,10 +1639,14 @@ class SyncScheduler:
                             self._std_cfg_key = ""
 
                         self._adv_seed_past_due_today(sch, tz)
-                        ran = self._adv_run_due(sch, tz)
-                        now_local = _as_now_in_tz(tz)
-                        nxt = self._adv_next(sch, now_local, tz)
-                        self._update_next(nxt, effective_mode="advanced")
+                        self._set_busy(True)
+                        try:
+                            ran = self._adv_run_due(sch, tz)
+                            now_local = _as_now_in_tz(tz)
+                            nxt = self._adv_next(sch, now_local, tz)
+                            self._update_next(nxt, effective_mode="advanced")
+                        finally:
+                            self._set_busy(False)
 
                         if ran:
                             # after running, re-evaluate
@@ -1719,13 +1694,17 @@ class SyncScheduler:
                             self._sleep_or_poke(2.0)
                             continue
 
-                        self._std_run_due()
+                        self._set_busy(True)
+                        try:
+                            self._std_run_due()
 
-                        now_local = _as_now_in_tz(tz)
-                        nxt2 = compute_next_run(now_local, sch)
-                        with self._lock:
-                            self._std_next_ts = int(nxt2.timestamp())
-                        self._update_next(nxt2, effective_mode=eff["mode"])
+                            now_local = _as_now_in_tz(tz)
+                            nxt2 = compute_next_run(now_local, sch)
+                            with self._lock:
+                                self._std_next_ts = int(nxt2.timestamp())
+                            self._update_next(nxt2, effective_mode=eff["mode"])
+                        finally:
+                            self._set_busy(False)
 
                         self._sleep_or_poke(0.5)
                         continue
@@ -1733,6 +1712,7 @@ class SyncScheduler:
                     remaining = max(0.0, (nxt - _as_now_in_tz(tz)).total_seconds())
                     self._sleep_or_poke(min(30.0, remaining if remaining > 0 else 0.5))
                 except Exception as exc:
+                    # Fork: one bad tick must not end the scheduler thread.
                     self._log(
                         f"scheduler tick failed: {type(exc).__name__}: {exc}; retrying in 5 seconds",
                         level="ERROR",
@@ -1742,6 +1722,10 @@ class SyncScheduler:
         finally:
             with self._lock:
                 self._status["running"] = False
+
+    def _set_busy(self, busy: bool) -> None:
+        with self._lock:
+            self._status["busy"] = busy
 
     def _sleep_or_poke(self, seconds: float) -> None:
         if seconds <= 0:

@@ -8,21 +8,78 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
+from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.run_control import cancel_requested
 
 from ._log import log as cw_log
-from .mdblist._common import read_json as mdblist_read_json, state_file as mdblist_state_file, write_json as mdblist_write_json
+from .mdblist._common import CursorPager, MDBListFetchError, read_json as mdblist_read_json, state_file as mdblist_state_file, write_json as mdblist_write_json
 from .mdblist import _auth as mdblist_auth
 
 from ._mod_common import (
     HitSession,
     SimpleRateLimiter,
     build_session,
+    request_with_retries,
     parse_rate_limit,
     make_snapshot_progress,
-    _confirmed_keys,
-    _unresolved_keys,
 )
+
+
+def _unresolved_keys(key_of, unresolved: Any) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        key = str(value or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    if unresolved:
+        for u in unresolved:
+            obj: Any = u
+            if isinstance(u, Mapping):
+                add(u.get("key"))
+                if isinstance(u.get("unresolved_key"), str):
+                    add(u.get("unresolved_key"))
+                if "item" in u:
+                    obj = u.get("item")
+            if isinstance(obj, str) and obj:
+                add(obj)
+                continue
+            if isinstance(obj, Mapping):
+                if obj.get("_cw_rewatch_sync") is True:
+                    add(obj.get("_cw_event_key"))
+                try:
+                    add(key_of(obj))
+                except Exception:
+                    pass
+    return keys
+
+
+def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any) -> list[str]:
+    attempted: list[str] = []
+    for it in items or []:
+        try:
+            k = str(it.get("_cw_event_key") or "").strip() if isinstance(it, Mapping) and it.get("_cw_rewatch_sync") is True else ""
+            if not k:
+                k = str(key_of(it) or "").strip()
+        except Exception:
+            k = ""
+        if k:
+            attempted.append(k)
+
+    unresolved_key_set = set(_unresolved_keys(key_of, unresolved))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in attempted:
+        if k in unresolved_key_set or k in seen:
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
 
 
 def _write_result(raw: Any, items: list[Mapping[str, Any]]) -> dict[str, Any]:
@@ -87,7 +144,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "1.6"
+__VERSION__ = "1.9"
 __all__ = ["get_manifest", "MDBLISTModule", "OPS"]
 
 def _health(status: str, ok: bool, latency_ms: int) -> None:
@@ -142,6 +199,12 @@ except Exception as e:
     feat_progress = None
 
 try:
+    from .mdblist import _collection as feat_collection
+except Exception as e:
+    _warn("feature_import_failed", import_feature="collection", error=f"{type(e).__name__}: {e}")
+    feat_collection = None
+
+try:
     from .mdblist import _playlists as feat_playlists
 except Exception as e:
     _warn("feature_import_failed", import_feature="playlists", error=f"{type(e).__name__}: {e}")
@@ -151,11 +214,14 @@ except Exception as e:
 _PLAYLIST_CAPABILITIES: dict[str, Any] = {
     "read": True,
     "create": True,
+    "rename": True,
+    "delete": True,
     "add": True,
     "remove": True,
     "reorder": False,
     "smart": True,
     "smart_writable": False,
+    "discovery": True,
     "media_types": ["movies", "shows"],
 }
 
@@ -169,6 +235,8 @@ if feat_history:
     _FEATURES["history"] = feat_history
 if feat_progress:
     _FEATURES["progress"] = feat_progress
+if feat_collection:
+    _FEATURES["collection"] = feat_collection
 
 
 def _features_flags() -> dict[str, bool]:
@@ -177,6 +245,7 @@ def _features_flags() -> dict[str, bool]:
         "ratings": "ratings" in _FEATURES,
         "history": "history" in _FEATURES,
         "progress": "progress" in _FEATURES,
+        "collection": "collection" in _FEATURES,
         "playlists": feat_playlists is not None,
     }
 
@@ -210,6 +279,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "rewatches": {"read": True, "write": True, "account_gate": False},
             },
             "ratings": {
+                "step": 0.5,
                 "observed_deletes": True,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
@@ -226,6 +296,12 @@ def get_manifest() -> Mapping[str, Any]:
                     "progress_write": {"mode": "none"},
                     "stop_scrobble": {"marks_watched_percent": 80, "comparison": "gte"},
                 },
+            },
+            "collection": {
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "upsert": True,
+                "remove": True,
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         },
@@ -250,7 +326,10 @@ class MDBLISTAuthError(MDBLISTError):
     pass
 
 
-def _pick_instance_id() -> str:
+def _pick_instance_id(cfg: Mapping[str, Any] | None = None) -> str:
+    explicit_instance = (cfg or {}).get("_cw_provider_instance")
+    if explicit_instance is not None:
+        return mdblist_auth.normalize_instance_id_value(explicit_instance)
     src_p = str(os.getenv("CW_PAIR_SRC") or "").upper().strip()
     dst_p = str(os.getenv("CW_PAIR_DST") or "").upper().strip()
     if src_p == "MDBLIST":
@@ -292,7 +371,7 @@ class MDBLISTClient:
             pass
         try:
             self.session.headers.setdefault("Accept", "application/json")
-            self.session.headers.setdefault("User-Agent", f"CrossWatch MDBLIST/{__VERSION__}")
+            self.session.headers["User-Agent"] = http_user_agent("MDBLIST", override_env="CW_MDBLIST_UA")
         except Exception:
             pass
         return self
@@ -348,19 +427,33 @@ class MDBLISTClient:
         elif since:
             params["since"] = str(since)
         r = self.get(f"{self.BASE}/sync/journal", params=params)
-        if 200 <= r.status_code < 300:
-            try:
-                data = r.json() if (r.text or "").strip() else {}
-                return dict(data) if isinstance(data, Mapping) else {}
-            except Exception:
-                return {}
-        return {"status": r.status_code}
+        if not (200 <= r.status_code < 300 or r.status_code == 409):
+            raise MDBListFetchError(f"MDBList journal HTTP {r.status_code}")
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise MDBListFetchError("Invalid MDBList journal JSON") from exc
+        if not isinstance(data, Mapping):
+            raise MDBListFetchError("Invalid MDBList journal response")
+        if data.get("requires_full_sync") is True:
+            return dict(data)
+        if r.status_code == 409 or not isinstance(data.get("journal"), list):
+            raise MDBListFetchError("Incomplete MDBList journal response")
+        data = dict(data)
+        pagination = dict(data.get("pagination") or {})
+        headers = {str(k).lower(): v for k, v in (getattr(r, "headers", None) or {}).items()}
+        if "has_more" not in pagination and "x-has-more" in headers:
+            pagination["has_more"] = headers["x-has-more"]
+        if not pagination.get("next_cursor"):
+            pagination["next_cursor"] = data.get("next_cursor") or headers.get("x-next-cursor")
+        data["pagination"] = pagination
+        return data
 
 
 class MDBLISTModule:
     def __init__(self, cfg: Mapping[str, Any]):
         m = dict(cfg.get("mdblist") or {})
-        self.instance_id = _pick_instance_id()
+        self.instance_id = _pick_instance_id(cfg)
         rl = m.get("rate_limit")
         if not isinstance(rl, dict):
             rl = {}
@@ -408,7 +501,7 @@ class MDBLISTModule:
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
-        toggles = {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": True}
+        toggles = {"watchlist": True, "ratings": True, "history": True, "progress": True, "collection": True, "playlists": True}
         present = _features_flags()
         return {k: bool(toggles.get(k, False) and present.get(k, False)) for k in toggles.keys()}
 
@@ -427,7 +520,7 @@ class MDBLISTModule:
                 "status": "ok",
                 "latency_ms": 0,
                 "features": {},
-                "details": {"disabled": ["watchlist", "ratings", "history", "progress"]},
+                "details": {"disabled": ["watchlist", "ratings", "history", "progress", "collection"]},
                 "api": {},
             }
 
@@ -479,6 +572,7 @@ class MDBLISTModule:
             "ratings": bool(enabled.get("ratings") and user_ok),
             "history": bool(enabled.get("history") and user_ok),
             "progress": bool(enabled.get("progress") and user_ok),
+            "collection": bool(enabled.get("collection") and user_ok),
             "playlists": bool(enabled.get("playlists") and user_ok),
         }
 
@@ -533,22 +627,26 @@ class MDBLISTModule:
         rows: list[dict[str, Any]] = []
         journal_oldest_at = ""
         latest_action_at = ""
-        cursor: str | None = None
-        pages = 0
+        pager = CursorPager(limit, 1000)
 
-        while pages < 1000:
+        while True:
             try:
-                data = self.client.journal_page(since=since, cursor=cursor, limit=limit)
+                data = self.client.journal_page(since=since if pager.cursor is None else None, cursor=pager.cursor, limit=pager.limit)
             except Exception as e:
-                _warn("journal_fetch_failed", cursor=cursor or "", since=since or "", error=str(e))
-                break
+                _warn("journal_fetch_failed", page=pager.pages + 1, since=since or "", error=str(e))
+                raise MDBListFetchError("MDBList journal read incomplete") from e
 
             if not isinstance(data, Mapping):
-                break
+                raise MDBListFetchError("Invalid MDBList journal page")
+            if data.get("requires_full_sync") is True:
+                return {"rows": [], "requires_full_sync": True}
             status = data.get("status")
             if status is not None:
-                _warn("journal_fetch_http", cursor=cursor or "", since=since or "", status=status)
-                break
+                _warn("journal_fetch_http", page=pager.pages + 1, since=since or "", status=status)
+                raise MDBListFetchError(f"MDBList journal HTTP {status}")
+            if not isinstance(data.get("journal"), list):
+                raise MDBListFetchError("MDBList journal page is missing rows")
+            more = pager.advance(data, None)
 
             oldest = str(data.get("journal_oldest_at") or "").strip()
             if oldest and not journal_oldest_at:
@@ -567,23 +665,8 @@ class MDBLISTModule:
                 if act:
                     latest_action_at = act if not latest_action_at else str(max(latest_action_at, act))
 
-            pag = data.get("pagination") if isinstance(data.get("pagination"), Mapping) else {}
-            has_more = bool(pag.get("has_more")) if isinstance(pag, Mapping) else False
-            next_cursor = ""
-            if isinstance(pag, Mapping):
-                next_cursor = str(
-                    pag.get("next_cursor")
-                    or pag.get("cursor")
-                    or data.get("next_cursor")
-                    or ""
-                ).strip()
-            if not has_more:
+            if not more:
                 break
-            if not next_cursor:
-                _warn("journal_fetch_paging_incomplete", since=since or "", page=pages + 1)
-                break
-            cursor = next_cursor
-            pages += 1
 
         return {
             "rows": rows,
@@ -659,6 +742,13 @@ class MDBLISTModule:
             raw_pag = data.get("pagination") if isinstance(data, Mapping) else None
             pag = raw_pag if isinstance(raw_pag, Mapping) else {}
             has_more = bool(pag.get("has_more")) if isinstance(pag, Mapping) else False
+            raw_total = pag.get("total")
+            try:
+                total = int(raw_total) if raw_total is not None else -1
+            except (TypeError, ValueError):
+                total = -1
+            if total >= 0 and offset + len(rows) < total:
+                has_more = True
             if not rows or not has_more:
                 break
             try:
@@ -676,6 +766,60 @@ class MDBLISTModule:
             },
         )
         return tokens
+
+    def tag_dropped_shows(self, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        shows: list[dict[str, Any]] = []
+        skipped = 0
+        for item in items:
+            raw = dict(item.get("ids") or {})
+            ids: dict[str, Any] = {}
+            imdb = str(raw.get("imdb") or "").strip()
+            if imdb.startswith("tt"):
+                ids["imdb"] = imdb
+            mdblist_id = str(raw.get("mdblist") or "").strip()
+            if mdblist_id:
+                ids["mdblist"] = mdblist_id
+            for key in ("tmdb", "tvdb", "trakt"):
+                value = str(raw.get(key) or "").strip()
+                if value.isdigit():
+                    ids[key] = int(value)
+            if ids:
+                shows.append({"ids": ids})
+            else:
+                skipped += 1
+        confirmed = 0
+        not_found = 0
+        errors = 0
+        for start in range(0, len(shows), 200):
+            if cancel_requested():
+                break
+            part = shows[start:start + 200]
+            try:
+                r = self.client.post(f"{self.client.BASE}/sync/dropped", params={"apikey": self.cfg.api_key}, json={"shows": part})
+            except Exception as e:
+                _warn("dropped_tag_failed", count=len(part), error=str(e))
+                errors += len(part)
+                continue
+            if not (200 <= r.status_code < 300):
+                _warn("dropped_tag_http", count=len(part), status=r.status_code)
+                errors += len(part)
+                continue
+            try:
+                data = r.json() if (r.text or "").strip() else {}
+            except Exception:
+                data = {}
+            updated = data.get("updated") if isinstance(data, Mapping) else None
+            missing = data.get("not_found") if isinstance(data, Mapping) else None
+            shows_updated = updated.get("shows") if isinstance(updated, Mapping) else None
+            shows_missing = missing.get("shows") if isinstance(missing, Mapping) else None
+            item_errors = data.get("errors") if isinstance(data, Mapping) else None
+            confirmed += len(shows_updated) if isinstance(shows_updated, list) else int(shows_updated or 0)
+            not_found += len(shows_missing) if isinstance(shows_missing, list) else int(shows_missing or 0)
+            if isinstance(item_errors, list) and item_errors:
+                errors += len(item_errors)
+                _warn("dropped_tag_item_errors", count=len(item_errors), first=str(item_errors[0])[:200])
+        _info("dropped_tagged", attempted=len(shows), confirmed=confirmed, skipped=skipped, not_found=not_found, errors=errors)
+        return {"attempted": len(shows), "confirmed": confirmed, "skipped": skipped, "not_found": not_found, "errors": errors}
 
     def build_index(self, feature: str, **kwargs: Any) -> dict[str, dict[str, Any]]:
         if not self._is_enabled(feature) or feature not in _FEATURES:
@@ -780,6 +924,7 @@ class _MDBLISTOPS:
                 "rewatches": {"read": True, "write": True, "account_gate": False},
             },
             "ratings": {
+                "step": 0.5,
                 "observed_deletes": True,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
@@ -796,6 +941,12 @@ class _MDBLISTOPS:
                     "progress_write": {"mode": "none"},
                     "stop_scrobble": {"marks_watched_percent": 80, "comparison": "gte"},
                 },
+            },
+            "collection": {
+                "observed_deletes": True,
+                "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
+                "upsert": True,
+                "remove": True,
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         }
@@ -845,7 +996,7 @@ class _MDBLISTOPS:
                 pass
             try:
                 sess.headers.setdefault("Accept", "application/json")
-                sess.headers.setdefault("User-Agent", f"CrossWatch MDBLIST/{__VERSION__}")
+                sess.headers["User-Agent"] = http_user_agent("MDBLIST", override_env="CW_MDBLIST_UA")
             except Exception:
                 pass
 
@@ -854,7 +1005,7 @@ class _MDBLISTOPS:
                 "GET",
                 f"{MDBLISTClient.BASE}/sync/last_activities",
                 cfg=c,
-                instance_id=_pick_instance_id(),
+                instance_id=_pick_instance_id(c),
                 params={"apikey": str(m.get("api_key") or "").strip()},
                 timeout=8.0,
                 max_retries=1,
@@ -955,6 +1106,9 @@ class _MDBLISTOPS:
     def dropped_show_tokens(self, cfg: Mapping[str, Any]) -> set[str]:
         return self._adapter(cfg).dropped_show_tokens()
 
+    def tag_dropped_shows(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        return self._adapter(cfg).tag_dropped_shows(items)
+
     def fetch_journal(
         self,
         cfg: Mapping[str, Any],
@@ -1003,6 +1157,27 @@ class _MDBLISTOPS:
             items=list(items or []),
             dry_run=dry_run,
         )
+
+    def rename_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        name: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ):
+        return self._pl().rename(self._playlist_adapter(cfg, instance), playlist_id, name, dry_run=dry_run)
+
+    def delete_playlist(
+        self,
+        cfg: Mapping[str, Any],
+        playlist_id: str,
+        *,
+        instance: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._pl().delete(self._playlist_adapter(cfg, instance), playlist_id, dry_run=dry_run)
 
     def add_playlist_items(
         self,

@@ -77,7 +77,8 @@
         id: txt(row?.id || "default") || "default",
         label: txt(row?.display_label || row?.label || row?.id || "Default"),
       }))
-      .filter((row) => row.id && !isDefaultInstanceId(row.id));
+      .filter((row) => row.id && !isDefaultInstanceId(row.id))
+      .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base", numeric: true }));
   }
 
   function allInstanceRows() {
@@ -157,8 +158,9 @@
     });
     const required = resourceRequiredMap();
     Object.entries(required).forEach(([provider, rows]) => {
-      const first = Object.keys(rows || {}).map(txt).filter(Boolean)[0];
-      if (first) out[providerKey(provider)] = [first];
+      const key = providerKey(provider);
+      const ids = Object.keys(rows || {}).map(txt).filter(Boolean);
+      if (ids.length) out[key] = Array.from(new Set([...(out[key] || []), ...ids]));
     });
     return out;
   }
@@ -258,13 +260,12 @@
             ${rows.map((row) => {
               const lockedBy = required[providerKey(provider)]?.[row.id] || [];
               const assignedProfile = instanceAssignedProfile(provider, row.id);
-              const requiredProvider = !!required[providerKey(provider)];
               const locked = lockedBy.length > 0;
-              const blocked = (requiredProvider && !locked) || !!assignedProfile;
+              const blocked = !!assignedProfile;
               const note = assignedProfile ? `Assigned to: ${assignedProfile.label || assignedProfile.id}` : (locked ? `Required by ${Array.from(new Set(lockedBy)).join(", ")}` : "");
               return `
               <label class="cw-upm-instance-option ${selected.has(row.id) || locked ? "is-selected" : ""} ${locked ? "is-required" : ""} ${blocked ? "is-blocked" : ""}">
-                <input type="checkbox" name="cw-upm-provider-${esc(provider)}" value="${esc(row.id)}" ${selected.has(row.id) || locked ? "checked" : ""} ${requiredProvider || assignedProfile ? "disabled" : ""} style="position:absolute;opacity:0;pointer-events:none">
+                <input type="checkbox" name="cw-upm-provider-${esc(provider)}" value="${esc(row.id)}" ${selected.has(row.id) || locked ? "checked" : ""} ${locked || assignedProfile ? "disabled" : ""} style="position:absolute;opacity:0;pointer-events:none">
                 <span class="cw-upm-instance-copy">
                   <strong>${esc(row.label)}</strong>
                   <code>${esc(row.id)}</code>
@@ -318,7 +319,7 @@
     const title = editing ? "Edit user profile" : "Add user profile";
     const currentLabel = modalDraft?.label ?? profile?.label ?? "";
     return `
-      <div class="cw-upm-overlay" data-action="close-modal">
+      <div class="cw-upm-overlay">
         <div class="cw-upm-dialog" role="dialog" aria-modal="true" aria-labelledby="cw-upm-dialog-title" data-modal-root>
           <div class="cw-upm-dialog-head">
             <span class="cw-auth-provider-mark cw-upm-dialog-icon" aria-hidden="true"><span class="material-symbols-rounded cw-auth-provider-icon">person</span></span>
@@ -362,20 +363,32 @@
       </div>`;
   }
 
+  function setHostHtml(host, html) {
+    if (host.__cwUpmHtml === html) return;
+    host.__cwUpmHtml = html;
+    host.innerHTML = html;
+  }
+
+  function invalidateHostHtml() {
+    [$(HOST_ID), $("cw-upm-floating-host")].forEach((node) => {
+      if (node) node.__cwUpmHtml = null;
+    });
+  }
+
   function render() {
     const host = (floatingModal ? $("cw-upm-floating-host") : null) || $(HOST_ID);
     if (!host) return;
     if (floatingModal) {
-      host.innerHTML = renderModal();
+      setHostHtml(host, renderModal());
       return;
     }
-    host.innerHTML = `
+    setHostHtml(host, `
       <div class="cw-auth-service-grid cw-upm-service-grid">
-        ${userProfiles.map(renderProfileCard).join("")}
+        ${[...userProfiles].sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base", numeric: true })).map(renderProfileCard).join("")}
         ${renderAddCard()}
       </div>
       <div class="cw-upm-status" id="cw-upm-status"></div>
-      ${renderModal()}`;
+      ${renderModal()}`);
   }
 
   async function load(force = false) {
@@ -407,7 +420,10 @@
       loadedOnce = true;
     } catch (e) {
       const status = $("cw-upm-status");
-      if (status) status.textContent = String(e?.message || e || "Failed to load user profiles");
+      if (status) {
+        status.textContent = String(e?.message || e || "Failed to load user profiles");
+        invalidateHostHtml();
+      }
       toast("Could not load user profiles: " + String(e?.message || e), false);
     } finally {
       loading = false;
@@ -504,16 +520,15 @@
     if (!root || !modalDraft) return;
     collectOpenResourceSections(root);
     const previous = modalDraft.instances || {};
+    const lockedBefore = resourceRequiredMap();
     modalDraft.label = txt($("cw-upm-modal-label")?.value);
     modalDraft.resources = collectModalResources(root);
     const manual = collectModalInstances(root);
-    const required = resourceRequiredMap();
-    Object.entries(required).forEach(([provider, rows]) => {
-      const requiredInstance = Object.keys(rows || {}).map(txt).filter(Boolean)[0];
-      const previousInstance = (Array.isArray(previous[provider]) ? previous[provider] : [previous[provider]]).map(txt).filter(Boolean)[0];
-      const currentInstance = (Array.isArray(manual[provider]) ? manual[provider] : [manual[provider]]).map(txt).filter(Boolean)[0];
-      if (requiredInstance && (previousInstance === requiredInstance || currentInstance === requiredInstance)) manual[provider] = [requiredInstance];
-      else delete manual[provider];
+    Object.entries(previous).forEach(([provider, values]) => {
+      const key = providerKey(provider);
+      const locked = lockedBefore[key] || {};
+      const kept = (Array.isArray(values) ? values : [values]).map(txt).filter((value) => value && locked[value]);
+      if (kept.length) manual[key] = Array.from(new Set([...(manual[key] || []), ...kept]));
     });
     modalDraft.instances = manual;
   }
@@ -561,6 +576,7 @@
     target.dataset.cwConfirmDelete = "";
     target.classList.remove("is-confirming");
     target.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">delete</span><span>Delete profile</span>`;
+    invalidateHostHtml();
   }
 
   function armDeleteConfirm(btn) {
@@ -568,6 +584,7 @@
     btn.dataset.cwConfirmDelete = "1";
     btn.classList.add("is-confirming");
     btn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">warning</span><span>Confirm delete</span>`;
+    invalidateHostHtml();
     if (deleteConfirmTimer) clearTimeout(deleteConfirmTimer);
     deleteConfirmTimer = setTimeout(() => resetDeleteConfirm(btn), 4200);
   }
@@ -582,6 +599,7 @@
     node.classList.add("hidden");
     node.classList.remove("is-fading");
     node.textContent = "";
+    invalidateHostHtml();
   }
 
   function showDeleteWarning(message) {
@@ -595,6 +613,7 @@
     node.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">warning</span><span class="cw-connection-footer-warn-text"></span>`;
     node.lastElementChild.textContent = text;
     node.classList.remove("hidden", "is-fading");
+    invalidateHostHtml();
   }
 
   async function deleteProfile(btn) {

@@ -11,13 +11,14 @@ from typing import Any
 from cw_platform.provider_instances import normalize_instance_id
 from providers.auth._auth_FLOPPY import FloppyAuthError, FloppyClient
 from providers.sync._mod_common import SimpleRateLimiter, build_op_result, build_session
+from providers.sync.floppy import _collection as feat_collection
 from providers.sync.floppy import _history as feat_history
 from providers.sync.floppy import _progress as feat_progress
 from providers.sync.floppy import _ratings as feat_ratings
 from providers.sync.floppy import _watchlist as feat_watchlist
 from providers.sync.floppy._common import api_delete, api_get, configured_block, is_configured, media_parts_from_item_id, paged
 
-__VERSION__ = "0.2"
+__VERSION__ = "0.6"
 __all__ = ["get_manifest", "FLOPPYModule", "OPS"]
 
 if "ctx" not in globals():
@@ -28,8 +29,14 @@ if "ctx" not in globals():
     ctx = _NullCtx()  # type: ignore[assignment]
 
 
-_FEATURES = {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False}
-_FEATURE_MODULES = {"watchlist": feat_watchlist, "ratings": feat_ratings, "history": feat_history, "progress": feat_progress}
+_FEATURES = {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False, "collection": True}
+_FEATURE_MODULES: dict[str, Any] = {"watchlist": feat_watchlist, "ratings": feat_ratings, "history": feat_history, "progress": feat_progress, "collection": feat_collection}
+
+
+def _index_dict(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(k): dict(v) for k, v in value.items() if isinstance(v, Mapping)}
 
 
 def _rate_limit_settings(block: Mapping[str, Any]) -> dict[str, float]:
@@ -46,7 +53,10 @@ def _rate_limit_settings(block: Mapping[str, Any]) -> dict[str, float]:
     return {"get_per_sec": _rate("get_per_sec", 20.0), "post_per_sec": _rate("post_per_sec", 20.0)}
 
 
-def _current_instance_id() -> str:
+def _current_instance_id(cfg: Mapping[str, Any] | None = None) -> str:
+    explicit_instance = (cfg or {}).get("_cw_provider_instance")
+    if explicit_instance is not None:
+        return normalize_instance_id(explicit_instance)
     if str(os.getenv("CW_PROBE_PROVIDER") or "").upper().strip() == "FLOPPY":
         return normalize_instance_id(os.getenv("CW_PROBE_INSTANCE"))
     if str(os.getenv("CW_PAIR_SRC") or "").upper().strip() == "FLOPPY":
@@ -73,10 +83,11 @@ def get_manifest() -> Mapping[str, Any]:
             "index_semantics": "present",
             "features": dict(_FEATURES),
             "watchlist": {"read": True, "write": True, "types": {"movies": True, "shows": True, "seasons": False, "episodes": False}, "upsert": True, "remove": True, "observed_deletes": True, "requires_ids": ["tmdb"], "custom_lists": True},
-            "ratings": {"read": True, "write": True, "types": {"movies": True, "shows": True, "seasons": False, "episodes": False}, "upsert": True, "remove": True, "observed_deletes": True, "requires_ids": ["tmdb"], "scale": "0-10"},
+            "ratings": {"read": True, "write": True, "types": {"movies": True, "shows": True, "seasons": True, "episodes": True}, "upsert": True, "remove": True, "observed_deletes": True, "requires_ids": ["tmdb"], "scale": "0-10", "step": 0.1},
             "history": {"read": True, "write": True, "types": {"movies": True, "shows": False, "seasons": False, "episodes": True}, "upsert": True, "remove": True, "observed_deletes": True, "requires_ids": ["tmdb"], "event_history": True, "rewatches": {"read": True, "write": True, "account_gate": False}},
             "progress": {"read": True, "write": True, "types": {"movies": True, "shows": False, "seasons": False, "episodes": True}, "upsert": True, "remove": True, "observed_deletes": False, "requires_ids": ["tmdb"], "units": "seconds", "completion_policy": {"progress_write": {"mode": "none"}}},
             "playlists": {"read": False, "write": False},
+            "collection": {"read": True, "write": True, "types": {"movies": True, "shows": True, "seasons": True, "episodes": True}, "upsert": True, "remove": True, "observed_deletes": True, "requires_ids": ["tmdb"], "provides_ids": ["tmdb", "imdb", "tvdb"], "default_format": "digital", "media_updates": True},
         },
     }
 
@@ -84,7 +95,7 @@ def get_manifest() -> Mapping[str, Any]:
 class FLOPPYModule:
     def __init__(self, cfg: Mapping[str, Any]):
         self.config = cfg or {}
-        self.instance_id = _current_instance_id()
+        self.instance_id = _current_instance_id(cfg)
         block = configured_block(self.config, self.instance_id)
         session = build_session("FLOPPY", ctx)
         try:
@@ -134,7 +145,12 @@ class FLOPPYModule:
 
     def build_index(self, feature: str, **kwargs: Any) -> Mapping[str, dict[str, Any]]:
         mod = _FEATURE_MODULES.get(str(feature or "").strip().lower())
-        return mod.build_index(self, **kwargs) if mod else {}
+        return _index_dict(mod.build_index(self, **kwargs)) if mod else {}
+
+    def destination_comparison_view(self, feature: str, index: Mapping[str, Mapping[str, Any]]) -> Mapping[str, dict[str, Any]]:
+        mod = _FEATURE_MODULES.get(str(feature or "").strip().lower())
+        hook = getattr(mod, "destination_comparison_view", None)
+        return _index_dict(hook(self, index)) if callable(hook) else _index_dict(index)
 
     def prepare_source_snapshot(self, feature: str, items: Any) -> int:
         mod = _FEATURE_MODULES.get(str(feature or "").strip().lower())
@@ -165,8 +181,14 @@ class FLOPPYModule:
         removed = 0
         errors: list[str] = []
         seen: set[tuple[str, str]] = set()
-        for media_type in ("movie", "tv"):
-            for row in paged(self, f"media/{media_type}"):
+        for media_type in ("movie", "tv", "anime"):
+            try:
+                rows = paged(self, f"media/{media_type}")
+            except FloppyAuthError:
+                if media_type != "anime":
+                    raise
+                rows = []
+            for row in rows:
                 typ, source, media_id, _, _ = media_parts_from_item_id(row.get("item_id"))
                 source = str(row.get("source") or source or "").strip()
                 media_id = str(row.get("media_id") or media_id or "").strip()
@@ -211,6 +233,9 @@ class _FLOPPYOPS:
 
     def build_index(self, cfg: Mapping[str, Any], *, feature: str) -> Mapping[str, dict[str, Any]]:
         return self._adapter(cfg).build_index(feature)
+
+    def destination_comparison_view(self, cfg: Mapping[str, Any], *, feature: str, index: Mapping[str, Mapping[str, Any]]) -> Mapping[str, dict[str, Any]]:
+        return self._adapter(cfg).destination_comparison_view(feature, index)
 
     def prepare_source_snapshot(self, cfg: Mapping[str, Any], *, feature: str, items: Any) -> int:
         return self._adapter(cfg).prepare_source_snapshot(feature, items)

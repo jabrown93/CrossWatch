@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections import Counter, defaultdict
@@ -36,11 +37,18 @@ from cw_platform.event_archive import (
     acknowledge_group as _acknowledge_group,
     unacknowledge_group as _unacknowledge_group,
     events_db_path,
+    calendar as _calendar,
+    day_runs as _day_runs,
+    CalendarScope,
+    CALENDAR_ALL,
+    scope_key as _scope_key,
+    invalidate_calendar as _invalidate_calendar,
+    purge as _purge_events,
 )
 from cw_platform.event_archive.groups import run_problem_items as _run_problem_items
-from cw_platform.access_policy import filter_pairs_for_user, pair_refs, request_user, user_can_access_instance
+from cw_platform.access_policy import filter_pairs_for_user, pair_refs, request_is_monitor, request_user, user_can_access_instance
 from cw_platform.config_base import load_config
-from cw_platform.provider_instances import normalize_instance_id
+from cw_platform.provider_instances import instances_for_user_profile, normalize_instance_id, provider_display_key
 from cw_platform.reason_labels import friendly_reason
 
 router = APIRouter(prefix="/api/events", tags=["events"])
@@ -122,11 +130,15 @@ def _group_has_allowed_event(cfg: dict[str, Any], request: Request | None, group
     return any(isinstance(row, dict) and _event_row_allowed(cfg, request, row, False) for row in rows)
 
 
+def _audit_row(row: Any) -> bool:
+    return isinstance(row, dict) and str(row.get("domain") or "").strip().lower() == "audit"
+
+
 def _event_row_allowed(cfg: dict[str, Any], request: Request | None, row: dict[str, Any] | None, allow_group_children: bool = True) -> bool:
     user = request_user(request)
     if not user or bool(user.get("is_admin")):
-        return True
-    if not isinstance(row, dict):
+        return not (request_is_monitor(request) and _audit_row(row))
+    if not isinstance(row, dict) or _audit_row(row):
         return False
     refs = _event_refs(row)
     if refs and all(user_can_access_instance(cfg, user, provider, instance) for provider, instance in refs):
@@ -135,7 +147,7 @@ def _event_row_allowed(cfg: dict[str, Any], request: Request | None, row: dict[s
         return False
     if _row_pair_allowed(cfg, user, row):
         return True
-    if allow_group_children and row.get("id") is not None:
+    if allow_group_children and "group_hash" in row and row.get("id") is not None:
         return _group_has_allowed_event(cfg, request, row.get("id"))
     return False
 
@@ -143,7 +155,18 @@ def _event_row_allowed(cfg: dict[str, Any], request: Request | None, row: dict[s
 def _filter_event_payload(cfg: dict[str, Any], request: Request | None, payload: dict[str, Any]) -> dict[str, Any]:
     user = request_user(request)
     if not user or bool(user.get("is_admin")):
-        return payload
+        if not request_is_monitor(request):
+            return payload
+        visible = dict(payload or {})
+        for key in ("items", "events", "groups", "children"):
+            rows = visible.get(key)
+            if not isinstance(rows, list):
+                continue
+            keep = [row for row in rows if not _audit_row(row)]
+            if key == "items" and isinstance(visible.get("total"), int):
+                visible["total"] = max(0, visible["total"] - (len(rows) - len(keep)))
+            visible[key] = keep
+        return visible
     out = dict(payload or {})
     for key in ("items", "events", "groups", "children"):
         rows = out.get(key)
@@ -152,6 +175,198 @@ def _filter_event_payload(cfg: dict[str, Any], request: Request | None, payload:
             if key == "items":
                 out["total"] = len(out[key])
     return out
+
+
+def _effective_profile_from_request(request: Request | None, requested: str) -> str:
+    try:
+        from api.appAuthAPI import effective_request_profile_id
+
+        cfg = load_config() or {}
+        return effective_request_profile_id(cfg, request, requested)
+    except Exception:
+        return "__none__"
+
+
+def _profile_filter(cfg: dict[str, Any], profile: str) -> dict[str, set[str]]:
+    pid = str(profile or "").strip()
+    if not pid:
+        return {}
+    try:
+        raw = instances_for_user_profile(cfg, pid)
+    except Exception:
+        raw = {}
+    return {
+        provider_display_key(provider): {normalize_instance_id(inst) for inst in (instances or [])}
+        for provider, instances in raw.items()
+    }
+
+
+def _row_matches_profile_filter(row: dict[str, Any], user_filter: dict[str, set[str]]) -> bool:
+    if not user_filter:
+        return True
+    for provider, instance in _event_refs(row):
+        prov = provider_display_key(provider)
+        if prov and normalize_instance_id(instance) in user_filter.get(prov, set()):
+            return True
+    return False
+
+
+def _detail_map(row: dict[str, Any]) -> dict[str, Any]:
+    detail = row.get("detail")
+    if isinstance(detail, dict):
+        return detail
+    if isinstance(detail, str) and detail:
+        try:
+            parsed = json.loads(detail)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _provider_route(row: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    def pick(key: str) -> str:
+        val = str(row.get(key) or "").strip()
+        if val:
+            return val.upper()
+        for event in events:
+            val = str(event.get(key) or "").strip()
+            if val:
+                return val.upper()
+        return ""
+
+    src = pick("source_provider") or pick("origin_provider")
+    dst = pick("destination_provider")
+    if src and dst and src != dst:
+        return f"{src} -> {dst}"
+    return dst or src
+
+
+def _event_source_kind(events: list[dict[str, Any]]) -> str:
+    for event in reversed(events):
+        kind = str(event.get("source_kind") or "").strip().lower()
+        if kind:
+            return kind
+    return ""
+
+
+def _scheduler_source(events: list[dict[str, Any]]) -> str:
+    for event in events:
+        detail = _detail_map(event)
+        source = str(detail.get("source") or "").strip().lower()
+        mode = str(detail.get("scheduler_mode") or "").strip().lower()
+        if source in {"scheduler", "scheduler_event"} or mode:
+            return mode or source
+    return ""
+
+
+def _first_text(row: dict[str, Any], events: list[dict[str, Any]], key: str) -> str:
+    val = str(row.get(key) or "").strip()
+    if val:
+        return val
+    for event in events:
+        val = str(event.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _scrobble_summary_parts(summary: str) -> dict[str, str]:
+    text = str(summary or "").strip()
+    if not text:
+        return {}
+    action = "Watching" if text.lower().startswith("watching ") else ""
+    body = text[len(action):].strip() if action else text
+    title = body
+    destination = ""
+    progress = ""
+    if " -> " in body:
+        title, rest = body.split(" -> ", 1)
+    elif " \u2192 " in body:
+        title, rest = body.split(" \u2192 ", 1)
+    else:
+        rest = ""
+    if rest:
+        bits = [part.strip() for part in rest.split(",") if part.strip()]
+        destination = bits[0] if bits else ""
+        progress = next((part for part in bits[1:] if part.endswith("%")), "")
+    return {"action": action, "title": title.strip(), "destination": destination, "progress": progress}
+
+
+def _feed_item(group: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    domain = str(group.get("domain") or "").strip().lower()
+    operation = str(group.get("operation") or "").strip().lower()
+    status = str(group.get("status") or "").strip().lower()
+    severity = str(group.get("severity") or "").strip().lower()
+    summary = str(group.get("summary") or "").strip()
+    source_kind = _event_source_kind(events)
+    scheduler_mode = _scheduler_source(events)
+    route = _provider_route(group, events)
+    item_title = _first_text(group, events, "title")
+    media_type = _first_text(group, events, "media_type")
+    scrobble_parts = _scrobble_summary_parts(summary)
+
+    kind = "sync"
+    icon = "sync"
+    badge = "Sync"
+    title = summary or "Sync activity"
+
+    if domain == "scrobble":
+        kind = "webhook" if source_kind == "webhook" else "watcher"
+        icon = "rss_feed" if kind == "webhook" else "sensors"
+        badge = "Webhook" if kind == "webhook" else "Watcher"
+        item_title = item_title or scrobble_parts.get("title", "")
+        title = item_title or summary or ("Webhook activity" if kind == "webhook" else "Watcher activity")
+    elif scheduler_mode:
+        kind = "scheduler"
+        icon = "event_available"
+        badge = "Scheduler"
+        if operation == "run" and status in {"completed", "failed", "warning"}:
+            title = "Scheduler sync completed" if status == "completed" else "Scheduler sync needs attention"
+    elif operation == "run":
+        icon = "sync"
+        badge = "Sync"
+        if status == "running":
+            title = "Sync run started"
+        elif status == "failed":
+            title = "Sync run failed"
+        elif status == "warning":
+            title = "Sync run completed with issues"
+        else:
+            title = "Sync run completed"
+    elif str(group.get("feature") or "").strip().lower() == "playlists":
+        kind = "playlist"
+        icon = "playlist_play"
+        badge = "Playlist"
+
+    created = int(group.get("last_event_at") or group.get("updated_at") or group.get("created_at") or 0)
+    meta = route or str(group.get("feature") or "").strip().title()
+    if summary and title != summary:
+        meta = f"{meta} - {summary}" if meta else summary
+
+    return {
+        "id": group.get("id"),
+        "kind": kind,
+        "icon": icon,
+        "badge": badge,
+        "title": title,
+        "item_title": item_title,
+        "summary": summary,
+        "meta": meta,
+        "status": status,
+        "severity": severity,
+        "domain": domain,
+        "operation": operation,
+        "feature": group.get("feature"),
+        "media_type": media_type,
+        "route": route,
+        "source_kind": source_kind,
+        "scrobble_action": scrobble_parts.get("action", ""),
+        "scrobble_destination": scrobble_parts.get("destination", ""),
+        "progress": scrobble_parts.get("progress", ""),
+        "event_count": group.get("event_count"),
+        "created_at": created,
+    }
 
 
 def _managed_request(request: Request | None) -> bool:
@@ -163,9 +378,16 @@ def _audit_domain_requested(domain: Any) -> bool:
     return str(domain or "").strip().lower() == "audit"
 
 
+def _audit_hidden(request: Request | None) -> bool:
+    return _managed_request(request) or request_is_monitor(request)
+
+
 @router.get("/status")
-def events_status() -> JSONResponse:
-    return _ok(_status())
+def events_status(request: Request = cast(Request, None)) -> JSONResponse:
+    payload = _status()
+    if request_is_monitor(request) and isinstance(payload.get("by_type"), dict):
+        payload = {**payload, "by_type": {key: value for key, value in payload["by_type"].items() if not str(key).startswith("audit_")}}
+    return _ok(payload)
 
 
 _RANGE_SECONDS = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400}
@@ -365,7 +587,7 @@ def _scoped_statistics(cfg: dict[str, Any], request: Request | None, since: int,
         if row.get("run_id"):
             entry["runs"] += 1 if row.get("event_type") == "sync_run_finished" else 0
             entry["bad"] += 1 if row.get("event_type") in _PROBLEM_EVENTS else 0
-        elif row.get("event_type") in ("scrobble_completed", "rating_applied", "scrobble_failed", "rating_failed"):
+        elif row.get("event_type") in ("scrobble_completed", "rating_applied", "scrobble_skipped", "scrobble_failed", "rating_failed"):
             entry["scrobbles"] += 1
             entry["ok"] += 1 if row.get("event_type") in ("scrobble_completed", "rating_applied") else 0
             entry["bad"] += 1 if row.get("event_type") in ("scrobble_failed", "rating_failed") else 0
@@ -425,6 +647,57 @@ def events_statistics(
     return _ok(_statistics(since=s, until=u, bucket=bs))
 
 
+_CALENDAR_MIN_DAYS = 7
+_CALENDAR_MAX_DAYS = 400
+
+
+def _calendar_scope(cfg: dict[str, Any], request: Request | None) -> CalendarScope:
+    user = request_user(request)
+    if not user or bool(user.get("is_admin")):
+        return CALENDAR_ALL
+    pair_ids: set[str] = set()
+    scope_keys: set[str] = set()
+    for pair in filter_pairs_for_user(cfg, user, _configured_pairs(cfg)):
+        pid = str(pair.get("id") or "").strip()
+        if pid:
+            pair_ids.add(pid)
+        (src, src_inst), (dst, dst_inst) = pair_refs(pair)
+        key = _scope_key(src, src_inst, dst, dst_inst)
+        if key:
+            scope_keys.add(key)
+    return CalendarScope(unrestricted=False, pair_ids=pair_ids, scope_keys=scope_keys)
+
+
+@router.get("/calendar")
+def events_calendar(
+    days: int = Query(371, ge=_CALENDAR_MIN_DAYS, le=_CALENDAR_MAX_DAYS),
+    tz: int = Query(0),
+    request: Request = cast(Request, None),
+) -> JSONResponse:
+    scope = _calendar_scope(load_config() or {}, request)
+    now = int(_time.time())
+    until = now + 86400
+    since = until - int(days) * 86400
+    payload = _calendar(since=since, until=until, tz_offset=tz, scope=scope)
+    payload["scoped"] = not scope.unrestricted
+    return _ok(payload)
+
+
+@router.get("/calendar/day")
+def events_calendar_day(
+    since: int = Query(..., ge=0),
+    until: int = Query(..., ge=0),
+    limit: int = Query(200, ge=1, le=500),
+    request: Request = cast(Request, None),
+) -> JSONResponse:
+    if until <= since or until - since > 7 * 86400:
+        return _ok({"ok": False, "error": "invalid_range"}, status_code=400)
+    scope = _calendar_scope(load_config() or {}, request)
+    payload = _day_runs(since=since, until=until, scope=scope, limit=limit)
+    payload["scoped"] = not scope.unrestricted
+    return _ok(payload)
+
+
 @router.get("/recent")
 def events_recent(
     limit: int = Query(50, ge=1, le=500),
@@ -436,11 +709,52 @@ def events_recent(
     request: Request = cast(Request, None),
 ) -> JSONResponse:
     cfg = load_config() or {}
-    if _managed_request(request) and _audit_domain_requested(domain):
+    if _audit_hidden(request) and _audit_domain_requested(domain):
         return _scope_denied()
     if str(view).lower() == "events":
         return _ok(_filter_event_payload(cfg, request, _recent(limit=limit, offset=offset, visibility=visibility, order=order, domain=domain)))
     return _ok(_filter_event_payload(cfg, request, _list_groups(visibility=visibility, order=order, limit=limit, offset=offset, domain=domain)))
+
+
+@router.get("/feed")
+def events_feed(
+    limit: int = Query(8, ge=1, le=50),
+    visibility: str = Query("all"),
+    user_profile: str = Query(""),
+    request: Request = cast(Request, None),
+) -> JSONResponse:
+    cfg = load_config() or {}
+    profile = _effective_profile_from_request(request, user_profile)
+    scoped = bool(str(profile or "").strip())
+    profile_filter = _profile_filter(cfg, profile) if scoped else {}
+    if scoped and not profile_filter:
+        return _ok({"ok": True, "items": [], "total": 0, "limit": limit, "user_profile": profile})
+
+    sample_limit = max(50, min(500, int(limit or 8) * 20))
+    rows: list[dict[str, Any]] = []
+    for domain in ("sync", "scrobble"):
+        payload = _list_groups(visibility=visibility, order="newest", limit=sample_limit, offset=0, domain=domain)
+        for group in payload.get("items") or []:
+            if not isinstance(group, dict):
+                continue
+            if not _event_row_allowed(cfg, request, group):
+                continue
+            events = [
+                event for event in (_group_events(group.get("id"), order="asc", limit=250, offset=0).get("items") or [])
+                if isinstance(event, dict)
+            ]
+            if scoped and not (_row_matches_profile_filter(group, profile_filter) or any(_row_matches_profile_filter(event, profile_filter) for event in events)):
+                continue
+            rows.append(_feed_item(group, events))
+
+    rows.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
+    return _ok({
+        "ok": True,
+        "items": rows[:limit],
+        "total": len(rows),
+        "limit": limit,
+        **({"user_profile": profile} if scoped else {}),
+    })
 
 
 @router.get("/search")
@@ -469,7 +783,7 @@ def events_search(
     request: Request = cast(Request, None),
 ) -> JSONResponse:
     cfg = load_config() or {}
-    if _managed_request(request) and _audit_domain_requested(domain):
+    if _audit_hidden(request) and _audit_domain_requested(domain):
         return _scope_denied()
     if str(view).lower() == "events":
         return _ok(_filter_event_payload(cfg, request, _search(
@@ -511,7 +825,7 @@ def events_groups(
     request: Request = cast(Request, None),
 ) -> JSONResponse:
     cfg = load_config() or {}
-    if _managed_request(request) and _audit_domain_requested(domain):
+    if _audit_hidden(request) and _audit_domain_requested(domain):
         return _scope_denied()
     return _ok(_filter_event_payload(cfg, request, _list_groups(
         q=q, status=status, category=category, event_type=event_type, provider=provider, origin_provider=origin_provider,
@@ -547,7 +861,7 @@ def events_tree(
     request: Request = cast(Request, None),
 ) -> JSONResponse:
     cfg = load_config() or {}
-    if _managed_request(request) and _audit_domain_requested(domain):
+    if _audit_hidden(request) and _audit_domain_requested(domain):
         return _scope_denied()
     return _ok(_filter_event_payload(cfg, request, _list_tree(
         order=order, limit=limit, offset=offset, include_children=children, domain=domain,
@@ -709,24 +1023,11 @@ def events_clear(payload: dict[str, Any] | None = Body(None), request: Request =
         return _scope_denied()
     if not bool((payload or {}).get("confirm")):
         return _ok({"ok": False, "error": "confirmation_required", "confirm": False}, status_code=400)
-    conn = get_conn()
-    if conn is None:
-        return _ok({"ok": False, "available": False, "path": str(events_db_path())})
     domain = str((payload or {}).get("domain") or "").strip().lower()
-    try:
-        with conn:
-            if domain in ("", "all"):
-                conn.execute("DELETE FROM events")
-                conn.execute("DELETE FROM event_groups")
-                conn.execute("DELETE FROM sync_runs")
-                conn.execute("DELETE FROM event_imports")
-            else:
-                conn.execute("DELETE FROM events WHERE domain=?", (domain,))
-                conn.execute("DELETE FROM event_groups WHERE domain=?", (domain,))
-                if domain == "sync":
-                    conn.execute("DELETE FROM sync_runs")
-                    conn.execute("DELETE FROM event_imports")
-        return _ok({"ok": True, "cleared": True, "domain": domain or "all"})
-    except Exception:
-        _LOG.exception("events clear failed")
+    result = _purge_events(domain)
+    if not result.get("ok"):
+        if result.get("available") is False:
+            return _ok(result)
+        _LOG.error("events clear failed: %s", result.get("error"))
         return _ok({"ok": False, "error": "internal_error"}, status_code=500)
+    return _ok(result)

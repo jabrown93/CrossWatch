@@ -48,19 +48,12 @@
     if (sourceSelect) {
       sourceSelect.querySelector('option[value="pair"]')?.remove();
       sourceSelect.querySelector('option[value="tracker"]')?.remove();
-      if (!sourceSelect.querySelector('option[value="manual"]')) {
-        const manualOpt = document.createElement("option");
-        manualOpt.value = "manual";
-        manualOpt.textContent = "Manual Overrides";
-        sourceSelect.appendChild(manualOpt);
-      } else {
-        sourceSelect.querySelector('option[value="manual"]').textContent = "Manual Overrides";
-      }
+      sourceSelect.querySelector('option[value="manual"]')?.remove();
       sourceSelect.querySelector('option[value="playlist"]')?.remove();
     }
 
     const sub = root?.querySelector(".cw-sub");
-    if (sub) sub.textContent = "Edit your current state or playlist endpoints";
+    if (sub) sub.textContent = "Fix, add or remove what CrossWatch syncs";
   }
 
   function addTrackerNotice(root) {
@@ -121,7 +114,7 @@
 
     const featureWrap = document.createElement("div");
     featureWrap.className = "cw-import-features";
-    [ctx.importWatchlistWrap, ctx.importHistoryWrap, ctx.importRatingsWrap, ctx.importProgressFeatWrap].forEach(wrap => {
+    [ctx.importWatchlistWrap, ctx.importHistoryWrap, ctx.importRatingsWrap, ctx.importProgressFeatWrap, ctx.importCollectionWrap].forEach(wrap => {
       if (!(wrap instanceof HTMLElement)) return;
       wrap.classList.add("cw-import-feature");
       wrap.style.cssText = "";
@@ -202,10 +195,27 @@
       if (!btn) return;
       btn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">${icon}</span><span>${label}</span>`;
       btn.setAttribute("aria-label", label);
+      btn.title = label;
     };
 
     setButtonIcon(ctx.addBtn, "add", "Add row");
     setButtonIcon(ctx.saveBtn, "check", "Save changes");
+    if (ctx.addBtn && !document.getElementById("cw-saved-mappings")) {
+      const button = document.createElement("button");
+      button.id = "cw-saved-mappings";
+      button.type = "button";
+      button.className = "cw-btn";
+      setButtonIcon(button, "compare_arrows", "Mapping");
+      ctx.addBtn.before(button);
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const view = await import(`/assets/js/editor/saved-mappings.js?v=${encodeURIComponent(window.APP_VERSION || "1")}`);
+          view.open(button, ctx.mappingEditor);
+        } catch { ctx.setStatus?.("Could not open saved mappings. Please try again."); }
+        finally { button.disabled = false; }
+      });
+    }
 
     const typeFilterWrap = ctx.typeFilterWrap;
     if (typeFilterWrap && typeFilterWrap.dataset.decorated !== "1") {
@@ -250,7 +260,24 @@
     }
   }
 
+  function prepareMobileFilters(root) {
+    const side = root.querySelector('.cw-side');
+    if (!side || side.parentElement.classList.contains('cw-editor-filters')) return;
+    const details = document.createElement('details');
+    details.className = 'cw-editor-filters';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Source and filters';
+    details.appendChild(summary);
+    side.before(details);
+    details.appendChild(side);
+    const narrow = window.matchMedia('(max-width: 1320px)');
+    const update = () => { details.open = !narrow.matches; };
+    update();
+    narrow.addEventListener('change', update);
+  }
+
   Editor.Chrome = {
+    prepareMobileFilters,
     wireStaticLabels,
     prepareSourceOptions,
     addTrackerNotice,

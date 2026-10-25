@@ -102,12 +102,11 @@ def register_ui_root(app: FastAPI) -> None:
         if isinstance(user, dict) and user.get("is_admin") is False:
             perms = _managed_user_permissions(user)
             view = str(request.query_params.get("view") or "").strip().lower()
-            read_view_allowed = (
-                view == "watchlist" and perms.get("watchlist")
-            ) or (
-                view == "playback_progress" and perms.get("playback")
-            )
-            if not perms.get("write") and not read_view_allowed:
+            if view == "playback_progress":
+                return RedirectResponse(url="/profile#playback", status_code=302)
+            if view == "watchlist":
+                return RedirectResponse(url="/profile#watchlist", status_code=302)
+            if not perms.get("write"):
                 return RedirectResponse(url="/profile", status_code=302)
             if perms.get("write") and request.query_params.get("main") != "1":
                 return RedirectResponse(url="/profile", status_code=302)
@@ -132,21 +131,21 @@ def register_ui_root(app: FastAPI) -> None:
 
 
 _HELPER_SCRIPTS = (
-    "help-links.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "api.js", "core.js", "details-log.js",
-    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "providers-ui.js", "env-lock.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
+    "help-links.js", "provider-meta.js", "feature-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js", "details-log.js",
+    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js", "providers-ui.js", "env-lock.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
     "restart_apply.js",
 )
 _APP_SCRIPTS = (
-    "syncbar.js", "run-summary-stream.js", "overview-profile.js", "main.js", "connections.overlay.js", "connections.pairs.overlay.js", "scheduler.js",
-    "schedulerbanner.js", "playingcard.js", "insights.js", "activity.js", "dashboard-widgets.js", "auth-dots.js", "main-status.js",
-    "scrobbler.js", "user-profiles.js", "app-users.js",
+    "syncbar.js", "run-summary-stream.js", "overview-profile.js", "sync-reviews.js", "plex-recovery-notifications.js", "main.js", "connections.overlay.js", "connections.pairs.overlay.js", "scheduler.js",
+    "schedulerbanner.js", "playingcard.js", "insights.js", "activity.js", "profile-media-modal.js", "dashboard-widgets.js", "auth-dots.js", "main-status.js",
+    "scrobbler.js", "user-profiles.js", "app-users.js", "mcp-access.js", "assistant-settings.js",
 )
 _USER_HELPER_SCRIPTS = (
-    "help-links.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "api.js", "core.js",
-    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js",
+    "help-links.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js",
+    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js",
 )
 _USER_APP_SCRIPTS = (
-    "overview-profile.js", "main.js", "playingcard.js", "insights.js", "activity.js", "dashboard-widgets.js", "auth-dots.js", "main-status.js",
+    "overview-profile.js", "sync-reviews.js", "plex-recovery-notifications.js", "main.js", "playingcard.js", "insights.js", "activity.js", "profile-media-modal.js", "dashboard-widgets.js", "auth-dots.js", "main-status.js",
 )
 _FULL_USER_HELPER_SCRIPTS = tuple(dict.fromkeys((*_USER_HELPER_SCRIPTS, "details-log.js")))
 _FULL_USER_APP_SCRIPTS = tuple(dict.fromkeys(("syncbar.js", "run-summary-stream.js", "schedulerbanner.js", *_USER_APP_SCRIPTS)))
@@ -209,6 +208,11 @@ _ADMIN_ONLY_MARKERS: tuple[tuple[str, str], ...] = (
     ('id="page-settings"', "settings pane"),
     ('id="app_user_manager"', "user manager"),
     ("app_auth_oidc_client_secret", "OIDC credentials form"),
+    ("cwAboutMenuSelect('assistant')", "assistant menu item"),
+)
+_ASSISTANT_MENU_ITEM = (
+    '        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect(\'assistant\')">'
+    '<span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">auto_awesome</span><span>Ask CrossWatch</span></button>'
 )
 
 
@@ -223,27 +227,339 @@ def _assert_admin_shell_stripped(html: str) -> None:
     raise RuntimeError("managed_user_shell_strip_failed:" + ",".join(sorted(leaked)))
 
 
-def _nav_profile_link() -> str:
-    return '    <a id="cw-nav-profile-link" class="cw-nav-profile-link" href="/profile" title="Open profile" aria-label="Open profile"><span id="cw-nav-profile-avatar" class="cw-nav-profile-avatar material-symbols-rounded" aria-hidden="true">person</span></a>'
+def _profile_nav_tab(label: str, href: str, active: bool = False) -> str:
+    cls = "tab active" if active else "tab"
+    return f"<button class=\"{cls}\" type=\"button\" onclick=\"location.href='{href}'\">{label}</button>"
+
+
+def _profile_bulk_bar(bar_id: str, scope: str) -> str:
+    return (
+        f'    <div id="{bar_id}" class="cw-tl-bulk" hidden>\n'
+        f'      <span class="cw-tl-bulk-count"><strong data-{scope}-count>0</strong><span>selected</span></span>\n'
+        f'      <button class="cw-tl-ghost" type="button" data-{scope}-select="visible"><span class="material-symbols-rounded" aria-hidden="true">select_all</span>Visible</button>\n'
+        f'      <button class="cw-tl-ghost" type="button" data-{scope}-select="all"><span class="material-symbols-rounded" aria-hidden="true">checklist</span>All results</button>\n'
+        f'      <button class="cw-tl-ghost" type="button" data-{scope}-select="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>\n'
+        '      <span class="cw-tl-bulk-actions">\n'
+        f'        <button class="cw-tl-action cw-tl-remove" type="button" data-{scope}-remove><span class="material-symbols-rounded" aria-hidden="true">delete</span>Remove</button>\n'
+        '      </span>\n'
+        '    </div>\n'
+    )
+
+
+def _profile_remove_dialog() -> str:
+    return """  <dialog id="profile-remove-dialog" class="cw-tl-dialog cw-tl-dialog--wide" aria-labelledby="profile-remove-title">
+    <form method="dialog" class="cw-tl-dialog-body">
+      <div class="cw-tl-remove-head">
+        <span class="cw-tl-remove-icon" aria-hidden="true"><span class="material-symbols-rounded">delete</span></span>
+        <div class="cw-tl-remove-heading"><strong id="profile-remove-title">Remove from providers</strong><small id="profile-remove-sub"></small></div>
+        <button class="cw-tl-remove-x" value="cancel" data-remove-close aria-label="Close" title="Close"><span class="material-symbols-rounded" aria-hidden="true">close</span></button>
+      </div>
+      <div id="profile-remove-targets" class="cw-tl-remove-list" aria-live="polite"></div>
+      <div id="profile-remove-note" class="cw-tl-remove-info" hidden>
+        <span class="material-symbols-rounded" aria-hidden="true">info</span>
+        <div><strong id="profile-remove-note-main"></strong><small id="profile-remove-note-detail"></small></div>
+      </div>
+      <div id="profile-remove-error" class="cw-tl-dialog-error" role="alert"></div>
+      <div id="profile-remove-result" class="cw-tl-remove-result" aria-live="polite"></div>
+      <div class="cw-tl-dialog-actions">
+        <button class="cw-tl-ghost" type="button" data-remove-all>Select all</button>
+        <span class="cw-tl-spacer"></span>
+        <button class="cw-tl-ghost" value="cancel" data-remove-close>Close</button>
+        <button class="cw-tl-primary cw-tl-remove-submit cw-danger-confirm" type="button" data-remove-submit disabled><span class="material-symbols-rounded" aria-hidden="true">delete</span><span>Remove</span></button>
+      </div>
+    </form>
+  </dialog>
+"""
+
+
+def _profile_timeline_panel(
+    key: str,
+    *,
+    kicker: str,
+    title: str,
+    lede: str,
+    search: str,
+    sources: tuple[tuple[str, str, str, str], ...],
+    coverage: tuple[tuple[str, str], ...],
+    scores: bool = False,
+    bulk: bool = False,
+    timeline: bool = True,
+) -> str:
+    timeline_button = (
+        '          <button class="active cw-view-timeline" type="button" data-timeline-toggle title="Show timeline" aria-label="Show timeline" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>\n'
+        if timeline else ""
+    )
+    source_block = ""
+    if len(sources) > 1:
+        buttons = "\n".join(
+            f'      <button class="{"active" if index == 0 else ""}" type="button" role="tab" aria-selected="{"true" if index == 0 else "false"}" data-timeline-source="{value}">\n'
+            f'        <span class="material-symbols-rounded" aria-hidden="true">{icon}</span>\n'
+            f'        <span class="cw-hist-source-copy"><strong>{label}</strong><small>{note}</small></span>\n'
+            "      </button>"
+            for index, (value, icon, label, note) in enumerate(sources)
+        )
+        source_block = f'    <div class="cw-hist-sources" role="tablist" aria-label="{title} source">\n{buttons}\n    </div>\n'
+    scores_block = f'    <div id="profile-{key}-scores" class="cw-hist-scores" aria-label="Filter by score"></div>\n' if scores else ""
+    options = "\n".join(f'          <option value="{value}">{label}</option>' for value, label in coverage)
+    bulk_block = _profile_bulk_bar(f"profile-{key}-bulk", "timeline") if bulk else ""
+    default_source = sources[0][0] if sources else ""
+    return f"""  <section id="profile-panel-{key}" class="cw-profile-panel cw-timeline-panel" data-source="{default_source}" data-coverage="on" data-dated="{"on" if timeline else "off"}">
+    <div class="cw-collection-head">
+      <div class="cw-collection-headline">
+        <span class="cw-collection-kicker" id="profile-{key}-kicker">{kicker}</span>
+        <h2 id="profile-{key}-title">{title}</h2>
+        <p id="profile-{key}-lede">{lede}</p>
+      </div>
+      <div class="cw-collection-tiles" id="profile-{key}-metrics"></div>
+    </div>
+{source_block}    <div id="profile-{key}-timeline" class="cw-hist-timeline" aria-label="{title} per month" hidden></div>
+{scores_block}    <div class="cw-collection-toolbar">
+      <label class="cw-collection-search">
+        <span class="material-symbols-rounded" aria-hidden="true">search</span>
+        <input id="profile-{key}-search" type="search" placeholder="{search}">
+      </label>
+      <div class="cw-collection-chips" id="profile-{key}-types" aria-label="{title} type filters"></div>
+      <div class="cw-collection-controls">
+        <select id="profile-{key}-coverage" class="cw-hist-coverage-select" aria-label="Sync coverage filter">
+{options}
+        </select>
+        <select id="profile-{key}-provider" aria-label="Provider filter"><option value="">All providers</option></select>
+        <div class="cw-collection-views" role="group" aria-label="View mode">
+{timeline_button}          <button class="active" type="button" data-timeline-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
+          <button type="button" data-timeline-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
+        </div>
+        <button id="profile-{key}-refresh" class="cw-tl-ghost cw-collection-refresh" type="button" data-timeline-refresh title="Refresh {title}" aria-label="Refresh {title}"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
+      </div>
+    </div>
+    <div id="profile-{key}-list" class="cw-hist-list" data-view="grid" aria-live="polite"></div>
+    <div id="profile-{key}-footer" class="cw-collection-footer" hidden>
+      <nav id="profile-{key}-pages" class="cw-collection-pages" aria-label="{title} pages"></nav>
+      <div class="cw-collection-summary">
+        <span id="profile-{key}-page-label"></span>
+        <select id="profile-{key}-page-size" aria-label="Items per page">
+          <option value="24">24</option>
+          <option value="48">48</option>
+          <option value="96">96</option>
+        </select>
+      </div>
+    </div>
+{bulk_block}  </section>"""
+
+
+def _profile_playback_panel() -> str:
+    return """  <section id="profile-panel-playback" class="cw-profile-panel cw-timeline-panel cw-playback-panel" data-source="playback">
+    <div class="cw-collection-head">
+      <div class="cw-collection-headline">
+        <span class="cw-collection-kicker">Live from your players</span>
+        <h2>Progress</h2>
+        <p>Unfinished plays read live from every connected provider.</p>
+      </div>
+      <div class="cw-collection-tiles" id="profile-playback-metrics"></div>
+    </div>
+    <div id="profile-playback-status" class="cw-play-status">
+      <span id="profile-playback-errors" class="cw-play-issues" role="status" hidden></span>
+    </div>
+    <div id="profile-playback-timeline" class="cw-hist-timeline" aria-label="Progress per month" hidden></div>
+    <div class="cw-collection-toolbar">
+      <label class="cw-collection-search">
+        <span class="material-symbols-rounded" aria-hidden="true">search</span>
+        <input id="profile-playback-search" type="search" placeholder="Search playback...">
+      </label>
+      <div class="cw-collection-chips" id="profile-playback-types" aria-label="Playback type filters"></div>
+      <div class="cw-collection-controls">
+        <div class="cw-play-filters">
+          <button id="profile-playback-filters-btn" class="cw-tl-ghost cw-play-filterbtn" type="button" data-playback-filters-toggle aria-expanded="false" aria-haspopup="true" aria-controls="profile-playback-filters-panel" title="Filter playback" aria-label="Filter playback"><span class="material-symbols-rounded" aria-hidden="true">filter_list</span><span>Filters</span><span id="profile-playback-filters-count" class="cw-play-filtercount" aria-live="polite" hidden>0</span></button>
+          <div id="profile-playback-filters-panel" class="cw-play-filterpanel" role="group" aria-labelledby="profile-playback-filters-btn" hidden>
+            <label class="cw-play-filterrow"><span>Provider</span>
+              <select id="profile-playback-provider" aria-label="Provider filter"><option value="">All providers</option></select>
+            </label>
+            <label class="cw-play-filterrow"><span>Progress</span>
+              <select id="profile-playback-progress" aria-label="Progress filter">
+                <option value="">Any progress</option>
+                <option value="0:24.99">Under 25%</option>
+                <option value="25:50">25 to 50%</option>
+                <option value="50:75">50 to 75%</option>
+                <option value="75:100">Over 75%</option>
+                <option value="90:100">Almost done</option>
+              </select>
+            </label>
+            <label class="cw-play-filterrow"><span>Paused</span>
+              <select id="profile-playback-age" aria-label="Paused filter">
+                <option value="">Any time</option>
+                <option value="today">Today</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+                <option value="older_30d">Older than 30 days</option>
+              </select>
+            </label>
+            <label class="cw-play-filterrow"><span>Sort</span>
+              <select id="profile-playback-sort" aria-label="Sort">
+                <option value="last_updated">Recently paused</option>
+                <option value="progress_high">Most watched</option>
+                <option value="progress_low">Least watched</option>
+                <option value="remaining_time">Shortest remaining</option>
+                <option value="rating_high">Highest rated</option>
+                <option value="title">Title A-Z</option>
+                <option value="provider">Provider</option>
+              </select>
+            </label>
+            <div class="cw-play-filterfoot">
+              <button class="cw-tl-ghost" type="button" data-playback-filters-clear>Clear all</button>
+            </div>
+          </div>
+        </div>
+        <div class="cw-collection-views" role="group" aria-label="View mode">
+          <button class="active cw-view-timeline" type="button" data-playback-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
+          <button class="active" type="button" data-playback-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
+          <button type="button" data-playback-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
+        </div>
+        <span id="profile-playback-sync" class="cw-play-sync" data-state="ready" aria-live="polite"><span class="cw-play-sync-dot" aria-hidden="true"></span><span>Updated <strong>not yet</strong></span></span>
+        <button id="profile-playback-settings" class="cw-tl-ghost cw-play-toolbtn" type="button" data-playback-open-settings hidden title="Choose playback providers" aria-label="Choose playback providers"><span class="material-symbols-rounded" aria-hidden="true">tune</span></button>
+        <button id="profile-playback-refresh" class="cw-tl-ghost cw-play-toolbtn" type="button" data-playback-retry title="Refresh Progress" aria-label="Refresh Progress"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
+      </div>
+    </div>
+    <div id="profile-playback-list" class="cw-hist-list" data-view="grid" aria-live="polite"></div>
+    <div id="profile-playback-footer" class="cw-collection-footer" hidden>
+      <nav id="profile-playback-pages" class="cw-collection-pages" aria-label="Playback pages"></nav>
+      <div class="cw-collection-summary">
+        <span id="profile-playback-page-label"></span>
+        <select id="profile-playback-page-size" aria-label="Items per page">
+          <option value="24">24</option>
+          <option value="48">48</option>
+          <option value="96">96</option>
+        </select>
+      </div>
+    </div>
+    <div id="profile-playback-bulk" class="cw-tl-bulk" hidden>
+      <span class="cw-tl-bulk-count"><strong data-playback-count>0</strong><span>selected</span></span>
+      <button class="cw-tl-ghost" type="button" data-playback-bulk-select="visible"><span class="material-symbols-rounded" aria-hidden="true">select_all</span>Visible</button>
+      <button class="cw-tl-ghost" type="button" data-playback-bulk-select="all"><span class="material-symbols-rounded" aria-hidden="true">checklist</span>All results</button>
+      <button class="cw-tl-ghost" type="button" data-playback-bulk-select="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>
+      <span class="cw-tl-bulk-actions">
+        <button class="cw-tl-action cw-tl-text" type="button" data-playback-bulk="update_progress" title="Edit progress"><span class="material-symbols-rounded" aria-hidden="true">edit</span>Edit progress</button>
+        <button class="cw-tl-action cw-tl-text is-good" type="button" data-playback-bulk="mark_watched" title="Mark as watched"><span class="material-symbols-rounded" aria-hidden="true">check_circle</span>Mark watched</button>
+        <button class="cw-tl-action cw-tl-remove" type="button" data-playback-bulk="remove_progress" title="Remove progress"><span class="material-symbols-rounded" aria-hidden="true">delete</span>Remove</button>
+      </span>
+    </div>
+    <dialog id="profile-playback-edit" class="cw-tl-dialog" aria-labelledby="profile-playback-edit-title">
+      <form method="dialog" class="cw-tl-dialog-body">
+        <div class="cw-tl-dialog-head">
+          <span class="material-symbols-rounded" aria-hidden="true">edit</span>
+          <span><strong id="profile-playback-edit-title">Edit progress</strong><small id="profile-playback-edit-sub"></small></span>
+        </div>
+        <div class="cw-play-edit">
+          <input id="profile-playback-edit-range" type="range" min="2" max="99" step="1" aria-label="Progress">
+          <span class="cw-play-edit-value"><input id="profile-playback-edit-value" type="number" min="2" max="99" step="0.01" aria-label="Progress percent"><span>%</span></span>
+        </div>
+        <div id="profile-playback-edit-error" class="cw-tl-dialog-error" role="alert"></div>
+        <div class="cw-tl-dialog-actions">
+          <button class="cw-tl-ghost" type="button" data-playback-dialog-cancel>Cancel</button>
+          <button class="cw-tl-primary" type="submit">Apply</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="profile-playback-providers" class="cw-tl-dialog cw-tl-dialog--wide" aria-labelledby="profile-playback-providers-title">
+      <form method="dialog" class="cw-tl-dialog-body">
+        <div class="cw-tl-dialog-head">
+          <span class="material-symbols-rounded" aria-hidden="true">tune</span>
+          <span><strong id="profile-playback-providers-title">Playback providers</strong><small>Choose which provider profiles show up here</small></span>
+        </div>
+        <label class="cw-play-timeout">
+          <span><strong>Slow provider timeout</strong><small>Skip providers that take longer than this</small></span>
+          <span class="cw-play-edit-value"><input id="profile-playback-timeout" type="number" min="3" max="60" step="1" aria-label="Timeout in seconds"><span>sec</span></span>
+        </label>
+        <div id="profile-playback-provider-list" class="cw-play-provider-list"></div>
+        <div id="profile-playback-providers-error" class="cw-tl-dialog-error" role="alert"></div>
+        <div class="cw-tl-dialog-actions">
+          <button class="cw-tl-ghost" type="button" data-playback-settings-reset>Reset</button>
+          <span class="cw-tl-spacer"></span>
+          <button class="cw-tl-ghost" type="button" data-playback-dialog-cancel>Cancel</button>
+          <button class="cw-tl-primary" type="submit">Apply</button>
+        </div>
+      </form>
+    </dialog>
+  </section>"""
+
+
+def _current_account_avatar_url(user: dict | None) -> str:
+    url = str((user or {}).get("avatar_url") or "").strip() if isinstance(user, dict) else ""
+    if url.startswith("/api/profile/avatar/"):
+        q = url.find("?")
+        return f"/api/profile/avatar{url[q:]}" if q >= 0 else "/api/profile/avatar"
+    return url
+
+
+def _avatar_img_html(url: str) -> str:
+    safe = html_lib.escape(url, quote=True)
+    return f'<img src="{safe}" alt="">'
+
+
+def _nav_profile_avatar(user: dict | None = None) -> str:
+    url = _current_account_avatar_url(user)
+    if url:
+        safe = html_lib.escape(url, quote=True)
+        return f'<span id="cw-nav-profile-avatar" class="cw-nav-profile-avatar" aria-hidden="true" data-cw-avatar-url="{safe}">{_avatar_img_html(url)}</span>'
+    return '<span id="cw-nav-profile-avatar" class="cw-nav-profile-avatar material-symbols-rounded" aria-hidden="true">person</span>'
+
+
+def _seed_nav_profile_avatar(html: str, user: dict | None = None) -> str:
+    placeholder = '<span id="cw-nav-profile-avatar" class="cw-nav-profile-avatar material-symbols-rounded" aria-hidden="true">person</span>'
+    return html.replace(placeholder, _nav_profile_avatar(user), 1)
+
+
+def _profile_avatar_inner(user: dict | None = None) -> str:
+    url = _current_account_avatar_url(user)
+    if url:
+        return _avatar_img_html(url)
+    return '<span class="material-symbols-rounded" aria-hidden="true">person</span>'
+
+
+_PROFILE_MENU_ITEMS = (
+    ("profile", "person", "Profile", ""),
+    ("watchlist", "bookmark", "Watchlist", "watchlist"),
+    ("history", "history", "History", ""),
+    ("ratings", "star", "Ratings", ""),
+    ("collections", "video_library", "Collections", ""),
+    ("playback", "resume", "Progress", "playback"),
+)
+
+
+def _profile_menu_items(user: dict | None = None) -> str:
+    is_admin = not isinstance(user, dict) or bool(user.get("is_admin"))
+    perms = _managed_user_permissions(user)
+    return "\n".join(
+        f'        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="{action}"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">{icon}</span><span>{label}</span></button>'
+        for action, icon, label, permission in _PROFILE_MENU_ITEMS
+        if not permission or is_admin or perms.get(permission)
+    )
+
+
+def _nav_profile_link(user: dict | None = None) -> str:
+    return """    <div class="cw-nav-profile-menu" id="cw-nav-profile-menu">
+      <button id="cw-nav-profile-link" class="cw-nav-profile-link" type="button" title="Open profile menu" aria-label="Open profile menu" aria-haspopup="menu" aria-expanded="false">
+        __CW_NAV_PROFILE_AVATAR__
+        <span class="tab-caret" aria-hidden="true"></span>
+      </button>
+      <div class="cw-menu cw-profile-menu hidden" id="cw-profile-menu" role="menu" aria-labelledby="cw-nav-profile-link">
+__CW_NAV_PROFILE_ITEMS__
+        <div class="cw-menu-sep" role="separator" aria-hidden="true"></div>
+        <button class="cw-menu-item danger" type="button" role="menuitem" data-cw-profile-menu-action="logout"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Logout</span></button>
+      </div>
+    </div>""".replace("__CW_NAV_PROFILE_AVATAR__", _nav_profile_avatar(user)).replace("__CW_NAV_PROFILE_ITEMS__", _profile_menu_items(user))
 
 
 def _managed_user_shell(html: str, user: dict | None = None) -> str:
+    html = html.replace('  <section id="page-maintenance" class="card hidden tab-page"></section>\n\n', "")
     perms = _managed_user_permissions(user)
     write_allowed = bool(perms.get("write"))
     dashboard_allowed = bool(perms.get("dashboard")) and write_allowed
-    watchlist_allowed = bool(perms.get("watchlist"))
-    playback_allowed = bool(perms.get("playback"))
-    logout_tab = '    <button id="cw-managed-logout" class="tab" type="button" onclick="fetch(\'/api/app-auth/logout\',{method:\'POST\',credentials:\'same-origin\',cache:\'no-store\'}).finally(()=>location.href=\'/login\')">Logout</button>'
     if write_allowed:
         tabs = [
             '    <button id="tab-main" class="tab active" type="button" onclick="showTab(\'main\')">Main</button>',
-            '    <button id="tab-watchlist" class="tab" type="button" onclick="showTab(\'watchlist\')">Watchlist</button>',
-            '    <button id="tab-playback_progress" class="tab" type="button" onclick="showTab(\'playback_progress\')">Playback</button>',
             '    <button id="tab-snapshots" class="tab" type="button" onclick="showTab(\'snapshots\')">Captures</button>',
             '    <button id="tab-playlists" class="tab" type="button" onclick="showTab(\'playlists\')">Playlists</button>',
             '    <button id="tab-editor" class="tab" type="button" onclick="showTab(\'editor\')">Editor</button>',
-            logout_tab,
-            _nav_profile_link(),
+            _nav_profile_link(user),
         ]
         html = _replace_html_range(
             html,
@@ -253,12 +569,7 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
         )
     else:
         tabs = ['    <button id="tab-main" class="tab" data-cw-profile-home="1" type="button" onclick="location.href=\'/profile\'">Main</button>']
-        if watchlist_allowed:
-            tabs.append('    <button id="tab-watchlist" class="tab" type="button" onclick="showTab(\'watchlist\')">Watchlist</button>')
-        if playback_allowed:
-            tabs.append('    <button id="tab-playback_progress" class="tab" type="button" onclick="showTab(\'playback_progress\')">Playback</button>')
-        tabs.append(logout_tab)
-        tabs.append(_nav_profile_link())
+        tabs.append(_nav_profile_link(user))
         html = html.replace(
             '<div class="brand" role="button" tabindex="0" title="Go to Main" onclick="showTab(\'main\')" onkeypress="if(event.key===\'Enter\'||event.key===\' \')showTab(\'main\')">',
             '<div class="brand" role="button" tabindex="0" title="Go to Profile" onclick="location.href=\'/profile\'" onkeypress="if(event.key===\'Enter\'||event.key===\' \')location.href=\'/profile\'">',
@@ -273,9 +584,15 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
         html = html.replace('    <button id="tab-playlists" class="tab" type="button" onclick="showTab(\'playlists\')">Playlists</button>\n', "")
         html = html.replace('    <button id="tab-editor" class="tab" type="button" onclick="showTab(\'editor\')">Editor</button>\n', "")
         for fragment in (
-            '  <section id="page-snapshots" class="card hidden tab-page"></section>\n\n',
-            '  <section id="page-playlists" class="card hidden tab-page"></section>\n\n',
-            '  <section id="page-editor" class="card hidden tab-page"></section>\n\n',
+            '  <section id="page-snapshots" class="card hidden tab-page cw-themed-page"></section>\n\n',
+            '  <section id="page-capture_compare" class="card hidden tab-page"></section>\n\n',
+            '  <section id="page-playlists" class="card hidden tab-page cw-themed-page"></section>\n\n',
+            '  <section id="page-editor" class="card hidden tab-page cw-themed-page"></section>\n\n',
+            '  <section id="page-analyzer" class="card hidden tab-page"></section>\n\n',
+            '  <section id="page-events" class="card hidden tab-page"></section>\n\n',
+            '  <section id="page-logs" class="card hidden tab-page"></section>\n\n',
+            '  <section id="page-import_export" class="card hidden tab-page"></section>\n\n',
+            '  <section id="page-interactive_sync" class="card hidden tab-page"></section>\n\n',
         ):
             html = html.replace(fragment, "")
     if not dashboard_allowed:
@@ -283,12 +600,6 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
         html = _remove_html_section(html, '  <section id="ops-card"')
         html = _remove_html_section(html, '  <section id="stats-card"')
         html = _remove_html_section(html, '  <section id="dashboard-widgets-card"')
-    if not playback_allowed:
-        html = _remove_line(html, '    <button id="tab-playback_progress" class="tab" type="button" onclick="showTab(\'playback_progress\')">Playback</button>')
-        html = html.replace('  <section id="page-playback_progress" class="card hidden tab-page">\n    <div id="playback-progress-root">\n      <div class="cw-page-loading">Loading Playback Progress...</div>\n    </div>\n  </section>\n\n', "")
-    if not watchlist_allowed:
-        html = _remove_line(html, '    <button id="tab-watchlist" class="tab" type="button" onclick="showTab(\'watchlist\')">Watchlist</button>')
-        html = html.replace('  <section id="page-watchlist" class="card hidden tab-page"></section>\n\n', "")
     html = _remove_html_range(
         html,
         '    <div class="cw-tabmenu" id="tab-settings-menu">',
@@ -299,6 +610,7 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
         '  <section id="page-settings" class="card hidden">',
         "\n\n</main>",
     )
+    html = _remove_line(html, _ASSISTANT_MENU_ITEM)
     _assert_admin_shell_stripped(html)
     return html
 
@@ -307,19 +619,20 @@ def _asset_block(include_admin: bool = True, user: dict | None = None) -> str:
     full_user = not include_admin and bool(_managed_user_permissions(user).get("write"))
     helper_scripts = _HELPER_SCRIPTS if include_admin else (_FULL_USER_HELPER_SCRIPTS if full_user else _USER_HELPER_SCRIPTS)
     app_scripts = _APP_SCRIPTS if include_admin else (_FULL_USER_APP_SCRIPTS if full_user else _USER_APP_SCRIPTS)
-    helper_tags = "\n".join(f'<script src="/assets/helpers/{name}?v=__CW_VERSION__"></script>' for name in helper_scripts)
+    helper_tags = "\n".join(f'<script src="/assets/helpers/{name}?v=__CW_VERSION__" defer></script>' for name in helper_scripts)
     app_tags = "\n".join(f'<script src="/assets/js/{name}?v=__CW_VERSION__" defer></script>' for name in app_scripts)
     admin_only_tags = (
         '<script src="/assets/helpers/media_user_picker.js?v=__CW_VERSION__" defer></script>',
         '<script src="/assets/helpers/whitelist_table.js?v=__CW_VERSION__" defer></script>',
-        '<script src="/assets/auth/auth.shared.js?v=__CW_VERSION__"></script>',
+        '<script src="/assets/auth/auth.shared.js?v=__CW_VERSION__" defer></script>',
         '<script src="/assets/auth/auth_loader.js?v=__CW_VERSION__" defer></script>',
         '<script src="/assets/auth/auth.tmdb.js?v=__CW_VERSION__" defer></script>',
         '<script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>',
+        '<script type="module" src="/assets/js/topology/advisor.js?v=__CW_VERSION__"></script>',
     ) if include_admin else (('<script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>',) if full_user else ())
     return "\n".join((
         helper_tags,
-        '<script src="/assets/crosswatch.js?v=__CW_VERSION__"></script>',
+        '<script src="/assets/crosswatch.js?v=__CW_VERSION__" defer></script>',
         app_tags,
         *admin_only_tags,
         '<script src="/assets/js/theme-flat-runtime.js?v=__CW_VERSION__" defer></script>',
@@ -365,10 +678,16 @@ def _get_index_html_static() -> str:
   const TITLES = {
     main: "Main",
     watchlist: "Watchlist",
-    playback_progress: "Playback Progress",
     snapshots: "Captures",
+    capture_compare: "Capture Compare",
     playlists: "Playlists",
     editor: "Editor",
+    analyzer: "Analyzer",
+    events: "Events",
+    logs: "Logs",
+    import_export: "Import / Export",
+    maintenance: "Maintenance tools",
+    interactive_sync: "Interactive Sync",
     settings: "Settings",
   };
 
@@ -431,8 +750,13 @@ def _get_index_html_static() -> str:
 <link rel="stylesheet" href="/assets/css/layout.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/components.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/pages.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/page-theme.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/ui-shell.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/account-menu.css?v=__CW_VERSION__">
+<link id="cw-notifications-css" rel="stylesheet" href="/assets/css/notifications.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/app-users.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/ai-settings.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/topology.css?v=__CW_VERSION__">
 <script>
 (() => {
   try {
@@ -454,7 +778,9 @@ def _get_index_html_static() -> str:
       } catch {}
       return false;
     })();
-    const wantCompact = ui === "compact" || q.get("compact") === "1" || (!explicit && hasCompactViewport && likelyHandheld);
+    let saved = "";
+    try { saved = String(localStorage.getItem("cw_ui_mode") || "").toLowerCase(); } catch {}
+    const wantCompact = ui === "compact" || q.get("compact") === "1" || (!explicit && (saved === "compact" || (saved !== "full" && hasCompactViewport && likelyHandheld)));
     if (wantCompact) document.documentElement.classList.add("cw-compact");
   } catch {}
 })();
@@ -462,34 +788,76 @@ def _get_index_html_static() -> str:
 <script>
 (() => {
   try {
-    const route = String(window.location.hash || "").replace(/^#\/?/, "").split("?")[0].split("/")[0].trim().toLowerCase().replace(/-/g, "_");
-    const tabs = new Set(["watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"]);
-    const tab = tabs.has(route) ? route : "main";
+    const segment = (value) => {
+      try { value = decodeURIComponent(String(value || "")); } catch {}
+      return String(value || "").trim().toLowerCase().replace(/-/g, "_");
+    };
+    const [path, query = ""] = String(window.location.hash || "").replace(/^#\/?/, "").split("?");
+    const parts = path.split("/").filter(Boolean);
+    const route = segment(parts[0]);
+    if (route === "playback_progress") {
+      window.location.replace("/profile#playback");
+      return;
+    }
+    if (route === "watchlist") {
+      window.location.replace("/profile#watchlist");
+      return;
+    }
+    const tabs = new Set(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
+    let tab = tabs.has(route) ? route : "main";
+    if (document.documentElement.classList.contains("cw-compact") && tab !== "main") tab = "main";
     document.documentElement.dataset.cwInitialTab = tab;
     document.documentElement.dataset.tab = tab;
+    if (tab === "settings") {
+      const aliases = { pairs: "sync", automation: "scheduling", ui: "app", security: "app" };
+      const requested = segment(parts[1] || new URLSearchParams(query).get("pane"));
+      const pane = Object.hasOwn(aliases, requested) ? aliases[requested] : requested;
+      const panes = new Set(["overview", "providers", "sync", "scrobbler", "scheduling", "app", "maintenance"]);
+      window.__cwSettingsPane = panes.has(pane) ? pane : "overview";
+      document.documentElement.dataset.cwInitialPane = window.__cwSettingsPane;
+    }
   } catch {
     document.documentElement.dataset.cwInitialTab = "main";
   }
 })();
 </script>
 <style>
+/* Keep Main's unfinished shell out of the first paint. */
+#cw-main-loading{display:none}
+html[data-cw-main-pending][data-tab="main"] #layout{visibility:hidden;pointer-events:none}
+html[data-cw-main-pending][data-tab="main"] #cw-main-loading{display:flex;position:fixed;inset:120px 0 auto;justify-content:center;color:var(--muted);padding:24px}
+/* Match the routed layout before the deferred router starts. */
+html[data-tab]:not([data-tab="main"]) #layout{grid-template-columns:minmax(0,1fr)}
+html[data-cw-initial-pane] #page-settings .cw-settings-pane{display:none!important}
+html[data-cw-initial-pane="overview"] #page-settings .cw-settings-pane[data-pane="overview"],
+html[data-cw-initial-pane="providers"] #page-settings .cw-settings-pane[data-pane="providers"],
+html[data-cw-initial-pane="sync"] #page-settings .cw-settings-pane[data-pane="sync"],
+html[data-cw-initial-pane="scrobbler"] #page-settings .cw-settings-pane[data-pane="scrobbler"],
+html[data-cw-initial-pane="scheduling"] #page-settings .cw-settings-pane[data-pane="scheduling"],
+html[data-cw-initial-pane="app"] #page-settings .cw-settings-pane[data-pane="app"],
+html[data-cw-initial-pane="maintenance"] #page-settings .cw-settings-pane[data-pane="maintenance"]{display:block!important}
 html[data-cw-initial-tab]:not([data-cw-initial-tab="main"]) #ops-card,
 html[data-cw-initial-tab]:not([data-cw-initial-tab="main"]) #stats-card,
 html[data-cw-initial-tab]:not([data-cw-initial-tab="main"]) #dashboard-widgets-card,
 html[data-cw-initial-tab]:not([data-cw-initial-tab="main"]) #log-panel{display:none!important}
-html[data-cw-initial-tab="watchlist"] #page-watchlist,
-html[data-cw-initial-tab="playback_progress"] #page-playback_progress,
 html[data-cw-initial-tab="snapshots"] #page-snapshots,
+html[data-cw-initial-tab="capture_compare"] #page-capture_compare,
 html[data-cw-initial-tab="playlists"] #page-playlists,
 html[data-cw-initial-tab="editor"] #page-editor,
+html[data-cw-initial-tab="analyzer"] #page-analyzer,
+html[data-cw-initial-tab="maintenance"] #page-maintenance,
+html[data-cw-initial-tab="events"] #page-events,
+html[data-cw-initial-tab="logs"] #page-logs,
+html[data-cw-initial-tab="import_export"] #page-import_export,
+html[data-cw-initial-tab="interactive_sync"] #page-interactive_sync,
 html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
 </style>
 
 <link rel="preload" href="/assets/fonts/material-symbols-rounded-full-v355.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/fonts/material-symbols-rounded.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/js/modals/core/styles.css?v=__CW_VERSION__">
-<link id="cw-theme-flat-css" rel="stylesheet" href="/assets/themes/flat.css?v=__CW_VERSION__" media="not all" disabled>
-<link id="cw-theme-original-css" rel="stylesheet" href="/assets/themes/original-coverage.css?v=__CW_VERSION__" media="not all" disabled>
+<link id="cw-theme-flat-css" rel="stylesheet" href="/assets/themes/flat.css?v=__CW_VERSION__">
+<link id="cw-theme-original-css" rel="stylesheet" href="/assets/themes/original-coverage.css?v=__CW_VERSION__">
 <script>
 (() => {
   const original = document.documentElement.classList.contains("cw-theme-original");
@@ -501,11 +869,26 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
   originalLink.media = original ? "all" : "not all";
 })();
 </script>
+<script>
+(() => {
+  const root = document.documentElement;
+  if (root.dataset.tab !== "main") return;
+  root.dataset.cwMainPending = "1";
+  const reveal = () => {
+    delete root.dataset.cwMainPending;
+    clearTimeout(fallback);
+  };
+  // A failed or stalled script must not leave the page hidden.
+  const fallback = setTimeout(reveal, 5000);
+  // Let all deferred scripts and ready listeners build the dashboard first.
+  document.addEventListener("DOMContentLoaded", () => requestAnimationFrame(reveal), { once: true });
+})();
+</script>
 </head><body>
 
 <header>
   <div class="brand" role="button" tabindex="0" title="Go to Main" onclick="showTab('main')" onkeypress="if(event.key==='Enter'||event.key===' ')showTab('main')">
-    <img class="logo" src="/assets/pwa/favicon-64.png?v=__CW_VERSION__" alt="CrossWatch">
+    <img class="logo" src="/assets/img/CROSSWATCH.svg?v=__CW_VERSION__" alt="CrossWatch">
     <span class="brand-text">
       <span class="name">CrossWatch</span>
       <span class="version">__CW_CURRENT_VERSION__</span>
@@ -514,8 +897,6 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
 
   <nav class="tabs" aria-label="Primary navigation">
     <button id="tab-main" class="tab active" type="button" onclick="showTab('main')">Main</button>
-    <button id="tab-watchlist" class="tab" type="button" onclick="showTab('watchlist')">Watchlist</button>
-    <button id="tab-playback_progress" class="tab" type="button" onclick="showTab('playback_progress')">Playback</button>
     <button id="tab-snapshots" class="tab" type="button" onclick="showTab('snapshots')">Captures</button>
     <button id="tab-playlists" class="tab" type="button" onclick="showTab('playlists')">Playlists</button>
     <button id="tab-editor" class="tab" type="button" onclick="showTab('editor')">Editor</button>
@@ -535,8 +916,6 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
         <button class="cw-menu-item" data-settings-pane="scheduling" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('scheduling')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">schedule</span><span>Scheduling</span></button>
         <button class="cw-menu-item" data-settings-pane="app" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('app')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">security</span><span>UI and Security</span></button>
         <button class="cw-menu-item" data-settings-pane="maintenance" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('maintenance')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">build</span><span>Maintenance</span></button>
-        <div class="cw-menu-sep" role="separator" aria-hidden="true"></div>
-        <button class="cw-menu-item danger" type="button" role="menuitem" onclick="window.cwSettingsMenuLogout()"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Log out</span></button>
       </div>
     </div>
     <div class="cw-tabmenu" id="tab-about-menu">
@@ -549,17 +928,33 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
       <div class="cw-menu hidden" id="cw-about-menu" role="menu" aria-labelledby="tab-about">
         <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('about')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">info</span><span>About</span></button>
         <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('help')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('assistant')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">auto_awesome</span><span>Ask CrossWatch</span></button>
       </div>
     </div>
-    <a id="cw-nav-profile-link" class="cw-nav-profile-link" href="/profile" title="Open profile" aria-label="Open profile"><span id="cw-nav-profile-avatar" class="cw-nav-profile-avatar material-symbols-rounded" aria-hidden="true">person</span></a>
+    <div class="cw-nav-profile-menu" id="cw-nav-profile-menu">
+      <button id="cw-nav-profile-link" class="cw-nav-profile-link" type="button" title="Open profile menu" aria-label="Open profile menu" aria-haspopup="menu" aria-expanded="false">
+        <span id="cw-nav-profile-avatar" class="cw-nav-profile-avatar material-symbols-rounded" aria-hidden="true">person</span>
+        <span class="tab-caret" aria-hidden="true"></span>
+      </button>
+      <div class="cw-menu cw-profile-menu hidden" id="cw-profile-menu" role="menu" aria-labelledby="cw-nav-profile-link">
+        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="profile"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">person</span><span>Profile</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="watchlist"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">bookmark</span><span>Watchlist</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="history"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">history</span><span>History</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="ratings"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">star</span><span>Ratings</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="collections"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">video_library</span><span>Collections</span></button>
+        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="playback"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">resume</span><span>Progress</span></button>
+        <div class="cw-menu-sep" role="separator" aria-hidden="true"></div>
+        <button class="cw-menu-item danger" type="button" role="menuitem" data-cw-profile-menu-action="logout"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Logout</span></button>
+      </div>
+    </div>
   </nav>
 
   <div class="cw-ui-toggle" aria-label="UI mode">
-    <button class="cw-ui-btn btn-full" type="button" onclick="cwSetUiMode('full')">Full UI</button>
-    <button class="cw-ui-btn btn-compact" type="button" onclick="cwSetUiMode('compact')">Compact</button>
+    <button id="cw-ui-mode-switch" class="cw-ui-mode-switch" type="button" role="switch" aria-checked="false" aria-label="Compact mode" onclick="cwSetUiMode(document.documentElement.classList.contains('cw-compact') ? 'full' : 'compact')"><span>Compact</span><span class="cw-ui-switch-track" aria-hidden="true"><span class="cw-ui-switch-thumb"></span></span></button>
   </div>
 </header>
 
+<div id="cw-main-loading" role="status">Loading dashboard...</div>
 <main id="layout">
   <section id="ops-card" class="card cw-main-card cw-main-card--sync">
     <div class="title">Sync Hub</div>
@@ -584,7 +979,19 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
     </div>
 
     <div class="sync-status" style="display:none"><div id="sync-icon"></div><div id="sync-status-text"></div><span id="sched-inline" style="display:none"></span></div>
-    <div id="ux-progress"></div><div id="ux-lanes"></div><div id="ux-spotlight"></div>
+    <div id="ux-progress">
+      <div class="sb-head">
+        <div class="sb-head-main">
+          <div>
+            <div class="sb-label">Sync status</div>
+            <div class="sb-phase"><div class="sb-phase-text">Waiting for the next sync run</div></div>
+          </div>
+        </div>
+        <div class="sb-head-side"><div class="sb-note hide"></div><div class="sb-badge">Idle</div></div>
+      </div>
+      <div class="sb-rail"><div class="sb-fill"></div><div class="sb-fly hide"></div></div>
+      <div class="sb-steps"><span data-step="start">Start</span><span data-step="discovering">Discovering</span><span data-step="syncing">Syncing</span><span data-step="done">Done</span></div>
+    </div><div id="ux-lanes"></div><div id="ux-spotlight"></div>
 
     <div class="action-row">
       <div class="action-buttons">
@@ -611,9 +1018,11 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
               <button id="det-tab-watcher" class="det-tab" type="button"
                 role="tab" aria-selected="false" aria-controls="det-panel-watcher" data-tab="watcher">Watcher</button>
               <button id="det-tab-debug" class="det-tab" type="button"
-                role="tab" aria-selected="false" aria-controls="det-panel-debug" data-tab="debug">Debug</button>
+                role="tab" aria-selected="false" aria-controls="det-panel-debug" data-tab="debug" hidden disabled aria-hidden="true" aria-disabled="true">Debug</button>
             </div>
             <div class="det-tools">
+              <button id="det-ai" class="ghost det-ai" type="button" title="Ask the assistant to explain this log" aria-label="Analyze this log with AI" data-ai-analyze><span class="material-symbols-rounded" aria-hidden="true">auto_awesome</span><span>Analyze</span></button>
+              <button id="det-open-logs" class="ghost det-tool-icon" type="button" title="Open logs page" aria-label="Open logs page" onclick="openLogs({channel: window._detailsTab || 'sync'})"><span class="material-symbols-rounded" aria-hidden="true">open_in_full</span></button>
               <button id="det-copy" class="ghost det-tool-icon" type="button" title="Copy current output" aria-label="Copy current output"><span class="material-symbols-rounded" aria-hidden="true">content_copy</span></button>
               <button id="det-clear" class="ghost det-tool-icon" type="button" title="Clear current output" aria-label="Clear current output"><span class="material-symbols-rounded" aria-hidden="true">delete</span></button>
               <button id="det-follow" class="ghost det-follow" type="button" title="Toggle auto-follow" aria-pressed="true"><span class="material-symbols-rounded det-follow-icon" aria-hidden="true">podcasts</span><span>Follow</span><span class="material-symbols-rounded det-follow-caret" aria-hidden="true">expand_more</span></button>
@@ -626,7 +1035,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
             <div id="det-panel-watcher" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-watcher">
               <div id="det-watch-log" class="log wlog"></div>
             </div>
-            <div id="det-panel-debug" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-debug">
+            <div id="det-panel-debug" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-debug" hidden aria-hidden="true">
               <div id="det-debug-log" class="log wlog"></div>
             </div>
           </div>
@@ -660,8 +1069,11 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
       <div class="cw-main-card-head-copy">
         <div class="cw-main-card-kicker">Statistics</div>
       </div>
-      <div id="cw-view-as" class="cw-view-as hidden">
-        <select id="cw-view-as-select" aria-label="View data as profile"></select>
+      <div class="cw-stats-head-side">
+        <button id="stats-calendar-open" class="cw-stats-calendar-btn" type="button" onclick="window.openStatisticsModal?.()" title="Sync activity calendar" aria-label="Open sync activity calendar"><span class="material-symbols-rounded" aria-hidden="true">calendar_month</span></button>
+        <div id="cw-view-as" class="cw-view-as hidden">
+          <select id="cw-view-as-select" aria-label="View data as profile"></select>
+        </div>
       </div>
     </div>
 
@@ -699,14 +1111,14 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
           </div>
         </div>
         <span id="watchlist-count-chip" class="cw-widget-count-chip hidden" aria-live="polite"></span>
-        <button class="cw-watchlist-see-all" type="button" onclick="showTab('watchlist')" title="View all" aria-label="Open Watchlist page"><span class="material-symbols-rounded" aria-hidden="true">arrow_forward</span></button>
+        <button class="cw-watchlist-see-all" type="button" onclick="location.href='/profile#watchlist'" title="View all" aria-label="Open Watchlist page"><span class="material-symbols-rounded" aria-hidden="true">arrow_forward</span></button>
       </div>
       <div id="wall-msg" class="wall-msg">Loading...</div>
       <div class="wall-wrap">
         <div id="edgeL" class="edge left"></div><div id="edgeR" class="edge right"></div>
         <div id="poster-row" class="row-scroll" aria-label="Watchlist"></div>
-        <button class="nav prev" type="button" onclick="scrollWall(-1)" aria-label="Scroll left"><</button>
-        <button class="nav next" type="button" onclick="scrollWall(1)" aria-label="Scroll right">></button>
+        <button class="nav prev" type="button" onclick="scrollWall(-1)" aria-label="Scroll left"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+        <button class="nav next" type="button" onclick="scrollWall(1)" aria-label="Scroll right"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
       </div>
     </article>
 
@@ -781,19 +1193,25 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
     </article>
   </section>
 
-  <section id="page-watchlist" class="card hidden tab-page"></section>
+  <section id="page-snapshots" class="card hidden tab-page cw-themed-page"></section>
 
-  <section id="page-playback_progress" class="card hidden tab-page">
-    <div id="playback-progress-root">
-      <div class="cw-page-loading">Loading Playback Progress...</div>
-    </div>
-  </section>
+  <section id="page-capture_compare" class="card hidden tab-page"></section>
 
-  <section id="page-snapshots" class="card hidden tab-page"></section>
+  <section id="page-playlists" class="card hidden tab-page cw-themed-page"></section>
 
-  <section id="page-playlists" class="card hidden tab-page"></section>
+  <section id="page-editor" class="card hidden tab-page cw-themed-page"></section>
 
-  <section id="page-editor" class="card hidden tab-page"></section>
+  <section id="page-analyzer" class="card hidden tab-page"></section>
+
+  <section id="page-maintenance" class="card hidden tab-page"></section>
+
+  <section id="page-events" class="card hidden tab-page"></section>
+
+  <section id="page-logs" class="card hidden tab-page"></section>
+
+  <section id="page-import_export" class="card hidden tab-page"></section>
+
+  <section id="page-interactive_sync" class="card hidden tab-page"></section>
 
   <section id="page-settings" class="card hidden">
     <div id="cw-settings-shell">
@@ -959,10 +1377,11 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
               <p>Connect media servers and/or Trackers first (Providers) then configure Metadata (TMDb)</p>
             </div>
             <div class="cw-settings-pane-head-actions">
-              <div class="cw-settings-jumpbar cw-connections-actions" aria-label="Connection actions">
-                <button type="button" class="cw-settings-jump" onclick="window.cwUserProfilesNew?.()"><span class="material-symbols-rounded" aria-hidden="true">add</span>Add profile</button>
-                <button type="button" class="cw-settings-jump" onclick="window.openAddMetadata?.()"><span class="material-symbols-rounded" aria-hidden="true">add</span>Add metadata</button>
-                <button type="button" class="cw-settings-jump" onclick="window.openAddConnection?.()"><span class="material-symbols-rounded" aria-hidden="true">add</span>Add provider</button>
+              <div class="cw-conn-hero-summary" aria-label="Connection actions">
+                <button type="button" class="cw-conn-seg" onclick="window.cwUserProfilesNew?.()"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>Add profile</span></button>
+                <button type="button" class="cw-conn-seg" onclick="window.openAddMetadata?.()"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>Add metadata</span></button>
+                <button type="button" class="cw-conn-seg" onclick="window.openAddConnection?.()"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>Add provider</span></button>
+                <button type="button" id="cw-conn-refresh" class="cw-conn-refresh" title="Re-check connections" aria-label="Re-check connections"><span class="material-symbol" aria-hidden="true">refresh</span></button>
               </div>
             </div>
             <span class="material-symbols-rounded cw-settings-hero-shape" aria-hidden="true">hub</span>
@@ -985,13 +1404,23 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
               <h3>Sync pairs</h3>
               <p>Choose providers and manage how data syncs between them.</p>
             </div>
+            <div class="cw-settings-pane-head-actions">
+              <div class="cw-conn-hero-summary" aria-label="Sync summary">
+                <div class="cw-conn-seg is-stat"><strong id="cw-sync-stat-providers">0</strong><span>Providers</span></div>
+                <div class="cw-conn-seg is-stat"><strong id="cw-sync-stat-active">0</strong><span>Active pairs</span></div>
+                <div class="cw-conn-seg is-stat"><strong id="cw-sync-stat-disabled">0</strong><span>Disabled pairs</span></div>
+                <button type="button" id="cw-sync-refresh" class="cw-conn-refresh" title="Refresh providers and pairs" aria-label="Refresh providers and pairs"><span class="material-symbol" aria-hidden="true">refresh</span></button>
+              </div>
+            </div>
             <span class="material-symbols-rounded cw-settings-hero-shape" aria-hidden="true">sync_alt</span>
           </div>
           <div class="cw-settings-pane-stack cw-settings-sync-stack">
             <div class="section open cw-settings-section" id="sec-sync" data-accordion="off">
               <div class="body">
                 <div id="providers_list" class="grid2"></div>
-                <div class="sep"></div><h4 class="cw-sync-subhead">Pairs</h4><div id="pairs_list"></div>
+                <div class="sep"></div><h4 class="cw-sync-subhead">Pairs</h4>
+                <section id="sync-topology-health" class="topology-summary" aria-label="Topology health"></section>
+                <div id="pairs_list"></div>
                 <div class="footer"><div class="pair-selectors" style="margin-top:1em;">
                   <label for="source-provider" style="margin-right:1em;">Source:</label><select id="source-provider" name="source_provider" style="margin-left:.5em;"></select>
                   <label for="target-provider">Target:</label><select id="target-provider" name="target_provider" style="margin-left:.5em;"></select>
@@ -1006,12 +1435,13 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
             <div>
               <div class="cw-settings-pane-kicker">Scheduling</div>
               <h3>Run automation</h3>
-              <p>Use standard for simple scheduling tasks or advanced for pair-based scheduling</p>
             </div>
             <div class="cw-settings-pane-head-actions">
-              <div class="cw-settings-jumpbar" id="sched-pane-tabs" aria-label="Scheduling sections">
-                <button type="button" class="cw-settings-jump active" data-sub="basic">Standard</button>
-                <button type="button" class="cw-settings-jump" data-sub="advanced">Advanced</button>
+              <div class="cw-conn-hero-summary" id="sched-pane-tabs" aria-label="Scheduling sections">
+                <button type="button" class="cw-conn-seg active" data-sub="basic">Standard</button>
+                <button type="button" class="cw-conn-seg" data-sub="advanced">Advanced</button>
+                <button type="button" class="cw-conn-seg" data-sub="webhooks">Webhooks</button>
+                <button type="button" id="cw-sched-refresh" class="cw-conn-refresh" title="Refresh scheduling" aria-label="Refresh scheduling"><span class="material-symbol" aria-hidden="true">refresh</span></button>
               </div>
             </div>
             <span class="material-symbols-rounded cw-settings-hero-shape" aria-hidden="true">event_repeat</span>
@@ -1029,6 +1459,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                   <div><label for="schCustomUnit">Custom unit</label><select id="schCustomUnit" data-cfg-path="scheduling.custom_interval_minutes" name="schCustomUnit"><option value="minutes">Minutes</option><option value="hours">Hours</option></select></div>
                 </div>
                 <div id="sched_advanced_mount"></div>
+                <div id="sched_webhooks_mount"></div>
               </div>
             </div>
           </div>
@@ -1066,9 +1497,10 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                 <p>Manage sign-in, sessions, remembered browsers and trusted proxy access.</p>
               </div>
             </div>
-            <div class="cw-settings-jumpbar" aria-label="UI settings sections">
-              <button type="button" class="cw-settings-jump active" data-target="ui" onclick="cwUiSettingsJump?.('ui')">User Interface</button>
-              <button type="button" class="cw-settings-jump" data-target="security" onclick="cwUiSettingsJump?.('security')">Security</button>
+            <div class="cw-conn-hero-summary" aria-label="UI settings sections">
+              <button type="button" class="cw-conn-seg active" data-target="ui" onclick="cwUiSettingsJump?.('ui')">User Interface</button>
+              <button type="button" class="cw-conn-seg" data-target="security" onclick="cwUiSettingsJump?.('security')">Security</button>
+              <button type="button" id="cw-app-refresh" class="cw-conn-refresh" title="Refresh settings and users" aria-label="Refresh settings and users"><span class="material-symbol" aria-hidden="true">refresh</span></button>
             </div>
             <span class="material-symbols-rounded cw-app-hero-shape active" data-app-hero-shape="ui" aria-hidden="true">desktop_windows</span>
             <span class="material-symbols-rounded cw-app-hero-shape" data-app-hero-shape="security" aria-hidden="true">shield</span>
@@ -1259,13 +1691,21 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                         <div>
                           <div class="cw-field-label-row">
                             <label for="ui_theme">Theme</label>
-                            <button type="button" class="cw-field-help material-symbols-rounded" title="Theme: Choose Flat dark, Flat light Experimental, or Original to use the classic CrossWatch styling." aria-label="Theme setting help">help</button>
+                            <button type="button" class="cw-field-help material-symbols-rounded" title="Theme: Choose Flat dark, Flat light, or Original to use the classic CrossWatch styling." aria-label="Theme setting help">help</button>
                           </div>
                           <select id="ui_theme" data-cfg-path="ui.theme" name="ui_theme">
                             <option value="flat-dark">Flat dark</option>
-                            <option value="flat-light">Flat light (Experimental)</option>
+                            <option value="flat-light">Flat light</option>
                             <option value="original">Original</option>
                           </select>
+                        </div>
+                        <div>
+                          <div class="cw-field-label-row"><label for="ui_media_card">Media details</label></div>
+                          <select id="ui_media_card" data-cw-media-card>
+                            <option value="full">Full media card</option>
+                            <option value="compact">Compact media card</option>
+                          </select>
+                          <div class="sub">Applies to Main and profile media details. Save to apply.</div>
                         </div>
                         <div>
                           <div class="cw-field-label-row">
@@ -1486,14 +1926,6 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                           </div>
                           <input id="app_auth_oidc_session_hours" data-cfg-path="app_auth.oidc.session_hours" name="app_auth_oidc_session_hours" type="number" min="1" max="168" step="1" placeholder="12">
                         </div>
-                        <div>
-                          <div class="cw-field-label-row">
-                            <label for="security_api_key">API key</label>
-                            <button type="button" class="cw-field-help material-symbols-rounded" title="API key: A static key accepted in the X-API-Key header for machine access. Leave it blank to disable machine access." aria-label="API key help">help</button>
-                          </div>
-                          <input id="security_api_key" data-cfg-path="security.api_key" name="security_api_key" type="password" autocomplete="new-password">
-                          <div class="sub" style="margin-top:0.35rem">Sent as <code>X-API-Key</code>. Blank disables key access.</div>
-                        </div>
                       </div>
                     </div>
 
@@ -1536,6 +1968,121 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                           <div class="sub" style="margin-top:0.35rem">
                             Only needed when behind a reverse proxy and you want accurate IP-based login rate limiting.
                             Enter proxy IPs or CIDR ranges separated by <code>;</code>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="cw-settings-block cw-app-card cw-ai-card" id="ai_section">
+                      <div class="cw-app-card-head">
+                        <span class="material-symbols-rounded cw-app-card-icon" aria-hidden="true">auto_awesome</span>
+                        <div>
+                          <div class="cw-settings-block-title">AI help</div>
+                          <div class="sub">Let AI look at your syncs, scrobbling, logs and settings and explain what went wrong. It can only read, it never changes anything.</div>
+                        </div>
+                      </div>
+                      <div class="cw-ai-grid">
+                        <form class="cw-ai-panel" id="assistant_settings" autocomplete="off" onsubmit="return false">
+                          <div class="cw-ai-panel-head">
+                            <div>
+                              <h4>Assistant in CrossWatch</h4>
+                              <p>Ask questions right here, from any browser or phone. You bring the AI model.</p>
+                            </div>
+                            <span class="cw-ai-pill" id="assistant_pill">Off</span>
+                          </div>
+                          <div class="cw-ai-caption" id="assistant_presets_label">AI provider</div>
+                          <div class="cw-ai-choices" id="assistant_presets" role="radiogroup" aria-labelledby="assistant_presets_label">
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-assistant-preset="openai"><strong>OpenAI</strong><small>Cloud, paid key</small></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-assistant-preset="gemini"><strong>Google Gemini</strong><small>Cloud, free tier</small></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-assistant-preset="openrouter"><strong>OpenRouter</strong><small>Cloud, many models</small></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-assistant-preset="ollama"><strong>Ollama</strong><small>Local, free</small></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-assistant-preset="lmstudio"><strong>LM Studio</strong><small>Local, free</small></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-assistant-preset="custom"><strong>Other</strong><small>Any OpenAI style API</small></button>
+                          </div>
+                          <div class="cw-ai-fields">
+                            <div class="cw-ai-field" id="assistant_url_field">
+                              <label for="assistant_base_url">Address</label>
+                              <input id="assistant_base_url" type="url" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:11434/v1">
+                              <small>Where the model answers, as seen from CrossWatch. For a model on another computer use its network address, not localhost.</small>
+                            </div>
+                            <div class="cw-ai-field" id="assistant_key_field">
+                              <label for="assistant_api_key">API key</label>
+                              <input id="assistant_api_key" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste your key">
+                              <small>From the provider's developer page. A ChatGPT or Claude subscription does not include one.</small>
+                            </div>
+                            <div class="cw-ai-field">
+                              <label for="assistant_model">Model</label>
+                              <div class="cw-ai-inline">
+                                <input id="assistant_model" type="text" list="assistant_models" autocomplete="off" spellcheck="false" placeholder="Search or type a model name">
+                                <datalist id="assistant_models"></datalist>
+                                <button type="button" class="btn" id="btn-assistant-models"><span class="material-symbols-rounded" aria-hidden="true">refresh</span><span>Load models</span></button>
+                              </div>
+                              <details>
+                                <summary>Model options</summary>
+                                <div class="cw-ai-field">
+                                  <label for="assistant_models_all">Model list</label>
+                                  <select id="assistant_models_all">
+                                    <option value="chat">Chat models</option>
+                                    <option value="all">All models</option>
+                                  </select>
+                                  <small>The chat filter uses model names; compatibility can vary.</small>
+                                  <div class="cw-ai-inline">
+                                    <button type="button" class="btn" id="btn-assistant-test">Test model</button>
+                                  </div>
+                                  <small id="assistant_model_test" role="status">Optional check. Uses two short requests; provider charges may apply.</small>
+                                </div>
+                              </details>
+                            </div>
+                            <div class="cw-ai-field">
+                              <label for="assistant_wiki_help">Without an AI provider</label>
+                              <select id="assistant_wiki_help">
+                                <option value="on">Answer from the CrossWatch wiki</option>
+                                <option value="off">Turn Ask CrossWatch off</option>
+                              </select>
+                            </div>
+                          </div>
+                          <div class="cw-ai-status" id="assistant_state" role="status"></div>
+                          <div class="cw-ai-actions">
+                            <button type="button" class="btn primary" id="btn-assistant-save">Save and turn on</button>
+                            <button type="button" class="btn" id="btn-assistant-open" disabled><span class="material-symbols-rounded" aria-hidden="true">forum</span><span>Ask a question</span></button>
+                            <button type="button" class="btn cw-ai-quiet hidden" id="btn-assistant-off">Turn off</button>
+                          </div>
+                          <p class="cw-ai-note"><span class="material-symbols-rounded" aria-hidden="true">shield</span><span>With a cloud provider, your questions and the log lines and settings needed to answer them go to that provider. Secrets are removed first. A local model keeps everything at home.</span></p>
+                        </form>
+
+                        <div class="cw-ai-panel" id="mcp_access">
+                          <div class="cw-ai-panel-head">
+                            <div>
+                              <h4>Use your own AI app (MCP server)</h4>
+                              <p>Connect an AI app on your computer, such as Claude, Codex or Cursor, to this CrossWatch.</p>
+                            </div>
+                          </div>
+                          <div class="cw-ai-label"><span class="cw-ai-step">1</span>Choose your app</div>
+                          <div class="cw-ai-choices cw-ai-choices-compact" id="mcp_clients" role="radiogroup" aria-label="AI app">
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="claude-code"><strong>Claude Code</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="claude-desktop"><strong>Claude Desktop</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="codex"><strong>Codex CLI</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="cursor"><strong>Cursor</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="gemini-cli"><strong>Gemini CLI</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="lm-studio"><strong>LM Studio</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="vscode"><strong>VS Code</strong></button>
+                            <button type="button" class="cw-ai-choice" role="radio" aria-checked="false" data-mcp-client="other"><strong>Other</strong></button>
+                          </div>
+                          <div class="cw-ai-where hidden" id="mcp_desktop_where" role="radiogroup" aria-label="Where CrossWatch runs">
+                            <span>CrossWatch runs on</span>
+                            <button type="button" class="cw-ai-toggle" role="radio" aria-checked="true" data-mcp-where="remote">a NAS or other computer</button>
+                            <button type="button" class="cw-ai-toggle" role="radio" aria-checked="false" data-mcp-where="local">this computer, in Docker</button>
+                          </div>
+                          <div class="cw-ai-label"><span class="cw-ai-step">2</span>Create a read-only token</div>
+                          <div class="cw-ai-tokens" id="mcp_tokens"></div>
+                          <div class="cw-ai-status" id="mcp_token_state" role="status"></div>
+                          <div class="cw-ai-actions">
+                            <button type="button" class="btn primary" id="btn-mcp-token-create" disabled><span class="material-symbols-rounded" aria-hidden="true">key</span><span>Create token</span></button>
+                          </div>
+                          <div class="cw-ai-label"><span class="cw-ai-step">3</span><span id="mcp_client_note">Paste this into your app</span></div>
+                          <div class="cw-ai-code">
+                            <pre><code id="mcp_snippet"></code></pre>
+                            <button type="button" class="cw-ai-copy" id="btn-mcp-copy"><span class="material-symbols-rounded" aria-hidden="true">content_copy</span><span>Copy</span></button>
                           </div>
                         </div>
                       </div>
@@ -1589,7 +2136,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
                     </span>
                     <span class="cw-maint-action-cta" aria-hidden="true"><span>Open</span><span class="material-symbols-rounded">arrow_forward</span></span>
                   </button>
-                  <button class="btn cw-maint-action tools" type="button" onclick="openMaintenanceModal()">
+                  <button class="btn cw-maint-action tools" type="button" onclick="openMaintenance()">
                     <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">tune</span>
                     <span class="cw-maint-action-copy">
                       <strong>Maintenance Tools</strong>
@@ -1643,7 +2190,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
 </div>
 
 
-<script>(()=>{const $=id=>document.getElementById(id),closeMenu=id=>{const m=$(id==="settings"?"cw-settings-menu":"cw-about-menu"),b=$(id==="settings"?"tab-settings":"tab-about");m?.classList.add("hidden");b?.setAttribute("aria-expanded","false")},closeAll=()=>{closeMenu("settings");closeMenu("about")},toggleMenu=(id,e)=>{e?.preventDefault?.();e?.stopPropagation?.();const menuId=id==="settings"?"cw-settings-menu":"cw-about-menu",btnId=id==="settings"?"tab-settings":"tab-about",m=$(menuId),b=$(btnId);if(!m||!b)return;const open=m.classList.contains("hidden");closeAll();m.classList.toggle("hidden",!open);b.setAttribute("aria-expanded",String(open))},setHelp=open=>{const o=$("cw-help-overlay");if(!o)return;if(open){const f=$("cw-help-frame");if(f&&!f.src)f.src="https://wiki.crosswatch.app";o.classList.remove("hidden");o.setAttribute("aria-hidden","false")}else{o.classList.add("hidden");o.setAttribute("aria-hidden","true")}},openSettings=pane=>{window.showTab?.("settings");setTimeout(()=>window.cwSettingsSelect?.(pane),0)},logout=()=>{closeMenu("settings");if(typeof window.cwAppLogout==="function")return window.cwAppLogout();window.location.href="/logout"};window.CW_CURRENT_VERSION="__CW_CURRENT_VERSION__";window.APP_VERSION="__CW_VERSION__";window["__CW_"+"VERSION__"]=window.APP_VERSION;window.cwOpenHelp=()=>setHelp(true);window.cwCloseHelp=()=>setHelp(false);window.openHelp=()=>window.location?.protocol==="https:"?window.cwOpenHelp?.():window.open("https://wiki.crosswatch.app","_blank","noopener,noreferrer");window.cwCloseAboutMenu=()=>closeMenu("about");window.cwCloseSettingsMenu=()=>closeMenu("settings");window.cwToggleAboutMenu=e=>toggleMenu("about",e);window.cwToggleSettingsMenu=e=>toggleMenu("settings",e);window.cwAboutMenuSelect=w=>(closeMenu("about"),w==="about"?window.openAbout?.():w==="help"?window.openHelp?.():undefined);window.cwSettingsMenuLogout=logout;window.cwSettingsMenuSelect=w=>{closeMenu("settings");if(w==="overview")return openSettings("overview");if(w==="providers")return openSettings("providers");if(w==="scheduling")return openSettings("scheduling");if(w==="pairs"||w==="sync")return openSettings("sync");if(w==="scrobbler")return openSettings("scrobbler");if(w==="app")return openSettings("app");if(w==="maintenance")return openSettings("maintenance")};document.addEventListener("click",e=>{const o=$("cw-help-overlay"),c=$("cw-help-card"),aboutHost=$("tab-about-menu"),settingsHost=$("tab-settings-menu");if(o&&!o.classList.contains("hidden")&&c&&!c.contains(e.target))window.cwCloseHelp?.();if(aboutHost&&!aboutHost.contains(e.target))closeMenu("about");if(settingsHost&&!settingsHost.contains(e.target))closeMenu("settings")},true);document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;window.cwCloseHelp?.();closeAll()},true)})();</script>
+<script>(()=>{const $=id=>document.getElementById(id),closeMenu=id=>{const m=$(id==="settings"?"cw-settings-menu":"cw-about-menu"),b=$(id==="settings"?"tab-settings":"tab-about");m?.classList.add("hidden");b?.setAttribute("aria-expanded","false")},closeAll=()=>{closeMenu("settings");closeMenu("about")},toggleMenu=(id,e)=>{e?.preventDefault?.();e?.stopPropagation?.();const menuId=id==="settings"?"cw-settings-menu":"cw-about-menu",btnId=id==="settings"?"tab-settings":"tab-about",m=$(menuId),b=$(btnId);if(!m||!b)return;const open=m.classList.contains("hidden");closeAll();m.classList.toggle("hidden",!open);b.setAttribute("aria-expanded",String(open))},setHelp=open=>{const o=$("cw-help-overlay");if(!o)return;if(open){const f=$("cw-help-frame");if(f&&!f.src)f.src="https://wiki.crosswatch.app";o.classList.remove("hidden");o.setAttribute("aria-hidden","false")}else{o.classList.add("hidden");o.setAttribute("aria-hidden","true")}},openSettings=pane=>{window.showTab?.("settings");setTimeout(()=>window.cwSettingsSelect?.(pane),0)};window.CW_CURRENT_VERSION="__CW_CURRENT_VERSION__";window.APP_VERSION="__CW_VERSION__";window["__CW_"+"VERSION__"]=window.APP_VERSION;window.cwOpenHelp=()=>setHelp(true);window.cwCloseHelp=()=>setHelp(false);window.openHelp=()=>window.location?.protocol==="https:"?window.cwOpenHelp?.():window.open("https://wiki.crosswatch.app","_blank","noopener,noreferrer");window.cwCloseAboutMenu=()=>closeMenu("about");window.cwCloseSettingsMenu=()=>closeMenu("settings");window.cwToggleAboutMenu=e=>toggleMenu("about",e);window.cwToggleSettingsMenu=e=>toggleMenu("settings",e);window.cwAboutMenuSelect=w=>(closeMenu("about"),w==="about"?window.openAbout?.():w==="help"?window.openHelp?.():w==="assistant"?window.openAssistant?.():undefined);window.cwSettingsMenuSelect=w=>{closeMenu("settings");if(w==="overview")return openSettings("overview");if(w==="providers")return openSettings("providers");if(w==="scheduling")return openSettings("scheduling");if(w==="pairs"||w==="sync")return openSettings("sync");if(w==="scrobbler")return openSettings("scrobbler");if(w==="app")return openSettings("app");if(w==="maintenance")return openSettings("maintenance")};document.addEventListener("click",e=>{const o=$("cw-help-overlay"),c=$("cw-help-card"),aboutHost=$("tab-about-menu"),settingsHost=$("tab-settings-menu");if(o&&!o.classList.contains("hidden")&&c&&!c.contains(e.target))window.cwCloseHelp?.();if(aboutHost&&!aboutHost.contains(e.target))closeMenu("about");if(settingsHost&&!settingsHost.contains(e.target))closeMenu("settings")},true);document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;window.cwCloseHelp?.();closeAll()},true)})();</script>
 
 __CW_ASSET_BLOCK__
 
@@ -1655,7 +2202,7 @@ __CW_ASSET_BLOCK__
 <script>(()=>{const list=p=>[...p.querySelectorAll(':scope>.section')].filter(s=>s.dataset.accordion!=='off'),set=(s,on)=>{s.classList.toggle('open',!!on);s.querySelector('.head')?.setAttribute('aria-expanded',String(!!on));const c=s.querySelector('.chev');if(c)c.textContent=''},siblings=s=>s?.parentElement?list(s.parentElement):[];window.toggleSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;const on=!s.classList.contains('open');siblings(s).forEach(x=>set(x,x===s&&on))};window.openSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;siblings(s).forEach(x=>set(x,x===s))};document.addEventListener('click',e=>{const h=e.target?.closest?.('[data-toggle-section]');if(!h)return;e.preventDefault();window.toggleSection?.(h.dataset.toggleSection)},true);document.addEventListener('DOMContentLoaded',()=>[...new Set([...document.querySelectorAll('.section')].map(s=>s.parentElement).filter(Boolean))].forEach(p=>{const open=list(p).find(s=>s.classList.contains('open'));list(p).forEach(s=>set(s,s===open))}),{once:true})})();</script>
 
 
-<script>(()=>{const panes='#page-settings .cw-settings-pane',nav='#cw-settings-nav .cw-settings-nav-btn',norm=v=>String(v||'overview').trim().toLowerCase(),apply=p=>{const name=norm(p);let found=false;document.querySelectorAll(panes).forEach(n=>{const on=norm(n.dataset.pane)===name;n.classList.toggle('active',on);found=found||on});if(!found&&name!=='overview')return apply('overview');document.querySelectorAll(nav).forEach(b=>{const on=norm(b.dataset.pane)===name;b.classList.toggle('active',on);b.setAttribute('aria-current',on?'page':'false')});window.__cwSettingsPane=name;document.dispatchEvent(new CustomEvent('cw-settings-pane-changed',{detail:{pane:name}}))};window.cwSettingsSelect=p=>{apply(p);const main=document.getElementById('cw-settings-left');if(main&&window.innerWidth<1200)main.scrollIntoView({behavior:'smooth',block:'start'})};document.addEventListener('DOMContentLoaded',()=>apply(window.__cwSettingsPane||'overview'),{once:true});document.addEventListener('tab-changed',e=>((e?.detail?.id||e?.detail?.tab)==='settings')&&setTimeout(()=>apply(window.__cwSettingsPane||'overview'),0))})();</script>
+<script>(()=>{const panes='#page-settings .cw-settings-pane',nav='#cw-settings-nav .cw-settings-nav-btn',norm=v=>String(v||'overview').trim().toLowerCase(),apply=p=>{const name=norm(p);let found=false;document.querySelectorAll(panes).forEach(n=>{const on=norm(n.dataset.pane)===name;n.classList.toggle('active',on);found=found||on});if(!found&&name!=='overview')return apply('overview');document.querySelectorAll(nav).forEach(b=>{const on=norm(b.dataset.pane)===name;b.classList.toggle('active',on);b.setAttribute('aria-current',on?'page':'false')});window.__cwSettingsPane=name;delete document.documentElement.dataset.cwInitialPane;document.dispatchEvent(new CustomEvent('cw-settings-pane-changed',{detail:{pane:name}}))};window.cwSettingsSelect=p=>{apply(p);const main=document.getElementById('cw-settings-left');if(main&&window.innerWidth<1200)main.scrollIntoView({behavior:'smooth',block:'start'})};apply(window.__cwSettingsPane||'overview');document.addEventListener('DOMContentLoaded',()=>apply(window.__cwSettingsPane||'overview'),{once:true});document.addEventListener('tab-changed',e=>((e?.detail?.id||e?.detail?.tab)==='settings')&&setTimeout(()=>apply(window.__cwSettingsPane||'overview'),0))})();</script>
 <script>(()=>{const sync=e=>{const pane=String(e?.detail?.pane||window.__cwSettingsPane||'overview').toLowerCase();document.querySelectorAll('#cw-settings-menu .cw-menu-item[data-settings-pane]').forEach(item=>{const active=item.dataset.settingsPane===pane;item.classList.toggle('active',active);if(active)item.setAttribute('aria-current','page');else item.removeAttribute('aria-current')})};document.addEventListener('cw-settings-pane-changed',sync);document.addEventListener('DOMContentLoaded',sync,{once:true})})();</script>
 
 <script>(()=>{const ready=()=>{const input=document.querySelector('#cw-settings-nav .cw-settings-search input'),items=[...document.querySelectorAll('#cw-settings-nav .cw-settings-nav-btn')];if(!input||!items.length)return;const apply=()=>{const q=input.value.trim().toLowerCase();items.forEach(btn=>{btn.hidden=!!q&&!btn.textContent.toLowerCase().includes(q)})};input.addEventListener('input',apply);document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&String(e.key).toLowerCase()==='k'){e.preventDefault();window.showTab?.('settings');setTimeout(()=>input.focus(),0)}})};document.readyState==='loading'?document.addEventListener('DOMContentLoaded',ready,{once:true}):ready()})();</script>
@@ -1846,6 +2393,17 @@ __CW_ASSET_BLOCK__
 
 """
 
+def _seed_media_card_style(html: str, user: dict | None = None) -> str:
+    from cw_platform.config_base import load_config
+
+    cfg = load_config() or {}
+    value = (cfg.get("ui") or {}).get("media_card", "full")
+    if isinstance(user, dict) and user.get("is_admin") is False:
+        value = (user.get("preferences") or {}).get("media_card", value)
+    style = "compact" if value == "compact" else "full"
+    return html.replace('<html lang="en"', f'<html lang="en" data-cw-media-card="{style}"', 1)
+
+
 def get_index_html(include_admin: bool = True, user: dict | None = None) -> str:
     html = _get_index_html_static().replace("__CW_ASSET_BLOCK__", _asset_block(include_admin=include_admin, user=user))
     if not include_admin:
@@ -1862,8 +2420,10 @@ def get_index_html(include_admin: bool = True, user: dict | None = None) -> str:
         )
         html = html.replace('<html lang="en"', attrs, 1)
         html = _managed_user_shell(html, user)
+    else:
+        html = _seed_nav_profile_avatar(html, user)
     return (
-        html
+        _seed_media_card_style(html, user)
         .replace("__CW_CURRENT_VERSION__", CURRENT_VERSION)
         .replace("__CW_VERSION__", _asset_version_token())
     )
@@ -1880,36 +2440,45 @@ def get_profile_html(user: dict | None = None) -> str:
     display_name = esc((user or {}).get("display_name") or (user or {}).get("label") or (user or {}).get("username") or ("Administrator" if is_admin else "Profile"))
     write = "on" if perms.get("write") else "off"
     preferences_allowed = is_admin or bool(perms.get("write"))
-    preferences_tab = (
-        '    <button id="profile-tab-preferences" type="button" data-profile-tab="preferences">Preferences</button>'
-        if preferences_allowed else ""
+    settings_interface_nav = (
+        '        <button type="button" data-settings-nav="interface"><span class="material-symbols-rounded" aria-hidden="true">tune</span><span>Display</span></button>'
     )
-    preferences_panel = """  <section id="profile-panel-preferences" class="cw-profile-panel">
-    <div class="cw-profile-security-grid">
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Interface</h2></div>
-        <p class="cw-profile-pref-intro">Choose which optional surfaces appear while you browse.</p>
-        <label class="cw-profile-pref">
-          <span><strong>Playing card</strong><small>Show the floating now-playing card while something is streaming.</small></span>
-          <input id="profile-pref-playing-card" type="checkbox" checked>
-        </label>
-        <label class="cw-profile-pref">
-          <span><strong>Quick add</strong><small>Show the quick add shortcut for logging watched items by hand.</small></span>
-          <input id="profile-pref-quick-add" type="checkbox" checked>
-        </label>
-        <div class="cw-profile-actions">
-          <button id="profile-pref-save" class="btn primary" type="button">Save preferences</button>
-        </div>
-      </article>
-    </div>
-  </section>""" if preferences_allowed else ""
+    settings_interface_controls = """          <label class="cw-set-row cw-set-toggle">
+            <span class="cw-set-copy"><strong>Now playing card</strong><small>Show a small card with what you are watching.</small></span>
+            <input id="profile-pref-playing-card" type="checkbox" checked role="switch"><span class="cw-set-switch" aria-hidden="true"></span>
+          </label>
+          <label class="cw-set-row cw-set-toggle">
+            <span class="cw-set-copy"><strong>Quick add button</strong><small>Show a shortcut to add something you watched by hand.</small></span>
+            <input id="profile-pref-quick-add" type="checkbox" checked role="switch"><span class="cw-set-switch" aria-hidden="true"></span>
+          </label>
+""" if preferences_allowed else ""
+    settings_interface = f"""        <section id="settings-interface" class="cw-set-card" data-settings-section="interface">
+          <header class="cw-set-head"><div><h2>Display</h2><p>Choose how your profile pages look.</p></div></header>
+{settings_interface_controls}          <div class="cw-set-row">
+            <label class="cw-set-copy" for="profile-media-card"><strong>Media details</strong><small>Choose the full or compact card on Main and your profile.</small></label>
+            <span class="cw-set-inline"><select id="profile-media-card" class="cw-set-input" data-cw-media-card><option value="full">Full media card</option><option value="compact">Compact media card</option></select></span>
+          </div>
+          <div class="cw-set-row">
+            <label class="cw-set-copy" for="profile-pref-timezone"><strong>Timezone</strong><small>Used for dates and day/month grouping on your profile pages.</small></label>
+            <div class="cw-set-inline cw-set-field">
+              <input id="profile-timezone-search" class="cw-set-input" type="search" placeholder="Search timezones" aria-label="Search timezones" aria-controls="profile-pref-timezone" autocomplete="off">
+              <select id="profile-pref-timezone" class="cw-set-input" data-cw-native-select="true"><option value="auto">Auto (browser settings)</option><option value="UTC">UTC</option></select>
+              <small id="profile-timezone-results" role="status" hidden></small>
+            </div>
+          </div>
+          <div class="cw-set-row">
+            <label class="cw-set-copy" for="profile-pref-time-format"><strong>Time format</strong><small>Choose a 12-hour or 24-hour clock on your profile pages.</small></label>
+            <span class="cw-set-inline"><select id="profile-pref-time-format" class="cw-set-input"><option value="auto">Auto (browser settings)</option><option value="12h">12-hour (6:30 PM)</option><option value="24h">24-hour (18:30)</option></select></span>
+          </div>
+        </section>"""
     dashboard = "on" if perms.get("dashboard") else "off"
     watchlist = "on" if perms.get("watchlist") else "off"
     playback = "on" if perms.get("playback") else "off"
     write_nav = is_admin or bool(perms.get("write"))
     app_href_prefix = "/" if is_admin else "/?main=1"
-    watchlist_href = f"{app_href_prefix}#watchlist" if is_admin or perms.get("write") else "/?view=watchlist#watchlist"
-    playback_href = f"{app_href_prefix}#playback_progress" if is_admin or perms.get("write") else "/?view=playback_progress#playback_progress"
+    watchlist_href = "/profile#watchlist"
+    playback_href = "/profile#playback"
+    profile_avatar_inner = _profile_avatar_inner(user)
     settings_nav = (
         '<div class="cw-tabmenu" id="tab-settings-menu">'
         '<button id="tab-settings" class="tab" type="button" aria-haspopup="menu" aria-expanded="false" onclick="window.cwToggleSettingsMenu(event)"><span>Settings</span><span class="tab-caret" aria-hidden="true"></span></button>'
@@ -1922,8 +2491,6 @@ def get_profile_html(user: dict | None = None) -> str:
         '<button class="cw-menu-item" data-settings-pane="scheduling" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect(\'scheduling\')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">schedule</span><span>Scheduling</span></button>'
         '<button class="cw-menu-item" data-settings-pane="app" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect(\'app\')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">security</span><span>UI and Security</span></button>'
         '<button class="cw-menu-item" data-settings-pane="maintenance" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect(\'maintenance\')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">build</span><span>Maintenance</span></button>'
-        '<div class="cw-menu-sep" role="separator" aria-hidden="true"></div>'
-        '<button class="cw-menu-item danger" type="button" role="menuitem" onclick="window.cwSettingsMenuLogout()"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Log out</span></button>'
         '</div></div>'
     )
     about_nav = (
@@ -1937,34 +2504,75 @@ def get_profile_html(user: dict | None = None) -> str:
     nav_items: list[str] = []
     if is_admin:
         nav_items.extend([
-            '<a class="tab active" href="/">Main</a>',
-            '<a class="tab" href="/#watchlist">Watchlist</a>',
-            '<a class="tab" href="/#playback_progress">Playback</a>',
-            '<a class="tab" href="/#snapshots">Captures</a>',
-            '<a class="tab" href="/#playlists">Playlists</a>',
-            '<a class="tab" href="/#editor">Editor</a>',
+            _profile_nav_tab("Main", "/"),
+            _profile_nav_tab("Captures", "/#snapshots"),
+            _profile_nav_tab("Playlists", "/#playlists"),
+            _profile_nav_tab("Editor", "/#editor"),
             settings_nav,
             about_nav,
         ])
     elif write_nav:
         nav_items.extend([
-            '<a class="tab active" href="/?main=1#main">Main</a>',
-            '<a class="tab" href="/?main=1#watchlist">Watchlist</a>',
-            '<a class="tab" href="/?main=1#playback_progress">Playback</a>',
-            '<a class="tab" href="/?main=1#snapshots">Captures</a>',
-            '<a class="tab" href="/?main=1#playlists">Playlists</a>',
-            '<a class="tab" href="/?main=1#editor">Editor</a>',
-            '<button id="cw-profile-logout" class="tab" type="button">Logout</button>',
+            _profile_nav_tab("Main", "/?main=1#main"),
+            _profile_nav_tab("Captures", "/?main=1#snapshots"),
+            _profile_nav_tab("Playlists", "/?main=1#playlists"),
+            _profile_nav_tab("Editor", "/?main=1#editor"),
         ])
     else:
-        nav_items.append('<a class="tab active" href="/profile">Main</a>')
-        if perms.get("watchlist"):
-            nav_items.append(f'<a class="tab" href="{watchlist_href}">Watchlist</a>')
-        if perms.get("playback"):
-            nav_items.append(f'<a class="tab" href="{playback_href}">Playback</a>')
-        nav_items.append('<button id="cw-profile-logout" class="tab" type="button">Logout</button>')
-    nav_items.append(_nav_profile_link().strip())
+        nav_items.append(_profile_nav_tab("Main", "/profile", active=True))
+    nav_items.append(_nav_profile_link(user).strip())
     profile_nav = "\n    ".join(nav_items)
+    history_panel = _profile_timeline_panel(
+        "history",
+        kicker="Sync output",
+        title="Synced history",
+        lede="Plays read back from every provider after sync.",
+        search="Search synced history...",
+        sources=(
+            ("synced", "sync", "Synced history", "Read from your providers after each sync run"),
+            ("scrobble", "sensors", "Scrobbles", "Recorded live by CrossWatch, with where each play was sent"),
+        ),
+        coverage=(("all", "Any coverage"), ("partial", "Missing somewhere"), ("full", "On every provider")),
+        bulk=True,
+    )
+    ratings_panel = _profile_timeline_panel(
+        "ratings",
+        kicker="Sync output",
+        title="Ratings",
+        lede="Your scores read back from every provider after sync.",
+        search="Search ratings...",
+        sources=(("ratings", "star", "Ratings", ""),),
+        coverage=(("all", "Any coverage"), ("partial", "Missing somewhere"), ("full", "On every provider"), ("mismatch", "Scores differ")),
+        scores=True,
+        bulk=True,
+    )
+    playback_allowed = bool(perms.get("playback"))
+    playback_tab = '    <button id="profile-tab-playback" type="button" data-profile-tab="playback">Progress</button>' if playback_allowed else ""
+    playback_panel = _profile_playback_panel() if playback_allowed else ""
+    watchlist_allowed = bool(perms.get("watchlist"))
+    watchlist_tab = '    <button id="profile-tab-watchlist" type="button" data-profile-tab="watchlist">Watchlist</button>' if watchlist_allowed else ""
+    watchlist_panel = _profile_timeline_panel(
+        "watchlist",
+        kicker="Sync output",
+        title="Watchlist",
+        lede="Everything on your watchlists.",
+        search="Filter by title, id or provider...",
+        sources=(("watchlist", "bookmark", "Watchlist", ""),),
+        coverage=(("all", "Any coverage"), ("partial", "Missing somewhere"), ("full", "On every provider")),
+        bulk=True,
+        timeline=False,
+    ) if watchlist_allowed else ""
+    collection_bulk = _profile_bulk_bar("profile-collection-bulk", "collection")
+    remove_dialog = _profile_remove_dialog()
+    view_as_picker = (
+        '<div id="cw-view-as" class="cw-view-as hidden"><select id="cw-view-as-select" aria-label="View profile as"></select></div>'
+        if is_admin else ""
+    )
+    view_as_banner = """  <div id="profile-view-as-banner" class="cw-profile-viewas" role="status" hidden>
+    <span class="material-symbols-rounded" aria-hidden="true">visibility</span>
+    <span class="cw-profile-viewas-copy">Viewing <strong id="profile-view-as-name"></strong> as read-only</span>
+    <button id="profile-view-as-exit" class="cw-profile-viewas-exit" type="button">Back to my profile</button>
+  </div>""" if is_admin else ""
     html = f"""<!DOCTYPE html>
 <html lang="en" data-cw-role="{role}" data-cw-page="profile" data-cw-perm-dashboard="{dashboard}" data-cw-perm-watchlist="{watchlist}" data-cw-perm-playback="{playback}" data-cw-perm-write="{write}" data-cw-profile-id="{profile_id}">
 <head>
@@ -1996,13 +2604,16 @@ def get_profile_html(user: dict | None = None) -> str:
 <link rel="stylesheet" href="/assets/css/layout.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/components.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/pages.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/page-theme.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/ui-shell.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/account-menu.css?v=__CW_VERSION__">
+<link id="cw-notifications-css" rel="stylesheet" href="/assets/css/notifications.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/profile-page.css?v=__CW_VERSION__">
 <link rel="preload" href="/assets/fonts/material-symbols-rounded-full-v355.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/fonts/material-symbols-rounded.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/js/modals/core/styles.css?v=__CW_VERSION__">
-<link id="cw-theme-flat-css" rel="stylesheet" href="/assets/themes/flat.css?v=__CW_VERSION__" media="not all" disabled>
-<link id="cw-theme-original-css" rel="stylesheet" href="/assets/themes/original-coverage.css?v=__CW_VERSION__" media="not all" disabled>
+<link id="cw-theme-flat-css" rel="stylesheet" href="/assets/themes/flat.css?v=__CW_VERSION__">
+<link id="cw-theme-original-css" rel="stylesheet" href="/assets/themes/original-coverage.css?v=__CW_VERSION__">
 <script>
 (() => {{
   const original = document.documentElement.classList.contains("cw-theme-original");
@@ -2014,14 +2625,20 @@ def get_profile_html(user: dict | None = None) -> str:
 </script>
 </head>
 <body class="cw-profile-page">
-<header class="cw-profile-topbar">
-  <a class="brand" href="/profile" title="Go to profile">
-    <img class="logo" src="/assets/pwa/favicon-64.png?v=__CW_VERSION__" alt="CrossWatch">
-    <span class="brand-text"><span class="name">CrossWatch</span><span class="version">__CW_CURRENT_VERSION__</span></span>
-  </a>
+<header>
+  <div class="brand" role="button" tabindex="0" title="Go to Profile" onclick="location.href='/profile'" onkeypress="if(event.key==='Enter'||event.key===' ')location.href='/profile'">
+    <img class="logo" src="/assets/img/CROSSWATCH.svg?v=__CW_VERSION__" alt="CrossWatch">
+    <span class="brand-text">
+      <span class="name">CrossWatch</span>
+      <span class="version">__CW_CURRENT_VERSION__</span>
+    </span>
+  </div>
   <nav class="tabs" aria-label="Primary navigation">
     {profile_nav}
   </nav>
+  <div class="cw-ui-toggle" aria-label="UI mode">
+    <button id="cw-profile-compact-switch" class="cw-ui-mode-switch" type="button" role="switch" aria-checked="false" aria-label="Compact mode"><span>Compact</span><span class="cw-ui-switch-track" aria-hidden="true"><span class="cw-ui-switch-thumb"></span></span></button>
+  </div>
 </header>
 <main class="cw-profile-shell" data-profile-id="{profile_id}" data-username="{username}" data-display-name="{display_name}">
   <section class="cw-profile-hero" id="profile-hero">
@@ -2031,12 +2648,12 @@ def get_profile_html(user: dict | None = None) -> str:
     <div class="cw-profile-hero-shade"></div>
     <div class="cw-profile-identity">
       <div class="cw-profile-avatar-wrap">
-        <button id="profile-avatar-button" class="cw-profile-avatar" type="button" title="Replace profile picture" aria-label="Replace profile picture"><span class="material-symbols-rounded" aria-hidden="true">person</span></button>
+        <button id="profile-avatar-button" class="cw-profile-avatar" type="button" title="Replace profile picture" aria-label="Replace profile picture">{profile_avatar_inner}</button>
         <span class="cw-profile-avatar-badge material-symbols-rounded" aria-hidden="true">photo_camera</span>
         <input id="profile-avatar-input" type="file" accept="image/png,image/jpeg,image/webp" hidden>
       </div>
       <div class="cw-profile-nameblock">
-        <span id="profile-role" class="cw-profile-role">{role_label}</span>
+        <div class="cw-profile-rolebar"><span id="profile-role" class="cw-profile-role">{role_label}</span>{view_as_picker}</div>
         <h1 id="profile-display-name">{display_name}</h1>
         <div id="profile-username" class="cw-profile-username">@{username}</div>
         <div id="profile-member-since" class="cw-profile-since hidden"><span class="material-symbols-rounded" aria-hidden="true">person</span><span></span></div>
@@ -2068,10 +2685,15 @@ def get_profile_html(user: dict | None = None) -> str:
       <img id="profile-now-poster" class="cw-profile-now-poster" src="/assets/img/placeholder_poster.svg" alt="">
     </div>
   </section>
+{view_as_banner}
   <div class="cw-profile-tabs" role="tablist" aria-label="Profile tabs">
     <button id="profile-tab-overview" class="active" type="button" data-profile-tab="overview">Overview</button>
-    <button id="profile-tab-security" type="button" data-profile-tab="security">Security</button>
-{preferences_tab}
+{watchlist_tab}
+    <button id="profile-tab-history" type="button" data-profile-tab="history">History</button>
+    <button id="profile-tab-ratings" type="button" data-profile-tab="ratings">Ratings</button>
+    <button id="profile-tab-collection" type="button" data-profile-tab="collection">Collections</button>
+{playback_tab}
+    <button id="profile-tab-account" class="cw-profile-tab-settings" type="button" data-profile-tab="account"><span class="material-symbols-rounded" aria-hidden="true">settings</span><span>Settings</span></button>
   </div>
   <section id="profile-panel-overview" class="cw-profile-panel active">
     <div class="cw-profile-pair-grid">
@@ -2086,10 +2708,8 @@ def get_profile_html(user: dict | None = None) -> str:
     </div>
     <div class="cw-profile-pair-grid">
       <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Recent Activity</h2><button id="activity-view-all" class="ghost refresh-insights" type="button">View all</button></div>
-        <div class="stat-block" id="recent-activity-block">
-          <div id="recent-activity" class="history-list"></div>
-        </div>
+        <div class="cw-profile-widget-head"><h2>Recent Activity</h2><button id="profile-activity-view-all" class="ghost refresh-insights" type="button">View all</button></div>
+        <div id="profile-activity" class="cw-profile-activity-list"></div>
       </article>
       <article class="cw-profile-widget">
         <div class="cw-profile-widget-head"><h2>Quick Stats</h2></div>
@@ -2168,65 +2788,152 @@ def get_profile_html(user: dict | None = None) -> str:
     </article>
   </section>
   </section>
-  <section id="profile-panel-security" class="cw-profile-panel">
-    <div class="cw-profile-security-grid">
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Account</h2></div>
-        <form id="profile-name-form" class="cw-profile-form">
-          <label>Display name<input id="profile-display-input" maxlength="64" autocomplete="name"></label>
-          <button class="btn primary" type="submit">Save profile</button>
-        </form>
-        <div class="cw-profile-avatar-actions">
-          <button id="profile-avatar-replace" class="btn" type="button">Replace picture</button>
-          <button id="profile-avatar-remove" class="btn danger" type="button">Remove picture</button>
+  <section id="profile-panel-collection" class="cw-profile-panel">
+    <div class="cw-collection-head">
+      <div class="cw-collection-headline">
+        <span class="cw-collection-kicker">Owned Media</span>
+        <h2>Collections</h2>
+        <p>Your unified library across all providers</p>
+      </div>
+      <div class="cw-collection-tiles" id="profile-collection-metrics"></div>
+    </div>
+    <div id="profile-collection-timeline" class="cw-hist-timeline" aria-label="Collections per month" hidden></div>
+    <div class="cw-collection-toolbar">
+      <label class="cw-collection-search">
+        <span class="material-symbols-rounded" aria-hidden="true">search</span>
+        <input id="profile-collection-search" type="search" placeholder="Search collections...">
+      </label>
+      <div class="cw-collection-chips" id="profile-collection-types" aria-label="Collection type filters"></div>
+      <div class="cw-collection-controls">
+        <select id="profile-collection-provider" aria-label="Provider filter"><option value="">All providers</option></select>
+        <select id="profile-collection-sort" aria-label="Collection sort">
+          <option value="collected_at">Recently added</option>
+          <option value="collected_at_asc">Oldest added</option>
+          <option value="title">Title A-Z</option>
+          <option value="title_desc">Title Z-A</option>
+          <option value="year_desc">Year: newest</option>
+          <option value="year_asc">Year: oldest</option>
+        </select>
+        <div class="cw-collection-views" role="group" aria-label="View mode">
+          <button class="active cw-view-timeline" type="button" data-collection-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
+          <button class="active" type="button" data-collection-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
+          <button type="button" data-collection-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
         </div>
-        <div id="profile-avatar-upload-status" class="cw-profile-upload hidden" role="status" aria-live="polite">
-          <div class="cw-profile-upload-head"><span id="profile-avatar-upload-label">Uploading picture</span><strong id="profile-avatar-upload-percent">0%</strong></div>
-          <div class="cw-profile-upload-bar"><span id="profile-avatar-upload-bar"></span></div>
+        <button id="profile-collection-refresh" class="cw-tl-ghost cw-collection-refresh" type="button" data-collection-refresh title="Refresh Collections" aria-label="Refresh Collections"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
+      </div>
+    </div>
+    <div id="profile-collection-grid" class="cw-collection-grid" data-view="grid" aria-live="polite"></div>
+    <div id="profile-collection-footer" class="cw-collection-footer" hidden>
+      <nav id="profile-collection-pages" class="cw-collection-pages" aria-label="Collection pages"></nav>
+      <div class="cw-collection-summary">
+        <span id="profile-collection-page-label"></span>
+        <select id="profile-collection-page-size" aria-label="Items per page">
+          <option value="24">24</option>
+          <option value="48">48</option>
+          <option value="72">72</option>
+          <option value="96">96</option>
+        </select>
+      </div>
+    </div>
+{collection_bulk}  </section>
+{history_panel}
+{ratings_panel}
+{playback_panel}
+{watchlist_panel}
+{remove_dialog}
+  <section id="profile-panel-account" class="cw-profile-panel">
+    <div class="cw-set">
+      <nav class="cw-set-nav" aria-label="Settings sections">
+        <button type="button" class="active" data-settings-nav="profile"><span class="material-symbols-rounded" aria-hidden="true">person</span><span>Profile</span></button>
+        <button type="button" data-settings-nav="security"><span class="material-symbols-rounded" aria-hidden="true">lock</span><span>Security</span></button>
+        <button type="button" data-settings-nav="linked"><span class="material-symbols-rounded" aria-hidden="true">link</span><span>Linked accounts</span></button>
+        <button type="button" data-settings-nav="sessions"><span class="material-symbols-rounded" aria-hidden="true">devices</span><span>Devices</span></button>
+{settings_interface_nav}
+      </nav>
+      <div class="cw-set-main">
+        <div class="cw-set-col">
+        <section id="settings-profile" class="cw-set-card" data-settings-section="profile">
+          <header class="cw-set-head"><div><h2>Profile</h2><p>How you appear in CrossWatch.</p></div></header>
+          <div class="cw-set-row">
+            <span id="profile-settings-avatar" class="cw-set-avatar" aria-hidden="true">{profile_avatar_inner}</span>
+            <span class="cw-set-copy"><strong>Profile picture</strong><small>Shown on your profile and in the menu.</small></span>
+            <span class="cw-set-actions">
+              <button id="profile-avatar-replace" class="cw-set-btn" type="button">Change</button>
+              <button id="profile-avatar-remove" class="cw-set-btn cw-set-btn--danger cw-danger-confirm" type="button">Remove</button>
+            </span>
+          </div>
+          <div id="profile-avatar-upload-status" class="cw-profile-upload hidden" role="status" aria-live="polite">
+            <div class="cw-profile-upload-head"><span id="profile-avatar-upload-label">Uploading picture</span><strong id="profile-avatar-upload-percent">0%</strong></div>
+            <div class="cw-profile-upload-bar"><span id="profile-avatar-upload-bar"></span></div>
+          </div>
+          <form id="profile-name-form" class="cw-set-row">
+            <label class="cw-set-copy" for="profile-display-input"><strong>Display name</strong><small>The name other people see.</small></label>
+            <span class="cw-set-inline"><input id="profile-display-input" class="cw-set-input" maxlength="64" autocomplete="name"><button class="cw-set-btn cw-set-btn--primary" type="submit">Save</button></span>
+          </form>
+          <div class="cw-set-row">
+            <span class="cw-set-copy"><strong>Username</strong><small>@{username}</small></span>
+            <span class="cw-set-tag">{role_label}</span>
+          </div>
+        </section>
+        <section id="settings-security" class="cw-set-card" data-settings-section="security">
+          <header class="cw-set-head"><div><h2>Security</h2><p>Keep your account safe.</p></div></header>
+          <div class="cw-set-row">
+            <span class="cw-set-copy"><strong>Password</strong><small>Change the password you use to sign in.</small></span>
+            <span class="cw-set-actions"><button id="profile-password-toggle" class="cw-set-btn" type="button" aria-expanded="false" aria-controls="profile-password-form">Change</button></span>
+          </div>
+          <form id="profile-password-form" class="cw-set-drawer" hidden>
+            <input type="text" name="username" value="{username}" autocomplete="username" hidden>
+            <label class="cw-set-field"><span>Current password</span><input id="profile-current-password" class="cw-set-input" type="password" autocomplete="current-password"></label>
+            <label class="cw-set-field"><span>New password</span><input id="profile-new-password" class="cw-set-input" type="password" autocomplete="new-password"></label>
+            <span class="cw-set-drawer-actions"><button id="profile-password-cancel" class="cw-set-btn" type="button">Cancel</button><button class="cw-set-btn cw-set-btn--primary" type="submit">Save password</button></span>
+          </form>
+          <div class="cw-set-row">
+            <span class="cw-set-copy"><strong>Two-step verification</strong><small id="profile-2fa-copy">Ask for a code from your phone when you sign in.</small></span>
+            <span class="cw-set-actions">
+              <span id="profile-2fa-state" class="cw-set-status">Off</span>
+              <button id="profile-2fa-setup-btn" class="cw-set-btn cw-set-btn--primary" type="button">Turn on</button>
+              <button id="profile-recovery-btn" class="cw-set-btn" type="button" hidden>Backup codes</button>
+              <button id="profile-2fa-disable-btn" class="cw-set-btn cw-set-btn--danger" type="button" hidden>Turn off</button>
+            </span>
+          </div>
+          <div id="profile-2fa-confirm" class="cw-set-drawer" hidden>
+            <label class="cw-set-field"><span id="profile-2fa-confirm-label">Enter your password</span><input id="profile-2fa-confirm-password" class="cw-set-input" type="password" autocomplete="current-password"></label>
+            <span class="cw-set-drawer-actions"><button id="profile-2fa-confirm-cancel" class="cw-set-btn" type="button">Cancel</button><button id="profile-2fa-confirm-go" class="cw-set-btn cw-set-btn--primary" type="button">Continue</button></span>
+          </div>
+          <div id="profile-2fa-setup" class="cw-profile-2fa"></div>
+        </section>
+        <section id="settings-linked" class="cw-set-card" data-settings-section="linked">
+          <header class="cw-set-head"><div><h2>Linked accounts</h2><p>Sign in with another account. Your password keeps working.</p></div></header>
+          <div class="cw-set-row">
+            <span class="cw-set-logo"><img id="profile-plex-logo" alt="" hidden><span class="material-symbols-rounded" aria-hidden="true">play_circle</span></span>
+            <span class="cw-set-copy"><strong>Plex</strong><small id="profile-plex-summary">Not linked</small></span>
+            <span class="cw-set-actions">
+              <span id="profile-plex-state" class="cw-set-status">Off</span>
+              <button id="profile-plex-link" class="cw-set-btn cw-set-btn--primary" type="button">Link</button>
+              <button id="profile-plex-unlink" class="cw-set-btn cw-set-btn--danger cw-danger-confirm" type="button" hidden>Unlink</button>
+            </span>
+          </div>
+          <div class="cw-set-row">
+            <span class="cw-set-logo"><span class="material-symbols-rounded" aria-hidden="true">key</span></span>
+            <span class="cw-set-copy"><strong>Single sign-on</strong><small id="profile-oidc-summary">Not linked</small></span>
+            <span class="cw-set-actions">
+              <span id="profile-oidc-state" class="cw-set-status">Off</span>
+              <button id="profile-oidc-link" class="cw-set-btn cw-set-btn--primary" type="button">Link</button>
+              <button id="profile-oidc-unlink" class="cw-set-btn cw-set-btn--danger cw-danger-confirm" type="button" hidden>Unlink</button>
+            </span>
+          </div>
+        </section>
         </div>
-      </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Password</h2></div>
-        <form id="profile-password-form" class="cw-profile-form">
-          <input type="text" name="username" value="{username}" autocomplete="username" hidden>
-          <label>Current password<input id="profile-current-password" type="password" autocomplete="current-password"></label>
-          <label>New password<input id="profile-new-password" type="password" autocomplete="new-password"></label>
-          <button class="btn primary" type="submit">Change password</button>
-        </form>
-      </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Two-factor authentication</h2><span id="profile-2fa-state" class="cw-profile-pill">Off</span></div>
-        <div id="profile-2fa-setup" class="cw-profile-2fa"></div>
-        <div class="cw-profile-actions">
-          <button id="profile-2fa-setup-btn" class="btn primary" type="button">Set up 2FA</button>
-          <button id="profile-2fa-disable-btn" class="btn danger" type="button">Disable 2FA</button>
-          <button id="profile-recovery-btn" class="btn" type="button">Recovery codes</button>
+        <div class="cw-set-col">
+{settings_interface}
+        <section id="settings-sessions" class="cw-set-card" data-settings-section="sessions">
+          <header class="cw-set-head"><div><h2>Devices</h2><p>Where you are signed in right now.</p></div><button id="profile-revoke-sessions" class="cw-set-btn cw-set-btn--danger cw-danger-confirm" type="button" hidden>Sign out everywhere else</button></header>
+          <div id="profile-sessions" class="cw-set-sessions"></div>
+        </section>
         </div>
-      </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Linked Plex account</h2><span id="profile-plex-state" class="cw-profile-pill">Off</span></div>
-        <div id="profile-plex-summary" class="cw-profile-linked">No Plex account linked.</div>
-        <div class="cw-profile-actions">
-          <button id="profile-plex-link" class="btn primary" type="button">Link Plex account</button>
-          <button id="profile-plex-unlink" class="btn" type="button">Unlink</button>
-        </div>
-      </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Linked OIDC account</h2><span id="profile-oidc-state" class="cw-profile-pill">Off</span></div>
-        <div id="profile-oidc-summary" class="cw-profile-linked">No OIDC account linked.</div>
-        <div class="cw-profile-actions">
-          <button id="profile-oidc-link" class="btn primary" type="button">Link OIDC account</button>
-          <button id="profile-oidc-unlink" class="btn" type="button">Unlink</button>
-        </div>
-      </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Active Sessions</h2></div>
-        <div id="profile-sessions" class="cw-profile-list"></div>
-        <button id="profile-revoke-sessions" class="btn" type="button">Revoke other sessions</button>
-      </article>
+      </div>
     </div>
   </section>
-{preferences_panel}
 </main>
 <div id="profile-toast" class="cw-profile-toast hidden" role="status" aria-live="polite"></div>
 <div id="cw-help-overlay" class="hidden" aria-hidden="true">
@@ -2307,11 +3014,6 @@ def get_profile_html(user: dict | None = None) -> str:
     if (what === "help") window.openHelp?.();
     else if (await ensureModals()) window.openAbout?.();
   }};
-  window.cwSettingsMenuLogout = async () => {{
-    closeMenu("settings");
-    try {{ await fetch("/api/app-auth/logout", {{ method: "POST", credentials: "same-origin", cache: "no-store" }}); }} catch {{}}
-    window.location.href = "/login";
-  }};
   document.addEventListener("click", event => {{
     const overlay = $("cw-help-overlay");
     const card = $("cw-help-card");
@@ -2325,21 +3027,32 @@ def get_profile_html(user: dict | None = None) -> str:
 }})();
 </script>
 <script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>
-<script src="/assets/helpers/provider-meta.js?v=__CW_VERSION__"></script>
-<script src="/assets/helpers/api.js?v=__CW_VERSION__"></script>
-<script src="/assets/helpers/media-meta.js?v=__CW_VERSION__"></script>
-<script src="/assets/helpers/trailer.js?v=__CW_VERSION__"></script>
-<script src="/assets/helpers/playing-card.js?v=__CW_VERSION__"></script>
-<script src="/assets/helpers/watchlist-preview.js?v=__CW_VERSION__"></script>
+<script src="/assets/helpers/provider-meta.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/icon-select.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/profile-select.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/account-menu.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/notifications.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/update-notifications.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/database-notifications.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/js/overview-profile.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/js/sync-reviews.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/js/plex-recovery-notifications.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/api.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/media-meta.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/trailer.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/playing-card.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/watchlist-preview.js?v=__CW_VERSION__" defer></script>
 <script>window.cwIsAuthSetupPending = window.cwIsAuthSetupPending || (() => window.__cwAuthSetupPending === true);</script>
 <script src="/assets/js/dashboard-widgets.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/activity.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/profile-datetime.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/js/profile-media-modal.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/profile-page.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/theme-flat-runtime.js?v=__CW_VERSION__" defer></script>
 </body>
 </html>"""
     return (
-        html
+        _seed_media_card_style(html, user)
         .replace("__CW_CURRENT_VERSION__", CURRENT_VERSION)
         .replace("__CW_VERSION__", _asset_version_token())
     )

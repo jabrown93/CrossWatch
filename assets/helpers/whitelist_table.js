@@ -18,7 +18,7 @@
   }
 
   const LIB_ICON = `<span class="material-symbols-rounded" aria-hidden="true">movie</span>`;
-  const FEATURE_ICON = { hist: "history", rate: "star", prog: "progress_activity", scr: "graphic_eq" };
+  const FEATURE_ICON = { hist: "history", rate: "star", prog: "progress_activity", coll: "inventory_2", scr: "graphic_eq" };
 
   function mount(opts) {
     const host = opts && opts.host;
@@ -28,11 +28,27 @@
     const getLibs = opts.getLibs || (() => []);
     const isOn = opts.isOn || (() => false);
     const setOn = opts.setOn || (() => {});
+    const selectedIds = opts.selectedIds || (() => []);
     const commit = opts.commit || (() => {});
     const load = opts.load || (async () => {});
 
     const libId = (l) => String(l.id != null ? l.id : l.key);
     const libTitle = (l) => String(l.title || l.name || libId(l));
+    const missingTitle = (id) => `Missing library (${id})`;
+
+    function withMissing(libs) {
+      if (!libs.length) return libs;
+      const known = new Set(libs.map(libId));
+      const missing = [];
+      for (const raw of selectedIds() || []) {
+        const id = String(raw == null ? "" : raw).trim();
+        if (!id || known.has(id)) continue;
+        known.add(id);
+        missing.push({ id, title: missingTitle(id), missing: true });
+      }
+      return libs.concat(missing);
+    }
+    const featureCount = Math.max(1, features.length);
 
     if (host.__cwWlTimer) { clearInterval(host.__cwWlTimer); host.__cwWlTimer = 0; }
 
@@ -46,7 +62,7 @@
     }
 
     function colHeadHTML() {
-      return features.map((f) => `<button type="button" class="cw-wl-colhead cw-wl-${f.key}" data-col="${f.key}"><span class="material-symbols-rounded cw-wl-cico" aria-hidden="true">${f.icon || FEATURE_ICON[f.key] || "check_circle"}</span><span>${esc(f.label)}</span></button>`).join("");
+      return features.map((f) => `<button type="button" class="cw-wl-colhead cw-wl-${f.key}" data-col="${f.key}"${f.title ? ` title="${esc(f.title)}"` : ""}><span class="material-symbols-rounded cw-wl-cico" aria-hidden="true">${f.icon || FEATURE_ICON[f.key] || "check_circle"}</span><span>${esc(f.label)}</span></button>`).join("");
     }
 
     function rowsHTML(libs) {
@@ -55,9 +71,10 @@
         const id = libId(l);
         const checks = features.map((f) => {
           const on = isOn(f.key, id);
-          return `<label class="cw-wl-check cw-wl-${f.key}"><input type="checkbox" data-feat="${f.key}" ${on ? "checked" : ""} aria-label="${esc(f.label)} — ${esc(libTitle(l))}"><span class="cw-wl-box"></span></label>`;
+          return `<label class="cw-wl-check cw-wl-${f.key}"><input type="checkbox" data-feat="${f.key}" ${on ? "checked" : ""} aria-label="${esc(f.label)} — ${esc(libTitle(l))}"><span class="cw-wl-box"></span><span class="cw-wl-feature-label" aria-hidden="true">${esc(f.label)}</span></label>`;
         }).join("");
-        return `<div class="cw-wl-row" data-id="${esc(id)}" title="${esc(libTitle(l))} · #${esc(id)}">
+        const tip = l.missing ? `${libTitle(l)} · no longer on the server. Untick it to remove it.` : `${libTitle(l)} · #${id}`;
+        return `<div class="cw-wl-row" data-id="${esc(id)}"${l.missing ? ' data-missing="1"' : ""} title="${esc(tip)}">
           <span class="cw-wl-handle" aria-hidden="true"></span>
           <span class="cw-wl-ic">${LIB_ICON}</span>
           <span class="cw-wl-name">${esc(libTitle(l))}</span>
@@ -74,16 +91,16 @@
     function render() {
       const libs = getLibs();
       host.innerHTML = `
-        <div class="cw-wl">
+        <div class="cw-wl" style="--wl-feature-count:${featureCount}">
           <div class="cw-wl-scroll">
             <div class="cw-wl-colrow">
-              <div class="cw-wl-collib">Library</div>
+              <div class="cw-wl-collib"><span class="cw-wl-desktop-label">Library</span><span class="cw-wl-mobile-label">Toggle all libraries</span></div>
               <div class="cw-wl-cols">${colHeadHTML()}</div>
             </div>
-            <div class="cw-wl-rows">${rowsHTML(libs)}</div>
+            <div class="cw-wl-rows">${rowsHTML(withMissing(libs))}</div>
           </div>
           <div class="cw-wl-foot">
-            <div class="cw-wl-note">Empty = all libraries.</div>
+            <div class="cw-wl-note">${esc(opts.note || "Empty = all libraries.")}</div>
             <div class="cw-wl-foot-r">
               <span class="cw-wl-stamp">${stampText()}</span>
               <button type="button" class="cw-wl-load" data-act="load"><span class="material-symbols-rounded" aria-hidden="true">sync</span>Load libraries</button>
@@ -124,24 +141,26 @@
       }
     }
 
-    if (!host.__cwWlBound) {
-      host.__cwWlBound = true;
-      host.addEventListener("click", (ev) => {
-        const act = ev.target.closest?.("[data-act]");
-        if (act && act.dataset.act === "load") return void doLoad(true, true);
-        const col = ev.target.closest?.(".cw-wl-colhead[data-col]");
-        if (col) return toggleColumn(col.dataset.col);
-      });
-      host.addEventListener("change", (ev) => {
-        const cb = ev.target.closest?.('input[type="checkbox"][data-feat]');
-        if (!cb) return;
-        const row = ev.target.closest?.(".cw-wl-row");
-        const id = row && row.dataset.id;
-        if (!id) return;
-        setOn(cb.dataset.feat, id, cb.checked);
-        commit();
-      });
-    }
+    if (host.__cwWlClickHandler) host.removeEventListener("click", host.__cwWlClickHandler);
+    if (host.__cwWlChangeHandler) host.removeEventListener("change", host.__cwWlChangeHandler);
+    host.__cwWlClickHandler = (ev) => {
+      const act = ev.target.closest?.("[data-act]");
+      if (act && act.dataset.act === "load") return void doLoad(true, true);
+      const col = ev.target.closest?.(".cw-wl-colhead[data-col]");
+      if (col) return toggleColumn(col.dataset.col);
+    };
+    host.__cwWlChangeHandler = (ev) => {
+      const cb = ev.target.closest?.('input[type="checkbox"][data-feat]');
+      if (!cb) return;
+      const row = ev.target.closest?.(".cw-wl-row");
+      const id = row && row.dataset.id;
+      if (!id) return;
+      setOn(cb.dataset.feat, id, cb.checked);
+      commit();
+      if (row.dataset.missing === "1" && !features.some((f) => isOn(f.key, id))) render();
+    };
+    host.addEventListener("click", host.__cwWlClickHandler);
+    host.addEventListener("change", host.__cwWlChangeHandler);
 
     render();
     (async () => {

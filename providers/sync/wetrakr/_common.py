@@ -1,0 +1,943 @@
+# providers/sync/wetrakr/_common.py
+# CrossWatch - WeTrakr shared HTTP, tracking snapshots, identifiers and writes
+# Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
+from __future__ import annotations
+
+from importlib import import_module
+from cw_platform.interactive_reads import accepted_result, replaying, replace_retained
+
+import hashlib
+import json
+import os
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import requests
+
+from cw_platform.config_base import CONFIG_BASE
+from cw_platform.history_events import history_epoch_from_item, history_sync_key
+from cw_platform.id_map import canonical_key
+from cw_platform.orchestrator._history_rewatches import history_event_matches, history_timestamp_tolerance_seconds
+from cw_platform.run_control import cancel_requested, raise_if_cancelled
+from providers.auth import _auth_WETRAKR as auth
+from providers.sync._log import log
+from providers.sync._mod_common import SimpleRateLimiter, build_op_result
+
+SCHEMA = 2
+MAX_CACHE_AGE = 3600
+WRITE_BATCH_SIZE = 500
+READ_PAGE_SIZE = 500
+DELTA_PAGE_SIZE = 100
+TRACKLOG_BATCH_SIZE = 100
+DAILY_QUOTA_CODES = {
+    "QUOTA_EXCEEDED": ("daily_quota_exceeded", "x-quota"),
+    "APP_USER_QUOTA_EXCEEDED": ("app_user_quota_exceeded", "x-app-user-quota"),
+    "APP_QUOTA_EXCEEDED": ("app_quota_exceeded", ""),
+}
+
+_STATES: dict[str, dict[str, Any]] = {}
+_STATES_LOCK = threading.Lock()
+_WRITE_LOCKS: dict[str, Any] = {}
+
+
+class WeTrakrSyncError(RuntimeError):
+    def __init__(self, reason: str, *, status: int = 0, retry_after: float = 0):
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status
+        self.retry_after = retry_after
+
+
+def int_value(value: Any, default: int = -1) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(str(value))
+    except (ValueError, TypeError):
+        return default
+
+
+def account_key(adapter: Any) -> str:
+    block = auth.provider_block(adapter.config, adapter.instance_id)
+    identity = str(block.get("user_id") or block.get("access_token") or adapter.instance_id)
+    return hashlib.sha256(f"{auth.app_client_id()}|{identity}".encode()).hexdigest()
+
+
+def write_lock(adapter: Any) -> Any:
+    with _STATES_LOCK:
+        return _WRITE_LOCKS.setdefault(account_key(adapter), threading.RLock())
+
+
+def _state(adapter: Any) -> dict[str, Any]:
+    with _STATES_LOCK:
+        return _STATES.setdefault(account_key(adapter), {
+            "limiter": SimpleRateLimiter(rates_per_sec={"GET": 3, "WRITE": 1}),
+            "lock": threading.RLock(), "blocked": {}, "minute": {},
+        })
+
+
+def retry_seconds(value: Any) -> float:
+    try:
+        return max(0, min(86400, float(value)))
+    except (TypeError, ValueError):
+        try:
+            return max(0, min(86400, parsedate_to_datetime(str(value)).timestamp() - time.time()))
+        except (ValueError, TypeError, OverflowError):
+            return 60
+
+
+def _seconds_to_utc_midnight() -> float:
+    now = datetime.now(timezone.utc)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (midnight - now).total_seconds()
+
+
+def request(adapter: Any, method: str, path: str, **kwargs: Any) -> Any:
+    if not path.startswith("/") or path.startswith("//"):
+        raise WeTrakrSyncError("invalid_api_path")
+    state = _state(adapter)
+    bucket = "GET" if method.upper() == "GET" else "WRITE"
+    with state["lock"]:
+        raise_if_cancelled()
+        blocked = max(state["blocked"].get(bucket, 0), state["blocked"].get("DAILY", 0))
+        if blocked > time.time():
+            raise WeTrakrSyncError("rate_limited", status=429, retry_after=blocked - time.time())
+        state["limiter"].wait(bucket)
+        try:
+            response = auth.request_with_auth(adapter.session, method, auth.API_BASE + path,
+                                              cfg=adapter.config, instance_id=adapter.instance_id,
+                                              timeout=20, max_retries=1, **kwargs)
+        except (requests.RequestException, auth.WeTrakrAuthError) as exc:
+            raise WeTrakrSyncError("request_failed") from exc
+        headers = {str(k).lower(): str(v) for k, v in response.headers.items()}
+        state["minute"][bucket] = {k: headers[k] for k in ("ratelimit-limit", "ratelimit-remaining", "ratelimit-reset") if k in headers}
+        if response.status_code == 429:
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            error = body.get("error") if isinstance(body, Mapping) else ""
+            code = error.get("code") if isinstance(error, Mapping) else error
+            code = code if isinstance(code, str) else ""
+            reason, exhausted = DAILY_QUOTA_CODES.get(code, ("rate_limited", ""))
+            daily = code in DAILY_QUOTA_CODES
+            delay = retry_seconds(headers["retry-after"]) if "retry-after" in headers or not daily else 0
+            if daily:
+                reset = headers.get("x-quota-reset")
+                delay = max(delay, retry_seconds(reset) if reset is not None else _seconds_to_utc_midnight())
+            delay = max(1, delay)
+            state["blocked"]["DAILY" if daily else bucket] = time.time() + delay
+            if exhausted:
+                auth.record_quota(auth.provider_block(adapter.config, adapter.instance_id),
+                                  {**headers, f"{exhausted}-remaining": "0", "x-quota-reset": str(int(delay))}, started_at=time.time())
+            log("WETRAKR", "http", "warn", "rate_limited", daily=daily, code=code, retry_after=delay)
+            raise WeTrakrSyncError(reason, status=429, retry_after=delay)
+        if not 200 <= response.status_code < 300:
+            raise WeTrakrSyncError("request_rejected", status=response.status_code)
+        if int_value(headers.get("ratelimit-remaining")) == 0 and "ratelimit-reset" in headers:
+            state["blocked"][bucket] = time.time() + max(1, retry_seconds(headers["ratelimit-reset"]))
+        return response
+
+
+def body_of(response: Any) -> Any:
+    try:
+        return response.json()
+    except (ValueError, TypeError) as exc:
+        raise WeTrakrSyncError("invalid_json") from exc
+
+
+def pages(adapter: Any, path: str, *, from_date: str | None = None,
+          on_page: Callable[[int], None] | None = None) -> list[Mapping[str, Any]]:
+    out: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    expected_total: int | None = None
+    expected_pages: int | None = None
+    for page in range(1, 10001):
+        raise_if_cancelled()
+        params: dict[str, Any] = {"page": page, "limit": DELTA_PAGE_SIZE if from_date is not None else READ_PAGE_SIZE}
+        if from_date is not None:
+            params["from_date"] = from_date
+        response = request(adapter, "GET", path, params=params)
+        rows = body_of(response)
+        if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+            raise WeTrakrSyncError("invalid_page")
+        headers = {str(k).lower(): v for k, v in response.headers.items()}
+        total_pages = int_value(headers.get("x-pagination-page-count"))
+        total = int_value(headers.get("x-pagination-item-count"))
+        returned_page = int_value(headers.get("x-pagination-page"), page)
+        if total_pages < 0 or total < 0 or (total_pages == 0 and (rows or total)) or returned_page != page or total_pages > 10000:
+            raise WeTrakrSyncError("invalid_pagination")
+        if expected_pages is not None and (total_pages != expected_pages or total != expected_total):
+            raise WeTrakrSyncError("snapshot_changed")
+        expected_pages, expected_total = total_pages, total
+        if not rows and (page < total_pages or total > len(out)):
+            raise WeTrakrSyncError("incomplete_snapshot")
+        signature = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+        if rows and signature in seen:
+            raise WeTrakrSyncError("repeated_page")
+        seen.add(signature)
+        out.extend(rows)
+        if on_page is not None:
+            on_page(len(out))
+        if page >= total_pages:
+            if total >= 0 and len(out) != total:
+                raise WeTrakrSyncError("incomplete_snapshot")
+            return out
+    raise WeTrakrSyncError("pagination_limit")
+
+
+def cache_path(adapter: Any, feature: str) -> Path:
+    mode = bool(feature == "history" and adapter.config.get("_cw_history_rewatches"))
+    identity = f"{account_key(adapter)}|{adapter.instance_id}|{feature}|{mode}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return CONFIG_BASE() / "state" / "wetrakr" / f"{digest}.json"
+
+
+def _read(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("sections"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save(path: Path, sections: Mapping[str, Any]) -> None:
+    temporary: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            json.dump({"schema": SCHEMA, "sections": sections}, handle)
+        os.replace(temporary, path)
+        temporary = None
+    except OSError:
+        log("WETRAKR", "cache", "warn", "snapshot_cache_write_failed")
+    finally:
+        if temporary is not None:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _activities(adapter: Any) -> dict[str, Any]:
+    try:
+        data = body_of(request(adapter, "GET", "/sync/last_activities"))
+    except WeTrakrSyncError as exc:
+        if exc.status_code in (401, 403, 429) or exc.retry_after:
+            raise
+        log("WETRAKR", "cache", "warn", "activities_unavailable_full_refresh")
+        return {}
+    return dict(data) if isinstance(data, Mapping) else {}
+
+
+def _stamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return stamp if stamp.tzinfo is not None else None
+    except ValueError:
+        return None
+
+
+def refresh_strategy(cached: Mapping[str, Any], current: Mapping[str, Any], feature: str, *, force: bool = False) -> str:
+    rows = cached.get("rows")
+    checked = cached.get("checked_at")
+    fresh = isinstance(checked, (int, float)) and 0 <= time.time() - checked < MAX_CACHE_AGE
+    valid = isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+    previous = cached.get("activity")
+    if force or not fresh or not valid or not isinstance(previous, Mapping):
+        return "full"
+    before, after = _stamp(previous.get("all")), _stamp(current.get("all"))
+    if before is None or after is None or after < before:
+        return "full"
+    if current == previous:
+        return "cached"
+    if after == before:
+        return "full"
+    for key, value in previous.items():
+        stamp = _stamp(value)
+        next_stamp = _stamp(current.get(key))
+        if stamp is not None and (next_stamp is None or next_stamp < stamp):
+            return "full"
+    removed = "last_removed_at" if feature == "ratings" else "last_tracking_removed_at"
+    if _stamp(previous.get(removed)) is None or _stamp(current.get(removed)) != _stamp(previous[removed]):
+        return "full"
+    field = {"watchlist": "last_tracking_planning_at", "history": "last_tracking_watched_at", "ratings": "last_updated_at"}[feature]
+    old_changed, changed = _stamp(previous.get(field)), _stamp(current.get(field))
+    if old_changed is None or changed is None or not old_changed < changed <= after:
+        return "full"
+    return "delta"
+
+
+def _merge_rows(previous: list[Mapping[str, Any]], changed: list[Mapping[str, Any]], *, removals: bool = False) -> list[Mapping[str, Any]]:
+    merged: dict[str, Mapping[str, Any]] = {}
+    for batch in (previous, changed):
+        seen: set[str] = set()
+        for row in batch:
+            key = str(row.get("id") or "").strip()
+            if not key or key in seen:
+                raise WeTrakrSyncError("invalid_delta_identity")
+            seen.add(key)
+            if removals and row.get("status") == "removed":
+                merged.pop(key, None)
+            else:
+                merged[key] = row
+    return list(merged.values())
+
+
+def activity_for(data: Mapping[str, Any], feature: str, section: str) -> dict[str, Any]:
+    block = data.get("ratings" if feature == "ratings" else section)
+    if isinstance(block, Mapping):
+        return dict(block)
+    if feature == "ratings" and _stamp(data.get("all")) is not None:
+        media = data.get(section)
+        return {"all": data["all"], "last_removed_at": data["all"],
+                "last_updated_at": media.get("last_rated_at") if isinstance(media, Mapping) else None}
+    return {}
+
+
+def journal_rows(adapter: Any, feature: str, since: str) -> tuple[list[Mapping[str, Any]], str]:
+    category = {"watchlist": "planning", "history": "watched", "ratings": "ratings"}[feature]
+    checkpoint = _stamp(since)
+    if checkpoint is None:
+        raise WeTrakrSyncError("invalid_journal_checkpoint")
+    rows: list[Mapping[str, Any]] = []
+    latest = checkpoint
+    expected: tuple[int, int] | None = None
+    seen: set[str] = set()
+    for page in range(1, 10001):
+        response = request(adapter, "GET", "/sync/journal", params={"from_date": since, "category": category, "page": page, "limit": 1000})
+        data = body_of(response)
+        batch = data.get("journal") if isinstance(data, Mapping) else None
+        if not isinstance(batch, list) or int_value(data.get("retention_days")) <= 0:
+            raise WeTrakrSyncError("invalid_journal")
+        headers = {str(k).lower(): v for k, v in response.headers.items()}
+        count = int_value(headers.get("x-pagination-item-count"))
+        pages_count = int_value(headers.get("x-pagination-page-count"))
+        if (count < 0 or not 0 <= pages_count <= 10000 or (pages_count == 0 and (batch or count))
+                or int_value(headers.get("x-pagination-page")) != page):
+            raise WeTrakrSyncError("invalid_journal_pagination")
+        if expected is not None and expected != (count, pages_count):
+            raise WeTrakrSyncError("journal_changed")
+        expected = (count, pages_count)
+        for row in batch:
+            stamp = _stamp(row.get("action_at")) if isinstance(row, Mapping) else None
+            if (stamp is None or stamp <= checkpoint or stamp < latest or row.get("category") != category
+                    or row.get("status") not in ("added", "updated", "removed") or int_value(row.get("id")) <= 0):
+                raise WeTrakrSyncError("invalid_journal_entry")
+            signature = str(row.get("entry_id") or "")
+            if not signature:
+                raise WeTrakrSyncError("invalid_journal_entry")
+            if signature in seen:
+                raise WeTrakrSyncError("repeated_journal_entry")
+            seen.add(signature)
+            latest = stamp
+            rows.append(row)
+        raise_if_cancelled()
+        if page >= pages_count:
+            if len(rows) != count:
+                raise WeTrakrSyncError("incomplete_journal")
+            return rows, latest.isoformat().replace("+00:00", "Z")
+        if not batch:
+            raise WeTrakrSyncError("incomplete_journal")
+    raise WeTrakrSyncError("journal_pagination_limit")
+
+
+def journal_worthwhile(size: int, extra_reads: int = 0) -> bool:
+    return (size + READ_PAGE_SIZE - 1) // READ_PAGE_SIZE > 2 + extra_reads
+
+
+def journal_removals(adapter: Any, feature: str, kind: str, old: Mapping[str, Any], activity: Mapping[str, Any],
+                     endpoint: str, feeds: dict[str, Any]) -> tuple[list[Mapping[str, Any]], str] | None:
+    if feature != "history" or not adapter.config.get("_cw_history_rewatches"):
+        return None
+    previous = old.get("activity")
+    if not isinstance(previous, Mapping) or not isinstance(old.get("rows"), list):
+        return None
+    cached = old["rows"]
+    if not journal_worthwhile(len(cached)):
+        return None
+    if refresh_strategy(old, previous, feature) != "cached":
+        return None
+    removed, changed = "last_tracking_removed_at", "last_tracking_watched_at"
+    before, after = _stamp(previous.get("all")), _stamp(activity.get("all"))
+    old_removed, new_removed = _stamp(previous.get(removed)), _stamp(activity.get(removed))
+    if (before is None or after is None or after <= before or old_removed is None or new_removed is None
+            or not old_removed < new_removed <= after or _stamp(previous.get(changed)) is None):
+        return None
+    for key, value in previous.items():
+        stamp, current = _stamp(value), _stamp(activity.get(key))
+        if stamp is not None and (current is None or current < stamp):
+            return None
+    history_delta = _stamp(previous[changed]) != _stamp(activity.get(changed))
+    if not journal_worthwhile(len(cached), int(history_delta)):
+        return None
+    mark = _stamp(old.get("journal_at")) or before - timedelta(seconds=2)
+    since = mark.isoformat().replace("+00:00", "Z")
+    if since not in feeds:
+        feeds[since] = None
+        feeds[since] = journal_rows(adapter, feature, since)
+    if feeds[since] is None:
+        return None
+    entries, next_mark = feeds[since]
+    relevant = [row for row in entries if row.get("type") == kind]
+    if not relevant or any(row["status"] != "removed" for row in relevant):
+        return None
+    if any(not str(row.get("play_id") or "").strip() for row in relevant):
+        return None
+    deleted = {str(row["play_id"]) for row in relevant}
+    victims = [row for row in cached if str(row.get("id")) in deleted]
+    if not victims:
+        return None
+    owners = {str(row["play_id"]): str(row["id"]) for row in relevant}
+    if any(not isinstance(row.get(kind), Mapping) or str(row[kind].get("id")) != owners[str(row["id"])] for row in victims):
+        raise WeTrakrSyncError("invalid_journal_identity")
+    result = [row for row in cached if str(row.get("id")) not in deleted]
+    if history_delta:
+        since = (before - timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
+        result = _merge_rows(result, pages(adapter, endpoint, from_date=since))
+    response = request(adapter, "GET", endpoint, params={"page": 1, "limit": 1})
+    probe = body_of(response)
+    headers = {str(k).lower(): v for k, v in response.headers.items()}
+    if (not isinstance(probe, list) or len(probe) > 1 or any(not isinstance(row, Mapping) for row in probe)
+            or int_value(headers.get("x-pagination-item-count")) != len(result)
+            or int_value(headers.get("x-pagination-page")) != 1 or bool(probe) != bool(result)
+            or int_value(headers.get("x-pagination-page-count")) not in (len(result), max(1, len(result)))):
+        return None
+    if probe and not any(row == probe[0] for row in result):
+        return None
+    return result, next_mark
+
+
+def tracking_rows(adapter: Any, feature: str, *, force: bool = False) -> dict[str, list[Mapping[str, Any]]]:
+    kinds = ("movie", "show", "season", "episode") if feature == "ratings" else ("movie", "show") if feature == "watchlist" else ("movie", "episode")
+    status = "planning" if feature == "watchlist" else "watched"
+    event_path = "history/" if feature == "history" and adapter.config.get("_cw_history_rewatches") else ""
+    with write_lock(adapter):
+        path = cache_path(adapter, feature)
+        cached = _read(path).get("sections", {})
+        before = _activities(adapter)
+        sections: dict[str, Any] = {}
+        result: dict[str, list[Mapping[str, Any]]] = {}
+        refreshed = False
+        feeds: dict[str, Any] = {}
+        completed = 0
+        progress = getattr(adapter, "_read_progress", None)
+
+        def page_progress(count: int) -> None:
+            raise_if_cancelled()
+            if progress is not None:
+                progress.tick(completed + count)
+            log("WETRAKR", feature, "info", "index_page", count=completed + count)
+
+        for kind in kinds:
+            raise_if_cancelled()
+            section = f"{kind}s"
+            old = cached.get(section)
+            old = old if isinstance(old, Mapping) else {}
+            activity = activity_for(before, feature, section)
+            strategy = refresh_strategy(old, activity, feature, force=force)
+            endpoint = f"/sync/ratings/{section}" if feature == "ratings" else f"/sync/tracking/{status}/{event_path}{section}"
+            reconciled = None
+            if strategy == "full" and not force:
+                try:
+                    reconciled = journal_removals(adapter, feature, kind, old, activity, endpoint, feeds)
+                except WeTrakrSyncError as exc:
+                    if exc.status_code in (401, 403, 429) or exc.retry_after:
+                        raise
+                    log("WETRAKR", feature, "debug", "journal_full_refresh", reason=exc.reason)
+            journal_at = old.get("journal_at")
+            if reconciled is not None:
+                rows, journal_at = reconciled
+                checked = old["checked_at"]
+                strategy = "journal"
+                refreshed = True
+            elif strategy == "cached":
+                rows = old["rows"]
+                checked = old["checked_at"]
+            else:
+                checkpoint = _stamp(old.get("activity", {}).get("all")) if strategy == "delta" else None
+                if checkpoint is not None:
+                    since = (checkpoint - timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
+                    changed = pages(adapter, endpoint, from_date=since, on_page=page_progress)
+                    if changed:
+                        rows = _merge_rows(old["rows"], changed, removals=feature == "ratings")
+                        checked = old["checked_at"]
+                    else:
+                        strategy = "full"
+                        rows = pages(adapter, endpoint, on_page=page_progress)
+                        checked = time.time()
+                else:
+                    rows = pages(adapter, endpoint, on_page=page_progress)
+                    checked = time.time()
+                refreshed = True
+            if strategy == "full":
+                stamp = _stamp(activity.get("all"))
+                journal_at = (stamp - timedelta(seconds=2)).isoformat().replace("+00:00", "Z") if stamp else None
+            sections[section] = {"activity": activity, "rows": rows, "checked_at": checked, "journal_at": journal_at}
+            result[kind] = rows
+            completed += len(rows)
+            if progress is not None:
+                progress.tick(completed, force=True)
+            log("WETRAKR", feature, "debug", "snapshot_section", section=section, strategy=strategy, count=len(rows))
+        if refreshed:
+            after = _activities(adapter)
+            for kind in kinds:
+                section = f"{kind}s"
+                old_activity = activity_for(before, feature, section)
+                new_activity = activity_for(after, feature, section)
+                has_stamp = _stamp(old_activity.get("all")) is not None or _stamp(new_activity.get("all")) is not None
+                if has_stamp and old_activity != new_activity:
+                    raise WeTrakrSyncError("snapshot_changed")
+                if _stamp(new_activity.get("all")) is None:
+                    sections[section]["activity"] = {}
+            adapter._pending_snapshot = (path, sections)
+        return result
+
+
+def commit_snapshot(adapter: Any) -> None:
+    pending = getattr(adapter, "_pending_snapshot", None)
+    adapter._pending_snapshot = None
+    if pending:
+        _save(*pending)
+
+
+def media_ids(row: Mapping[str, Any]) -> dict[str, str]:
+    raw = row.get("ids")
+    raw = raw if isinstance(raw, Mapping) else {}
+    out: dict[str, str] = {}
+    for source in ("tmdb", "imdb", "tvdb"):
+        value = raw.get(source)
+        if isinstance(value, Mapping):
+            value = value.get("id")
+        if value is not None and str(value).strip():
+            out[source] = str(value).strip()
+    if int_value(row.get("id")) > 0:
+        out["wetrakr"] = str(row["id"])
+    return out
+
+
+def media_item(row: Mapping[str, Any], kind: str) -> dict[str, Any]:
+    if row.get("type") != kind:
+        raise WeTrakrSyncError("invalid_media_type")
+    item: dict[str, Any] = {"type": kind, "ids": media_ids(row), "title": row.get("title")}
+    date = str(row.get("release_date") or row.get("first_air_date") or "")
+    if int_value(date[:4]) > 0:
+        item["year"] = int(date[:4])
+    if kind in ("season", "episode"):
+        show = row.get("show")
+        if not isinstance(show, Mapping):
+            raise WeTrakrSyncError("missing_episode_show")
+        item.update(show_ids=media_ids(show), series_title=show.get("title"),
+                    season=int_value(row.get("number") if kind == "season" else row.get("season_number")))
+        if kind == "episode":
+            item["episode"] = int_value(row.get("number"))
+        if not item["show_ids"] or item["season"] < 0 or (kind == "episode" and item["episode"] < 1):
+            raise WeTrakrSyncError("invalid_episode_coordinates")
+    if not item["ids"] or canonical_key(item) == "unknown:":
+        raise WeTrakrSyncError("missing_media_identity")
+    return item
+
+
+def item_key(adapter: Any, feature: str, item: Mapping[str, Any]) -> str:
+    if feature == "history":
+        return history_sync_key(item, item.get("_cw_event_key"), event_mode=bool(adapter.config.get("_cw_history_rewatches")))
+    return canonical_key(item)
+
+
+def add_index_item(out: dict[str, dict[str, Any]], feature: str, key: str, item: dict[str, Any]) -> bool:
+    previous = out.get(key)
+    if previous is None:
+        out[key] = item
+        return True
+    ids = item.get("ids")
+    ids = ids if isinstance(ids, Mapping) else {}
+    log("WETRAKR", feature, "warn", "duplicate_media_identity", key=key, media_id=ids.get("wetrakr"))
+    return False
+
+
+def identity_tokens(item: Mapping[str, Any]) -> set[str]:
+    kind = str(item.get("type") or "")
+    ids = item.get("show_ids") if kind in ("season", "episode") else item.get("ids")
+    if not isinstance(ids, Mapping):
+        return set()
+    suffix = f":s{item.get('season')}e{item.get('episode')}" if kind == "episode" else f":s{item.get('season')}" if kind == "season" else ""
+    return {f"{kind}:{source}:{value}{suffix}" for source, value in ids.items() if source in ("tmdb", "imdb", "tvdb", "wetrakr") and value}
+
+
+def matching(adapter: Any, feature: str, source: Mapping[str, Any], dest: Mapping[str, Any]) -> dict[str, str]:
+    if feature == "history" and adapter.config.get("_cw_history_rewatches"):
+        event_ids = {str(row.get("_wetrakr_history_id")): key for key, row in dest.items() if row.get("_wetrakr_history_id")}
+        matches: dict[str, str] = {}
+        used: set[str] = set()
+        for key, item in source.items():
+            event_id = str(item.get("_wetrakr_history_id") or item.get("provider_event_id") or "")
+            peer = event_ids.get(event_id)
+            if peer is not None and peer not in used and identity_tokens(item) & identity_tokens(dest[peer]):
+                matches[key] = peer
+                used.add(peer)
+        matches.update(history_event_matches(
+            {key: item for key, item in source.items() if key not in matches},
+            {key: item for key, item in dest.items() if key not in used},
+            identity_tokens, tolerance_seconds=history_timestamp_tolerance_seconds(adapter.config)))
+        return matches
+    lookup: dict[str, set[str]] = {}
+    for key, item in dest.items():
+        for token in identity_tokens(item):
+            lookup.setdefault(token, set()).add(key)
+    matches = {}
+    for key, item in source.items():
+        peers = set().union(*(lookup.get(token, set()) for token in identity_tokens(item)))
+        if len(peers) > 1:
+            raise WeTrakrSyncError("ambiguous_media_identity")
+        if peers:
+            matches[key] = next(iter(peers))
+    return matches
+
+
+def identifier(ids: Any) -> dict[str, Any]:
+    if not isinstance(ids, Mapping):
+        raise WeTrakrSyncError("missing_supported_id")
+    for source in ("wetrakr", "tmdb", "imdb", "tvdb"):
+        value = ids.get(source)
+        if source == "imdb" and isinstance(value, str) and value.startswith("tt") and value[2:].isdigit():
+            return {"ids": {source: value}}
+        if source != "imdb" and int_value(value) > 0:
+            return {"id": int_value(value)} if source == "wetrakr" else {"ids": {source: int_value(value)}}
+    raise WeTrakrSyncError("missing_supported_id")
+
+
+def rating_value(value: Any) -> float:
+    try:
+        rating = Decimal(str(value))
+        if isinstance(value, bool) or not rating.is_finite() or not 0 <= rating <= 10:
+            raise ValueError
+        return float(rating.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError):
+        raise WeTrakrSyncError("invalid_rating") from None
+
+
+def payload_item(item: Mapping[str, Any], feature: str, *, include_date: bool = True) -> tuple[str, dict[str, Any]]:
+    kind = item.get("type")
+    if feature == "ratings":
+        if kind not in ("movie", "show", "season", "episode"):
+            raise WeTrakrSyncError("unsupported_media_type")
+        if kind in ("season", "episode"):
+            if int_value(item.get("season")) < 0 or (kind == "episode" and int_value(item.get("episode")) < 1):
+                raise WeTrakrSyncError("invalid_episode_coordinates")
+            identifier(item.get("show_ids"))
+        row = identifier(item.get("ids")) if kind not in ("season", "episode") or item.get("ids") else {}
+        if include_date:
+            rating = rating_value(item.get("rating"))
+            row["rating"] = rating
+        return f"{kind}s", row
+    allowed = ("movie", "show") if feature == "watchlist" else ("movie", "episode")
+    if kind not in allowed:
+        raise WeTrakrSyncError("unsupported_media_type")
+    fields: dict[str, Any] = {"status": "planning" if feature == "watchlist" else "watched"}
+    if feature == "history" and include_date:
+        stamp = history_epoch_from_item(item)
+        if stamp is None or item.get("_wetrakr_watched_at_unknown"):
+            fields["tracked_at_unknown"] = True
+        else:
+            fields["tracked_at"] = datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace("+00:00", "Z")
+    if kind == "episode":
+        season, episode = int_value(item.get("season")), int_value(item.get("episode"))
+        if season < 0 or episode < 1:
+            raise WeTrakrSyncError("invalid_episode_coordinates")
+        show = identifier(item.get("show_ids"))
+        return "shows", {**show, "seasons": [{"number": season, "episodes": [{"number": episode, **fields}]}]}
+    return f"{kind}s", {**identifier(item.get("ids")), **fields}
+
+
+def resolve_child(adapter: Any, item: Mapping[str, Any]) -> dict[str, Any]:
+    ids = item.get("ids")
+    show_ids = item.get("show_ids")
+    show_native = int_value(show_ids.get("wetrakr")) if isinstance(show_ids, Mapping) else -1
+    if isinstance(ids, Mapping) and int_value(ids.get("wetrakr")) > 0 and int_value(ids.get("wetrakr")) != show_native:
+        return dict(item)
+    season, episode = int_value(item.get("season")), int_value(item.get("episode"))
+    kind = item.get("type")
+    if season < 0 or (kind == "episode" and episode < 1):
+        raise WeTrakrSyncError("invalid_episode_coordinates")
+    show = identifier(item.get("show_ids"))
+    cache = getattr(adapter, "_resolved_shows", {})
+    cache_key = json.dumps(show, sort_keys=True)
+    show_id = show.get("id") or cache.get(cache_key)
+    if not show_id:
+        source, value = next(iter(show["ids"].items()))
+        data = body_of(request(adapter, "GET", f"/media/external/{source}/{quote(str(value), safe='')}", params={"type": "show"}))
+        if not isinstance(data, Mapping) or data.get("type") != "show" or int_value(data.get("id")) <= 0:
+            raise WeTrakrSyncError("show_not_resolved")
+        show_id = data["id"]
+        cache[cache_key] = show_id
+        adapter._resolved_shows = cache
+    path = f"/shows/{show_id}/seasons/{season}"
+    if kind == "episode":
+        path += f"/episodes/{episode}"
+    row = body_of(request(adapter, "GET", path))
+    if (not isinstance(row, Mapping) or row.get("type") != kind or int_value(row.get("id")) <= 0
+            or int_value(row.get("season_number") if kind == "episode" else row.get("number")) != season
+            or (kind == "episode" and int_value(row.get("number")) != episode)
+            or int_value(row.get("media_id")) != int_value(show_id)):
+        raise WeTrakrSyncError("child_not_resolved")
+    return {**item, "ids": {**(ids if isinstance(ids, Mapping) else {}), "wetrakr": str(row["id"])}}
+
+
+def write_matches(feature: str, item: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    return feature != "ratings" or rating_value(item.get("rating")) == rating_value(target.get("rating"))
+
+
+def _rejected_batch_keys(items, feature, missing):
+    if not isinstance(missing, Mapping):
+        return set(items)
+    rejected = set()
+    for group, rows in missing.items():
+        if not rows:
+            continue
+        if not isinstance(rows, list):
+            return set(items)
+        for row in rows:
+            if not isinstance(row, Mapping):
+                return set(items)
+            show = row.get("show") if feature != "ratings" and group == "episodes" else None
+            flat = isinstance(show, Mapping)
+            ids = set(media_ids(show if isinstance(show, Mapping) else row).items())
+            matches = set()
+            for key, item in items.items():
+                expected_group, payload = payload_item(item, feature, include_date=False)
+                if ("shows" if flat else group) != expected_group or not ids.intersection(media_ids(payload).items()):
+                    continue
+                if flat:
+                    if item.get("type") != "episode" or (int_value(item.get("season")), int_value(item.get("episode"))) != (int_value(row.get("season")), int_value(row.get("number"))):
+                        continue
+                elif row.get("seasons"):
+                    seasons = row["seasons"]
+                    if not isinstance(seasons, list) or any(not isinstance(season, Mapping) or not isinstance(season.get("episodes", []), list) for season in seasons):
+                        return set(items)
+                    if any(not isinstance(episode, Mapping) for season in seasons for episode in season.get("episodes", [])):
+                        return set(items)
+                    coordinates = {(int_value(season.get("number")), int_value(episode.get("number")))
+                                   for season in seasons for episode in season.get("episodes", [])}
+                    if item.get("type") == "episode" and (int_value(item.get("season")), int_value(item.get("episode"))) not in coordinates:
+                        continue
+                matches.add(key)
+            if not matches:
+                return set(items)
+            rejected.update(matches)
+    return rejected
+
+
+def write_items(adapter: Any, feature: str, items: Iterable[Mapping[str, Any]], *, remove: bool, dry_run: bool) -> dict[str, Any]:
+    selected: dict[str, Mapping[str, Any]] = {}
+    unresolved: list[dict[str, str]] = []
+    confirmed: list[str] = []
+    accepted: list[str] = []
+    event_mode = feature == "history" and bool(adapter.config.get("_cw_history_rewatches"))
+    for item in items:
+        key = item_key(adapter, feature, item)
+        try:
+            payload_item(item, feature, include_date=not remove)
+            if event_mode and (history_epoch_from_item(item) is None or item.get("_wetrakr_watched_at_unknown")):
+                raise WeTrakrSyncError("missing_watch_timestamp")
+            selected[key] = item
+        except (WeTrakrSyncError, ValueError, OverflowError, OSError) as exc:
+            reason = exc.reason if isinstance(exc, WeTrakrSyncError) else "invalid_watch_timestamp"
+            unresolved.append({"key": key, "reason": reason})
+            log("WETRAKR", feature, "warn", "item_unresolved_before_write", key=key, reason=reason)
+    if dry_run:
+        return build_op_result(ok=not unresolved, count=len(selected), unresolved=unresolved,
+                               unresolved_keys=[r["key"] for r in unresolved], dry_run=True)
+    if not selected:
+        return build_op_result(ok=not unresolved, unresolved=unresolved, unresolved_keys=[r["key"] for r in unresolved])
+    with write_lock(adapter):
+        try:
+            before = adapter.build_index(feature, force_refresh=True)
+            matches = matching(adapter, feature, selected, before)
+        except WeTrakrSyncError as exc:
+            return build_op_result(ok=False, unresolved_keys=list(selected) + [r["key"] for r in unresolved], unresolved=unresolved,
+                                   error=exc.reason, retry_after=exc.retry_after)
+        pending: dict[str, Mapping[str, Any]] = {}
+        for key, item in selected.items():
+            if event_mode and key not in matches:
+                stamp = history_epoch_from_item(item)
+                tolerance = history_timestamp_tolerance_seconds(adapter.config)
+                peers = [row for row in before.values() if identity_tokens(row) & identity_tokens(item)
+                         and stamp is not None and (other := history_epoch_from_item(row)) is not None and abs(stamp - other) <= tolerance]
+                if peers:
+                    unresolved.append({"key": key, "reason": "ambiguous_watch_event"})
+                    continue
+            if (remove and key not in matches) or (not remove and key in matches and write_matches(feature, item, before[matches[key]])):
+                confirmed.append(key)
+            else:
+                try:
+                    pending[key] = resolve_child(adapter, item) if feature == "ratings" and item.get("type") in ("season", "episode") and not remove else item
+                except WeTrakrSyncError as exc:
+                    unresolved.append({"key": key, "reason": exc.reason})
+        log("WETRAKR", feature, "debug", "write_prepare", op="remove" if remove else "add", count=len(pending))
+        keys = list(pending)
+        for start in range(0, len(keys), WRITE_BATCH_SIZE):
+            batch = keys[start:start + WRITE_BATCH_SIZE]
+            error: WeTrakrSyncError | None = None
+            rejected: set[str] = set()
+            try:
+                if event_mode and remove:
+                    event_ids: dict[str, str] = {}
+                    for key in batch:
+                        event_ids[key] = str(before[matches[key]].get("_wetrakr_history_id") or "")
+                        if not event_ids[key]:
+                            raise WeTrakrSyncError("missing_history_id")
+                    values = list(dict.fromkeys(event_ids.values()))
+                    not_found: set[str] = set()
+                    for offset in range(0, len(values), TRACKLOG_BATCH_SIZE):
+                        response = body_of(request(adapter, "POST", "/sync/tracklogs/remove",
+                                                   json={"ids": values[offset:offset + TRACKLOG_BATCH_SIZE]}))
+                        missing = response.get("not_found") if isinstance(response, Mapping) else None
+                        if not isinstance(missing, list):
+                            raise WeTrakrSyncError("invalid_response")
+                        not_found.update(str(value) for value in missing)
+                    rejected = {key for key, event_id in event_ids.items() if event_id in not_found}
+                else:
+                    payload: dict[str, list[dict[str, Any]]] = {}
+                    for key in batch:
+                        item = before[matches[key]] if remove else pending[key]
+                        group, row = payload_item(item, feature, include_date=not remove)
+                        payload.setdefault(group, []).append(row)
+                    path = "/sync/ratings" if feature == "ratings" else "/sync/tracking"
+                    if remove:
+                        path += "/remove/all" if feature == "history" else "/remove"
+                    response = body_of(request(adapter, "POST", path, json=payload))
+                    if replaying() and isinstance(response, Mapping):
+                        missing = response.get("notFound") or response.get("not_found") or {}
+                        if any(missing.values()) if isinstance(missing, Mapping) else bool(missing):
+                            rejected = _rejected_batch_keys({key: pending[key] for key in batch}, feature, missing)
+            except WeTrakrSyncError as exc:
+                error = exc
+            if replaying():
+                if error:
+                    unresolved.extend({"key": key, "reason": error.reason} for key in keys[start:])
+                    break
+                unresolved.extend({"key": key, "reason": "write_partially_rejected"} for key in batch if key in rejected)
+                batch = [key for key in batch if key not in rejected]
+                confirmed.extend(batch)
+                accepted.extend(batch)
+                for key in batch:
+                    target_key = matches.get(key, key)
+                    if remove:
+                        before.pop(target_key, None)
+                    else:
+                        before[target_key] = dict(pending[key])
+                replace_retained(import_module(f"providers.sync.wetrakr._{feature}").build_index, before)
+                continue
+            try:
+                after = adapter.build_index(feature, force_refresh=True)
+                verified = matching(adapter, feature, {k: pending[k] for k in batch}, after)
+                for key in batch:
+                    removed_event = event_mode and remove and not any(
+                        row.get("_wetrakr_history_id") == before[matches[key]].get("_wetrakr_history_id") for row in after.values())
+                    matches_value = key in verified and write_matches(feature, pending[key], after[verified[key]])
+                    if removed_event or (not (event_mode and remove) and (key not in verified if remove else matches_value)):
+                        confirmed.append(key)
+                    else:
+                        unresolved.append({"key": key, "reason": error.reason if error else "write_not_verified"})
+            except WeTrakrSyncError as exc:
+                error = error or exc
+                unresolved.extend({"key": key, "reason": "verification_failed"} for key in batch)
+            if error:
+                unresolved.extend({"key": key, "reason": error.reason} for key in keys[start + WRITE_BATCH_SIZE:])
+                break
+        log("WETRAKR", feature, "info", "write_done", op="remove" if remove else "add", ok=not unresolved,
+            applied=len(confirmed), unresolved=len(unresolved))
+    result = build_op_result(ok=not unresolved, count=len(confirmed), confirmed_keys=confirmed,
+                             unresolved=unresolved, unresolved_keys=[r["key"] for r in unresolved])
+    return accepted_result(result, accepted) if replaying() and not remove else result
+
+
+def _show_tokens(rows: Iterable[Mapping[str, Any]]) -> set[str]:
+    tokens: set[str] = set()
+    for row in rows:
+        try:
+            item = media_item(row, "show")
+        except WeTrakrSyncError:
+            continue
+        tokens.add(canonical_key(item))
+        tokens.update(f"{source}:{str(value).lower()}" for source, value in item["ids"].items())
+    return tokens
+
+
+def dropped_show_tokens(adapter: Any) -> set[str]:
+    activity = activity_for(_activities(adapter), "history", "shows")
+    marker = json.dumps(activity, sort_keys=True) if _stamp(activity.get("all")) is not None else ""
+    path = cache_path(adapter, "dropped")
+    cached = _read(path).get("sections", {})
+    tokens = cached.get("tokens")
+    if marker and cached.get("marker") == marker and isinstance(tokens, list):
+        return {str(token) for token in tokens if str(token).strip()}
+    found = _show_tokens(pages(adapter, "/sync/tracking/dropped/shows"))
+    _save(path, {"marker": marker, "tokens": sorted(found)})
+    return found
+
+
+def _count_rows(value: Any) -> int:
+    if isinstance(value, Mapping):
+        value = value.get("shows")
+    if isinstance(value, list):
+        return len(value)
+    return int_value(value, 0) if value is not None else 0
+
+
+def tag_dropped_shows(adapter: Any, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    with write_lock(adapter):
+        completed = _show_tokens(pages(adapter, "/sync/tracking/watched/shows"))
+        for item in items:
+            raw_ids = item.get("ids")
+            ids: Mapping[str, Any] = raw_ids if isinstance(raw_ids, Mapping) else {}
+            tokens = {f"{source}:{str(value).lower()}" for source, value in ids.items() if value not in (None, "")}
+            try:
+                row = identifier(ids)
+            except WeTrakrSyncError:
+                skipped += 1
+                continue
+            if tokens & completed:
+                skipped += 1
+                continue
+            rows.append({**row, "status": "dropped"})
+        confirmed = 0
+        not_found = 0
+        errors = 0
+        for start in range(0, len(rows), WRITE_BATCH_SIZE):
+            if cancel_requested():
+                break
+            part = rows[start:start + WRITE_BATCH_SIZE]
+            try:
+                response = body_of(request(adapter, "POST", "/sync/tracking", json={"shows": part}))
+            except WeTrakrSyncError as exc:
+                log("WETRAKR", "history", "warn", "dropped_tag_failed", count=len(part), reason=exc.reason)
+                errors += len(part)
+                if exc.status_code == 429 or exc.retry_after:
+                    errors += len(rows) - start - len(part)
+                    break
+                continue
+            body = response if isinstance(response, Mapping) else {}
+            missing = _count_rows(body.get("notFound") or body.get("not_found"))
+            failed = _count_rows(body.get("errored"))
+            not_found += missing
+            errors += failed
+            confirmed += max(0, len(part) - missing - failed)
+    log("WETRAKR", "history", "info", "dropped_tagged", attempted=len(rows), confirmed=confirmed,
+        skipped=skipped, not_found=not_found, errors=errors)
+    return {"attempted": len(rows), "confirmed": confirmed, "skipped": skipped, "not_found": not_found, "errors": errors}

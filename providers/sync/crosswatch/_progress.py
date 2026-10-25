@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.id_map import migrate_media_key, canonical_key
 
 from ._common import (
     _atomic_write,
@@ -19,14 +19,16 @@ from ._common import (
     _record_unresolved,
     _root,
     _snapshot_state,
-    latest_snapshot_file,
-    latest_state_file,
+    fallback_snapshot_file,
+    fallback_state_file,
     make_logger,
     may_persist,
+    merge_tracker_identity,
     pair_scoped,
     readonly,
     scoped_file,
     state_file_for_read,
+    tracker_minimal,
 )
 
 _dbg, _info, _warn, _error = make_logger("progress")
@@ -108,7 +110,7 @@ def _metadata_show_detail(adapter: Any, show_ids: Mapping[str, Any]) -> dict[str
 
 
 def _accepted(obj: Mapping[str, Any], adapter: Any | None = None) -> dict[str, Any]:
-    base = id_minimal(obj)
+    base = tracker_minimal(obj)
     out: dict[str, Any] = dict(base)
 
     typ = str(obj.get("type") or base.get("type") or "").strip().lower()
@@ -132,11 +134,11 @@ def _accepted(obj: Mapping[str, Any], adapter: Any | None = None) -> dict[str, A
             out["series_year"] = obj.get("series_year")
         season = _as_int(obj.get("season"))
         episode = _as_int(obj.get("episode"))
-        if season:
+        if season is not None:
             out["season"] = season
         if episode:
             out["episode"] = episode
-        if season and episode:
+        if season is not None and episode:
             out["title"] = f"S{season:02d}E{episode:02d}"
         elif "title" in obj:
             out["title"] = obj.get("title")
@@ -203,13 +205,15 @@ def _load_state(adapter: Any) -> dict[str, Any]:
     read_path = state_file_for_read(root, "progress", path)
     raw = _read_json(read_path)
     if raw is None:
-        alt = latest_state_file(root, "progress")
+        alt = fallback_state_file(root, "progress")
         if alt and alt != path:
             raw = _read_json(alt)
     if raw is None:
-        snap = latest_snapshot_file(root, "progress")
+        snap = fallback_snapshot_file(root, "progress")
         if snap:
             raw = _read_json(snap)
+            if raw is not None:
+                _warn("state_restored_from_snapshot", snapshot=snap.name)
     if raw is None:
         return {"ts": 0, "items": {}}
 
@@ -243,7 +247,7 @@ def _load_state(adapter: Any) -> dict[str, Any]:
                     accepted = _accepted(value, adapter)
                 except Exception:
                     continue
-                ck = str(key) or canonical_key(accepted)
+                ck = migrate_media_key(str(key), accepted)
                 if not ck:
                     continue
                 items2[ck] = accepted
@@ -260,7 +264,7 @@ def _load_state(adapter: Any) -> dict[str, Any]:
                 accepted = _accepted(value, adapter)
             except Exception:
                 continue
-            ck = str(key) or canonical_key(accepted)
+            ck = migrate_media_key(str(key), accepted)
             if not ck:
                 continue
             items3[ck] = accepted
@@ -356,6 +360,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             or (new_ms is None and new_percent is not None and (old_percent is None or new_percent > old_percent or (abs(new_percent - old_percent) <= 0.001 and new_ts and old_ts <= new_ts)))
         )
         if should_write:
+            if isinstance(existing, Mapping):
+                accepted = merge_tracker_identity(existing, accepted)
             cur[key] = accepted
             changed += 1
 
@@ -384,7 +390,7 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
     for obj in src:
         if not isinstance(obj, Mapping):
             continue
-        base = id_minimal(obj)
+        base = tracker_minimal(obj)
         key = canonical_key(base)
         if not key:
             unresolved_src.append(obj)

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import heapq
 import re
 from typing import Any, Iterable, Mapping
 
+from services.activity import DEFAULT_LIMIT as ACTIVITY_DEFAULT_LIMIT
 from services.activity import list_events
 from cw_platform.provider_instances import normalize_instance_id, provider_display_key
 
@@ -34,10 +36,13 @@ _ID_KEYS = (
     "plex",
     "jellyfin",
     "mdblist",
+    "wetrakr",
     "emby",
     "guid",
     "slug",
 )
+_SERVER_SCOPED_ID_KEYS = frozenset({"plex", "jellyfin", "emby", "guid"})
+
 _SHOW_ID_ALIASES = {
     "tmdb_show": "tmdb",
     "imdb_show": "imdb",
@@ -356,9 +361,11 @@ def _unwrap_history_item(value: Any) -> dict[str, Any]:
 
 def _canonical_key(raw_key: str, item: Mapping[str, Any]) -> str:
     ids = _ids(item)
-    for key in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "anilist", "mal"):
+    for key in ("tmdb", "imdb", "tvdb", "trakt", "simkl", "anilist", "mal", "wetrakr"):
         value = ids.get(key)
         if value not in (None, "", 0, False):
+            if key == "tmdb" and _media_type(item) == "show":
+                return f"{key}:{value}#show"
             return f"{key}:{value}"
     return str(raw_key or _title(item)).strip().lower()
 
@@ -560,6 +567,36 @@ def _art_debug(row: dict[str, Any], reason: str, **fields: Any) -> None:
         return
 
 
+def _anime_art_ids(row: Mapping[str, Any], ids: Mapping[str, Any]) -> dict[str, str]:
+    if _art_type(row) != "movie":
+        show_ids = _ids(row).get("show_ids")
+        ids = {**dict(show_ids), "tmdb": ids.get("tmdb")} if isinstance(show_ids, Mapping) else {}
+    if ids.get("tmdb") or not any(ids.get(key) for key in ("anidb", "mal", "anilist", "simkl", "kitsu")):
+        return {}
+    try:
+        from cw_platform.anime_mapping import artwork_ids
+        from cw_platform.config_base import load_config
+
+        return artwork_ids(load_config() or {}, ids, media_type=_art_type(row))
+    except Exception:
+        return {}
+
+
+def _apply_resolved_tmdb(
+    row: dict[str, Any], tmdb: Any, *, size: str, episode_still: bool, backdrop_fallback: bool
+) -> None:
+    row["tmdb"] = tmdb
+    current_ids = dict(row.get("ids") or {}) if isinstance(row.get("ids"), Mapping) else {}
+    if _art_type(row) == "movie":
+        current_ids.setdefault("tmdb", tmdb)
+    else:
+        show_ids = dict(current_ids.get("show_ids") or {}) if isinstance(current_ids.get("show_ids"), Mapping) else {}
+        show_ids.setdefault("tmdb", tmdb)
+        current_ids["show_ids"] = show_ids
+    row["ids"] = current_ids
+    row["poster"] = _grid_art_url(row, size=size) if backdrop_fallback else _poster_url(row, size=size, episode_still=episode_still)
+
+
 def _resolve_missing_art(
     row: dict[str, Any], *, size: str, episode_still: bool = False, backdrop_fallback: bool = False
 ) -> None:
@@ -567,6 +604,13 @@ def _resolve_missing_art(
         row["art_reason"] = "existing_tmdb"
         return
     ids = _metadata_lookup_ids(row)
+    mapped = _anime_art_ids(row, ids)
+    if mapped.get("tmdb"):
+        _apply_resolved_tmdb(row, mapped["tmdb"], size=size, episode_still=episode_still, backdrop_fallback=backdrop_fallback)
+        _art_debug(row, "anime_mapping_resolved", tmdb=mapped["tmdb"])
+        return
+    for key, value in mapped.items():
+        ids.setdefault(key, value)
     if not ids.get("title") and not any(ids.get(key) for key in ("imdb", "tmdb")):
         _art_debug(row, "missing_lookup_identity")
         return
@@ -589,16 +633,7 @@ def _resolve_missing_art(
     if tmdb in (None, "", 0, False):
         _art_debug(row, "metadata_no_tmdb", lookup_keys=sorted(ids.keys()))
         return
-    row["tmdb"] = tmdb
-    current_ids = dict(row.get("ids") or {}) if isinstance(row.get("ids"), Mapping) else {}
-    if _art_type(row) == "movie":
-        current_ids.setdefault("tmdb", tmdb)
-    else:
-        show_ids = dict(current_ids.get("show_ids") or {}) if isinstance(current_ids.get("show_ids"), Mapping) else {}
-        show_ids.setdefault("tmdb", tmdb)
-        current_ids.setdefault("show_ids", show_ids)
-    row["ids"] = current_ids
-    row["poster"] = _grid_art_url(row, size=size) if backdrop_fallback else _poster_url(row, size=size, episode_still=episode_still)
+    _apply_resolved_tmdb(row, tmdb, size=size, episode_still=episode_still, backdrop_fallback=backdrop_fallback)
     _art_debug(row, "metadata_resolved", tmdb=tmdb)
 
 
@@ -614,6 +649,19 @@ def _ensure_art_urls(
 
 
 _ART_RESOLVE_WORKERS = 8
+_ROW_WINDOW = 400
+
+
+def _window_per_source(entries: list, window: int | None, *, rank, source_of) -> list:
+    if window is None or window <= 0 or len(entries) <= window:
+        return list(entries)
+    buckets: dict[Any, list] = {}
+    for entry in entries:
+        buckets.setdefault(source_of(entry), []).append(entry)
+    out: list = []
+    for bucket in buckets.values():
+        out.extend(heapq.nlargest(window, bucket, key=rank) if len(bucket) > window else bucket)
+    return out
 
 
 def _needs_metadata_lookup(row: Mapping[str, Any]) -> bool:
@@ -761,13 +809,13 @@ def _rating_row(raw_key: str, item: Mapping[str, Any], sources: list[dict[str, s
 
 def _rating_aliases(row: Mapping[str, Any]) -> list[str]:
     title = _norm_text(row.get("title"))
-    if not title:
-        return []
     typ = str(row.get("type") or "").strip().lower() or "movie"
     season = _as_int(row.get("season"))
     episode = _as_int(row.get("episode"))
     year = _as_int(row.get("year"))
-    aliases = []
+    aliases = _media_id_aliases("rating", row)
+    if not title:
+        return aliases
     if typ == "episode" and season is not None and episode is not None:
         aliases.append(f"rating|episode|{title}|s{season}|e{episode}")
     elif typ == "season" and season is not None:
@@ -777,7 +825,71 @@ def _rating_aliases(row: Mapping[str, Any]) -> list[str]:
     return aliases
 
 
+def _id_alias_value(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _media_id_aliases(prefix: str, row: Mapping[str, Any], *, bucket: int | None = None) -> list[str]:
+    ids = _ids(row)
+    typ = str(row.get("type") or "").strip().lower() or "movie"
+    season = _as_int(row.get("season"))
+    episode = _as_int(row.get("episode"))
+    source = ids
+    suffix = ""
+    if typ == "episode":
+        show_ids = ids.get("show_ids") if isinstance(ids.get("show_ids"), Mapping) else {}
+        source = show_ids or ids
+        if season is None or episode is None:
+            return []
+        suffix = f"|s{season}|e{episode}"
+    elif typ == "season":
+        show_ids = ids.get("show_ids") if isinstance(ids.get("show_ids"), Mapping) else {}
+        source = show_ids or ids
+        if season is None:
+            return []
+        suffix = f"|s{season}"
+    aliases: list[str] = []
+    local: list[str] = []
+    show_scope = typ in {"episode", "season", "show"}
+    if isinstance(source, Mapping):
+        for key in _ID_KEYS:
+            if key == "slug":
+                continue
+            value = _id_alias_value(source.get(key))
+            if not value:
+                continue
+            base = f"{prefix}|id|{typ}|{key}:{value}{suffix}"
+            target = local if show_scope and key in _SERVER_SCOPED_ID_KEYS else aliases
+            if bucket is not None:
+                target.append(f"{base}|b{bucket}")
+            target.append(base)
+    return aliases or local
+
+
+def _history_id_aliases(row: Mapping[str, Any], *, bucket: int) -> list[str]:
+    return _media_id_aliases("history", row, bucket=bucket)
+
+
+def _progress_aliases(row: Mapping[str, Any]) -> list[str]:
+    return _media_id_aliases("progress", row)
+
+
+def _merged_row_ids(dst: Mapping[str, Any], src: Mapping[str, Any]) -> dict[str, Any]:
+    dst_ids = _as_dict(dst.get("ids"))
+    src_ids = _as_dict(src.get("ids"))
+    merged = _merge_ids(dst_ids, src_ids)
+    dst_show = dst_ids.get("show_ids") if isinstance(dst_ids.get("show_ids"), Mapping) else {}
+    src_show = src_ids.get("show_ids") if isinstance(src_ids.get("show_ids"), Mapping) else {}
+    show_ids = _merge_ids(_as_dict(dst_show), _as_dict(src_show))
+    if show_ids:
+        merged["show_ids"] = show_ids
+    return merged
+
+
 def _copy_richer_media_fields(dst: dict[str, Any], src: Mapping[str, Any]) -> None:
+    merged_ids = _merged_row_ids(dst, src)
+    if merged_ids:
+        dst["ids"] = merged_ids
     for key in ("tmdb", "poster", "cover", "ids"):
         if not dst.get(key) and src.get(key):
             dst[key] = src[key]
@@ -852,7 +964,9 @@ def latest_ratings_widget(
     limit: int = 12,
     tracker_items: Mapping[str, Any] | None = None,
     user_filter: Mapping[str, Any] | None = None,
+    window: int | None = None,
 ) -> dict[str, Any]:
+    window = window if window is not None else max(_ROW_WINDOW, min(int(limit or 12), 24) * 8)
     rows: dict[str, dict[str, Any]] = {}
     aliases: dict[str, str] = {}
 
@@ -871,14 +985,19 @@ def latest_ratings_widget(
         for alias in _rating_aliases(rows[match_key]):
             aliases[alias] = match_key
 
+    entries: list[tuple[tuple[int, int, str], int, str, dict[str, Any], list[dict[str, str]], bool]] = []
+
+    def _rank(item: Mapping[str, Any]) -> tuple[int, int, str]:
+        return (int(_rating_epoch(item) or 0), int(_update_epoch(item) or 0), str(_title(item) or ""))
+
     for raw_key, raw_item in (tracker_items or {}).items():
         item = _unwrap_rating_item(raw_item)
-        row = _rating_row(str(raw_key), item, _sources_from_item(item))
-        if row:
-            if not _sources_match_user(row.get("sources"), user_filter):
-                continue
-            row[_RATING_TRACKER_FLAG] = True
-            put(row)
+        if _rating_value(item) is None:
+            continue
+        sources = _sources_from_item(item)
+        if not _sources_match_user(sources, user_filter):
+            continue
+        entries.append((_rank(item), len(entries), str(raw_key), item, sources, True))
 
     providers = state.get("providers") if isinstance(state.get("providers"), Mapping) else {}
     provider_keys = sorted({str(p).upper() for p in providers.keys()}) if isinstance(providers, Mapping) else []
@@ -886,23 +1005,48 @@ def latest_ratings_widget(
         for instance, block in _provider_blocks(state, provider):
             if not _endpoint_matches_user(provider, instance, user_filter):
                 continue
+            ref = _provider_ref(provider, instance)
             for raw_key, raw_item in _feature_items(block, "ratings").items():
                 item = _unwrap_rating_item(raw_item)
-                row = _rating_row(str(raw_key), item, [_provider_ref(provider, instance)])
-                if not row:
+                if _rating_value(item) is None:
                     continue
-                put(row)
+                entries.append((_rank(item), len(entries), str(raw_key), item, [ref], False))
 
-    items = sorted(
-        rows.values(),
-        key=lambda x: (
-            int(x.get("sort_epoch") or 0),
-            int(x.get("updated_epoch") or 0),
-            str(x.get("title") or ""),
-        ),
-        reverse=True,
-    )
     cap = max(1, min(int(limit or 12), 24))
+
+    def _build(selected: list) -> list[dict[str, Any]]:
+        rows.clear()
+        aliases.clear()
+        for _rank_key, _ordinal, raw_key, item, sources, from_tracker in selected:
+            row = _rating_row(raw_key, item, sources)
+            if not row:
+                continue
+            if from_tracker:
+                row[_RATING_TRACKER_FLAG] = True
+            put(row)
+        return sorted(
+            rows.values(),
+            key=lambda x: (
+                int(x.get("sort_epoch") or 0),
+                int(x.get("updated_epoch") or 0),
+                str(x.get("title") or ""),
+            ),
+            reverse=True,
+        )
+
+    windowed = _window_per_source(
+        entries,
+        window,
+        rank=lambda entry: entry[0],
+        source_of=lambda entry: tuple(
+            (ref.get("provider"), ref.get("instance")) for ref in (entry[4] or [])
+        ),
+    )
+    windowed.sort(key=lambda entry: entry[1])
+
+    items = _build(windowed)
+    if len(items) < cap and len(windowed) < len(entries):
+        items = _build(entries)
     selected = _resolve_missing_art_rows(
         items[:cap], size="w300", episode_still=True, backdrop_fallback=True, resolve_art_type=True
     )
@@ -965,9 +1109,8 @@ def _activity_row(event: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _history_state_row(raw_key: str, item: Mapping[str, Any], sources: list[dict[str, str]]) -> dict[str, Any] | None:
-    sort_epoch = _history_sort_epoch(item) or _history_key_epoch(raw_key)
-    if sort_epoch <= 0:
-        return None
+    fallback_watched_at = str(item.get("_stremio_watched_at_fallback") or "").strip()
+    sort_epoch = 0 if fallback_watched_at else (_history_sort_epoch(item) or _history_key_epoch(raw_key))
     return {
         "id": str(raw_key or ""),
         "key": _history_key(raw_key, item),
@@ -1035,8 +1178,6 @@ def _history_alias_representatives() -> dict[str, str]:
 def _history_aliases(row: Mapping[str, Any], alias_map: Mapping[str, str] | None = None) -> list[str]:
     rep = (alias_map or {}).get(str(row.get("id") or "").split("@", 1)[0])
     title = _norm_text(row.get("title"))
-    if not title:
-        return [f"history|xalias|{rep}"] if rep else []
     typ = str(row.get("type") or "").strip().lower() or "movie"
     bucket = _time_bucket(row.get("sort_epoch") or row.get("watched_at"))
     year = _as_int(row.get("year"))
@@ -1045,6 +1186,9 @@ def _history_aliases(row: Mapping[str, Any], alias_map: Mapping[str, str] | None
     aliases: list[str] = []
     if rep:
         aliases.append(f"history|xalias|{rep}")
+    aliases.extend(_history_id_aliases(row, bucket=bucket))
+    if not title:
+        return aliases
     if typ == "episode" and season is not None and episode is not None:
         aliases.append(f"history|episode|{title}|s{season}|e{episode}|b{bucket}")
         aliases.append(f"history|episode|{title}|s{season}|e{episode}")
@@ -1058,45 +1202,108 @@ def _history_aliases(row: Mapping[str, Any], alias_map: Mapping[str, str] | None
     return aliases
 
 
-def _latest_history_state_rows(state: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+def _latest_history_state_rows(
+    state: Mapping[str, Any],
+    *,
+    user_filter: Mapping[str, Any] | None = None,
+    window: int | None = None,
+) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
+    entries: list[tuple[int, int, str, dict[str, Any], dict[str, str]]] = []
+    for provider, instance, block in _history_provider_blocks(state, user_filter):
+        ref = _provider_ref(provider, instance)
+        for raw_key, raw_item in _feature_items(block, "history").items():
+            item = _unwrap_history_item(raw_item)
+            key = str(raw_key)
+            epoch = int(_history_sort_epoch(item) or _history_key_epoch(key) or 0)
+            entries.append((epoch, len(entries), key, item, ref))
+    entries = _window_per_source(
+        entries,
+        window,
+        rank=lambda entry: entry[0],
+        source_of=lambda entry: (entry[4]["provider"], entry[4]["instance"]),
+    )
+    entries.sort(key=lambda entry: entry[1])
+    for _epoch, _ordinal, raw_key, item, ref in entries:
+        row = _history_state_row(raw_key, item, [ref])
+        if not row:
+            continue
+        key = str(row["key"])
+        prev = rows.get(key)
+        if not prev:
+            rows[key] = row
+            continue
+        prev_sources = prev.setdefault("sources", [])
+        for src in row.get("sources") or []:
+            if src not in prev_sources:
+                prev_sources.append(src)
+        if int(row.get("sort_epoch") or 0) >= int(prev.get("sort_epoch") or 0):
+            row["sources"] = prev_sources
+            rows[key] = row
+    return sorted(rows.values(), key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
+
+
+def _history_provider_blocks(state: Mapping[str, Any], user_filter: Mapping[str, Any] | None):
     providers = state.get("providers") if isinstance(state.get("providers"), Mapping) else {}
     provider_keys = sorted({str(p).upper() for p in providers.keys()}) if isinstance(providers, Mapping) else []
     for provider in provider_keys:
         for instance, block in _provider_blocks(state, provider):
             if not _endpoint_matches_user(provider, instance, user_filter):
                 continue
-            for raw_key, raw_item in _feature_items(block, "history").items():
-                item = _unwrap_history_item(raw_item)
-                row = _history_state_row(str(raw_key), item, [_provider_ref(provider, instance)])
-                if not row:
-                    continue
-                key = str(row["key"])
-                prev = rows.get(key)
-                if not prev:
-                    rows[key] = row
-                    continue
-                prev_sources = prev.setdefault("sources", [])
-                for src in row.get("sources") or []:
-                    if src not in prev_sources:
-                        prev_sources.append(src)
-                if int(row.get("sort_epoch") or 0) >= int(prev.get("sort_epoch") or 0):
-                    row["sources"] = prev_sources
-                    rows[key] = row
-    return sorted(rows.values(), key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
+            yield provider, instance, block
 
 
-def _latest_history_tracker_rows(items: Mapping[str, Any], *, user_filter: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
-    rows: dict[str, dict[str, Any]] = {}
-    for raw_key, raw_item in (items or {}).items():
+def _latest_history_tracker_rows(
+    items: Mapping[str, Any],
+    *,
+    user_filter: Mapping[str, Any] | None = None,
+    window: int | None = None,
+) -> list[dict[str, Any]]:
+    entries: list[tuple[int, int, str, dict[str, Any], list[dict[str, str]]]] = []
+    for ordinal, (raw_key, raw_item) in enumerate((items or {}).items()):
         item = _unwrap_history_item(raw_item)
-        row = _history_state_row(str(raw_key), item, _sources_from_item(item))
-        if not row:
+        sources = _sources_from_item(item)
+        if not _sources_match_user(sources, user_filter):
             continue
-        if not _sources_match_user(row.get("sources"), user_filter):
+        key = str(raw_key)
+        epoch = int(_history_sort_epoch(item) or _history_key_epoch(key) or 0)
+        entries.append((epoch, ordinal, key, item, sources))
+    if window is not None and window > 0 and len(entries) > window:
+        entries = heapq.nlargest(window, entries, key=lambda entry: entry[0])
+        entries.sort(key=lambda entry: entry[1])
+    rows: dict[str, dict[str, Any]] = {}
+    for _epoch, _ordinal, raw_key, item, sources in entries:
+        row = _history_state_row(raw_key, item, sources)
+        if not row:
             continue
         rows[str(row["key"])] = row
     return sorted(rows.values(), key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
+
+
+_HISTORY_TRUSTED_ALIAS_PREFIXES = ("history|id|", "history|xalias|")
+
+
+def _history_identity_ids(row: Mapping[str, Any]) -> dict[str, str]:
+    ids = _ids(row)
+    source: Any = ids
+    if str(row.get("type") or "").strip().lower() in {"episode", "season"}:
+        source = ids.get("show_ids")
+    if not isinstance(source, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for key in _ID_KEYS:
+        if key == "slug" or key in _SERVER_SCOPED_ID_KEYS:
+            continue
+        value = _id_alias_value(source.get(key))
+        if value:
+            out[key] = value
+    return out
+
+
+def _history_identity_conflict(prev: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
+    prev_ids = _history_identity_ids(prev)
+    row_ids = _history_identity_ids(row)
+    return any(prev_ids[key] != value for key, value in row_ids.items() if key in prev_ids)
 
 
 def _merge_history_rows(
@@ -1105,6 +1312,7 @@ def _merge_history_rows(
 ) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     aliases: dict[str, str] = {}
+    epochs: dict[str, list[int]] = {}
     for group in groups:
         for raw in group:
             row = dict(raw)
@@ -1113,19 +1321,95 @@ def _merge_history_rows(
                 continue
             match_key = key
             for alias in _history_aliases(row, alias_map):
-                if alias in aliases:
-                    match_key = aliases[alias]
-                    break
+                if alias not in aliases:
+                    continue
+                if not alias.startswith(_HISTORY_TRUSTED_ALIAS_PREFIXES) and _history_identity_conflict(rows[aliases[alias]], row):
+                    continue
+                match_key = aliases[alias]
+                break
             prev = rows.get(match_key)
             if not prev:
                 rows[match_key] = row
             else:
                 rows[match_key] = _merge_media_row(prev, row, sort_key="sort_epoch")
+            epoch = int(row.get("sort_epoch") or row.get("watched_at") or 0)
+            if epoch > 0:
+                epochs.setdefault(match_key, []).append(epoch)
             for alias in _history_aliases(rows[match_key], alias_map):
                 aliases[alias] = match_key
             for alias in _history_aliases(row, alias_map):
                 aliases.setdefault(alias, match_key)
-    return sorted(rows.values(), key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
+    dated_rows = []
+    for match_key, row in rows.items():
+        if int(row.get("sort_epoch") or row.get("watched_at") or 0) <= 0:
+            continue
+        watches = _distinct_watches(epochs.get(match_key) or [])
+        row["watch_count"] = len(watches)
+        if len(watches) > 1:
+            row["watch_epochs"] = watches
+        dated_rows.append(row)
+    return sorted(dated_rows, key=lambda x: int(x.get("sort_epoch") or 0), reverse=True)
+
+
+def _distinct_watches(epochs: Iterable[int]) -> list[int]:
+    watches: list[int] = []
+    for epoch in sorted(set(epochs), reverse=True):
+        if not watches or watches[-1] - epoch > _HISTORY_BUCKET_SECONDS:
+            watches.append(epoch)
+    return watches
+
+
+def _plex_history_identity_aliases(item: Mapping[str, Any]) -> list[str]:
+    row = {"type": _media_type(item), "season": _season_number(item), "episode": _episode_number(item), "ids": _ids(item)}
+    return [alias for alias in _media_id_aliases("history", row)
+            if any(f"|{key}:" in alias for key in ("tmdb", "imdb", "tvdb")) or "|guid:plex://" in alias]
+
+
+def _complete_plex_history_sources(
+    rows: list[dict[str, Any]], state: Mapping[str, Any], user_filter: Mapping[str, Any] | None,
+) -> None:
+    from cw_platform.config_base import load_config
+
+    if not any(source.get("provider") == "PLEX" for row in rows for source in row.get("sources") or []):
+        return
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        return
+    partners: dict[str, set[str]] = {}
+    for pair in cfg.get("pairs") or []:
+        if not isinstance(pair, Mapping) or pair.get("enabled") is False:
+            continue
+        if str(pair.get("source") or "").upper() != "PLEX" or str(pair.get("target") or "").upper() != "PLEX":
+            continue
+        feature = (pair.get("features") or {}).get("history")
+        if not isinstance(feature, Mapping) or feature.get("enable") is False:
+            continue
+        src = normalize_instance_id(pair.get("source_instance"))
+        dst = normalize_instance_id(pair.get("target_instance"))
+        if src == dst or not all(_endpoint_matches_user("PLEX", instance, user_filter) for instance in (src, dst)):
+            continue
+        partners.setdefault(src, set()).add(dst)
+        partners.setdefault(dst, set()).add(src)
+    if not partners:
+        return
+    matches: dict[tuple[str, str], set[int]] = {}
+    for index, row in enumerate(rows):
+        existing = {normalize_instance_id(source.get("instance")) for source in row.get("sources") or []
+                    if source.get("provider") == "PLEX"}
+        candidates = {partner for instance in existing for partner in partners.get(instance, set())} - existing
+        for instance in candidates:
+            for alias in _plex_history_identity_aliases(row):
+                matches.setdefault((instance, alias), set()).add(index)
+    instances = {instance for instance, _alias in matches}
+    for provider, instance, block in _history_provider_blocks(state, user_filter):
+        if provider != "PLEX" or instance not in instances:
+            continue
+        source = {"sources": [_provider_ref("PLEX", instance)]}
+        for raw_item in _feature_items(block, "history").values():
+            for alias in _plex_history_identity_aliases(_unwrap_history_item(raw_item)):
+                for index in matches.get((instance, alias), ()):
+                    _merge_sources(rows[index], source)
 
 
 def recent_history_widget(
@@ -1136,21 +1420,29 @@ def recent_history_widget(
     user_filter: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     cap = max(1, min(int(limit or 8), 24))
-    state_rows = _latest_history_state_rows(state or {}, user_filter=user_filter)
-    tracker_rows = _latest_history_tracker_rows(tracker_items or {}, user_filter=user_filter)
-    rows = _merge_history_rows(state_rows, tracker_rows, alias_map=_history_alias_representatives())
-    selected = _resolve_missing_art_rows(rows[:cap], size="w300", episode_still=True)
+    window = max(_ROW_WINDOW, cap * 8)
+    alias_map = _history_alias_representatives()
+    state_rows = _latest_history_state_rows(state or {}, user_filter=user_filter, window=window)
+    tracker_rows = _latest_history_tracker_rows(tracker_items or {}, user_filter=user_filter, window=window)
+    rows = _merge_history_rows(state_rows, tracker_rows, alias_map=alias_map)
+    if len(rows) < cap and (len(state_rows) >= window or len(tracker_rows) >= window):
+        state_rows = _latest_history_state_rows(state or {}, user_filter=user_filter, window=None)
+        tracker_rows = _latest_history_tracker_rows(tracker_items or {}, user_filter=user_filter, window=None)
+        rows = _merge_history_rows(state_rows, tracker_rows, alias_map=alias_map)
+    selected = rows[:cap]
+    _complete_plex_history_sources(selected, state or {}, user_filter)
+    selected = _resolve_missing_art_rows(selected, size="w300", episode_still=True)
     return {"ok": True, "items": selected, "total": len(rows)}
 
 
 def recent_scrobble_widget(*, limit: int = 8, user_filter: Mapping[str, Any] | None = None) -> dict[str, Any]:
     cap = max(1, min(int(limit or 8), 24))
-    payload = list_events(limit=max(cap, 12), offset=0, status="ok", kind="all", group_routes=True)
+    payload = list_events(limit=ACTIVITY_DEFAULT_LIMIT, offset=0, status="ok", kind="all", group_routes=True)
     rows = [
         row
         for item in payload.get("items") or []
-        for row in [_activity_row(item)]
         if isinstance(item, Mapping) and str(item.get("kind") or "").strip().lower() in {"scrobble", "history_sync"}
+        for row in [_activity_row(item)]
         if _sources_match_user(row.get("sources"), user_filter)
     ]
     selected = _resolve_missing_art_rows(rows[:cap], size="w300", episode_still=True)
@@ -1263,13 +1555,23 @@ def recent_progress_widget(
     user_filter: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows: dict[str, dict[str, Any]] = {}
+    aliases: dict[str, str] = {}
 
     def put(row: dict[str, Any]) -> None:
         key = str(row.get("key") or row.get("id") or "")
         if not key:
             return
-        prev = rows.get(key)
-        rows[key] = _merge_media_row(prev, row, sort_key="sort_epoch") if prev else row
+        match_key = key
+        for alias in _progress_aliases(row):
+            if alias in aliases:
+                match_key = aliases[alias]
+                break
+        prev = rows.get(match_key)
+        rows[match_key] = _merge_media_row(prev, row, sort_key="sort_epoch") if prev else row
+        for alias in _progress_aliases(rows[match_key]):
+            aliases[alias] = match_key
+        for alias in _progress_aliases(row):
+            aliases.setdefault(alias, match_key)
 
     for raw_key, raw_item in (tracker_items or {}).items():
         item = raw_item if isinstance(raw_item, Mapping) else {}
@@ -1302,7 +1604,7 @@ def recent_playlists_widget(*, limit: int = 8, user_filter: Mapping[str, Any] | 
         from cw_platform.config_base import load_config
         from services import playlists
 
-        rows = playlists.activity(load_config() or {}, limit=max(1, min(int(limit or 8), 24)))
+        rows = playlists.activity(load_config() or {}, limit=None)
         if _normalize_user_filter(user_filter):
             rows = [
                 row for row in rows
@@ -1310,7 +1612,8 @@ def recent_playlists_widget(*, limit: int = 8, user_filter: Mapping[str, Any] | 
             ]
     except Exception:
         rows = []
-    return {"ok": True, "items": rows, "total": len(rows)}
+    cap = max(1, min(int(limit or 8), 24))
+    return {"ok": True, "items": rows[:cap], "total": len(rows)}
 
 
 def dashboard_widgets_payload(
@@ -1323,6 +1626,7 @@ def dashboard_widgets_payload(
     playlists_limit: int = 8,
     include: set[str] | None = None,
     user_filter: Mapping[str, Any] | None = None,
+    media_scope: Any = None,
 ) -> dict[str, Any]:
     requested = {str(key).strip().lower() for key in include} if include is not None else {
         "history",
@@ -1331,12 +1635,17 @@ def dashboard_widgets_payload(
         "progress",
         "playlists",
     }
+
+    def tracker(feature: str) -> dict[str, Any]:
+        items = _tracker_feature_items(feature)
+        return media_scope.tracker(items, feature) if media_scope else items
+
     payload: dict[str, Any] = {"ok": True}
     if "history" in requested:
         payload["recent_history"] = recent_history_widget(
             state,
             limit=history_limit,
-            tracker_items=_tracker_feature_items("history"),
+            tracker_items=tracker("history"),
             user_filter=user_filter,
         )
     if "scrobble" in requested:
@@ -1345,14 +1654,14 @@ def dashboard_widgets_payload(
         payload["latest_ratings"] = latest_ratings_widget(
             state,
             limit=ratings_limit,
-            tracker_items=_tracker_feature_items("ratings"),
+            tracker_items=tracker("ratings"),
             user_filter=user_filter,
         )
     if "progress" in requested:
         payload["recent_progress"] = recent_progress_widget(
             state,
             limit=progress_limit,
-            tracker_items=_tracker_feature_items("progress"),
+            tracker_items=tracker("progress"),
             user_filter=user_filter,
         )
     if "playlists" in requested:

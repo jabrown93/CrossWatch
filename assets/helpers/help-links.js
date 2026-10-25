@@ -13,8 +13,13 @@
     tmdb: "crosswatch/settings/connections/trackers/tmdb",
     mdblist: "crosswatch/settings/connections/trackers/mdblist",
     publicmetadb: "crosswatch/settings/connections/trackers/publicmetadb",
+    kitsu: "crosswatch/settings/connections/trackers/kitsu",
+    myanimelist: "crosswatch/settings/connections/trackers/myanimelist",
     anilist: "crosswatch/settings/connections/trackers/anilist",
+    wetrakr: "crosswatch/settings/connections/trackers/wetrakr",
     punchplay: "crosswatch/settings/connections/trackers/punchplay",
+    bingebase: "crosswatch/settings/connections/trackers/bingebase",
+    flicklist: "crosswatch/settings/connections/trackers/flicklist",
     floppy: "crosswatch/settings/connections/trackers/floppy",
     scrob: "crosswatch/settings/connections/trackers/scrob",
     crosswatch: "crosswatch/settings/connections/trackers/crosswatch",
@@ -22,6 +27,7 @@
     kodi: "crosswatch/settings/connections/media-clients/kodi",
     stremio: "crosswatch/settings/connections/media-clients/stremio",
     tautulli: "crosswatch/settings/connections/others/tautulli",
+    tracearr: "crosswatch/settings/connections/others/tracearr",
     "tmdb-metadata": "crosswatch/settings/connections/metadata/tmdb-metadata",
     "anime-mapping": "crosswatch/settings/connections/metadata/anime-id-mapping",
     "connection-profiles": "crosswatch/settings/connections/profiles",
@@ -36,7 +42,7 @@
 
   function url(key){
     const rel = path(key);
-    return rel ? BASE + rel : BASE;
+    return /^https:\/\//.test(rel) ? rel : rel ? BASE + rel : BASE;
   }
 
   const HelpLinks = Object.freeze({ base: BASE, paths: PATHS, path, url });

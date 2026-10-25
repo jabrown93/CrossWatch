@@ -3,27 +3,57 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.path_matching import media_paths
+
 import json
+import hashlib
 import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import unicodedata
 import uuid
 import socket
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from threading import RLock
-from typing import Any, Iterable, Mapping
+from threading import RLock, local
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit, quote
 
 from .._log import log as cw_log
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope
+from cw_platform.app_version import app_version, user_agent as http_user_agent
+from cw_platform.log_context import log_run_id
+from cw_platform.id_map import ids_from
 
 import requests
 
 STATE_DIR = Path("/config/.cw_state")
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def scope_safe() -> str:
@@ -36,7 +66,7 @@ def state_file(name: str) -> Path:
     p = Path(name)
     scoped = STATE_DIR / (f"{p.stem}.{safe}{p.suffix}" if p.suffix else f"{name}.{safe}")
     legacy = STATE_DIR / (f"{p.stem}{p.suffix}" if p.suffix else name)
-    if (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
+    if not str(_pair_scope() or "").startswith("cw2_") and (not _is_capture_mode()) and (not scoped.exists()) and legacy.exists():
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(legacy, scoped)
@@ -87,7 +117,22 @@ try:
 except ImportError:
     from _id_map import minimal as id_minimal, ids_from_guid  # type: ignore
 
-_PLEX_CTX: dict[str, str | None] = {"baseurl": None, "token": None, "account_token": None}
+_PLEX_CTX: dict[str, Any] = {"baseurl": None, "token": None, "account_token": None, "session": None}
+_SCOPED_PLEX_CTX: ContextVar[dict[str, Any] | None] = ContextVar("plex_context", default=None)
+
+
+def plex_context() -> dict[str, Any]:
+    scoped = _SCOPED_PLEX_CTX.get()
+    return scoped if scoped is not None else _PLEX_CTX
+
+
+@contextmanager
+def isolated_plex_context():
+    token = _SCOPED_PLEX_CTX.set({"baseurl": None, "token": None, "account_token": None, "session": None})
+    try:
+        yield
+    finally:
+        _SCOPED_PLEX_CTX.reset(token)
 
 
 def configure_plex_context(
@@ -95,11 +140,14 @@ def configure_plex_context(
     baseurl: str | None,
     token: str | None,
     account_token: str | None = None,
+    session: requests.Session | None = None,
 ) -> None:
-    _PLEX_CTX["baseurl"] = baseurl.rstrip("/") if isinstance(baseurl, str) else None
-    _PLEX_CTX["token"] = token or None
-    if account_token:
-        _PLEX_CTX["account_token"] = account_token
+    context = plex_context()
+    context["baseurl"] = baseurl.rstrip("/") if isinstance(baseurl, str) else None
+    context["token"] = token or None
+    context["session"] = session
+    if account_token is not None:
+        context["account_token"] = account_token or None
 
 
 DISCOVER = "https://discover.provider.plex.tv"
@@ -282,7 +330,7 @@ def emit(evt: dict[str, Any], *, default_feature: str = "common") -> None:
                         cw_log("PLEX", s_feat, s_level, s_event, **s_fields)
                     return
 
-                if mode == "summary" and not act.endswith("_miss"):
+                if mode == "summary":
                     _meta_enrich_note_suppressed()
                     summ = _meta_enrich_maybe_flush()
                     if summ:
@@ -382,10 +430,10 @@ def active_pms_token(source: Any) -> str | None:
         seen.add(marker)
         candidates.append(obj)
 
+    add(getattr(getattr(source, "client", None), "server", None))
+    add(getattr(source, "server", None))
     add(source)
     add(getattr(source, "client", None))
-    add(getattr(source, "server", None))
-    add(getattr(getattr(source, "client", None), "server", None))
     add(getattr(source, "cfg", None))
     add(getattr(getattr(source, "client", None), "cfg", None))
 
@@ -431,6 +479,11 @@ def active_cloud_token(source: Any) -> str | None:
                 return str(tok).strip()
         except Exception:
             pass
+    for obj in (source, getattr(source, "client", None)):
+        cfg = getattr(obj, "cfg", None)
+        token = getattr(cfg, "token", None)
+        if token and str(token).strip():
+            return str(token).strip()
     return active_pms_token(source)
 
 
@@ -451,7 +504,7 @@ def plex_headers(
     user_agent: str | None = None,
 ) -> dict[str, str]:
     cid = str(client_id or CLIENT_ID or "").strip() or stable_client_id()
-    version_s = str(version or os.environ.get("CW_PLEX_VERSION") or os.environ.get("CW_VERSION") or "").strip() or "unknown"
+    version_s = str(version or app_version()).strip()
     headers = {
         "X-Plex-Product": product,
         "X-Plex-Platform": platform,
@@ -460,7 +513,7 @@ def plex_headers(
         "X-Plex-Token": token,
         "Accept": accept,
     }
-    ua = str(user_agent or os.environ.get("CW_PLEX_UA") or os.environ.get("CW_UA") or "").strip()
+    ua = str(user_agent or http_user_agent("Plex", override_env="CW_PLEX_UA")).strip()
     if ua:
         headers["User-Agent"] = ua
     return headers
@@ -559,15 +612,51 @@ def meta_guids(meta_obj: Any) -> list[str]:
     return vals
 
 
+_LOOKUP_SCOPE: ContextVar[tuple[Any, ...] | None] = ContextVar("plex_lookup_scope", default=None)
+_LOOKUP_CACHE = local()
+
+
+@contextmanager
+def guid_lookup_scope(key: tuple[Any, ...]):
+    token = _LOOKUP_SCOPE.set(key)
+    try:
+        yield
+    finally:
+        _LOOKUP_SCOPE.reset(token)
+
+
+def _guid_query_cache() -> dict[str, str | None]:
+    key = _LOOKUP_SCOPE.get()
+    if key is None:
+        return {}
+    entry = getattr(_LOOKUP_CACHE, "entry", None)
+    if entry is None or entry[0] != key or (not log_run_id.get() and time.monotonic() - entry[1] >= 300):
+        entry = (key, time.monotonic(), {})
+        _LOOKUP_CACHE.entry = entry
+    return entry[2]
+
+
 def server_find_rating_key_by_guid(srv: Any, guids: Iterable[str]) -> str | None:
+    candidates = list(dict.fromkeys(str(g) for g in (guids or []) if g))
+    cache = _guid_query_cache()
+    queried: set[str] = set()
     # PlexAPI XML query path
     try:
-        for g in [x for x in (guids or []) if x]:
+        for g in candidates:
+            if g in cache:
+                if cache[g]:
+                    return cache[g]
+                queried.add(g)
+                continue
             try:
                 qg = quote(str(g), safe="")
                 root = srv.query(  # type: ignore[attr-defined]
                     f"/library/all?guid={qg}&X-Plex-Container-Start=0&X-Plex-Container-Size=1"
                 )
+                # A valid empty response is a completed lookup. Raw HTTP is
+                # only needed if PlexAPI could not query or parse this GUID.
+                if root is not None and getattr(root, "tag", None) == "MediaContainer":
+                    queried.add(g)
                 el = None
                 try:
                     el = root.find(".//*[@ratingKey]") if root is not None else None
@@ -577,7 +666,10 @@ def server_find_rating_key_by_guid(srv: Any, guids: Iterable[str]) -> str | None
                     a = getattr(el, "attrib", {}) or {}
                     rk = a.get("ratingKey") or a.get("ratingkey")
                     if rk:
+                        cache[g] = str(rk)
                         return str(rk)
+                if g in queried and root is not None and not list(root) and root.get("size") == "0":
+                    cache[g] = None
             except Exception:
                 continue
     except Exception:
@@ -593,7 +685,9 @@ def server_find_rating_key_by_guid(srv: Any, guids: Iterable[str]) -> str | None
     hdrs = dict(getattr(ses, "headers", {}) or {})
     hdrs.update(plex_headers(tok, accept="application/xml, application/json;q=0.9,*/*;q=0.5"))
 
-    for g in [x for x in (guids or []) if x]:
+    for g in candidates:
+        if g in queried:
+            continue
         try:
             r = ses.get(
                 f"{base}/library/all",
@@ -608,15 +702,19 @@ def server_find_rating_key_by_guid(srv: Any, guids: Iterable[str]) -> str | None
 
             # JSON path
             if "json" in ct:
-                try:
-                    j = r.json()
-                except Exception:
-                    j = {}
-                md = (j.get("MediaContainer", {}) or {}).get("Metadata") or []
+                j = r.json()
+                container = j.get("MediaContainer") if isinstance(j, Mapping) else None
+                if not isinstance(container, Mapping):
+                    continue
+                md = container.get("Metadata") or []
                 if md and isinstance(md, list):
                     rk = md[0].get("ratingKey") or md[0].get("ratingkey")
                     if rk:
+                        cache[g] = str(rk)
                         return str(rk)
+                if not md and (container.get("size") == 0 or container.get("Metadata") == []):
+                    cache[g] = None
+                continue
 
             # XML path
             try:
@@ -628,13 +726,17 @@ def server_find_rating_key_by_guid(srv: Any, guids: Iterable[str]) -> str | None
             if el is not None:
                 rk = (el.attrib or {}).get("ratingKey") or (el.attrib or {}).get("ratingkey")
                 if rk:
+                    cache[g] = str(rk)
                     return str(rk)
+            if root.tag == "MediaContainer" and not list(root) and root.get("size") == "0":
+                cache[g] = None
         except Exception:
             pass
     return None
 
 
 _FBGUID_MEMO: dict[str, Any] = {}
+_FBGUID_MEMO_PATH: Path | None = None
 _FBGUID_NOHIT = "__NOHIT__"
 def _fbguid_cache_path() -> Path:
     return state_file("plex_fallback_memo.json")
@@ -692,10 +794,18 @@ def _fb_key_from_row(row: Any) -> str:
 
 
 def _fb_cache_load() -> dict[str, Any]:
+    global _FBGUID_MEMO_PATH, _FBGUID_MEMO_DIRTY
+    path = _fbguid_cache_path()
+    if path != _FBGUID_MEMO_PATH:
+        if _FBGUID_MEMO_DIRTY and _FBGUID_MEMO_PATH is not None:
+            _fb_cache_save()
+        _FBGUID_MEMO.clear()
+        _FBGUID_MEMO_DIRTY = False
+        _FBGUID_MEMO_PATH = path
     if _FBGUID_MEMO:
         return _FBGUID_MEMO
     try:
-        data = read_json(_fbguid_cache_path())
+        data = read_json(path)
         if isinstance(data, dict):
             _FBGUID_MEMO.update(data)
     except Exception:
@@ -705,7 +815,7 @@ def _fb_cache_load() -> dict[str, Any]:
 
 def _fb_cache_save() -> None:
     try:
-        write_json(_fbguid_cache_path(), _FBGUID_MEMO, indent=0, sort_keys=False, separators=(",", ":"))
+        write_json(_FBGUID_MEMO_PATH or _fbguid_cache_path(), _FBGUID_MEMO, indent=0, sort_keys=False, separators=(",", ":"))
     except Exception:
         pass
 
@@ -721,19 +831,45 @@ def _fb_cache_flush() -> None:
 _SHOW_PMS_GUID_CACHE: dict[str, dict[str, str]] = {}
 _EP_SHOW_IDS_CACHE: dict[str, dict[str, str]] = {}
 
+def _metadata_cache_key(rating_key: str, token: str | None = None, base: str | None = None) -> str:
+    identity = [scope_safe(), base or plex_context().get("baseurl"), token or plex_context().get("token"), plex_context().get("account_token"), getattr(plex_context().get("session"), "verify", True)]
+    digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    return f"{digest}:{rating_key}"
+
+
+def _metadata_request(base: str, rating_key: str, token: str, *, session: Any = None, timeout: int = 10) -> requests.Response:
+    cloud = base.rstrip("/") == METADATA
+    source = "meta" if cloud else "pms"
+    if not cloud and session is None and base.rstrip("/") == plex_context().get("baseurl"):
+        session = plex_context().get("session")
+    get = requests.get if cloud or session is None else session.get
+    try:
+        response = get(
+            f"{base.rstrip('/')}/library/metadata/{rating_key}",
+            headers=plex_headers(token), params={"includeGuids": 1}, timeout=timeout,
+            verify=False if cloud else getattr(session, "verify", True),
+        )
+    except requests.RequestException as exc:
+        _warn("hydrate_request_failed", rk=rating_key, source=source, error_type=type(exc).__name__)
+        raise
+    if not response.ok:
+        log = _dbg if response.status_code == 404 else _warn
+        log("hydrate_miss", rk=rating_key, source=source, status=response.status_code)
+    return response
+
+
 def _hydrate_show_ids_from_episode_rk(token: str | None, episode_rk: str | None) -> dict[str, str]:
     if not token or not episode_rk:
         return {}
     rk = str(episode_rk).strip()
     if not rk:
         return {}
+    key = _metadata_cache_key(rk, token)
 
-    if rk in _EP_SHOW_IDS_CACHE:
-        return dict(_EP_SHOW_IDS_CACHE[rk])
+    if key in _EP_SHOW_IDS_CACHE:
+        return dict(_EP_SHOW_IDS_CACHE[key])
 
-    headers = plex_headers(token)
-    headers["Accept"] = "application/json, application/xml;q=0.9,*/*;q=0.5"
-    base = str(_PLEX_CTX.get("baseurl") or "").strip().rstrip("/")
+    base = str(plex_context().get("baseurl") or "").strip().rstrip("/")
 
     def _parse(r: requests.Response) -> dict[str, str]:
         ctype = (r.headers.get("content-type") or "").lower()
@@ -758,23 +894,24 @@ def _hydrate_show_ids_from_episode_rk(token: str | None, episode_rk: str | None)
                 out.update({k: v for k, v in extra.items() if v})
         return {k: v for k, v in out.items() if v}
 
-    urls: list[str] = []
+    bases: list[str] = []
     if base:
-        urls.append(f"{base}/library/metadata/{rk}")
-    urls.append(f"{METADATA}/library/metadata/{rk}")
+        bases.append(base)
+    bases.append(METADATA)
 
-    for url in urls:
+    for target in bases:
         try:
-            r = requests.get(url, headers=headers, params={"includeGuids": 1}, timeout=10)
+            request_token = str(plex_context().get("account_token") or token) if target == METADATA else token
+            r = _metadata_request(target, rk, request_token)
             if not r.ok:
                 continue
             ids = _parse(r)
-            _EP_SHOW_IDS_CACHE[rk] = dict(ids)
+            _EP_SHOW_IDS_CACHE[key] = dict(ids)
             return dict(ids)
         except Exception:
             continue
 
-    _EP_SHOW_IDS_CACHE[rk] = {}
+    _EP_SHOW_IDS_CACHE[key] = {}
     return {}
 
 
@@ -783,24 +920,17 @@ def _hydrate_show_ids_from_pms(obj: Any) -> dict[str, str]:
     if not rk:
         return {}
     rk = str(rk)
-    if rk in _SHOW_PMS_GUID_CACHE:
-        return _SHOW_PMS_GUID_CACHE[rk]
     srv = getattr(obj, "_server", None)
-    base = _as_base_url(srv) or _PLEX_CTX["baseurl"]
-    token = getattr(srv, "token", None) or getattr(srv, "_token", None) or _PLEX_CTX["token"]
+    key = _metadata_cache_key(rk, getattr(srv, "token", None) or getattr(srv, "_token", None), _as_base_url(srv))
+    if key in _SHOW_PMS_GUID_CACHE:
+        return _SHOW_PMS_GUID_CACHE[key]
+    base = _as_base_url(srv) or plex_context()["baseurl"]
+    token = getattr(srv, "token", None) or getattr(srv, "_token", None) or plex_context()["token"]
     if not base or not token:
-        _SHOW_PMS_GUID_CACHE[rk] = {}
+        _SHOW_PMS_GUID_CACHE[key] = {}
         return {}
-    url = f"{base}/library/metadata/{rk}?includeGuids=1"
     try:
-        r = requests.get(
-            url,
-            headers={
-                "X-Plex-Token": token,
-                "Accept": "application/json, application/xml;q=0.9, */*;q=0.5",
-            },
-            timeout=8,
-        )
+        r = _metadata_request(base, rk, token, session=getattr(srv, "_session", None), timeout=8)
         ids: dict[str, str] = {}
         if r.ok:
             ctype = (r.headers.get("content-type") or "").lower()
@@ -823,11 +953,11 @@ def _hydrate_show_ids_from_pms(obj: Any) -> dict[str, str]:
                         if gid:
                             ids.update(ids_from_guid(str(gid)))
         ids = {k: v for k, v in ids.items() if v}
-        _SHOW_PMS_GUID_CACHE[rk] = ids
+        _SHOW_PMS_GUID_CACHE[key] = ids
         return ids
     except Exception as e:
         _warn("hydrate_show_pms_failed", rk=rk, error=str(e))
-        _SHOW_PMS_GUID_CACHE[rk] = {}
+        _SHOW_PMS_GUID_CACHE[key] = {}
         return {}
 
 
@@ -846,6 +976,9 @@ def _xml_to_container(xml_text: str) -> Mapping[str, Any]:
             "viewCount": _safe_int(a.get("viewCount")),
             "viewedAt": _safe_int(a.get("viewedAt")),
             "lastViewedAt": _safe_int(a.get("lastViewedAt")),
+            "addedAt": _safe_int(a.get("addedAt")),
+            "updatedAt": _safe_int(a.get("updatedAt")),
+            "originallyAvailableAt": a.get("originallyAvailableAt"),
             "guid": a.get("guid"),
             "ratingKey": a.get("ratingKey"),
             "parentGuid": a.get("parentGuid"),
@@ -916,16 +1049,15 @@ def hydrate_external_ids(token: str | None, rating_key: str | None) -> dict[str,
     rk = str(rating_key).strip()
     if not rk:
         return {}
+    key = _metadata_cache_key(rk, token)
     with _HYDRATE_LOCK:
-        if rk in _GUID_CACHE:
-            return _GUID_CACHE[rk]
-        if rk in _HYDRATE_404:
+        if key in _GUID_CACHE:
+            return _GUID_CACHE[key]
+        if key in _HYDRATE_404:
             return {}
 
-    headers = plex_headers(token)
-    cloud_token = str(_PLEX_CTX.get("account_token") or "").strip() or token
-    cloud_headers = plex_headers(cloud_token) if cloud_token != token else headers
-    base = str(_PLEX_CTX.get("baseurl") or "").strip().rstrip("/")
+    cloud_token = str(plex_context().get("account_token") or "").strip() or token
+    base = str(plex_context().get("baseurl") or "").strip().rstrip("/")
 
     meta_status: int | None = None
     last_err: str | None = None
@@ -953,31 +1085,23 @@ def hydrate_external_ids(token: str | None, rating_key: str | None) -> dict[str,
                         ids.update(ids_from_guid(str(gid)))
         return {k: v for k, v in ids.items() if v}
 
-    urls: list[tuple[str, str]] = []
+    bases: list[tuple[str, str]] = []
     if base:
-        urls.append((f"{base}/library/metadata/{rk}", "pms"))
-    urls.append((f"{METADATA}/library/metadata/{rk}", "meta"))
+        bases.append((base, "pms"))
+    bases.append((METADATA, "meta"))
 
-    for url, kind in urls:
+    for target, kind in bases:
         try:
-            r = requests.get(
-                url,
-                headers=cloud_headers if kind == "meta" else headers,
-                params={"includeGuids": 1},
-                timeout=10,
-            )
+            r = _metadata_request(target, rk, cloud_token if kind == "meta" else token)
             if kind == "meta":
                 meta_status = r.status_code
             if r.status_code == 401:
                 raise RuntimeError("Unauthorized (bad Plex token)")
             if not r.ok:
-                if kind == "meta":
-                    _dbg("hydrate_miss", rk=rk, status=r.status_code, source=kind)
-                    _emit({"feature": "common", "event": "hydrate", "action": "miss", "rk": rk, "status": r.status_code})
                 continue
             ids = _parse_response(r)
             with _HYDRATE_LOCK:
-                _GUID_CACHE[rk] = ids
+                _GUID_CACHE[key] = ids
             return ids
         except Exception as e:
             last_err = str(e)
@@ -985,12 +1109,12 @@ def hydrate_external_ids(token: str | None, rating_key: str | None) -> dict[str,
 
     if meta_status == 404:
         with _HYDRATE_LOCK:
-            _HYDRATE_404.add(rk)
-            _GUID_CACHE[rk] = {}
+            _HYDRATE_404.add(key)
+            _GUID_CACHE[key] = {}
         return {}
 
     with _HYDRATE_LOCK:
-        _GUID_CACHE[rk] = {}
+        _GUID_CACHE[key] = {}
     if last_err:
         _warn("hydrate_failed", rk=rk, error=last_err, meta_status=meta_status)
     return {}
@@ -1004,6 +1128,7 @@ def normalize(obj: Any) -> dict[str, Any]:
         "year": getattr(obj, "year", None),
         "ids": ids,
         "guid": getattr(obj, "guid", None),
+        "media_paths": media_paths(obj),
     }
     lid = _safe_int(
         getattr(obj, "librarySectionID", None)
@@ -1027,7 +1152,7 @@ def normalize(obj: Any) -> dict[str, Any]:
                 base.setdefault("show_ids", {}).update(extra)
         if not has_ext(base.get("show_ids")):
             srv = getattr(obj, "_server", None)
-            token = getattr(srv, "_token", None) or getattr(srv, "token", None) or _PLEX_CTX["token"]
+            token = getattr(srv, "_token", None) or getattr(srv, "token", None) or plex_context()["token"]
             gp_rk = getattr(obj, "grandparentRatingKey", None)
             if token and gp_rk:
                 extra2 = hydrate_external_ids(token, str(gp_rk))
@@ -1075,7 +1200,7 @@ def normalize_discover_row(
     hydrate_item_ids: bool = True,
 ) -> dict[str, Any]:
     if token is None:
-        token = _PLEX_CTX["token"]
+        token = plex_context()["token"]
     t = (row.get("type") or "movie").lower()
     ids = ids_from_discover_row(row)
     if hydrate_item_ids and not any(k in ids for k in ("tmdb", "imdb", "tvdb")) and token:
@@ -1087,6 +1212,7 @@ def normalize_discover_row(
         "title": row.get("title"),
         "year": row.get("year"),
         "guid": row.get("guid"),
+        "media_paths": media_paths(row),
         "ids": ids,
     }
     lid = (
@@ -1247,7 +1373,41 @@ def section_allowed(obj: Any, allow: set[str]) -> bool:
     if not allow:
         return True
     sid = str(getattr(obj, "librarySectionID", "") or getattr(obj, "sectionID", "") or "").strip()
-    return not sid or sid in allow
+    return sid in allow
+
+
+def native_item_matches(obj: Any, item: Mapping[str, Any]) -> bool:
+    kind = str(item.get("type") or "movie").lower()
+    kind = "episode" if kind == "anime" else kind
+    if object_type(obj) != kind:
+        return False
+    namespaces = ("tmdb", "imdb", "tvdb", "mal", "anilist")
+
+    def matches(wanted: Mapping[str, Any], actual: Mapping[str, Any]) -> bool:
+        for key in namespaces:
+            want, have = str(wanted.get(key) or "").strip().lower(), str(actual.get(key) or "").strip().lower()
+            if want and have and (want == have or (want.isdigit() and have.isdigit() and int(want) == int(have))):
+                return True
+        return False
+
+    try:
+        if kind in ("episode", "season"):
+            season = item.get("season") if item.get("season") is not None else item.get("season_number")
+            episode = item.get("episode") if item.get("episode") is not None else item.get("episode_number")
+            if season is not None and int(getattr(obj, "parentIndex" if kind == "episode" else "index", -1)) != int(season):
+                return False
+            if kind == "episode" and episode is not None and int(getattr(obj, "index", -1)) != int(episode):
+                return False
+        ids = ids_from(item)
+        if any(ids.get(key) for key in namespaces) and not matches(ids, ids_from_obj(obj)):
+            return False
+        if kind in ("episode", "season"):
+            show_ids = extract_show_ids(item)
+            if any(show_ids.get(key) for key in namespaces) and not matches(show_ids, ids_from_obj(obj.show())):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def item_guid_candidates(ids: Mapping[str, Any], show_ids: Mapping[str, Any], item: Mapping[str, Any]) -> list[str]:
@@ -1309,7 +1469,7 @@ def season_rating_key_from_show(show_obj: Any, season: Any) -> str | None:
     return None
 
 
-_SHOW_EPISODE_CACHE: dict[str, dict[str, Any]] = {}
+_SHOW_EPISODE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SHOW_EPISODE_CACHE_TTL = 300.0
 _SHOW_EPISODE_CACHE_MAX = 256
 
@@ -1320,7 +1480,9 @@ def _show_episode_cache_entry(show_obj: Any) -> dict[str, Any]:
     if rk:
         srv = getattr(show_obj, "_server", None) or getattr(show_obj, "server", None)
         sid = getattr(srv, "machineIdentifier", None) or _as_base_url(srv) or ""
-        key = f"{sid}:{rk}"
+        owner = _LOOKUP_SCOPE.get() or ("object", id(show_obj))
+        key = (owner, log_run_id.get(), _pair_scope(),
+               _metadata_cache_key(f"{sid}:{rk}", getattr(srv, "_token", None), _as_base_url(srv)))
     now = time.monotonic()
     if key:
         entry = _SHOW_EPISODE_CACHE.get(key)
@@ -1516,7 +1678,8 @@ def _build_minimal_from_row(row: Any, ids: Mapping[str, Any]) -> dict[str, Any]:
         base["series_title"] = (
             _row_get(row, "grandparentTitle") or _row_get(row, "title") or _row_get(row, "parentTitle")
         )
-        base["season"] = _safe_int(_row_get(row, "parentIndex") or _row_get(row, "seasonNumber"))
+        season = _row_get(row, "parentIndex")
+        base["season"] = _safe_int(season if season is not None else _row_get(row, "seasonNumber"))
         base["episode"] = _safe_int(_row_get(row, "index"))
         gp = _row_get(row, "grandparentGuid")
         gp_rk = _row_get(row, "grandparentRatingKey")
@@ -1554,6 +1717,7 @@ def _discover_search_title(
     limit: int = 15,
     season: int | None = None,
     episode: int | None = None,
+    check_cancel: Callable[[], None] | None = None,
 ) -> Mapping[str, Any] | None:
     try:
         if not title or not token:
@@ -1690,6 +1854,8 @@ def _discover_search_title(
             }
             combos = [t for t in types if t] + [""]
             for st in combos:
+                if check_cancel:
+                    check_cancel()
                 params = dict(base_params)
                 if st:
                     params["searchTypes"] = st
@@ -1802,6 +1968,8 @@ def _discover_search_title(
         best_t: str | None = None
         tried: set[str] = set()
         for q in _variants(title):
+            if check_cancel:
+                check_cancel()
             if q in tried:
                 continue
             tried.add(q)
@@ -1828,6 +1996,8 @@ def _discover_search_title(
                 if yb is not None and abs(yb - year) > 1:
                     return None
         return best
+    except InterruptedError:
+        raise
     except Exception:
         return None
 
@@ -1837,12 +2007,15 @@ def minimal_from_history_row(
     *,
     token: str | None = None,
     allow_discover: bool = False,
+    memo: dict[str, Any] | None = None,
+    check_cancel: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     global _FBGUID_MEMO_DIRTY
-    key = _fb_key_from_row(row)
-    memo = _fb_cache_load()
+    key = _metadata_cache_key(_fb_key_from_row(row), token)
+    persistent = memo is None
+    memo = _fb_cache_load() if persistent else memo
     hit = memo.get(key, None)
-    if hit == _FBGUID_NOHIT and not allow_discover:
+    if hit == _FBGUID_NOHIT and (not allow_discover or not persistent):
         return None
     if isinstance(hit, dict) and hit:
         return dict(hit)
@@ -1851,7 +2024,7 @@ def minimal_from_history_row(
     m = _build_minimal_from_row(row, ids)
     if not _has_ext_ids(m.get("ids", {})):
         rk = m.get("ids", {}).get("plex")
-        tok = token or _PLEX_CTX["token"]
+        tok = token or plex_context()["token"]
         if rk and tok:
             _emit(
                 {
@@ -1874,7 +2047,7 @@ def minimal_from_history_row(
                 m["ids"].update({k: v for k, v in extra.items() if v})
                 
     if kind == "episode" and not _has_ext_ids(m.get("show_ids", {})):
-        tok = token or _PLEX_CTX["token"]
+        tok = token or plex_context()["token"]
         gp_rk = _row_get(row, "grandparentRatingKey")
         if tok and gp_rk:
             _emit(
@@ -1906,7 +2079,7 @@ def minimal_from_history_row(
                     m.setdefault("show_ids", {}).update({k: v for k, v in extra3.items() if v})
                     
     if not _has_ext_ids(m.get("ids", {})) and allow_discover:
-        tok = token or _PLEX_CTX["token"]
+        tok = token or plex_context()["token"]
         title = m.get("series_title") if kind == "episode" else m.get("title")
         year = m.get("year")
         _emit(
@@ -1926,6 +2099,7 @@ def minimal_from_history_row(
             year,
             season=m.get("season"),
             episode=m.get("episode"),
+            check_cancel=check_cancel,
         )
         _emit(
             {
@@ -1975,17 +2149,17 @@ def minimal_from_history_row(
                     
     if not (m.get("title") or m.get("series_title")):
         if allow_discover:
-            _FBGUID_MEMO[key] = _FBGUID_NOHIT
-            _FBGUID_MEMO_DIRTY = True
+            memo[key] = _FBGUID_NOHIT
+            _FBGUID_MEMO_DIRTY = _FBGUID_MEMO_DIRTY or persistent
         return None
 
     if not _has_ext_ids(m.get("ids", {})) and not _has_ext_ids(m.get("show_ids", {})):
         if allow_discover:
-            _FBGUID_MEMO[key] = _FBGUID_NOHIT
-            _FBGUID_MEMO_DIRTY = True
+            memo[key] = _FBGUID_NOHIT
+            _FBGUID_MEMO_DIRTY = _FBGUID_MEMO_DIRTY or persistent
         return None
-    _FBGUID_MEMO[key] = dict(m)
-    _FBGUID_MEMO_DIRTY = True
+    memo[key] = dict(m)
+    _FBGUID_MEMO_DIRTY = _FBGUID_MEMO_DIRTY or persistent
     return m
 
 
@@ -2165,3 +2339,70 @@ def key_of(obj: Any) -> str:
     except Exception:
         pass
     return ""
+
+
+def _fetch_section_guid_rows(srv: Any, section_id: str, plex_type: int, *, check_cancel=None, strict: bool = False, extra_params: Mapping[str, Any] | None = None) -> tuple[list[Mapping[str, Any]], int]:
+    base = _as_base_url(srv)
+    ses = getattr(srv, "_session", None)
+    token = getattr(srv, "token", None) or getattr(srv, "_token", None) or ""
+    if not (base and ses and token and section_id):
+        raise RuntimeError("plex_guid_index_server_unavailable")
+
+    headers = dict(getattr(ses, "headers", {}) or {})
+    headers.update(plex_headers(token))
+    headers["Accept"] = "application/json"
+
+    page_size = 1000
+    out: list[Mapping[str, Any]] = []
+    seen_pages: set[tuple[str, ...]] = set()
+    start = 0
+    made = 0
+
+    while True:
+        if check_cancel:
+            check_cancel()
+        params = {
+            "type": plex_type,
+            "includeGuids": 1,
+            "X-Plex-Container-Start": start,
+            "X-Plex-Container-Size": page_size,
+            **dict(extra_params or {}),
+        }
+        try:
+            r = ses.get(f"{base}/library/sections/{section_id}/all", params=params, headers=headers, timeout=20)
+        except Exception as exc:
+            raise RuntimeError("plex_guid_index_request_failed") from exc
+        made += 1
+        if not getattr(r, "ok", False):
+            raise RuntimeError(f"plex_guid_index_http_{getattr(r, 'status_code', 0)}")
+        try:
+            ctype = (r.headers.get("content-type") or "").lower()
+            data = (r.json() or {}) if "application/json" in ctype else _xml_to_container(r.text or "")
+            mc = data.get("MediaContainer") or {}
+            metadata = mc.get("Metadata")
+            if strict:
+                if metadata is None and (mc.get("size") == 0 or mc.get("totalSize") == 0):
+                    metadata = []
+                if not isinstance(metadata, list) or any(not isinstance(x, Mapping) or not x.get("ratingKey") for x in metadata):
+                    raise ValueError("Incomplete Plex library metadata")
+            rows = [x for x in (metadata or []) if isinstance(x, Mapping)]
+            total = mc.get("totalSize")
+            total_i = int(total) if total is not None else None
+        except Exception as exc:
+            raise RuntimeError("plex_guid_index_parse_failed") from exc
+        if not rows:
+            if total_i is not None and start < total_i:
+                raise RuntimeError("plex_guid_index_incomplete_page")
+            break
+        signature = tuple(str(row.get("ratingKey") or row.get("key") or "") for row in rows)
+        if signature in seen_pages:
+            raise RuntimeError("plex_guid_index_repeated_page")
+        seen_pages.add(signature)
+        out.extend(rows)
+        start += len(rows)
+        if total_i is not None and start >= total_i:
+            break
+        if total_i is None and len(rows) < page_size:
+            break
+
+    return out, made

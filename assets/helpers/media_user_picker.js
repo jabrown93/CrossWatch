@@ -24,7 +24,6 @@
     if (d.getElementById(HOST_ID)) return;
 
     const overlay = el("div", { id: OVERLAY_ID, className: "hidden" });
-    overlay.addEventListener("click", () => api.close());
 
     const host = el("div", { id: HOST_ID, className: "hidden", role: "dialog", "aria-modal": "true" });
     host.appendChild(
@@ -99,6 +98,7 @@
       if (t === "friend") return "Friend";
       return "";
     }
+    if (p === "kodi") return u?.current === true ? "Current" : "";
     const isAdmin = u?.IsAdministrator === true || u?.Policy?.IsAdministrator === true || u?.is_admin === true || u?.admin === true;
     return isAdmin ? "Admin" : "";
   }

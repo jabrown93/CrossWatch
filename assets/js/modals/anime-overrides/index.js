@@ -30,6 +30,7 @@ async function apiJson(url, opts = {}) {
     const r = await fetch(url, { cache: "no-store", credentials: "same-origin", ...opts, signal: ctrl.signal });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.message || data.error || `${r.status} ${r.statusText || ""}`.trim());
+    if (opts.method && opts.method !== "GET" && (url === API || url.startsWith(`${API}/`))) window.dispatchEvent(new CustomEvent("cw:anime-mappings-changed"));
     return data;
   } catch (e) {
     if (e?.name === "AbortError") throw new Error("Request timed out");
@@ -103,7 +104,6 @@ export default {
         <div class="ao-body cw-scrollbars">
           <section class="ao-card">
             <div class="ao-card-head">
-              <span class="material-symbols-rounded" aria-hidden="true">edit_note</span>
               <div>
                 <h3 id="ao-form-title">Add a rule</h3>
                 <p>Point a show or movie at the anime entry it really is. Leave the episode fields empty to only correct the ID.</p>
@@ -189,10 +189,9 @@ export default {
 
           <section class="ao-card">
             <div class="ao-card-head compact has-tools">
-              <span class="material-symbols-rounded" aria-hidden="true">list</span>
               <div>
                 <h3>Your rules <span class="ao-count" id="ao-count"></span></h3>
-                <p>Rules are checked in order, top first. Disabled rules are ignored.</p>
+                <p>Rules are checked in order, top first. A rule that targets a service directly wins for that service. Disabled rules are ignored.</p>
               </div>
               <div class="ao-tools">
                 <select id="ao-import-mode" title="How an imported file is applied">
@@ -246,7 +245,7 @@ export default {
     }
 
     function fillSelect(node, values, current) {
-      node.innerHTML = values.map((v) => `<option value="${esc(v)}">${esc(label(v))}</option>`).join("");
+      node.innerHTML = [...values].sort((a, b) => label(a).localeCompare(label(b), undefined, { sensitivity: "base", numeric: true })).map((v) => `<option value="${esc(v)}">${esc(label(v))}</option>`).join("");
       if (current) node.value = current;
     }
 

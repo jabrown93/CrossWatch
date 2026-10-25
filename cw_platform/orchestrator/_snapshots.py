@@ -3,18 +3,22 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from ._scope import provider_call
+from ..interactive_reads import read_once, replaying
+
 from collections.abc import Mapping
 from typing import Any, Callable
 
 import json
+import os
 from pathlib import Path
 
 from ._scope import pair_scope, scoped_file
 import time
 import datetime as _dt
 
-from ..id_map import canonical_key, KEY_PRIORITY
-from ..history_events import history_event_key, is_history_event_key
+from ..id_map import canonical_key, KEY_PRIORITY, _norm_type
+from ..history_events import has_history_watch, history_event_key, is_history_event_key
 from ..provider_instances import normalize_instance_id
 from ..run_control import raise_if_cancelled
 from ._types import InventoryOps
@@ -43,6 +47,7 @@ def canonicalize_index(idx_raw: Any, *, feature: str) -> "SnapIndex":
             if not isinstance(raw, Mapping):
                 continue
             item = dict(raw)
+            item.pop("_cw_simkl_native", None)
             key = canonical_key(item)
             if key:
                 canon[key] = item
@@ -51,6 +56,7 @@ def canonicalize_index(idx_raw: Any, *, feature: str) -> "SnapIndex":
             if not isinstance(raw, Mapping):
                 continue
             item = dict(raw)
+            item.pop("_cw_simkl_native", None)
             computed = canonical_key(item) or ""
             provider_key = str(k or "").strip().lower() if isinstance(k, str) and k else ""
             if str(feature or "").lower() == "history" and is_history_event_key(provider_key):
@@ -64,6 +70,8 @@ def canonicalize_index(idx_raw: Any, *, feature: str) -> "SnapIndex":
 
 
 def needs_post_apply_refresh(result: Mapping[str, Any] | None) -> bool:
+    if replaying():
+        return False
     r = result or {}
     not_seen = r.get("accepted_not_seen_live_keys") or []
     if not_seen:
@@ -86,12 +94,12 @@ def refresh_destination_after_apply(
     refresher = getattr(ops, "snapshot_refresh", None)
     if callable(refresher):
         try:
-            idx_raw = refresher(config, feature=feature)
+            idx_raw = provider_call(refresher, config, feature=feature)
         except Exception:
             idx_raw = None
     if idx_raw is None:
         try:
-            idx_raw = ops.build_index(config, feature=feature)  # type: ignore[call-arg]
+            idx_raw = provider_call(ops.build_index, config, feature=feature)  # type: ignore[call-arg]
         except Exception:
             return None
     canon = canonicalize_index(idx_raw, feature=feature)
@@ -99,7 +107,10 @@ def refresh_destination_after_apply(
         scope = pair_scope() or "unscoped"
         if canon:
             mode = "events" if bool((config or {}).get("_cw_history_rewatches")) and str(feature).lower() == "history" else "state"
-            snap_cache[(scope, provider, feature, mode)] = (time.time(), canon)
+            memo_key = (scope, provider, feature, mode, "paths" if config.get("_cw_path_matching") else "ids")
+            if "_cw_provider_instance" in config:
+                memo_key += (str(config["_cw_provider_instance"]),)
+            snap_cache[memo_key] = (time.time(), canon)
     except Exception:
         pass
     return canon
@@ -158,7 +169,7 @@ def _pick_key(provider_key: str, computed_key: str) -> str:
 _ID_COALESCE_KEYS = ("tmdb", "imdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb")
 
 def _coalesce_by_shared_ids(idx: SnapIndex, *, feature: str) -> SnapIndex:
-    if str(feature or "").lower() != "watchlist" or not idx:
+    if str(feature or "").lower() not in {"watchlist", "collection"} or not idx:
         return dict(idx)
 
     parent: dict[str, str] = {}
@@ -206,6 +217,8 @@ def _coalesce_by_shared_ids(idx: SnapIndex, *, feature: str) -> SnapIndex:
             t = _tok(idk, ids.get(idk))
             if not t:
                 continue
+            typ = _norm_type(it.get("type"))
+            t = f"{'show' if typ == 'anime' else typ}|{t}"
             other = seen.get(t)
             if other and other != ck:
                 _union(ck, other)
@@ -360,7 +373,7 @@ def module_checkpoint(ops: InventoryOps, config: Mapping[str, Any], feature: str
         return None
 
     try:
-        raw = acts_fn(config)
+        raw = provider_call(lambda cfg: read_once(["activities", ops.name()], lambda: acts_fn(cfg)), config)
     except Exception:
         return None
 
@@ -432,7 +445,7 @@ def _eventish_count(feature: str, idx: Mapping[str, Any]) -> int:
         return sum(
             1
             for v in idx.values()
-            if isinstance(v, Mapping) and (v.get("watched_at") or v.get("last_watched_at"))
+            if has_history_watch(v)
         )
     if feature == "ratings":
         return sum(
@@ -666,7 +679,7 @@ def prepare_source_snapshot(
     if not callable(hook) or not items:
         return False
     try:
-        hook(config, feature=feature, items=items)
+        provider_call(hook, config, feature=feature, items=items)
     except Exception as e:
         if dbg is not None:
             dbg("snapshot.prepare_failed", feature=feature, error=str(e))
@@ -725,9 +738,12 @@ def build_snapshots_for_feature(
         if not provider_configured(config, name):
             continue
 
+        emit_info(json.dumps(dict(event="snapshot:start", provider=name, feature=feature)))
         scope = pair_scope() or "unscoped"
         mode = "events" if bool((config or {}).get("_cw_history_rewatches")) and str(feature).lower() == "history" else "state"
-        memo_key = (scope, name, feature, mode)
+        memo_key = (scope, name, feature, mode, "paths" if config.get("_cw_path_matching") else "ids")
+        if "_cw_provider_instance" in config:
+            memo_key += (str(config["_cw_provider_instance"]),)
         if snap_ttl_sec > 0:
             ent = snap_cache.get(memo_key)
             if ent is not None:
@@ -735,12 +751,16 @@ def build_snapshots_for_feature(
                 if (now - ts) < snap_ttl_sec:
                     snaps[name] = cached_idx
                     dbg("snapshot.memo", provider=name, feature=feature, count=_eventish_count(feature, cached_idx), raw_count=len(cached_idx))
+                    emit_info(json.dumps(dict(event="snapshot:done", provider=name, feature=feature, count=_eventish_count(feature, cached_idx))))
                     if on_snapshot is not None:
                         on_snapshot(name, cached_idx)
                     continue
 
         try:
-            idx_raw = ops.build_index(config, feature=feature)  # type: ignore[call-arg]
+            idx_raw = provider_call(lambda cfg: read_once(["inventory", name, feature], lambda: ops.build_index(cfg, feature=feature)), config)
+            normalize = getattr(ops, "replay_index", None)
+            if replaying() and callable(normalize):
+                idx_raw = provider_call(normalize, config, feature=feature, items=idx_raw)
         except Exception as e:
             emit_info(
                 f"[!] snapshot.failed provider={name} feature={feature} error={e}"
@@ -763,6 +783,7 @@ def build_snapshots_for_feature(
                 snap_cache[memo_key] = (now, canon)
 
         dbg("snapshot", provider=name, feature=feature, count=_eventish_count(feature, canon), raw_count=len(canon))
+        emit_info(json.dumps(dict(event="snapshot:done", provider=name, feature=feature, count=_eventish_count(feature, canon))))
         if on_snapshot is not None:
             on_snapshot(name, canon)
 

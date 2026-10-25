@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from cw_platform import config_base
+from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.id_map import canonical_key, minimal as id_minimal
-from .._mod_common import _pair_scope, _is_capture_mode, _safe_scope, _iso_ok, _iso_z, _max_iso
+from cw_platform.simkl_http import token_key
 
 START_OF_TIME_ISO = "1900-01-01T00:00:00Z"
 DEFAULT_DATE_FROM = START_OF_TIME_ISO
@@ -19,35 +22,206 @@ SIMKL_BASE = "https://api.simkl.com"
 URL_USER_SETTINGS = f"{SIMKL_BASE}/users/settings"
 REWATCH_ACCOUNT_TYPES = frozenset({"pro", "vip"})
 _SETTINGS_TTL = 300.0
-_SETTINGS_MEMO: tuple[float, dict[str, Any] | None] = (0.0, None)
+_SETTINGS_MEMO: dict[str, tuple[float, dict[str, Any]]] = {}
+_SETTINGS_LOCKS: dict[tuple[str, str], Any] = {}
+_SETTINGS_GUARD = threading.Lock()
+
+
+def account_settings_lock(key: str) -> Any:
+    with _SETTINGS_GUARD:
+        return _SETTINGS_LOCKS.setdefault((str(STATE_DIR), key), threading.RLock())
+
+
+def account_settings_ttl() -> float:
+    try:
+        return float(os.getenv("CW_SIMKL_ACCOUNT_TTL") or "3600")
+    except Exception:
+        return 3600.0
+
+
+def account_cache_key(token: Any) -> str:
+    return token_key(token)
+
+
+def _account_cache_path(key: str) -> Path:
+    return STATE_DIR / f"simkl.account.{key}.json"
+
+
+def account_settings_cached(key: str, max_age: float) -> dict[str, Any] | None:
+    if not key or max_age <= 0:
+        return None
+    try:
+        raw = json.loads(_account_cache_path(key).read_text("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        age = time.time() - float(raw.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    data = raw.get("data")
+    if age > max_age or not isinstance(data, str):
+        return None
+    try:
+        cipher = config_base._get_cipher(create=False)
+        if cipher is None:
+            return None
+        decoded = json.loads(cipher.decrypt(data.encode("ascii")))
+    except Exception:
+        return None
+    return dict(decoded) if isinstance(decoded, Mapping) else None
+
+
+def account_settings_store(key: str, data: Mapping[str, Any] | None) -> None:
+    if not key or not isinstance(data, Mapping):
+        return
+    _SETTINGS_MEMO[key] = (time.time(), dict(data))
+    path = _account_cache_path(key)
+    try:
+        with config_base._CONFIG_LOCK:
+            cipher = config_base._get_cipher(create=True)
+        if cipher is None:
+            return
+        encrypted = cipher.encrypt(json.dumps(dict(data)).encode("utf-8")).decode("ascii")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp")
+        tmp.write_text(json.dumps({"ts": time.time(), "data": encrypted}), "utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
 
 
 class SIMKLFetchError(RuntimeError):
     """Raised when a SIMKL read cannot produce a good snapshot"""
 
 
+class SIMKLQuotaError(SIMKLFetchError):
+    cw_no_retry = True
+
+    def __init__(self, until: float):
+        self.until = float(until)
+        super().__init__(f"SIMKL daily request limit reached, resets at {quota_reset_label(self.until)}")
+
+
+_QUOTA_BLOCKS: dict[str, float] = {}
+_QUOTA_LOCK = threading.Lock()
+QUOTA_LOW_WATERMARK = 50
+
+
+def quota_account_key(block: Mapping[str, Any] | None) -> str:
+    blk = block if isinstance(block, Mapping) else {}
+    seed = str(blk.get("access_token") or blk.get("refresh_token") or "").strip()
+    return token_key(seed)
+
+
+def _next_eastern_midnight(now: float) -> float:
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/New_York")
+        local = datetime.fromtimestamp(now, tz)
+        nxt = (local + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        return nxt.timestamp()
+    except Exception:
+        return now + 3600.0
+
+
+def block_quota(key: str, retry_after: Any = None) -> float:
+    now = time.time()
+    try:
+        secs = float(retry_after)
+    except (TypeError, ValueError):
+        secs = 0.0
+    until = now + secs if secs > 0 else _next_eastern_midnight(now)
+    if key:
+        with _QUOTA_LOCK:
+            _QUOTA_BLOCKS[key] = max(until, _QUOTA_BLOCKS.get(key, 0.0))
+    return until
+
+
+def quota_blocked_until(key: str) -> float:
+    if not key:
+        return 0.0
+    with _QUOTA_LOCK:
+        until = _QUOTA_BLOCKS.get(key, 0.0)
+        if until and until <= time.time():
+            _QUOTA_BLOCKS.pop(key, None)
+            return 0.0
+        return until
+
+
+_QUOTA_SEEN: dict[str, tuple[float, int | None, int | None]] = {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def record_quota(key: str, headers: Mapping[str, Any] | None) -> None:
+    if not key or not headers:
+        hdrs: Mapping[str, Any] = {}
+    else:
+        hdrs = {str(k).lower(): v for k, v in headers.items()}
+    remaining = _int_or_none(hdrs.get("x-ratelimit-remaining"))
+    if not key or remaining is None:
+        return
+    with _QUOTA_LOCK:
+        _QUOTA_SEEN[key] = (time.time(), _int_or_none(hdrs.get("x-ratelimit-limit")), remaining)
+
+
+def latest_quota(key: str) -> dict[str, Any]:
+    if not key:
+        return {}
+    with _QUOTA_LOCK:
+        seen = _QUOTA_SEEN.get(key)
+    blocked = quota_blocked_until(key)
+    if not seen and not blocked:
+        return {}
+    now = time.time()
+    seen_at, limit, remaining = seen if seen else (0.0, None, None)
+    resets_at = blocked or _next_eastern_midnight(seen_at or now)
+    if seen and not blocked and resets_at <= now:
+        return {}
+    out: dict[str, Any] = {
+        "daily_limit": limit,
+        "daily_remaining": 0 if blocked else remaining,
+        "daily_resets_at": int(resets_at),
+        "daily_resets_label": quota_reset_label(resets_at),
+    }
+    if seen_at:
+        out["daily_seen_at"] = int(seen_at)
+    return out
+
+
+def quota_reset_label(until: float) -> str:
+    try:
+        return datetime.fromtimestamp(float(until)).astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
+    except Exception:
+        return "later"
+
+
+def is_user_limit_response(resp: Any) -> bool:
+    if getattr(resp, "status_code", 0) != 429:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, Mapping):
+        return str(body.get("error") or "").strip().lower() == "user_limit_exceeded"
+    return "user_limit_exceeded" in str(getattr(resp, "text", "") or "")
+
+
 def simkl_user_agent() -> str:
-    env_ua = str(os.getenv("CW_UA") or "").strip()
-    if env_ua:
-        return env_ua
-    for mod_name in ("sync._mod_SIMKL", "providers.sync._mod_SIMKL"):
-        mod = sys.modules.get(mod_name)
-        version = getattr(mod, "__VERSION__", None) if mod is not None else None
-        if isinstance(version, str) and version.strip():
-            return f"CrossWatch/{version.strip()} (SIMKL)"
-    return "CrossWatch (SIMKL)"
+    return http_user_agent("SIMKL", override_env="CW_SIMKL_UA")
 
 
 def simkl_app_version() -> str:
-    env_version = str(os.getenv("APP_VERSION") or "").strip()
-    if env_version:
-        return env_version
-    for mod_name in ("sync._mod_SIMKL", "providers.sync._mod_SIMKL"):
-        mod = sys.modules.get(mod_name)
-        version = getattr(mod, "__VERSION__", None) if mod is not None else None
-        if isinstance(version, str) and version.strip():
-            return version.strip()
-    return "1.0"
+    return app_version()
 
 
 def simkl_api_params(api_key: Any, **extra: Any) -> dict[str, Any]:
@@ -64,6 +238,29 @@ def simkl_api_params_from_headers(headers: Mapping[str, Any], **extra: Any) -> d
     return simkl_api_params((headers or {}).get("simkl-api-key"), **extra)
 
 STATE_DIR = Path("/config/.cw_state")
+
+
+def _pair_scope() -> str | None:
+    for k in ("CW_PAIR_KEY", "CW_PAIR_SCOPE", "CW_SYNC_PAIR", "CW_PAIR"):
+        v = os.getenv(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+
+
+def _is_capture_mode() -> bool:
+    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _safe_scope(value: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
+    s = s.strip("_ ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s[:96] if s else "default"
 
 
 def state_file(name: str) -> Path:
@@ -93,6 +290,8 @@ def _legacy_path(path: Path) -> Path | None:
 
 
 def _migrate_legacy_json(path: Path) -> None:
+    if str(_pair_scope() or "").startswith("cw2_"):
+        return
     if path.exists():
         return
     if _is_capture_mode() or _pair_scope() is None:
@@ -207,6 +406,37 @@ def coalesce_date_from(
         if _iso_ok(candidate):
             return _iso_z(candidate)
     return hard_default
+
+
+def _iso_ok(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except Exception:
+        return False
+
+
+def _iso_z(value: str | None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid ISO timestamp")
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _max_iso(a: str | None, b: str | None) -> str | None:
+    if not _iso_ok(a):
+        return _iso_z(b) if _iso_ok(b) else None
+    if not _iso_ok(b):
+        return _iso_z(a)
+    a_z = _iso_z(a)
+    b_z = _iso_z(b)
+    dt_a = datetime.fromisoformat(a_z.replace("Z", "+00:00"))
+    dt_b = datetime.fromisoformat(b_z.replace("Z", "+00:00"))
+    return _iso_z(a if dt_a >= dt_b else b)
 
 
 def build_headers(cfg: Mapping[str, Any], *, force_refresh: bool = False) -> dict[str, str]:
@@ -404,12 +634,14 @@ def sync_date_from(
     return START_OF_TIME_ISO if shadow_has_data else None
 
 
-_ACT_MEMO: tuple[float, dict[str, Any] | None, dict[str, Any]] = (0.0, None, {})
+_ACT_MEMO: dict[str, tuple[float, dict[str, Any], dict[str, Any]]] = {}
 
 
 def memoize_activities(
     data: Mapping[str, Any] | None,
     rate: Mapping[str, Any] | None = None,
+    *,
+    token: str = "",
 ) -> None:
     global _ACT_MEMO
     if not isinstance(data, Mapping):
@@ -422,19 +654,21 @@ def memoize_activities(
         cached_rate = dict(rate or {})
     except Exception:
         cached_rate = {}
-    _ACT_MEMO = (time.time(), cached, cached_rate)
+    _ACT_MEMO[account_cache_key(token)] = (time.time(), cached, cached_rate)
 
 
 def fetch_activities(
     session: Any,
-    headers: Mapping[str, str],
+    headers: Mapping[str, str | bytes],
     *,
     timeout: float = 8.0,
+    force: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     global _ACT_MEMO
     now = time.time()
-    ts, cached, rate_cached = _ACT_MEMO
-    if cached is not None and (now - ts) < 10.0:
+    key = account_cache_key(headers.get("Authorization"))
+    ts, cached, rate_cached = _ACT_MEMO.get(key, (0.0, None, {}))
+    if not force and cached is not None and (now - ts) < 10.0:
         return cached, rate_cached
 
     url = "https://api.simkl.com/sync/activities"
@@ -449,8 +683,10 @@ def fetch_activities(
         rate = parse_rate_limit(resp.headers)
         if 200 <= resp.status_code < 300:
             data = resp.json() if (resp.text or "").strip() else {}
-            _ACT_MEMO = (now, data, rate)
-            return data, rate
+            if isinstance(data, Mapping):
+                out = dict(data)
+                _ACT_MEMO[key] = (now, out, rate)
+                return out, rate
         return None, rate
     except Exception:
         return None, rate
@@ -458,38 +694,65 @@ def fetch_activities(
 
 def reset_user_settings_memo() -> None:
     global _SETTINGS_MEMO
-    _SETTINGS_MEMO = (0.0, None)
+    _SETTINGS_MEMO.clear()
+
+
+def refresh_user_settings_from_activities(
+    session: Any,
+    headers: Mapping[str, str | bytes],
+    activities: Mapping[str, Any] | None,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any] | None:
+    with account_settings_lock(account_cache_key(headers.get("Authorization"))):
+        latest = extract_latest_ts(activities or {}, (("settings", "all"),))
+        max_age = float("inf")
+        if latest:
+            changed_at = datetime.fromisoformat(latest.replace("Z", "+00:00")).timestamp()
+            max_age = max(0.0, time.time() - changed_at)
+        cached = account_settings_cached(account_cache_key(headers.get("Authorization")), max_age)
+        if cached is not None:
+            return cached
+        return fetch_user_settings(session, headers, timeout=timeout, force_refresh=True)
 
 
 def fetch_user_settings(
     session: Any,
-    headers: Mapping[str, str],
+    headers: Mapping[str, str | bytes],
     *,
     timeout: float = 15.0,
     force_refresh: bool = False,
 ) -> dict[str, Any] | None:
     global _SETTINGS_MEMO
-    now = time.time()
-    ts, cached = _SETTINGS_MEMO
-    if cached is not None and not force_refresh and (now - ts) < _SETTINGS_TTL:
-        return cached
-    try:
-        resp = session.post(
-            URL_USER_SETTINGS,
-            headers=dict(headers),
-            params=simkl_api_params_from_headers(headers),
-            timeout=timeout,
-        )
-        if not (200 <= int(getattr(resp, "status_code", 0) or 0) < 300):
+    with account_settings_lock(account_cache_key(headers.get("Authorization"))):
+        now = time.time()
+        key = account_cache_key((headers or {}).get("Authorization"))
+        ts, cached = _SETTINGS_MEMO.get(key, (0.0, None))
+        if cached is not None and not force_refresh and (now - ts) < _SETTINGS_TTL:
+            return cached
+        if not force_refresh:
+            shared = account_settings_cached(key, float("inf"))
+            if shared is not None:
+                _SETTINGS_MEMO[key] = (now, shared)
+                return shared
+        try:
+            resp = session.post(
+                URL_USER_SETTINGS,
+                headers=dict(headers),
+                params=simkl_api_params_from_headers(headers),
+                timeout=timeout,
+            )
+            if not (200 <= int(getattr(resp, "status_code", 0) or 0) < 300):
+                return None
+            data = resp.json()
+        except Exception:
             return None
-        data = resp.json()
-    except Exception:
-        return None
-    if not isinstance(data, Mapping):
-        return None
-    out = dict(data)
-    _SETTINGS_MEMO = (now, out)
-    return out
+        if not isinstance(data, Mapping):
+            return None
+        out = dict(data)
+        _SETTINGS_MEMO[key] = (now, out)
+        account_settings_store(key, out)
+        return out
 
 
 def account_type(session: Any, headers: Mapping[str, str], *, timeout: float = 15.0) -> str:
@@ -623,7 +886,7 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
             "title": (payload.get("title") if isinstance(payload, Mapping) else None) or obj.get("title"),
             "year": (payload.get("year") if isinstance(payload, Mapping) else None) or obj.get("year"),
             "ids": {k: v for k, v in ids.items() if v},
-            "season": _to_int(obj.get("season") or obj.get("season_number") or obj.get("number")),
+            "season": _to_int(next((v for v in (obj.get("season"), obj.get("season_number"), obj.get("number")) if v is not None), None)),
             "series_title": obj.get("series_title"),
             "show_ids": {k: v for k, v in show_ids.items() if v},
         }
@@ -639,6 +902,8 @@ def normalize(obj: Mapping[str, Any]) -> dict[str, Any]:
         "year": payload.get("year") or obj.get("year"),
         "ids": {k: v for k, v in ids.items() if v},
     }
+    if "part" in obj:
+        base["part"] = obj.get("part")
     return id_minimal(base)
 
 
@@ -670,7 +935,7 @@ def key_of(item: Mapping[str, Any]) -> str:
             show_ids = {k: ids[k] for k in ("tmdb", "imdb", "tvdb", "simkl") if ids.get(k)}
 
         if show_ids and s_num is not None and s_num >= 0 and e_num is not None and e_num > 0:
-            show_key = canonical_key(id_minimal({"type": "show", "ids": _fix_imdb(show_ids)})) or ""
+            show_key = (canonical_key(id_minimal({"type": "show", "ids": _fix_imdb(show_ids)})) or "").removesuffix("#show")
             if show_key:
                 return f"{show_key}#s{s_num:02d}e{e_num:02d}"
 
@@ -695,7 +960,7 @@ def key_of(item: Mapping[str, Any]) -> str:
             show_ids = {k: ids[k] for k in ("tmdb", "imdb", "tvdb", "simkl") if ids.get(k)}
 
         if show_ids and s_num is not None and s_num >= 0:
-            show_key = canonical_key(id_minimal({"type": "show", "ids": _fix_imdb(show_ids)})) or ""
+            show_key = (canonical_key(id_minimal({"type": "show", "ids": _fix_imdb(show_ids)})) or "").removesuffix("#show")
             if show_key:
                 return f"{show_key}#season:{s_num}"
 

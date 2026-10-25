@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from providers.sync import _mod_SCROB as mod
-from providers.sync.scrob import _history, _progress, _ratings, _watchlist
+from providers.sync.scrob import _collection, _history, _progress, _ratings, _watchlist
 
 
 @dataclass
@@ -66,7 +66,7 @@ def _patch_transport(monkeypatch: pytest.MonkeyPatch):
     def fake_webhook(adapter: Any, path: str, payload: Any) -> ResponseStub:
         return adapter.respond("POST", path, json=payload)
 
-    for module in (_common, _history, _ratings, _progress, _watchlist):
+    for module in (_common, _history, _ratings, _progress, _watchlist, _collection):
         if hasattr(module, "scrob_request"):
             monkeypatch.setattr(module, "scrob_request", fake_request)
         if hasattr(module, "webhook_post"):
@@ -113,9 +113,9 @@ def episode_row(**over: Any) -> dict[str, Any]:
 def test_manifest_declares_supported_features_only():
     manifest = mod.get_manifest()
     assert manifest["name"] == "SCROB"
-    assert manifest["version"] == "0.1"
+    assert manifest["version"] == "0.3"
     assert manifest["bidirectional"] is True
-    assert manifest["features"] == {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False}
+    assert manifest["features"] == {"watchlist": True, "ratings": True, "history": True, "progress": True, "playlists": False, "collection": True}
 
 
 def test_capabilities_declare_event_history_and_rewatches():
@@ -131,6 +131,7 @@ def test_registry_discovers_scrob():
     assert "SCROB" in sync_provider_names()
     assert load_sync_ops("SCROB") is mod.OPS
     assert sync_provider_supports_feature("scrob", "history") is True
+    assert sync_provider_supports_feature("scrob", "collection") is True
     assert sync_provider_supports_feature("scrob", "playlists") is False
 
 
@@ -380,6 +381,7 @@ def test_progress_index_converts_fraction_to_percent():
     assert item["duration_ms"] == 8340000
     assert item["_scrob_media_id"] == "5"
     assert item["progress_at_source"] == "scrob"
+    assert adapter.calls[0]["params"] == {"limit": _progress.CONTINUE_WATCHING_LIMIT}
 
 
 def test_progress_add_uses_a_stop_below_the_watched_threshold():
@@ -392,6 +394,24 @@ def test_progress_add_uses_a_stop_below_the_watched_threshold():
     assert body["total_seconds"] == 8340
     assert body["position_seconds"] == 3336
     assert body["session_id"].startswith("crosswatch-progress-")
+
+
+def test_progress_add_looks_up_the_show_tvdb_id_when_missing():
+    from providers.sync.scrob import _common
+
+    _common._SHOW_TVDB.clear()
+    adapter = FakeAdapter({
+        ("POST", "webhooks/kodi"): ResponseStub(200, {"status": "ok"}),
+        ("GET", "shows/2996"): ResponseStub(200, {"tmdb_id": 2996, "tvdb_id": 78107}),
+    })
+    item = {"type": "episode", "ids": {}, "show_ids": {"tmdb": "2996"}, "season": 1, "episode": 2, "series_title": "The Office", "progress_percent": 40, "duration_ms": 1800000}
+
+    assert _progress.add(adapter, [item, dict(item, episode=3)])["count"] == 2
+
+    posted = [call["json"]["item"]["uniqueid"] for call in adapter.calls if call["method"] == "POST"]
+    assert posted == [{"tmdb": "2996", "tvdb": "78107"}, {"tmdb": "2996", "tvdb": "78107"}]
+    assert sum(1 for call in adapter.calls if call["path"] == "shows/2996") == 1
+    _common._SHOW_TVDB.clear()
 
 
 def test_progress_add_refuses_values_scrob_will_not_keep():
@@ -424,6 +444,159 @@ def test_progress_remove_without_media_id_is_unresolved():
     result = _progress.remove(adapter, [{"type": "movie", "ids": {"tmdb": "550"}}])
     assert result["unresolved"][0]["status"] == "missing_scrob_media_id"
     assert not adapter.calls
+
+
+def test_collection_index_reads_export_collection_rows():
+    payload = {
+        "collection": [
+            {
+                "id": 71,
+                "movie": {"tmdb_id": 550, "type": "movie", "title": "Fight Club", "release_date": "1999-10-15"},
+                "collected_at": "2026-08-01T10:00:00",
+            },
+            {
+                "show": {"tmdb_id": 1399, "type": "series", "title": "Game of Thrones"},
+                "seasons": [{"number": 1, "episodes": [{"number": 1, "tmdb_id": 63056, "title": "Winter Is Coming"}]}],
+            },
+        ]
+    }
+    adapter = FakeAdapter({("GET", "export/data"): ResponseStub(200, payload)})
+
+    index = _collection.build_index(adapter)
+
+    assert sorted(index) == ["tmdb:1399#s01e01", "tmdb:550"]
+    assert index["tmdb:550"]["_scrob_collection_id"] == "71"
+    assert index["tmdb:550"]["collected_at"] == "2026-08-01T10:00:00.000Z"
+    assert index["tmdb:1399#s01e01"]["show_ids"] == {"tmdb": "1399"}
+
+
+def test_collection_index_reads_nested_episode_export_rows():
+    payload = [
+        {
+            "type": "episode",
+            "collected_at": "2026-10-11T10:48:09.000Z",
+            "episode": {"season": 1, "number": 2, "title": "Cat's in the Bag...", "ids": {"tmdb": 62086}},
+            "show": {"title": "Breaking Bad", "year": 2008, "ids": {"tmdb": 1396, "tvdb": 81189}},
+        },
+        {
+            "type": "episode",
+            "episode": {"season": 0, "number": 1, "title": "Good Cop / Bad Cop", "ids": {"tmdb": 62131}},
+            "show": {"title": "Breaking Bad", "year": 2008, "ids": {"tmdb": 1396, "tvdb": 81189}},
+        },
+    ]
+    adapter = FakeAdapter({("GET", "export/data"): ResponseStub(200, payload)})
+
+    index = _collection.build_index(adapter)
+
+    assert sorted(index) == ["tmdb:1396#s00e01", "tmdb:1396#s01e02"]
+    item = index["tmdb:1396#s01e02"]
+    assert item["type"] == "episode"
+    assert item["ids"] == {"tmdb": "62086"}
+    assert item["show_ids"] == {"tmdb": "1396", "tvdb": "81189"}
+    assert item["title"] == "Cat's in the Bag..."
+    assert item["collected_at"] == "2026-10-11T10:48:09.000Z"
+    assert _collection._payload_for(item) == (
+        "media/collect",
+        {"tmdb_id": 62086, "media_type": "episode", "series_tmdb_id": 1396, "season_number": 1, "episode_number": 2},
+    )
+
+
+def test_collection_add_maps_each_scope():
+    adapter = FakeAdapter({
+        ("POST", "media/collect"): ResponseStub(200, {"status": "ok"}),
+        ("POST", "media/collect-show"): ResponseStub(200, {"status": "ok"}),
+        ("POST", "media/collect-season"): ResponseStub(200, {"status": "ok"}),
+    })
+    items = [
+        {"type": "movie", "ids": {"tmdb": "550"}},
+        {"type": "show", "ids": {"tmdb": "1400"}},
+        {"type": "season", "show_ids": {"tmdb": "1399"}, "season": 2},
+        {"type": "episode", "ids": {"tmdb": "63056"}, "show_ids": {"tmdb": "1399"}, "season": 1, "episode": 1},
+    ]
+
+    result = _collection.add(adapter, items)
+
+    assert result["ok"] and len(result["confirmed_keys"]) == 4
+    bodies = [call["json"] for call in adapter.calls if call["method"] == "POST"]
+    assert bodies[0] == {"tmdb_id": 550, "media_type": "movie"}
+    assert bodies[1] == {"tmdb_id": 1400, "media_type": "series"}
+    assert bodies[2] == {"series_tmdb_id": 1399, "season_number": 2}
+    assert bodies[3] == {"tmdb_id": 63056, "media_type": "episode", "series_tmdb_id": 1399, "season_number": 1, "episode_number": 1}
+
+
+def _episode_export(show_tmdb: int, season: int, episode: int, ep_tmdb: int) -> list[dict[str, Any]]:
+    return [{
+        "type": "episode",
+        "episode": {"season": season, "number": episode, "ids": {"tmdb": ep_tmdb}},
+        "show": {"title": "Marshals", "ids": {"tmdb": show_tmdb}},
+    }]
+
+
+def test_collection_add_skips_show_and_season_covered_by_batch_episodes():
+    adapter = FakeAdapter({("POST", "media/collect"): ResponseStub(200, {"status": "ok"})})
+    items = [
+        {"type": "episode", "ids": {"tmdb": "9001"}, "show_ids": {"tmdb": "500"}, "season": 1, "episode": 1},
+        {"type": "season", "show_ids": {"tmdb": "500"}, "season": 1},
+        {"type": "show", "ids": {"tmdb": "500"}},
+    ]
+
+    result = _collection.add(adapter, items)
+
+    assert result["ok"]
+    assert result["confirmed_keys"] == ["tmdb:500#s01e01"]
+    assert sorted(result["skipped_keys"]) == ["tmdb:500#season:1", "tmdb:500#show"]
+    assert [call["path"] for call in adapter.calls] == ["media/collect"]
+
+
+def test_collection_add_skips_containers_already_covered_in_scrob():
+    adapter = FakeAdapter({
+        ("GET", "export/data"): ResponseStub(200, _episode_export(500, 1, 1, 9001)),
+        ("POST", "media/collect-season"): ResponseStub(200, {"status": "ok"}),
+    })
+    items = [
+        {"type": "season", "show_ids": {"tmdb": "500"}, "season": 1},
+        {"type": "show", "ids": {"tmdb": "500"}},
+        {"type": "season", "show_ids": {"tmdb": "500"}, "season": 2},
+    ]
+
+    result = _collection.add(adapter, items)
+
+    assert result["confirmed_keys"] == ["tmdb:500#season:2"]
+    assert sorted(result["skipped_keys"]) == ["tmdb:500#season:1", "tmdb:500#show"]
+    assert [(call["method"], call["path"]) for call in adapter.calls] == [("GET", "export/data"), ("POST", "media/collect-season")]
+
+
+def test_collection_add_leaves_container_unresolved_when_coverage_unknown():
+    adapter = FakeAdapter({("GET", "export/data"): ResponseStub(503, {"detail": "down"})})
+
+    result = _collection.add(adapter, [{"type": "show", "ids": {"tmdb": "500"}}])
+
+    assert not result["confirmed_keys"] and not result["skipped_keys"]
+    assert result["unresolved_keys"] == ["tmdb:500#show"]
+    assert all(call["method"] == "GET" for call in adapter.calls)
+
+
+def test_collection_remove_maps_each_scope():
+    adapter = FakeAdapter({
+        ("DELETE", "media/collect"): ResponseStub(200, {"status": "ok"}),
+        ("DELETE", "media/collect-show"): ResponseStub(200, {"status": "ok"}),
+        ("DELETE", "media/collect-season"): ResponseStub(200, {"status": "ok"}),
+    })
+    items = [
+        {"type": "movie", "ids": {"tmdb": "550"}, "_scrob_collection_id": "71"},
+        {"type": "show", "ids": {"tmdb": "1399"}},
+        {"type": "season", "show_ids": {"tmdb": "1399"}, "season": 2},
+        {"type": "episode", "ids": {"tmdb": "63056"}, "show_ids": {"tmdb": "1399"}, "season": 1, "episode": 1},
+    ]
+
+    result = _collection.remove(adapter, items)
+
+    assert result["ok"] and len(result["confirmed_keys"]) == 4
+    params = [call["params"] for call in adapter.calls]
+    assert params[0] == {"media_type": "movie", "id": 71}
+    assert params[1] == {"tmdb_id": 1399}
+    assert params[2] == {"series_tmdb_id": 1399, "season_number": 2}
+    assert params[3] == {"media_type": "episode", "tmdb_id": 63056}
 
 
 def test_watchlist_index_reads_the_named_list():

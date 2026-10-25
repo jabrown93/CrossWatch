@@ -8,8 +8,10 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import time
-from typing import Any
+from functools import wraps
+from typing import Any, Callable, ParamSpec, TypeVar
 
 from .db import get_conn
 from . import query as _query
@@ -17,6 +19,21 @@ from .scrobble_recorder import session_token
 from ..reason_labels import friendly_reason
 
 _LOG = logging.getLogger("crosswatch.event_archive")
+
+_GROUP_LOCK = threading.RLock()
+_PArgs = ParamSpec("_PArgs")
+_Result = TypeVar("_Result")
+
+
+def _serialized(fn: Callable[_PArgs, _Result]) -> Callable[_PArgs, _Result]:
+    @wraps(fn)
+    def wrapped(*args: _PArgs.args, **kwargs: _PArgs.kwargs) -> _Result:
+        # Include version checks and reads so a rebuild cannot invalidate the
+        # groups another request is currently assembling.
+        with _GROUP_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
 
 _GROUP_COLUMNS = (
     "id", "group_hash", "domain", "created_at", "updated_at", "first_event_at", "last_event_at",
@@ -33,7 +50,9 @@ _RUN_TYPES = ("sync_run_started", "sync_run_finished")
 _SCROBBLE_STATUS = {
     "scrobble_completed": "completed",
     "scrobble_failed": "failed",
+    "scrobble_skipped": "skipped",
     "scrobble_started": "running",
+    "scrobble_playback": "running",
     "rating_applied": "rated",
     "rating_failed": "failed",
 }
@@ -57,7 +76,8 @@ _AUDIT_STATUS = {
     "audit_2fa_failed": "failed",
     "audit_2fa_required": "informational",
 }
-_PAST = {"add": "added", "remove": "removed", "update": "updated"}
+_PAST = {"add": "added", "remove": "removed", "update": "updated", "tag_dropped": "marked dropped"}
+_VERB = {"tag_dropped": "mark dropped"}
 _SEVERITY = {
     "completed": "success", "resolved": "success", "rated": "success",
     "warning": "warning", "blackboxed": "warning", "unresolved": "warning",
@@ -67,7 +87,7 @@ _PROBLEM_TYPES_SQL = "('write_failed','unresolved_recorded','blackbox_promoted',
 _UNRESOLVED_TYPES_SQL = "('write_failed','unresolved_recorded')"
 
 # DO NOT FORGET to update the version when the correlation key/status/summary logic
-CORRELATION_VERSION = 14
+CORRELATION_VERSION = 16
 
 
 def _with_reason_labels(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -121,6 +141,13 @@ def _g(r: Any, key: str) -> Any:
         return None
 
 
+def _is_playlist_batch_event(r: Any) -> bool:
+    if str(_g(r, "feature") or "").strip().lower() != "playlists":
+        return False
+    event_type = str(_g(r, "event_type") or "").strip().lower()
+    return event_type in {"playlist_add", "playlist_remove", "playlist_update"}
+
+
 def group_hash(r: Any) -> str:
     if str(_g(r, "domain") or "").strip().lower() == "audit":
         ident = str(_g(r, "event_hash") or _g(r, "id") or _g(r, "created_at") or "").strip()
@@ -141,6 +168,17 @@ def group_hash(r: Any) -> str:
             token,
         ]
         return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()
+    if _is_playlist_batch_event(r):
+        run_or_batch = str(_g(r, "run_id") or _g(r, "created_at") or "").strip()
+        parts = [
+            "\x00playlist_batch",
+            run_or_batch,
+            _norm_op(_g(r, "operation")),
+            str(_g(r, "pair_key") or "").strip(),
+            _route_anchor(r),
+        ]
+        return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()
+
     item_key = str(_g(r, "item_key") or "").strip()
     if item_key:
         parts = [
@@ -180,6 +218,17 @@ def _derive_status(events: list[dict[str, Any]], extra_problems: int = 0) -> str
         return best
 
     if types & set(_SCROBBLE_STATUS):
+        playback = next((e for e in reversed(events) if e.get("event_type") == "scrobble_playback"), None)
+        if playback is not None:
+            detail = _detail(playback)
+            if "scrobble_completed" in types:
+                return "completed"
+            if _skipped_delivery(detail):
+                return "skipped"
+            if "scrobble_skipped" in types and "scrobble_failed" not in types and detail.get("state") == "stopped":
+                return "skipped"
+            if detail.get("state") in {"running", "paused", "stopped"}:
+                return str(detail["state"])
         best, best_ts = None, -1
         for e in events:
             st = _SCROBBLE_STATUS.get(str(e.get("event_type") or ""))
@@ -189,6 +238,9 @@ def _derive_status(events: list[dict[str, Any]], extra_problems: int = 0) -> str
             if ts >= best_ts:
                 best_ts, best = ts, st
         return best or "informational"
+
+    if any(_is_playlist_batch_event(e) for e in events):
+        return "completed"
 
     # status reflects the run's completion
     if "sync_run_finished" in types:
@@ -238,8 +290,45 @@ def _detail(e: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+_ROUTES_SHOWN = 3
+
+
+def _endpoint(provider: Any, instance: Any) -> str:
+    p = _P(provider)
+    i = _I(instance)
+    return f"{p} {i}" if p and i != "default" else p
+
+
+def _run_routes(plan_events: list[dict[str, Any]]) -> str:
+    seen: dict[frozenset[str], list[Any]] = {}
+    for e in plan_events:
+        a = _endpoint(e.get("source_provider"), e.get("source_instance"))
+        b = _endpoint(e.get("destination_provider"), e.get("destination_instance"))
+        if not a or not b:
+            continue
+        key = frozenset((a, b))
+        if key in seen:
+            if seen[key][0] == b and seen[key][1] == a:
+                seen[key][2] = True
+            continue
+        seen[key] = [a, b, False]
+    if not seen:
+        return ""
+    segments: dict[str, list[str]] = {}
+    for a, b, both in seen.values():
+        if both:
+            segments[f"{a} ⇄ {b}"] = []
+        else:
+            segments.setdefault(f"{a} →", []).append(b)
+    parts = [f"{head} {', '.join(dsts[:_ROUTES_SHOWN])}" + (f" +{len(dsts) - _ROUTES_SHOWN} more" if len(dsts) > _ROUTES_SHOWN else "")
+             if dsts else head for head, dsts in segments.items()]
+    more = len(parts) - _ROUTES_SHOWN
+    shown = " · ".join(parts[:_ROUTES_SHOWN])
+    return f"{shown} +{more} more" if more > 0 else shown
+
+
 def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str, norm_op: str, reason_code: str, feat_issues: dict[str, int] | None = None) -> str:
-    verb = norm_op or "update"
+    verb = _VERB.get(norm_op, norm_op or "update")
     past = _PAST.get(norm_op, "updated")
 
     types = {e.get("event_type") for e in events}
@@ -267,6 +356,17 @@ def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str
     if types & set(_SCROBBLE_STATUS):
         return _summarize_scrobble(status, events, dst)
 
+    if str(feature or "").strip().lower() == "playlists" and any(_is_playlist_batch_event(e) for e in events):
+        src = _P(_pick(events, "source_provider"))
+        route = f"{src} -> {dst}" if (src and dst) else (dst or src or "")
+        op = _norm_op(_pick(events, "operation"))
+        noun = "item" if len(events) == 1 else "items"
+        action = {"add": "added", "remove": "removed", "update": "updated"}.get(op, "updated")
+        head = f"Playlist {action}"
+        if route:
+            head = f"{route} {head[:1].lower()}{head[1:]}"
+        return f"{head}, {len(events)} {noun}"
+
     # one sync run with its pair/feature jobs and health checks
     if types & {"sync_run_started", "sync_run_finished"}:
         plan_events = [e for e in events if e.get("event_type") == "plan_created"]
@@ -279,7 +379,9 @@ def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str
             if fe and fe not in feats:
                 feats.append(fe)
         feat_disp = ", ".join(f.title() for f in feats)
-        tail = f", {pairs} {'pair' if pairs == 1 else 'pairs'}" if pairs else ""
+        routes = _run_routes(plan_events)
+        pairs_txt = routes or (f"{pairs} {'pair' if pairs == 1 else 'pairs'}" if pairs else "")
+        tail = f", {pairs_txt}" if pairs_txt else ""
         if tail and feat_disp:
             tail += f" ({feat_disp})"
         if "sync_run_finished" in types:
@@ -303,7 +405,7 @@ def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str
             err_txt = f", {errs} errors" if errs else ""
             bb = f", {blocked} blackboxed" if blocked else ""
             clean = errs == 0 and unres == 0
-            tail_final = tail if clean else (f", {pairs} {'pair' if pairs == 1 else 'pairs'}" if pairs else "")
+            tail_final = tail if clean else (f", {pairs_txt}" if pairs_txt else "")
             return f"{head}{err_txt}{unres_txt}{bb}{tail_final}"
         return f"Sync run in progress{tail}"
 
@@ -391,6 +493,18 @@ def _title_of(e: dict[str, Any]) -> str:
     return t
 
 
+def _skipped_delivery(detail: dict[str, Any]) -> str:
+    delivery = detail.get("delivery")
+    if not isinstance(delivery, dict) or detail.get("state") != "stopped":
+        return ""
+    if delivery.get("status") != "skipped" or delivery.get("action") != "stop":
+        return ""
+    from .playback_recorder import UNWRITTEN_SKIPS
+
+    reason = str(delivery.get("reason") or "").strip().lower()
+    return reason if reason in UNWRITTEN_SKIPS else ""
+
+
 def _summarize_scrobble(status: str, events: list[dict[str, Any]], dst: str) -> str:
     last = events[-1] if events else {}
     name = _title_of(last) or "item"
@@ -405,10 +519,21 @@ def _summarize_scrobble(status: str, events: list[dict[str, Any]], dst: str) -> 
         reason = str(_pick(events, "reason_code") or _pick(events, "reason") or "")
         head = "Rating forward failed" if rating_thread else "Scrobble failed"
         return f"{head}{to}, {reason}" if reason else f"{head}{to}"
-    prog = _detail(last).get("progress")
+    playback = next((e for e in reversed(events) if e.get("event_type") == "scrobble_playback"), None)
+    prog = _detail(playback or last).get("progress")
     tail = f", {prog}%" if prog not in (None, "") else ""
     if status == "completed":
         return f"Watched {name}{to}{tail}"
+    if status == "paused":
+        return f"Paused {name}{to}{tail}"
+    if status == "skipped":
+        why = _skipped_delivery(_detail(playback or last))
+        if not why:
+            skip = next((e for e in reversed(events) if e.get("event_type") == "scrobble_skipped"), None)
+            why = str((skip or {}).get("reason_code") or (skip or {}).get("reason") or "")
+        return f"Skipped {name}{to}{tail}: {friendly_reason(why)}" if why else f"Skipped {name}{to}{tail}"
+    if status == "stopped":
+        return f"Stopped before completion: {name}{to}{tail}"
     return f"Watching {name}{to}{tail}"
 
 
@@ -444,6 +569,11 @@ def _recompute(conn: sqlite3.Connection, group_id: int, now: int) -> None:
     if not events:
         return
     ts = [int(e.get("created_at") or 0) for e in events]
+    for e in events:
+        if e.get("event_type") == "scrobble_playback":
+            history = _detail(e).get("playback") or []
+            if history:
+                ts.append(int(history[0][0]))
     types = {e.get("event_type") for e in events}
     is_run = bool(types & set(_RUN_TYPES))
     feature = str(_pick(events, "feature") or "")
@@ -452,20 +582,40 @@ def _recompute(conn: sqlite3.Connection, group_id: int, now: int) -> None:
     feat_issues = _run_feature_issues(conn, _pick(events, "run_id")) if is_run else {}
     status = _derive_status(events, sum(feat_issues.values()))
     severity = _SEVERITY.get(status, "info")
+    playback = next((e for e in reversed(events) if e.get("event_type") == "scrobble_playback"), None)
+    delivery = (_detail(playback).get("delivery") or {}) if playback else {}
+    if delivery.get("status") == "failed":
+        severity = "error"
     fail_evt = None
     for e in events:
         if e.get("event_type") in _FAIL_TYPES:
             fail_evt = e
     reason_code = str((fail_evt or {}).get("reason_code") or _pick(events, "reason_code") or "")
     reason = str((fail_evt or {}).get("reason") or _pick(events, "reason") or "")
+    if status == "skipped" and playback and not reason_code:
+        reason_code = reason = _skipped_delivery(_detail(playback))
     summary = _summarize(status, events, feature, dst, norm_op, reason_code, feat_issues)
+    if delivery.get("status") == "failed":
+        summary += "; delivery failed"
     domain = str(_pick(events, "domain") or "sync")
+    is_playlist_batch = feature.strip().lower() == "playlists" and any(_is_playlist_batch_event(e) for e in events)
 
     if is_run:
         vals = (
             domain, now, min(ts), max(ts), len(events), status, severity,
             None, "run", None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, summary, group_id,
+        )
+    elif is_playlist_batch:
+        vals = (
+            domain, now, min(ts), max(ts), len(events), status, severity,
+            feature or None, norm_op or None,
+            _pick(events, "source_provider"), _pick(events, "source_instance"),
+            _pick(events, "destination_provider"), _pick(events, "destination_instance"),
+            _pick(events, "origin_provider"), _pick(events, "origin_instance"),
+            _pick(events, "pair_key"), _pick(events, "direction"),
+            None, None, None, None, None, None,
+            reason_code or None, reason or None, summary, group_id,
         )
     else:
         vals = (
@@ -532,38 +682,33 @@ def _persist_titles(conn: sqlite3.Connection, ids: list[int]) -> None:
             pass
 
 
+@_serialized
 def correlate(*, conn: sqlite3.Connection | None = None, reset: bool = False) -> dict[str, Any]:
     c = conn or get_conn()
     if c is None:
         return {"ok": False, "available": False, "grouped": 0}
-    if reset:
-        try:
-            with c:
-                c.execute("UPDATE events SET group_id=NULL")
-                c.execute("DELETE FROM event_groups")
-        except Exception as exc:
-            _LOG.warning("event correlation reset failed: %s", exc)
-    try:
-        rows = c.execute(
-            "SELECT id, event_hash, domain, feature, operation, item_key, title, season, episode, created_at, "
-            "source_kind, session_key, source_provider, source_instance, destination_provider, destination_instance, "
-            "pair_key, run_id FROM events WHERE group_id IS NULL"
-        ).fetchall()
-    except Exception as exc:
-        _LOG.warning("event correlation query failed: %s", exc)
-        return {"ok": False, "error": "internal_error", "grouped": 0}
-    if not rows:
-        return {"ok": True, "grouped": 0, "groups_touched": 0}
-
-    now = int(time.time())
-    all_ids = [int(r["id"]) for r in rows]
-    buckets: dict[str, list[int]] = {}
-    for r in rows:
-        buckets.setdefault(group_hash(r), []).append(int(r["id"]))
-
-    touched: set[int] = set()
     try:
         with c:
+            # Reset and replacement must commit together. On failure, retain
+            # the previous groups so the next request can retry the rebuild.
+            if reset:
+                c.execute("UPDATE events SET group_id=NULL")
+                c.execute("DELETE FROM event_groups")
+            rows = c.execute(
+                "SELECT id, event_hash, domain, event_type, feature, operation, item_key, title, season, episode, created_at, "
+                "source_kind, session_key, source_provider, source_instance, destination_provider, destination_instance, "
+                "pair_key, run_id FROM events WHERE group_id IS NULL"
+            ).fetchall()
+            if not rows:
+                return {"ok": True, "grouped": 0, "groups_touched": 0}
+
+            now = int(time.time())
+            all_ids = [int(r["id"]) for r in rows]
+            buckets: dict[str, list[int]] = {}
+            for r in rows:
+                buckets.setdefault(group_hash(r), []).append(int(r["id"]))
+
+            touched: set[int] = set()
             _persist_titles(c, all_ids)
             for gh, ids in buckets.items():
                 c.execute(
@@ -577,18 +722,56 @@ def correlate(*, conn: sqlite3.Connection | None = None, reset: bool = False) ->
             for gid in touched:
                 _recompute(c, gid, now)
     except Exception as exc:
-        _LOG.warning("event correlation failed: %s", exc)
+        _LOG.warning("event correlation failed: %s", exc, exc_info=True)
         return {"ok": False, "error": "internal_error", "grouped": 0}
     return {"ok": True, "grouped": len(rows), "groups_touched": len(touched)}
 
 
+_RUN_SUMMARY_META = "run_route_summary_version"
+_RUN_SUMMARY_VERSION = 2
+
+
+@_serialized
+def refresh_run_summaries(*, conn: sqlite3.Connection | None = None) -> int:
+    c = conn or get_conn()
+    if c is None:
+        return 0
+    try:
+        done = c.execute("SELECT value_int FROM local_meta WHERE key=?", (_RUN_SUMMARY_META,)).fetchone()
+        if done is not None and int(done[0] or 0) >= _RUN_SUMMARY_VERSION:
+            return 0
+        gids = [int(r[0]) for r in c.execute(
+            "SELECT DISTINCT group_id FROM events WHERE group_id IS NOT NULL "
+            "AND event_type IN ('sync_run_started','sync_run_finished')"
+        ).fetchall()]
+        now = int(time.time())
+        for i in range(0, len(gids), 200):
+            with c:
+                for gid in gids[i:i + 200]:
+                    _recompute(c, gid, now)
+        with c:
+            c.execute(
+                "INSERT INTO local_meta(key,value_int,value_type,updated_at) VALUES(?,?,'int',?) "
+                "ON CONFLICT(key) DO UPDATE SET value_int=excluded.value_int,value_type=excluded.value_type,"
+                "updated_at=excluded.updated_at",
+                (_RUN_SUMMARY_META, _RUN_SUMMARY_VERSION, now),
+            )
+        return len(gids)
+    except Exception as exc:
+        _LOG.warning("run summary refresh failed: %s", exc, exc_info=True)
+        return 0
+
+
+@_serialized
 def _ensure_correlated(conn: sqlite3.Connection) -> None:
     try:
         appid = int(conn.execute("PRAGMA application_id").fetchone()[0] or 0)
     except Exception:
         appid = CORRELATION_VERSION
     if appid < CORRELATION_VERSION:
-        correlate(conn=conn, reset=True)
+        result = correlate(conn=conn, reset=True)
+        if not result.get("ok"):
+            return
         try:
             conn.execute(f"PRAGMA application_id={CORRELATION_VERSION}")
         except Exception:
@@ -627,6 +810,7 @@ _CATEGORY_STATUS = {
 }
 
 
+@_serialized
 def list_groups(
     *,
     q: str | None = None,
@@ -668,7 +852,10 @@ def list_groups(
 
     eq("domain", domain)
     eq("feature", feature)
-    eq("status", status)
+    if domain == "scrobble" and status == "failed":
+        clauses.append("(g.status='failed' OR g.severity='error')")
+    else:
+        eq("status", status)
     eq("item_key", item_key)
     eq("pair_key", pair_key)
 
@@ -760,7 +947,7 @@ def list_groups(
             [*params, lim, off],
         ).fetchall()
     except Exception as exc:
-        _LOG.warning("group list failed: %s", exc)
+        _LOG.warning("group list failed: %s", exc, exc_info=True)
         return {"items": [], "total": 0, "limit": lim, "offset": off}
     return {"items": _with_reason_labels([dict(r) for r in rows]), "total": total, "limit": lim, "offset": off}
 
@@ -1036,6 +1223,7 @@ def _run_problem_status_counts_bulk(
     return out
 
 
+@_serialized
 def list_tree(*, order: str | None = "newest", limit: int = 50, offset: int = 0,
               include_children: bool = True, domain: str | None = None,
               conn: sqlite3.Connection | None = None, **filters: Any) -> dict[str, Any]:

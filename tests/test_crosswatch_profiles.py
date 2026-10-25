@@ -384,14 +384,14 @@ def test_user_profile_rejects_duplicate_labels(monkeypatch) -> None:
     assert renamed["ok"] is True
 
 
-def test_user_profile_allows_one_instance_per_provider(monkeypatch) -> None:
+def test_user_profile_keeps_several_instances_per_provider(monkeypatch) -> None:
     store: dict[str, Any] = {
         "user_profiles": {
             ALICE_PROFILE_ID: {"label": "Alice", "instances": {"JELLYFIN": ["JELLYFIN-P01"]}},
             FRANK_PROFILE_ID: {"label": "Frank", "instances": {"JELLYFIN": ["JELLYFIN-P02"]}},
         }
     }
-    _configured_refs(store, [("JELLYFIN", "JELLYFIN-P01"), ("JELLYFIN", "JELLYFIN-P02"), ("CROSSWATCH", "CW-P01")])
+    _configured_refs(store, [("JELLYFIN", "JELLYFIN-P01"), ("JELLYFIN", "JELLYFIN-P02"), ("JELLYFIN", "JELLYFIN-P03"), ("CROSSWATCH", "CW-P01")])
 
     def fake_load() -> dict[str, Any]:
         return json.loads(json.dumps(store))
@@ -406,12 +406,12 @@ def test_user_profile_allows_one_instance_per_provider(monkeypatch) -> None:
 
     updated = provider_api.api_user_profiles_update(
         ALICE_PROFILE_ID,
-        {"label": "Alice", "instances": {"JELLYFIN": ["JELLYFIN-P01", "JELLYFIN-P02"], "CROSSWATCH": ["CW-P01"]}},
+        {"label": "Alice", "instances": {"JELLYFIN": ["JELLYFIN-P01", "JELLYFIN-P03"], "CROSSWATCH": ["CW-P01"]}},
      request=_admin_req())
 
     assert updated["profile"]["instances"] == {
         "CROSSWATCH": ["CW-P01"],
-        "JELLYFIN": ["JELLYFIN-P01"],
+        "JELLYFIN": ["JELLYFIN-P01", "JELLYFIN-P03"],
     }
     assert _profile_instances(store, FRANK_PROFILE_ID) == {"JELLYFIN": ["JELLYFIN-P02"]}
 
@@ -481,6 +481,56 @@ def test_provider_instances_are_scoped_for_managed_user(monkeypatch) -> None:
     assert [row["id"] for row in crosswatch_rows] == ["CW-P01"]
     assert [row["id"] for row in all_rows["CROSSWATCH"]] == ["CW-P01"]
     assert [row["id"] for row in all_rows["PLEX"]] == ["PLEX-P01"]
+
+
+def test_provider_instances_are_scoped_for_managed_user_api_token(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from api import apiTokensAPI as api_tokens
+    from tests.test_app_auth_api import _auth_cfg, _request
+
+    user_id = "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"
+    secret = "A" * 32
+    raw_token = f"{api_tokens.TOKEN_PREFIX}abcdefabcdefabcd.{secret}"
+    store: dict[str, Any] = _auth_cfg()
+    store["user_profiles"] = {
+        ALICE_PROFILE_ID: {"label": "Alice", "instances": {"CROSSWATCH": ["CW-P01"], "PLEX": ["PLEX-P01"]}},
+        BOB_PROFILE_ID: {"label": "Bob", "instances": {"CROSSWATCH": ["CW-P02"], "PLEX": ["PLEX-P02"]}},
+    }
+    _configured_refs(store, [("CROSSWATCH", "CW-P01"), ("CROSSWATCH", "CW-P02"), ("PLEX", "PLEX-P01"), ("PLEX", "PLEX-P02")])
+    store["app_auth"]["users"] = {
+        user_id: {
+            "username": "alice",
+            "enabled": True,
+            "role": "user",
+            "profile_id": ALICE_PROFILE_ID,
+            "permissions": {"dashboard": True},
+            "password": auth._password_hash("secrett2"),
+        }
+    }
+    store["app_auth"]["api_tokens"] = [
+        {
+            "id": "abcdefabcdefabcd",
+            "version": 2,
+            "name": "alice cli",
+            "secret": secret,
+            "prefix": raw_token[: len(api_tokens.TOKEN_PREFIX) + 16 + 1 + 6],
+            "user_id": user_id,
+            "username": "alice",
+            "created_at": auth._now(),
+            "expires_at": 0,
+            "last_used_at": 0,
+        }
+    ]
+    request = _request("/api/provider-instances", method="GET", headers={"Authorization": f"Bearer {raw_token}"})
+
+    monkeypatch.setattr(provider_api, "load_config", lambda: json.loads(json.dumps(store)))
+
+    all_rows = _loads_body(provider_api.api_provider_instances_all(request).body)
+    plex_rows = _loads_body(provider_api.api_provider_instances_provider("PLEX", request).body)
+
+    assert [row["id"] for row in all_rows["CROSSWATCH"]] == ["CW-P01"]
+    assert [row["id"] for row in all_rows["PLEX"]] == ["PLEX-P01"]
+    assert [row["id"] for row in plex_rows] == ["PLEX-P01"]
 
 
 def test_user_profile_detail_is_scoped_for_managed_user(monkeypatch) -> None:
@@ -616,6 +666,94 @@ def test_currently_watching_managed_user_forces_own_profile(monkeypatch) -> None
     assert data["streams_count"] == 1
     assert [row["title"] for row in data["streams"]] == ["Bob Movie"]
     assert data["currently_watching"]["provider_instance"] == "PLEX-P02"
+
+
+def test_currently_watching_managed_api_token_user_forces_own_profile(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from tests.test_app_auth_api import _auth_cfg
+
+    store: dict[str, Any] = _auth_cfg()
+    store["user_profiles"] = {
+        ALICE_PROFILE_ID: {"label": "Alice", "instances": {"PLEX": ["PLEX-P01"]}},
+        BOB_PROFILE_ID: {"label": "Bob", "instances": {"PLEX": ["PLEX-P02"]}},
+    }
+    _configured_refs(store, [("PLEX", "PLEX-P01"), ("PLEX", "PLEX-P02")])
+    store["app_auth"]["users"] = {
+        "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa": {
+            "username": "bob",
+            "enabled": True,
+            "role": "user",
+            "profile_id": BOB_PROFILE_ID,
+            "permissions": {"dashboard": True},
+            "password": auth._password_hash("secrett2"),
+        }
+    }
+    user = auth._public_user("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa", store["app_auth"]["users"]["aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"])
+    request = SimpleNamespace(cookies={}, state=SimpleNamespace(cw_user=user))
+
+    monkeypatch.setattr(scrobble_api, "load_config", lambda: json.loads(json.dumps(store)))
+    monkeypatch.setattr(scrobble_api, "_cw_load_state", _currently_watching_state)
+
+    data = _loads_body(scrobble_api.api_currently_watching(cast(Any, request), user_profile="").body)
+
+    assert data["streams_count"] == 1
+    assert [row["title"] for row in data["streams"]] == ["Bob Movie"]
+    assert data["currently_watching"]["provider_instance"] == "PLEX-P02"
+
+
+def test_currently_watching_managed_api_token_cannot_request_another_profile(monkeypatch) -> None:
+    from api import appAuthAPI as auth
+    from tests.test_app_auth_api import _auth_cfg
+
+    store: dict[str, Any] = _auth_cfg()
+    store["user_profiles"] = {
+        ALICE_PROFILE_ID: {"label": "Alice", "instances": {"PLEX": ["PLEX-P01"]}},
+        BOB_PROFILE_ID: {"label": "Bob", "instances": {"PLEX": ["PLEX-P02"]}},
+    }
+    _configured_refs(store, [("PLEX", "PLEX-P01"), ("PLEX", "PLEX-P02")])
+    store["app_auth"]["users"] = {
+        "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa": {
+            "username": "bob",
+            "enabled": True,
+            "role": "user",
+            "profile_id": BOB_PROFILE_ID,
+            "permissions": {"dashboard": True},
+            "password": auth._password_hash("secrett2"),
+        }
+    }
+    user = auth._public_user("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa", store["app_auth"]["users"]["aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"])
+    request = SimpleNamespace(cookies={}, state=SimpleNamespace(cw_user=user))
+
+    monkeypatch.setattr(scrobble_api, "load_config", lambda: json.loads(json.dumps(store)))
+    monkeypatch.setattr(scrobble_api, "_cw_load_state", _currently_watching_state)
+
+    data = _loads_body(scrobble_api.api_currently_watching(cast(Any, request), user_profile=ALICE_PROFILE_ID).body)
+
+    assert data["streams_count"] == 1
+    assert [row["title"] for row in data["streams"]] == ["Bob Movie"]
+    assert data["currently_watching"]["provider_instance"] == "PLEX-P02"
+
+
+def test_currently_watching_admin_can_read_all_or_requested_profile(monkeypatch) -> None:
+    store: dict[str, Any] = {
+        "user_profiles": {
+            ALICE_PROFILE_ID: {"label": "Alice", "instances": {"PLEX": ["PLEX-P01"]}},
+            BOB_PROFILE_ID: {"label": "Bob", "instances": {"PLEX": ["PLEX-P02"]}},
+        }
+    }
+    _configured_refs(store, [("PLEX", "PLEX-P01"), ("PLEX", "PLEX-P02")])
+    request = SimpleNamespace(cookies={}, state=SimpleNamespace(cw_user={"id": "administrator", "is_admin": True}))
+
+    monkeypatch.setattr(scrobble_api, "load_config", lambda: json.loads(json.dumps(store)))
+    monkeypatch.setattr(scrobble_api, "_cw_load_state", _currently_watching_state)
+
+    all_data = _loads_body(scrobble_api.api_currently_watching(cast(Any, request), user_profile="").body)
+    alice = _loads_body(scrobble_api.api_currently_watching(cast(Any, request), user_profile=ALICE_PROFILE_ID).body)
+
+    assert all_data["streams_count"] == 2
+    assert [row["title"] for row in all_data["streams"]] == ["Bob Movie", "Alice Movie"]
+    assert alice["streams_count"] == 1
+    assert [row["title"] for row in alice["streams"]] == ["Alice Movie"]
 
 
 def test_playback_progress_filter_for_managed_user_forces_own_profile(monkeypatch) -> None:
@@ -776,7 +914,7 @@ def test_events_audit_domain_is_admin_only_for_managed_users(monkeypatch) -> Non
 
 
 def test_events_modal_has_admin_only_audits_tab() -> None:
-    js = Path("assets/js/modals/events/index.js").read_text("utf-8")
+    js = Path("assets/js/events/index.js").read_text("utf-8")
 
     assert 'value: "scrobble", label: "Scrobble"' in js
     assert 'value: "audit", label: "Audits"' in js
@@ -804,6 +942,84 @@ def test_overview_profile_avatar_link_replaces_selector() -> None:
     assert ".cw-nav-profile-avatar img" in css
     assert "overview-profile-control" not in css
     assert "cw-overview-profile-menu" not in css
+
+
+def test_profile_avatar_is_seeded_in_main_and_profile_html() -> None:
+    import ui_frontend
+
+    user = {
+        "is_admin": True,
+        "username": "admin",
+        "display_name": "Pascal",
+        "avatar_url": "/api/profile/avatar/admin_user?ts=1785066084",
+    }
+
+    main = ui_frontend.get_index_html(include_admin=True, user=user)
+    profile = ui_frontend.get_profile_html(user=user)
+
+    assert 'id="cw-nav-profile-avatar" class="cw-nav-profile-avatar" aria-hidden="true" data-cw-avatar-url="/api/profile/avatar?ts=1785066084"><img src="/api/profile/avatar?ts=1785066084" alt=""></span>' in main
+    assert 'id="cw-nav-profile-avatar" class="cw-nav-profile-avatar" aria-hidden="true" data-cw-avatar-url="/api/profile/avatar?ts=1785066084"><img src="/api/profile/avatar?ts=1785066084" alt=""></span>' in profile
+    assert 'id="profile-avatar-button" class="cw-profile-avatar" type="button" title="Replace profile picture" aria-label="Replace profile picture"><img src="/api/profile/avatar?ts=1785066084" alt=""></button>' in profile
+
+
+def test_account_menu_preserves_existing_avatar_node_for_same_url() -> None:
+    js = Path("assets/helpers/account-menu.js").read_text("utf-8")
+    overview = Path("assets/js/overview-profile.js").read_text("utf-8")
+    profile = Path("assets/js/profile-page.js").read_text("utf-8")
+
+    assert 'const existing = node.querySelector("img")?.getAttribute("src") || "";' in js
+    assert "if (url && existing === url)" in js
+    assert "normalizeAvatarUrl(value)" in js
+    assert "window.CW.AccountMenu.setAvatarNode(avatar, url)" in overview
+    assert "window.CW.AccountMenu.setAvatarNode(node, normalized)" in profile
+
+
+def test_linked_profile_avatar_is_cached_after_first_proxy_fetch(monkeypatch, tmp_path) -> None:
+    from api import profileAPI as profile_api
+
+    png = b"\x89PNG\r\n\x1a\ncached-avatar"
+    calls = 0
+
+    class FakeAvatarResponse:
+        headers = {"Content-Type": "image/png"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1, **_kwargs):
+            return png
+
+        @property
+        def raw(self):
+            return self
+
+    # Fork: avatars are fetched through guarded_request (SSRF guard), not urlopen.
+    def fake_guarded_request(_method, _url, *, timeout=0, **_kwargs):
+        nonlocal calls
+        calls += 1
+        assert timeout == 8
+        return FakeAvatarResponse()
+
+    monkeypatch.setattr(profile_api, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("cw_platform.url_validation.guarded_request", fake_guarded_request)
+
+    raw = {
+        "plex_sso": {
+            "linked_thumb": "https://plex.tv/users/cfccf9c5c1d518d1/avatar?c=1785066084",
+            "linked_at": 1785066084,
+        }
+    }
+
+    first = profile_api._avatar_response(raw)
+    second = profile_api._avatar_response(raw)
+
+    assert calls == 1
+    assert first.headers["cache-control"] == profile_api.AVATAR_CACHE_HEADERS["Cache-Control"]
+    assert second.headers["cache-control"] == profile_api.AVATAR_CACHE_HEADERS["Cache-Control"]
+    assert len(list((tmp_path / "profile_avatars").glob("linked-*.png"))) == 1
 
 
 def test_provider_instances_all_can_return_configured_only(monkeypatch) -> None:
@@ -1151,7 +1367,7 @@ def test_crosswatch_tracker_settings_live_only_in_connection_modal() -> None:
     assert 'restore: ["restore_page"' not in providers_ui
     assert "Local Tracker Restore" not in providers_ui
     assert "Storage and restore" in providers_ui
-    assert "Use profiles when you want separate local watchlist, ratings, history or progress data." in providers_ui
+    assert "Use profiles when you want separate local watchlist, ratings, history, progress or collection data." in providers_ui
     assert 'introSubs: ["auth"]' in providers_ui
     assert 'introSubs: ["auth", "settings"]' not in providers_ui
     assert "cw_crosswatch_disconnect" in auth_html
@@ -1163,6 +1379,16 @@ def test_crosswatch_tracker_settings_live_only_in_connection_modal() -> None:
     assert "cw_tracker_root_dir" not in auth_js
     assert "cw_tracker_root_dir" not in settings_save
     assert "cw_tracker_restore_progress" in auth_html
+
+
+def test_provider_connection_modal_saves_profile_label_before_global_settings() -> None:
+    providers_ui = Path("assets/helpers/providers-ui.js").read_text("utf-8")
+
+    label_save = "saveVisibleProfileLabels?.(panel)"
+    settings_save = "window.saveSettings?.()"
+    assert label_save in providers_ui
+    assert settings_save in providers_ui
+    assert providers_ui.index(label_save) < providers_ui.index(settings_save)
 
 
 def test_tmdb_metadata_modal_refreshes_saved_key_before_opening() -> None:
@@ -1218,14 +1444,14 @@ def test_connection_modals_mount_and_bind_before_opening() -> None:
 
 def test_maintenance_tracker_archive_uses_profile_selector_toolbar() -> None:
     root = Path(__file__).resolve().parents[1]
-    modal_js = (root / "assets" / "js" / "modals" / "maintenance" / "index.js").read_text("utf-8")
-    modal_css = (root / "assets" / "js" / "modals" / "maintenance" / "styles.css").read_text("utf-8")
+    modal_js = (root / "assets" / "js" / "maintenance" / "index.js").read_text("utf-8")
+    modal_css = (root / "assets" / "js" / "maintenance" / "styles.css").read_text("utf-8")
     icon_select_js = (root / "assets" / "helpers" / "icon-select.js").read_text("utf-8")
     profile_select_js = (root / "assets" / "helpers" / "profile-select.js").read_text("utf-8")
 
     assert "tracker-archive-options" in modal_js
     assert "tracker-profile-control" in modal_js
-    assert "archive-btn icon-only secondary" in modal_js
+    assert "archive-btn secondary" in modal_js
     assert "aria-label=\"Download tracker archive\"" in modal_js
     assert "aria-label=\"Import tracker archive\"" in modal_js
     assert "CW?.ProfileSelect?.enhanceProfile" in modal_js
@@ -1233,13 +1459,37 @@ def test_maintenance_tracker_archive_uses_profile_selector_toolbar() -> None:
     assert "menuClassName: \"cxm-tracker-profile-menu\"" in modal_js
     assert "menuMinWidth: 220" in modal_js
     assert "button, input, label, a, summary, .cw-icon-select" in modal_js
-    assert "tracker-archive-options { align-items: center; flex-wrap: nowrap" in modal_css
-    assert "archive-btn.icon-only" in modal_css
+    assert "tracker-archive-options { display:grid;" in modal_css
     assert ".tracker-profile-control .cxm-tracker-profile-select" in modal_css
     assert "cxm-tracker-profile-menu" in modal_css
     assert "menuMinWidth" in icon_select_js
     assert "menuClassName" in icon_select_js
     assert "{ ...cfg, className:" in profile_select_js
+
+
+def test_maintenance_rebuild_state_refreshes_main_page_caches() -> None:
+    root = Path(__file__).resolve().parents[1]
+    modal_js = (root / "assets" / "js" / "maintenance" / "index.js").read_text("utf-8")
+    helper_js = (root / "assets" / "helpers" / "maintenance.js").read_text("utf-8")
+
+    assert "function applySyncStateReset(result = {})" in helper_js
+    assert '"insights.tiles.v1", "cw.dashboardWidgets.data.v1", "cw.profileWidgets.data.v1"' in helper_js
+    assert 'prefixes: ["cw.wall.preview.v2."]' in helper_js
+    assert 'window.dispatchEvent(new CustomEvent("cw:sync-state-cleared"' in helper_js
+    assert "window.CW?.DashboardWidgets?.refresh?.({ force: true, forceConfig: true, preserve: false })" in helper_js
+    assert 'if (kind === "state")' in modal_js
+    assert "window.CW?.Maintenance?.applySyncStateReset?.(res || { ok: true })" in modal_js
+    assert "const notifyTrackerStateChanged = (result = {}) =>" in modal_js
+    assert 'window.CW.Maintenance.applySyncStateReset({ ...(result || {}), source: "tracker" })' in modal_js
+    assert 'localStorage.removeItem("cw.dashboardWidgets.data.v1")' in modal_js
+    assert 'window.dispatchEvent(new CustomEvent("cw:sync-state-cleared"' in modal_js
+    assert 'trackerStateChanged = clearState;' in modal_js
+    assert 'if (kind === "tracker" && trackerStateChanged)' in modal_js
+    assert "if (Number(data?.states || 0) > 0) notifyTrackerStateChanged(data);" in modal_js
+    assert "await injectCSS();" in modal_js
+    assert "const loadMaintenanceBootStatus = async () =>" in modal_js
+    assert "void loadMaintenanceBootStatus();" in modal_js
+    assert "await loadTrackerProfiles();\n      await refreshSummary();" in modal_js
 
 
 def test_maintenance_tracker_archive_exports_and_imports_profile_storage(tmp_path: Path, monkeypatch) -> None:
@@ -1460,7 +1710,7 @@ def test_crosswatch_connect_creates_connection_config(monkeypatch) -> None:
     assert store["crosswatch"]["max_snapshots"] == 64
 
 
-def test_crosswatch_default_config_is_not_connected() -> None:
+def test_crosswatch_explicitly_disconnected_config_stays_disconnected() -> None:
     from providers.auth._auth_CROSSWATCH import PROVIDER
     from providers.sync._mod_CROSSWATCH import OPS
 
@@ -1470,18 +1720,29 @@ def test_crosswatch_default_config_is_not_connected() -> None:
     assert OPS.is_configured(cfg) is False
 
 
-def test_crosswatch_config_default_does_not_auto_connect(tmp_path: Path, monkeypatch) -> None:
+def test_crosswatch_config_default_connects_new_install_but_respects_opt_out(tmp_path: Path, monkeypatch) -> None:
     import cw_platform.config_base as config_base
 
     monkeypatch.setattr(config_base, "CONFIG", tmp_path)
     cfg = config_base.load_config()
 
-    assert cfg["crosswatch"]["connected"] is False
+    assert cfg["crosswatch"]["connected"] is True
 
     (tmp_path / "config.json").write_text(json.dumps({"crosswatch": {"root_dir": "/tmp/cw"}}), "utf-8")
     migrated = config_base.load_config()
 
     assert migrated["crosswatch"]["connected"] is True
+
+    (tmp_path / "config.json").write_text(json.dumps({}), "utf-8")
+    removed = config_base.load_config()
+
+    assert removed["crosswatch"]["connected"] is False
+
+    (tmp_path / "config.json").write_text(json.dumps({"crosswatch": {"enabled": False}}), "utf-8")
+    disabled = config_base.load_config()
+
+    assert disabled["crosswatch"]["connected"] is False
+    assert disabled["crosswatch"]["enabled"] is False
 
 
 def test_analyzer_treats_crosswatch_as_tracker_provider() -> None:
@@ -1491,8 +1752,8 @@ def test_analyzer_treats_crosswatch_as_tracker_provider() -> None:
 
 
 def test_profile_labels_are_used_in_analyzer_and_events_modals() -> None:
-    analyzer_js = Path("assets/js/modals/analyzer/index.js").read_text("utf-8")
-    events_js = Path("assets/js/modals/events/index.js").read_text("utf-8")
+    analyzer_js = Path("assets/js/analyzer/index.js").read_text("utf-8")
+    events_js = Path("assets/js/events/index.js").read_text("utf-8")
     scrobbler_js = Path("assets/js/scrobbler.js").read_text("utf-8")
     dashboard_js = Path("assets/js/dashboard-widgets.js").read_text("utf-8")
 
@@ -1565,22 +1826,17 @@ def test_non_admin_tabs_are_guarded_in_spa_router() -> None:
     assert "function canUseRouteTab(tab)" in core_js
     assert "window.CW?.AuthState?.read?.()" in core_js
     assert 'document.documentElement?.dataset?.cwRole === "user"' in core_js
-    assert 'normalized === "watchlist"' in core_js
-    assert 'normalized === "playback_progress"' in core_js
     assert "perms.dashboard !== false" in core_js
-    assert "perms.playback !== false" in core_js
-    assert "perms.watchlist !== false" in core_js
     assert "perms.write === true" in core_js
     assert "let tab = allowedRouteTab(name);" in core_js
-    assert '!(tab === "playback_progress" && playbackAllowed)' in core_js
     assert 'window.addEventListener("cw:overview-profile-changed"' in core_js
     assert ".cw-nav-profile-link" in css
     assert "html[data-cw-role=user][data-cw-perm-write=off] #tab-snapshots" in css
     assert "html[data-cw-role=user][data-cw-perm-dashboard=off] #tab-main:not([data-cw-profile-home])" in css
     assert "html[data-cw-role=user][data-cw-perm-write=off] #ops-card .action-buttons" in css
     assert "html[data-cw-role=user][data-cw-perm-write=off] #cw-quick-add" in css
-    assert "html[data-cw-role=user] #tab-playback_progress" not in css
-    assert "html[data-cw-role=user][data-cw-perm-playback=off] #tab-playback_progress" in css
+    assert "#tab-playback" not in css
+    assert "#tab-watchlist" not in css
     assert "html[data-cw-role=user][data-cw-perm-write=off] #tab-snapshots" in css
 
 
@@ -1624,9 +1880,10 @@ def test_non_admin_shell_omits_admin_only_modules() -> None:
     assert 'id="tab-main"' in html
     assert 'id="tab-main" class="tab" data-cw-profile-home="1" type="button"' in html
     assert '<a id="tab-main"' not in html
-    assert 'id="tab-watchlist"' in html
-    assert 'id="tab-playback_progress"' in html
-    assert 'id="cw-managed-logout"' in html
+    assert 'id="tab-watchlist"' not in html
+    assert 'id="tab-playback"' not in html
+    assert 'id="cw-managed-logout"' not in html
+    assert 'data-cw-profile-menu-action="logout"' in html
     assert 'id="tab-about-menu"' not in html
 
 
@@ -1653,19 +1910,19 @@ def test_non_admin_shell_uses_initial_permissions() -> None:
     assert f'data-cw-profile-id="{ALICE_PROFILE_ID}"' in watchlist_only
     assert 'id="tab-main"' in watchlist_only
     assert 'id="tab-main" class="tab" data-cw-profile-home="1" type="button"' in watchlist_only
-    assert 'id="tab-playback_progress"' not in watchlist_only
+    assert 'id="tab-playback"' not in watchlist_only
     assert 'id="ops-card"' not in watchlist_only
     assert 'id="stats-card"' not in watchlist_only
     assert 'id="dashboard-widgets-card"' not in watchlist_only
-    assert 'id="tab-watchlist"' in watchlist_only
-    assert 'id="page-watchlist"' in watchlist_only
+    assert 'id="tab-watchlist"' not in watchlist_only
+    assert 'id="page-watchlist"' not in watchlist_only
 
     assert 'data-cw-perm-dashboard="off"' in dashboard_only
     assert 'data-cw-perm-watchlist="off"' in dashboard_only
     assert 'data-cw-perm-playback="on"' in dashboard_only
     assert 'id="tab-main"' in dashboard_only
     assert 'id="tab-main" class="tab" data-cw-profile-home="1" type="button"' in dashboard_only
-    assert 'id="tab-playback_progress"' in dashboard_only
+    assert 'id="tab-playback"' not in dashboard_only
     assert 'id="tab-watchlist"' not in dashboard_only
     assert 'id="ops-card"' not in dashboard_only
     assert 'id="stats-card"' not in dashboard_only
@@ -1677,17 +1934,16 @@ def test_non_admin_shell_uses_initial_permissions() -> None:
     assert 'id="tab-snapshots"' in full_access
     assert 'id="tab-playlists"' in full_access
     assert 'id="tab-editor"' in full_access
-    assert 'id="cw-managed-logout"' in full_access
+    assert 'id="cw-managed-logout"' not in full_access
+    assert 'data-cw-profile-menu-action="logout"' in full_access
     assert "/assets/js/modals.js" in full_access
     assert 'id="tab-settings-menu"' not in full_access
     assert 'id="tab-about-menu"' not in full_access
     assert 'id="tab-about"' not in full_access
-    assert full_access.index('id="tab-main"') < full_access.index('id="tab-watchlist"')
-    assert full_access.index('id="tab-watchlist"') < full_access.index('id="tab-playback_progress"')
-    assert full_access.index('id="tab-playback_progress"') < full_access.index('id="tab-snapshots"')
+    assert full_access.index('id="tab-main"') < full_access.index('id="tab-snapshots"')
     assert full_access.index('id="tab-snapshots"') < full_access.index('id="tab-playlists"')
     assert full_access.index('id="tab-playlists"') < full_access.index('id="tab-editor"')
-    assert full_access.index('id="tab-editor"') < full_access.index('id="cw-managed-logout"')
+    assert full_access.index('id="tab-editor"') < full_access.index('id="cw-nav-profile-menu"')
 
 
 def test_profile_nav_keeps_read_only_managed_links() -> None:
@@ -1697,14 +1953,15 @@ def test_profile_nav_keeps_read_only_managed_links() -> None:
         user={"is_admin": False, "profile_id": ALICE_PROFILE_ID, "username": "pascal", "permissions": {"dashboard": True, "watchlist": True, "playback": True, "write": False}},
     )
 
-    assert 'class="tab active" href="/profile">Main</a>' in html
-    assert 'class="tab" href="/?view=watchlist#watchlist">Watchlist</a>' in html
-    assert 'class="tab" href="/?view=playback_progress#playback_progress">Playback</a>' in html
-    assert 'href="/?view=watchlist#watchlist">View all</a>' in html
-    assert 'href="/?view=playback_progress#playback_progress">View all</a>' in html
-    assert 'id="cw-profile-logout"' in html
-    assert 'href="/?main=1#main">Main</a>' not in html
-    assert 'href="/?main=1#snapshots">Captures</a>' not in html
+    assert """<button class="tab active" type="button" onclick="location.href='/profile'">Main</button>""" in html
+    assert """location.href='/profile#watchlist'">Watchlist</button>""" not in html
+    assert """location.href='/profile#playback'">Playback</button>""" not in html
+    assert 'href="/profile#watchlist">View all</a>' in html
+    assert 'href="/profile#playback">View all</a>' in html
+    assert 'id="cw-profile-logout"' not in html
+    assert 'data-cw-profile-menu-action="logout"' in html
+    assert "location.href='/?main=1#main'" not in html
+    assert "location.href='/?main=1#snapshots'" not in html
 
 
 def test_profile_nav_uses_full_user_links_for_write_managed_user() -> None:
@@ -1714,16 +1971,17 @@ def test_profile_nav_uses_full_user_links_for_write_managed_user() -> None:
         user={"is_admin": False, "profile_id": ALICE_PROFILE_ID, "username": "pascal", "permissions": {"dashboard": True, "watchlist": True, "playback": True, "write": True}},
     )
 
-    assert 'class="tab active" href="/?main=1#main">Main</a>' in html
-    assert 'href="/?main=1#watchlist">Watchlist</a>' in html
-    assert 'href="/?main=1#playback_progress">Playback</a>' in html
-    assert 'href="/?main=1#snapshots">Captures</a>' in html
-    assert 'href="/?main=1#playlists">Playlists</a>' in html
-    assert 'href="/?main=1#editor">Editor</a>' in html
-    assert 'href="/?main=1#watchlist">View all</a>' in html
-    assert 'href="/?main=1#playback_progress">View all</a>' in html
+    assert """<button class="tab" type="button" onclick="location.href='/?main=1#main'">Main</button>""" in html
+    assert """location.href='/profile#watchlist'">Watchlist</button>""" not in html
+    assert """location.href='/profile#playback'">Playback</button>""" not in html
+    assert """<button class="tab" type="button" onclick="location.href='/?main=1#snapshots'">Captures</button>""" in html
+    assert """<button class="tab" type="button" onclick="location.href='/?main=1#playlists'">Playlists</button>""" in html
+    assert """<button class="tab" type="button" onclick="location.href='/?main=1#editor'">Editor</button>""" in html
+    assert 'href="/profile#watchlist">View all</a>' in html
+    assert 'href="/profile#playback">View all</a>' in html
     assert 'href="/?main=1#settings">Settings</a>' not in html
-    assert 'id="cw-profile-logout"' in html
+    assert 'id="cw-profile-logout"' not in html
+    assert 'data-cw-profile-menu-action="logout"' in html
 
 
 def test_profile_page_redirects_stale_app_hashes_to_the_app_shell() -> None:
@@ -1732,7 +1990,6 @@ def test_profile_page_redirects_stale_app_hashes_to_the_app_shell() -> None:
     assert 'window.location?.pathname !== "/profile"' in js
     assert '"playback_progress"' in js
     assert 'window.location.replace(`/?main=1${raw}`)' in js
-    assert 'window.location.replace(`/?view=${encodeURIComponent(tab)}${raw}`)' in js
 
 
 def test_profile_page_supports_admin_account() -> None:
@@ -1745,17 +2002,19 @@ def test_profile_page_supports_admin_account() -> None:
     assert 'data-cw-role="admin"' in html
     assert 'data-cw-profile-id=""' in html
     assert 'id="profile-role" class="cw-profile-role">Administrator</span>' in html
-    assert 'class="tab active" href="/">Main</a>' in html
-    assert 'href="/#watchlist">Watchlist</a>' in html
-    assert 'href="/#playback_progress">Playback</a>' in html
-    assert 'href="/#snapshots">Captures</a>' in html
-    assert 'href="/#playlists">Playlists</a>' in html
-    assert 'href="/#editor">Editor</a>' in html
+    assert """<button class="tab" type="button" onclick="location.href='/'">Main</button>""" in html
+    assert """location.href='/profile#watchlist'">Watchlist</button>""" not in html
+    assert """location.href='/profile#playback'">Playback</button>""" not in html
+    assert """<button class="tab" type="button" onclick="location.href='/#snapshots'">Captures</button>""" in html
+    assert """<button class="tab" type="button" onclick="location.href='/#playlists'">Playlists</button>""" in html
+    assert """<button class="tab" type="button" onclick="location.href='/#editor'">Editor</button>""" in html
     assert 'id="tab-settings" class="tab"' in html
     assert '<span>Settings</span><span class="tab-caret"' in html
     assert 'id="tab-about" class="tab"' in html
     assert '<span>About</span><span class="tab-caret"' in html
     assert 'id="cw-profile-logout"' not in html
+    assert 'onclick="window.cwSettingsMenuLogout()"' not in html
+    assert 'data-cw-profile-menu-action="logout"' in html
 
 
 def test_profile_admin_menu_opens_local_modals_without_main_flash() -> None:
@@ -1817,7 +2076,7 @@ def test_main_shell_has_early_hash_route_hint() -> None:
     core_js = Path("assets/helpers/core.js").read_text("utf-8")
 
     assert "data-cw-initial-tab" in html
-    assert 'const tabs = new Set(["watchlist", "playback_progress", "snapshots", "playlists", "editor", "settings"]);' in html
+    assert 'const tabs = new Set(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);' in html
     assert 'html[data-cw-initial-tab]:not([data-cw-initial-tab="main"]) #ops-card' in html
     assert 'html[data-cw-initial-tab="settings"] #page-settings' in html
     assert "delete document.documentElement.dataset.cwInitialTab;" in core_js
@@ -1866,6 +2125,18 @@ def test_profile_last_watched_uses_provider_branding_icons() -> None:
     assert "#profile-watchlist .cw-profile-watchlist-status{display:inline-flex;align-items:center;justify-content:center;align-self:center;justify-self:center;height:28px;min-height:28px" in css
 
 
+def test_profile_show_tmdb_id_reads_nested_ids_show_ids() -> None:
+    js = Path("assets/js/profile-page.js").read_text("utf-8")
+
+    # history widget rows nest the show id at ids.show_ids, not at top level
+    show = js[js.index("  const showTmdbId = (item) => {"):js.index("  const titleOf =")]
+    assert "const idsShowIds = objectOf(ids.show_ids);" in show
+    assert "directShowIds.tmdb || idsShowIds.tmdb" in show
+
+    tmdb = js[js.index("  const tmdbId = (item) => {"):js.index("  const showTmdbId =")]
+    assert "objectOf(item?.show_ids).tmdb || idsShowIds.tmdb" in tmdb
+
+
 def test_profile_watchlist_rows_reuse_widget_art_url() -> None:
     js = Path("assets/js/profile-page.js").read_text("utf-8")
     helper = Path("assets/helpers/watchlist-preview.js").read_text("utf-8")
@@ -1907,7 +2178,8 @@ def test_quick_stats_counts_movies_and_shows_from_history_breakdown() -> None:
     assert "const movies = Number(breakdown.movies ?? watchtime.movies ?? sampleStats.movies) || 0;" in stats
     assert "const shows = Number(breakdown.shows ?? watchtime.shows ?? sampleStats.shows) || 0;" in stats
     assert "const anime = Number(breakdown.anime) || 0;" in stats
-    assert "const episodes = Number(breakdown.episodes ?? sampleStats.episodes) || 0;" in stats
+    assert "const owned = (Number(collectionCounts.movie) || 0) + (Number(collectionCounts.show) || 0);" in stats
+    assert '["collections", "inventory_2", "video_library", "Collections", numberFmt.format(owned), "Movies and shows you own"],' in stats
     assert 'const breakdown = insights?.features?.history?.breakdown || {};' in stats
     assert '["anime", "animation", "auto_awesome", "Anime", numberFmt.format(anime), "Total anime in your syncs"],' in stats
     assert "cw-profile-stat--anime" in Path("assets/css/profile-page.css").read_text("utf-8")
@@ -1918,7 +2190,7 @@ def test_profile_overview_paints_shimmer_skeletons_before_data_lands() -> None:
     css = Path("assets/css/profile-page.css").read_text("utf-8")
 
     assert "async function init() {\n    paintOverviewSkeletons();" in js
-    assert "posterItems.clear();\n    paintOverviewSkeletons();" in js
+    assert "prunePosterItems();" in js
     for host in ("#profile-progress", "#profile-watchlist", "#profile-quick-stats"):
         assert host in js[js.index("function paintOverviewSkeletons()"):js.index("function setAvatar(url)")]
     for primitive in ("cw-dash-skeleton", "cw-dash-skeleton-row", "cw-skel-block", "cw-skel-line--title", "cw-skel-line--meta", "cw-skel-dot"):
@@ -1953,6 +2225,25 @@ def test_quick_add_uses_authenticated_write_gate() -> None:
     assert "auth.permissions.write === true" in js
     assert 'window.addEventListener("cw:auth-state-changed", syncVisibility);' in js
     assert "renderAll();\n  queuePairsRefresh();" in js
+
+
+def test_setup_wizard_uses_privacy_backdrop() -> None:
+    modals = Path("assets/js/modals.js").read_text("utf-8")
+    host = Path("assets/js/modals/core/host.js").read_text("utf-8")
+    css = Path("assets/js/modals/core/styles.css").read_text("utf-8")
+    flat = Path("assets/themes/flat.css").read_text("utf-8")
+
+    assert "props?.auth_reset_required !== true" in modals
+    assert "'cw-welcome-setup-privacy-backdrop'" in modals
+    assert "window.openUpgradeWarning = (props = {}) => ModalRegistry.open('upgrade-warning', props);" in modals
+    assert "props?.backdropClassName || props?.backdropClass" in host
+    assert "this.backdrop.className = 'cx-backdrop';" in host
+    assert ".cx-backdrop.cw-welcome-setup-privacy-backdrop" in css
+    assert "blur(20px)" in css
+    assert "brightness(.24)" in css
+    assert ".cx-backdrop.cw-welcome-setup-privacy-backdrop:has(#setup-host)" in flat
+    assert ".cx-backdrop.cw-welcome-setup-privacy-backdrop:has(#upg-host)" not in flat
+    assert "brightness(0.24)!important" in flat
 
 
 def test_managed_pair_policy_filters_to_profile_instances() -> None:
@@ -2008,6 +2299,41 @@ def test_managed_pair_endpoints_are_profile_scoped(monkeypatch) -> None:
     assert [row["id"] for row in listed] == ["own"]
     assert blocked == {"ok": False, "error": "profile_scope_denied"}
     assert denied_delete == {"ok": False, "error": "profile_scope_denied"}
+
+
+def test_playlist_managed_pairs_use_playlist_api(monkeypatch) -> None:
+    import api.syncAPI as sync_api
+
+    cfg = {
+        "pairs": [
+            {
+                "id": "pair_playlist_abc123",
+                "source": "TRAKT",
+                "source_instance": "default",
+                "target": "PLEX",
+                "target_instance": "default",
+                "enabled": True,
+                "features": {
+                    "playlists": {
+                        "enable": True,
+                        "mappings": ["MAP-01"],
+                        "managed_by": "playlists",
+                        "mapping_id": "MAP-01",
+                    }
+                },
+            }
+        ],
+    }
+    saves: list[dict[str, Any]] = []
+    monkeypatch.setattr(sync_api, "_env", lambda: (lambda: cfg, lambda next_cfg: saves.append(next_cfg)))
+
+    blocked_update = sync_api.api_pairs_update("pair_playlist_abc123", sync_api.PairPatch(enabled=False), request=cast(Any, None))
+    blocked_delete = sync_api.api_pairs_delete("pair_playlist_abc123", request=cast(Any, None))
+
+    assert blocked_update == {"ok": False, "error": "playlist_managed_pair"}
+    assert blocked_delete == {"ok": False, "error": "playlist_managed_pair"}
+    assert cfg["pairs"][0]["enabled"] is True
+    assert saves == []
 
 
 def test_managed_events_are_profile_scoped_to_assigned_pairs() -> None:
@@ -2199,6 +2525,16 @@ def test_playing_card_uses_overview_profile_scope() -> None:
     assert "CARD.cacheScope !== scope" in js
 
 
+def test_playing_card_art_starts_early_and_skips_redundant_image_updates() -> None:
+    driver = Path("assets/js/playingcard.js").read_text("utf-8")
+    renderer = Path("assets/helpers/playing-card.js").read_text("utf-8")
+
+    assert "const buildBackdropUrl = (p, meta = null)" in driver
+    assert "backdrop: buildBackdropUrl(p, meta)" in driver
+    assert "if (currentPosterSrc === next) return;" in renderer
+    assert "if (currentBackdropValue === next) return;" in renderer
+
+
 def test_insights_snapshot_selector_saves_crosswatch_profile_choice(monkeypatch) -> None:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -2349,6 +2685,7 @@ def test_status_probes_resolve_provider_without_configured_default() -> None:
         ("SIMKL", "simkl", "SIMKL-P01", {"access_token": "t", "client_id": "c"}),
         ("MDBLIST", "mdblist", "MDBLIST-P01", {"api_key": "k"}),
         ("TAUTULLI", "tautulli", "TAUTULLI-P01", {"server_url": "http://t:8181", "api_key": "k"}),
+        ("TRACEARR", "tracearr", "TRACEARR-P01", {"server_url": "http://t:3000", "api_key": "k"}),
     ]
 
     for prov, ck, inst, blk in cases:
@@ -2392,17 +2729,40 @@ def test_connection_cards_show_default_and_friendly_profile_names() -> None:
     ui = Path("assets/helpers/providers-ui.js").read_text("utf-8")
 
     assert "function profileFriendlyName(cfg, provider, id)" in ui
-    assert "PROFILE_PILL_LIMIT" in ui
-    assert 'is-overflow' in ui
-    # default is no longer stripped from the card badges
+    assert "function authProfileSummary(card, cfg)" in ui
+    assert "PROFILE_NAME_LIMIT" in ui
+    assert "${names.length} profiles" in ui
+    assert "const onlyDefault = names.length === 1" in ui
+    assert "cw-auth-profile-pill" not in ui
+    assert "cw-auth-profile-strip" not in ui
     assert '.filter((id) => String(id || "").trim().toLowerCase() !== "default")' not in ui
 
     css = Path("assets/css/auth-providers.css").read_text("utf-8")
-    pill = css.split(".cw-auth-profile-pill{", 1)[1].split("}", 1)[0]
-    assert "text-overflow:ellipsis" in pill
-    assert "overflow:hidden" in pill
-    strip = css.split(".cw-auth-profile-strip{", 1)[1].split("}", 1)[0]
-    assert "max-width:" in strip and "overflow:hidden" in strip
+    assert ".cw-auth-profile-summary{" in css
+    assert ".cw-auth-profile-pill" not in css
+    assert ".cw-auth-profile-strip" not in css
+    assert ".cw-auth-profile-pill" not in Path("assets/themes/flat.css").read_text("utf-8")
+
+
+def test_connection_cards_name_failed_profiles_and_dot_each_profile() -> None:
+    ui = Path("assets/helpers/providers-ui.js").read_text("utf-8")
+
+    assert "function failedProfileIds(" in ui
+    assert "function authProfileState(" in ui
+    assert "Check connection: ${shown}${overflow}" in ui
+    assert "if (entry.configured === true) return \"ok\";" in ui
+    assert "data?.instances && typeof data.instances === \"object\"" in ui
+    assert "${okCount} of ${names.length} connected" in ui
+    assert 'dot: "warn"' in ui
+    assert 'item.state === "ok" ? "Connected" : "Check connection"' in ui
+
+    css = Path("assets/css/auth-providers.css").read_text("utf-8")
+    assert ".cw-auth-status-dot.ok" in css
+    assert ".cw-auth-status-dot.warn" in css
+    assert ".cw-auth-status-dot.fail" in css
+    assert 'card.status.failed ? "fail" : ""' in ui
+    status_text = css.split(".cw-auth-status-text{", 1)[1].split("}", 1)[0]
+    assert "text-overflow:ellipsis" in status_text
 
 
 def test_connection_delete_guard_ignores_unconfigured_default() -> None:
@@ -2438,6 +2798,15 @@ def test_auth_remount_preserves_open_connection_overlay() -> None:
     assert body.index("overlay?.remove();") < body.index("slot.innerHTML = authHtml;")
     assert "liveSectionIds" in body
     assert "slot.appendChild(overlay);" in body
+
+
+def test_connection_overlay_ignores_backdrop_clicks() -> None:
+    ui = Path("assets/helpers/providers-ui.js").read_text("utf-8")
+    handler = ui.split("slot.addEventListener(\"click\",", 1)[1].split("\n    });", 1)[0]
+
+    assert "[data-cw-auth-close]" in handler
+    assert "closeAuthProviderOverlay();" in handler
+    assert "classList?.contains(\"cw-auth-overlay\")" not in handler
 
 
 def test_status_probes_ignore_pair_reference_to_unconfigured_default() -> None:
@@ -2616,7 +2985,21 @@ def test_cards_tag_user_profile_class() -> None:
     assert '${r.user_profile_label ? "has-user-profile" : ""}' in routes
 
 
-def test_pair_config_profile_selector_sits_before_mode_control() -> None:
+def test_scrobbler_cards_summarize_media_ignore_filters() -> None:
+    js = Path("assets/js/scrobbler.js").read_text("utf-8")
+    webhooks = js.split("function renderWebhooks(", 1)[1].split("function renderRoutes(", 1)[0]
+    routes = js.split("function renderRoutes(", 1)[1]
+
+    assert "ignore_agregarr_trailers" in js
+    assert "ignored_path_prefixes" in js
+    assert "ignored_filename_patterns" in js
+    assert "ignored_editions" in js
+    assert "function webhookFilterSummary(row = {})" in js
+    assert "${esc(webhookFilterSummary(x))}" in webhooks
+    assert "${esc(routeFilterSummary(r.filters))}" in routes
+
+
+def test_pair_config_profile_display_sits_before_mode_control() -> None:
     js = Path("assets/js/modals/pair-config/index.js").read_text("utf-8")
     css = Path("assets/js/modals/pair-config/styles.css").read_text("utf-8")
 
@@ -2624,36 +3007,77 @@ def test_pair_config_profile_selector_sits_before_mode_control() -> None:
     assert js.index("cx-user-profile-slot") < js.index("flow-mode-inline")
     assert "slot.appendChild(row)" in js
     assert ".flow-control-row" in css
-    assert "cx-user-profile-select" in js
+    assert "cx-user-profile-display" in js
     assert "resetPairUserProfileControl(state)" in js
-    assert 'sel.value=""' in js
     assert "selected_user_profile_id" in js
-    assert "applying_user_profile" in js
     assert "eligiblePairUserProfiles(state)" in js
     assert "profileCanOwnCurrentPair(profile,state)" in js
-    assert ".cx-user-profile-select" in css
+    assert ".cx-user-profile-display" in css
     assert "cx-user-profile-label" not in js
     assert ">User profile<" not in js
+    assert "id=\"cx-user-profile\"" not in js
+    assert "enhanceUserProfile" not in js
     assert "display_label||x.label||x.id" in js
     assert 'title="${escHTML(row.id)}"' in js
 
-def test_scrobbler_modals_have_conditional_user_profile_selector() -> None:
+
+def test_pair_config_instance_select_hides_unconfigured_default() -> None:
+    js = Path("assets/js/modals/pair-config/index.js").read_text("utf-8")
+    block = js.split("function renderInstanceSelects(", 1)[1].split("function resetPairUserProfileControl(", 1)[0]
+
+    assert '[["default",{id:"default",label:"Default"}]]' not in block
+    assert 'typeof x.configured==="boolean"?x.configured:null' in block
+    assert 'const gated=all.some(row=>typeof row.configured==="boolean")' in block
+    assert "gated?all.filter(row=>row.configured!==false):all.slice()" in block
+    assert 'sel.value=ids.includes(want)?want:(ids[0]||"")' in block
+    assert 'sel.value=ids.includes(want)?want:"default"' not in block
+
+
+def test_pair_config_pins_saved_instance_that_became_unconfigured() -> None:
+    js = Path("assets/js/modals/pair-config/index.js").read_text("utf-8")
+    block = js.split("function renderInstanceSelects(", 1)[1].split("function resetPairUserProfileControl(", 1)[0]
+
+    assert "savedInstances:{src:null,dst:null}" in js
+    assert "state.savedInstances={src:{provider:state.src,instance:state.src_instance}" in js
+    assert 'String(row.provider||"").toUpperCase()!==String(prov||"").toUpperCase()' in block
+    assert "if(pin&&pin===want&&!rows.some(row=>row.id===pin))" in block
+    assert 'pin==="default"?[stale,...rows]:[...rows,stale]' in block
+    assert "row.stale?`${row.label} - not configured`:row.label" in block
+    assert 'rows=[{id:"default",label:"Default",stale:!!state.instancesLoaded}]' in block
+    assert "state.instancesLoaded=!!r.ok" in js
+
+
+def test_provider_instances_report_unconfigured_default_beside_configured_profile(monkeypatch) -> None:
+    from api import providerInstancesAPI as provider_api
+
+    cfg = {"plex": {"instances": {"PLEX-P01": {"account_token": "tok"}}}}
+    monkeypatch.setattr(provider_api, "load_config", lambda: cfg)
+
+    rows = _loads_body(provider_api.api_provider_instances_all().body)["PLEX"]
+    by_id = {row["id"]: row for row in rows}
+
+    assert by_id["default"]["configured"] is False
+    assert by_id["PLEX-P01"]["configured"] is True
+
+def test_scrobbler_modals_have_conditional_user_profile_display() -> None:
     route_js = Path("assets/js/modals/scrobbler-route/index.js").read_text("utf-8")
     webhook_js = Path("assets/js/modals/scrobbler-webhook/index.js").read_text("utf-8")
     css = Path("assets/css/components.css").read_text("utf-8")
 
     assert "/api/user-profiles" in route_js
     assert "/api/user-profiles" in webhook_js
-    assert "id=\"scr-user-profile\"" in route_js
-    assert "id=\"scw-user-profile\"" in webhook_js
-    assert "if (!userProfiles.length) return \"\"" in route_js
-    assert "if (!userProfiles.length || props.mode === \"edit\") return \"\"" in webhook_js
+    assert "id=\"scr-user-profile\"" not in route_js
+    assert "id=\"scw-user-profile\"" not in webhook_js
+    assert "scrm-profile-display" in route_js
+    assert "scrm-profile-display" in webhook_js
+    assert "profileCanOwnRoute(profile, draft || {})" in route_js
+    assert "profileCanOwnWebhook(profile, selectedWebhook())" in webhook_js
     assert "selectedUserProfileId" in route_js
     assert "selectedUserProfileId" in webhook_js
-    assert 'selectedUserProfileId = applyUserProfile(selected) ? selected : ""' in route_js
-    assert 'selectedUserProfileId = applyUserProfile(selected) ? selected : ""' in webhook_js
-    assert '${p.id === current ? "selected" : ""}' in route_js
-    assert '${p.id === current ? "selected" : ""}' in webhook_js
+    assert "applyUserProfile" not in route_js
+    assert "applyUserProfile" not in webhook_js
+    assert "Manual profiles" not in webhook_js
+    assert "Unassigned" not in route_js
     assert "profileOptionLabel(profile)" in route_js
     assert "profileOptionLabel(profile)" in webhook_js
     assert "display_label || profile?.label" in route_js
@@ -2661,36 +3085,37 @@ def test_scrobbler_modals_have_conditional_user_profile_selector() -> None:
     assert 'title="${esc(p.instance)}"' in route_js
     assert 'title="${esc(p.instance)}"' in webhook_js
     assert ".scrm-profile-row" in css
+    assert ".scrm-profile-display" in css
+
+
+def test_scrobbler_route_and_webhook_modals_are_not_backdrop_dismissible() -> None:
+    modals_js = Path("assets/js/modals.js").read_text("utf-8")
+
+    assert "ModalRegistry.open('scrobbler-webhook', { ...props, dismissible: false })" in modals_js
+    assert "ModalRegistry.open('scrobbler-route', { ...props, dismissible: false })" in modals_js
 
 
 def test_version_stamp_file_beats_stale_env(tmp_path, monkeypatch) -> None:
     from api import versionAPI
 
-    stamp = tmp_path / "VERSION"
-    monkeypatch.setattr(versionAPI, "VERSION_FILE", stamp)
-
-    # a container env pinned by Portainer or Watchtower must not win
-    stamp.write_text("v0.11.1", encoding="utf-8")
-    monkeypatch.setenv("APP_VERSION", "v0.11.0")
-    assert versionAPI.resolve_current_version() == "v0.11.1"
-
-    # without a stamp the env still works, for bare python runs
-    stamp.unlink()
-    assert versionAPI.resolve_current_version() == "v0.11.0"
-
-    # an empty or truncated stamp must not blank the version
-    stamp.write_text("   ", encoding="utf-8")
-    assert versionAPI.resolve_current_version() == "v0.11.0"
-
-    monkeypatch.delenv("APP_VERSION", raising=False)
-    assert versionAPI.resolve_current_version() == versionAPI.FALLBACK_VERSION
-
-    # dev images build without the arg, so the placeholder must fall through
-    stamp.write_text("v0.0.0", encoding="utf-8")
-    monkeypatch.setenv("APP_VERSION", "v0.0.0")
-    assert versionAPI.resolve_current_version() == versionAPI.FALLBACK_VERSION
-    stamp.write_text("0.0.0", encoding="utf-8")
-    assert versionAPI.resolve_current_version() == versionAPI.FALLBACK_VERSION
+    cases = [
+        ("v0.11.1", "v0.11.0", "v0.11.1"),
+        (None, "v0.11.0", "v0.11.0"),
+        ("   ", "v0.11.0", "v0.11.0"),
+        ("   ", None, versionAPI.FALLBACK_VERSION),
+        ("v0.0.0", "v0.0.0", versionAPI.FALLBACK_VERSION),
+        ("0.0.0", "v0.0.0", versionAPI.FALLBACK_VERSION),
+    ]
+    for index, (stamped, environment, expected) in enumerate(cases):
+        stamp = tmp_path / f"VERSION-{index}"
+        if stamped is not None:
+            stamp.write_text(stamped, encoding="utf-8")
+        monkeypatch.setattr(versionAPI, "VERSION_FILE", stamp)
+        if environment is None:
+            monkeypatch.delenv("APP_VERSION", raising=False)
+        else:
+            monkeypatch.setenv("APP_VERSION", environment)
+        assert versionAPI.resolve_current_version() == expected
 
 
 def test_dockerfile_stamps_version_into_the_image() -> None:
@@ -2751,7 +3176,7 @@ def test_status_frontend_sends_selected_profile() -> None:
     api_js = Path("assets/helpers/api.js").read_text("utf-8")
     core_js = Path("assets/helpers/core.js").read_text("utf-8")
 
-    assert "`/api/status?user_profile=${encodeURIComponent(profile)}`" in api_js
+    assert "qs.push(`user_profile=${encodeURIComponent(profile)}`)" in api_js
     assert '`${KEY.status}:${profile || "all"}`' in api_js
     assert "key === KEY.pairs || key === KEY.status" in api_js
     assert "const statusCacheKey = ()" in core_js
@@ -2870,15 +3295,17 @@ def test_view_as_query_overrides_ambient_header(monkeypatch) -> None:
 
 
 def test_events_modal_has_profile_filter_in_more_filters() -> None:
-    js = Path("assets/js/modals/events/index.js").read_text("utf-8")
+    js = Path("assets/js/events/index.js").read_text("utf-8")
 
-    assert "function withEventScope(u)" in js
+    assert "function withEventScope(u, eventScope)" in js
     assert 'if (!url.pathname.startsWith("/api/events/")) return u;' in js
     assert 'url.searchParams.set("user_profile", eventScope || "all");' in js
     assert "const ddProfile = createDropdown({" in js
     assert "const placeProfileDd = () => {" in js
     assert "const host = stats ? tabsRightEl : filtersEl;" in js
     assert "renderStatsRange(); placeProfileDd(); loadStats();" in js
+    assert 'if (isAdmin && (all || k === "profile")) { eventScope = ""; ddProfile.value = ""; }' in js
+    assert 'if (isAdmin && eventScope) chips.push({ k: "profile", label: ddProfile.labelOf(eventScope) });' in js
 
 
 def test_profile_hero_prefers_last_scrobble_over_history() -> None:

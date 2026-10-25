@@ -1,0 +1,200 @@
+/* tests/notifications.test.mjs */
+/* CrossWatch - Notification dismissal, persistence and profile isolation tests */
+/* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import vm from "node:vm";
+import {readFileSync} from "node:fs";
+
+const script = readFileSync(new URL("../assets/helpers/notifications.js", import.meta.url), "utf8");
+function setup(storage = new Map(), {pairs = true, role = "admin", write = "on"} = {}) {
+  class Element {
+    hidden = false; innerHTML = ""; style = {}; dataset = {}; children = new Map(); listeners = {};
+    setAttribute() {} append() {} before() {} focus() {} contains() { return true; }
+    getBoundingClientRect() { return {bottom:40,right:900}; }
+    querySelector(selector) {
+      if (!this.children.has(selector)) this.children.set(selector, new Element());
+      return this.children.get(selector);
+    }
+    addEventListener(name, fn) { this.listeners[name] = fn; }
+  }
+  const elements = [];
+  const document = {head:new Element(),body:new Element(),documentElement:{dataset:{cwRole:role,cwPermWrite:write}},
+    getElementById:id=>id==="cw-notifications-css" || (id==="pairs_list" && !pairs) ? null : new Element(),
+    createElement:()=>{const el=new Element();elements.push(el);return el;},addEventListener:(name,fn)=>events[name]=fn};
+  const events = {};
+  const window = {CW:{AuthState:{user:{id:"alice"}},OverviewProfile:{id:"home"}},
+    innerHeight:900,innerWidth:1200,addEventListener:(name,fn)=>events[name]=fn};
+  const context = {window,document,clearTimeout(){},setTimeout(){},navigator:{},location:{href:"http://localhost/",origin:"http://localhost"},URL,
+    localStorage:{getItem:key=>storage.get(key),setItem:(key,value)=>storage.set(key,value)}};
+  vm.runInNewContext(script, context);
+  const panel = elements[2], body = panel.querySelector(".cw-notifications-body");
+  const item = (id,revision="review") => ({id,revision,title:`Review ${id}`,href:`/#review=${id}`});
+  function publish(items, name="sync-reviews", scope="profile") { window.CW.Notifications.setSource(name,{items,scope}); }
+  function clear(id,revision="review") {
+    const button = {dataset:{notificationClear:JSON.stringify(["sync-reviews",id,revision])}};
+    panel.listeners.click({target:{closest:selector=>selector==="[data-notification-clear]" ? button : null}});
+  }
+  function clearAll() {
+    panel.listeners.click({target:{closest:selector=>selector==="[data-notifications-clear-all]" ? {} : null}});
+  }
+  return {window,events,publish,clear,clearAll,item,html:()=>body.innerHTML,storage,context,alert:elements[3]};
+}
+
+test("mobile alerts are opt-in, skip initial items and do not repeat on polling", () => {
+  const app = setup(), pulses = [];
+  app.window.matchMedia = () => ({matches:true});
+  app.context.navigator.vibrate = value => pulses.push([...value]);
+  app.publish([app.item("old")]);
+  app.publish([app.item("old"),app.item("disabled")]);
+  assert.equal(app.alert.hidden,true);
+  app.storage.set("cw.mobile.notificationAlerts","1");
+  app.publish([app.item("old"),app.item("new")]);
+  assert.equal(app.alert.hidden,false);
+  assert.deepEqual(pulses,[[30,60,30]]);
+  app.publish([app.item("old"),app.item("new")]);
+  app.publish([]);
+  app.publish([app.item("new")]);
+  assert.equal(pulses.length,1);
+  app.context.document.hidden = true;
+  app.events.visibilitychange();
+  app.publish([app.item("hidden")]);
+  assert.equal(app.alert.hidden,true);
+  assert.equal(pulses.length,1);
+  app.context.document.hidden = false;
+  app.publish([app.item("hidden")]);
+  assert.equal(app.alert.hidden,true);
+});
+
+test("mobile banner survives unsupported vibration and skips desktop and profile baselines", () => {
+  const app=setup(new Map([["cw.mobile.notificationAlerts","1"]]));
+  app.window.matchMedia = () => ({matches:false});
+  app.publish([]); app.publish([app.item("desktop")]);
+  assert.equal(app.alert.hidden,true);
+  app.window.matchMedia = () => ({matches:true});
+  app.publish([app.item("mobile")]);
+  assert.equal(app.alert.hidden,false);
+  app.window.CW.OverviewProfile.id="other";
+  app.events["cw:overview-profile-changed"]();
+  app.publish([app.item("initial")]);
+  assert.equal(app.alert.hidden,true);
+  app.context.navigator.vibrate = () => { throw new Error("blocked"); };
+  app.publish([app.item("another")]);
+  assert.equal(app.alert.hidden,false);
+});
+
+test("sync reviews link works from the main app and standalone profiles", () => {
+  assert.match(setup().html(), /class="cw-notifications-footer" href="#settings\/sync"/);
+  const profile = setup(new Map(), {pairs:false});
+  assert.match(profile.html(), /class="cw-notifications-footer" href="\/#settings\/sync"/);
+  const managed = setup(new Map(), {pairs:false,role:"user"});
+  assert.match(managed.html(), /href="\/\?main=1#settings\/sync"/);
+});
+
+test("sync reviews link respects write access and setup state", () => {
+  const profile = setup(new Map(), {pairs:false,role:"user",write:"off"});
+  assert.doesNotMatch(profile.html(), /cw-notifications-footer/);
+  profile.context.document.documentElement.dataset.cwPermWrite = "on";
+  profile.events["cw:auth-state-changed"]();
+  assert.match(profile.html(), /cw-notifications-footer/);
+  profile.window.cwIsAuthSetupPending = () => true;
+  profile.publish([]);
+  assert.doesNotMatch(profile.html(), /cw-notifications-footer/);
+});
+
+test("clear one survives polling and reload without clearing another review", () => {
+  const app=setup(), items=[app.item("one"),app.item("two")];
+  app.publish(items); app.clear("one"); app.publish(items);
+  assert.doesNotMatch(app.html(), /Review one/);
+  assert.match(app.html(), /Review two/);
+  const reloaded=setup(app.storage); reloaded.publish(items);
+  assert.doesNotMatch(reloaded.html(), /Review one/);
+  assert.match(reloaded.html(), /Review two/);
+});
+
+test("clear all affects current notifications but allows new notifications and status changes", () => {
+  const app=setup(); app.publish([app.item("one"),app.item("two")]); app.clearAll();
+  assert.match(app.html(), /all caught up/);
+  app.publish([app.item("one"),app.item("two","complete"),app.item("three")]);
+  assert.doesNotMatch(app.html(), /Review one/);
+  assert.match(app.html(), /Review two/);
+  assert.match(app.html(), /Review three/);
+});
+
+test("dismissals are isolated by account, profile and notification source", () => {
+  const app=setup(), items=[app.item("one")]; app.publish(items); app.clearAll();
+  app.window.CW.OverviewProfile.id="work"; app.events["cw:overview-profile-changed"](); app.publish(items);
+  assert.match(app.html(), /Review one/);
+  app.window.CW.OverviewProfile.id="home"; app.events["cw:overview-profile-changed"](); app.publish(items);
+  assert.doesNotMatch(app.html(), /Review one/);
+  app.publish(items,"another-source"); assert.match(app.html(), /Review one/);
+  app.window.CW.AuthState.user.id="bob"; app.events["auth-changed"](); app.publish(items);
+  assert.match(app.html(), /Review one/);
+});
+
+test("storage events reflect clearing in another tab", () => {
+  const app=setup(), other=setup(app.storage), items=[app.item("one")];
+  app.publish(items); other.publish(items); other.clearAll();
+  app.events.storage({key:[...app.storage.keys()][0]});
+  assert.doesNotMatch(app.html(), /Review one/);
+});
+
+test("release dismissals follow the account across profiles and allow newer releases", () => {
+  const app=setup(), release=app.item("0.12.0");
+  app.publish([release],"updates","account"); app.clearAll();
+  app.window.CW.OverviewProfile.id="work"; app.events["cw:overview-profile-changed"]();
+  app.publish([release],"updates","account"); assert.doesNotMatch(app.html(),/Review 0.12.0/);
+  app.publish([app.item("0.12.1")],"updates","account"); assert.match(app.html(),/Review 0.12.1/);
+  app.window.CW.AuthState.user.id="bob"; app.events["auth-changed"]();
+  app.publish([release],"updates","account"); assert.match(app.html(),/Review 0.12.0/);
+});
+
+test("release announcements use the read-only version endpoint and official release links", async () => {
+  const app=setup();
+  Object.assign(app.context,{AbortController,setTimeout,clearTimeout,setInterval(){},fetch:async url=>{
+    assert.equal(url,"/api/version");
+    return {ok:true,json:async()=>({current:"0.11.7",latest:"0.12.0",update_available:true})};
+  }});
+  vm.runInNewContext(readFileSync(new URL("../assets/helpers/update-notifications.js",import.meta.url),"utf8"),app.context);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(app.html(), /CrossWatch v0.12.0 is available/);
+  assert.match(app.html(), /https:\/\/github.com\/cenodude\/CrossWatch\/releases\/tag\/v0.12.0/);
+  assert.match(app.html(), /target="_blank" rel="noopener noreferrer"/);
+  app.events["cw:overview-profile-changed"](); assert.match(app.html(),/CrossWatch v0.12.0/);
+  app.events["cw-update-status"]({detail:{current:"0.12.0",latest:"0.12.0",available:false}});
+  assert.doesNotMatch(app.html(),/CrossWatch v0.12.0 is available/);
+});
+
+async function databaseApp(status, options) {
+  const app=setup(new Map(), options), calls=[];
+  Object.assign(app.context,{AbortController,setTimeout(){},clearTimeout(){},fetch:async url=>{
+    calls.push(url);
+    return {ok:true,status:200,json:async()=>status};
+  }});
+  vm.runInNewContext(readFileSync(new URL("../assets/helpers/database-notifications.js",import.meta.url),"utf8"),app.context);
+  await new Promise(resolve=>setImmediate(resolve));
+  return {...app,calls};
+}
+
+test("database busy and network storage warnings show for admins", async () => {
+  const app=await databaseApp({busy:true,operation:"state.save_pair_blocks",seconds:42,since:1760000000,filesystem:"cifs",network_filesystem:true});
+  assert.deepEqual(app.calls,["/api/health/database"]);
+  assert.match(app.html(), /Database busy/);
+  assert.match(app.html(), /state\.save_pair_blocks\) has been running for 42 seconds/);
+  assert.match(app.html(), /Database on a network share/);
+  assert.match(app.html(), /The local database is on cifs/);
+  assert.match(app.html(), /href="\/#settings\/maintenance"/);
+});
+
+test("managed users see the busy notice without maintenance or storage details", async () => {
+  const app=await databaseApp({busy:true,operation:"state.save_state",seconds:300,since:1760000000,filesystem:"nfs4",network_filesystem:true},{role:"user"});
+  assert.match(app.html(), /running for 5 minutes/);
+  assert.match(app.html(), /Got it/);
+  assert.doesNotMatch(app.html(), /network share|settings\/maintenance/);
+});
+
+test("an idle database on local storage adds no notifications", async () => {
+  const app=await databaseApp({busy:false,operation:null,seconds:0,since:null,filesystem:"ext4",network_filesystem:false});
+  assert.match(app.html(), /all caught up/);
+});

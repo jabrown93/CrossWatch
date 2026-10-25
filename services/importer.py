@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from cw_platform.access_policy import request_user, user_can_access_instance
 from cw_platform.config_base import load_config
@@ -188,16 +189,22 @@ SOURCE_GUIDES: dict[str, dict[str, Any]] = {
 }
 
 
-class ImportCommitRequest(BaseModel):
+class ImportCommitFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     import_id: str = Field(min_length=8, max_length=80)
     target_instance: str = "default"
     mode: Literal["ready", "selected"] = "ready"
     row_ids: list[str] = Field(default_factory=list, max_length=MAX_ROWS)
+    excluded_row_ids: list[str] = Field(default_factory=list, max_length=MAX_ROWS)
+    q: str = Field(default="", max_length=1000)
     features: list[str] = Field(default_factory=lambda: ["history", "ratings", "watchlist"])
     media_types: list[str] = Field(default_factory=lambda: list(DEFAULT_MEDIA_TYPES))
     include_existing: bool = False
+
+
+class ImportCommitRequest(ImportCommitFields):
+    status: Literal["all", "ready", "exists", "duplicate", "missing_identity", "unsupported", "invalid"] = "all"
 
 
 def _clean_cache() -> None:
@@ -764,7 +771,7 @@ def _tvtime_expand(data: Any, path: str) -> list[tuple[str, Mapping[str, Any], s
         for season in seasons:
             if not isinstance(season, Mapping):
                 continue
-            season_number = season.get("number") or season.get("season")
+            season_number = next((v for v in (season.get("number"), season.get("season")) if v is not None), None)
             episodes = season.get("episodes")
             if not isinstance(episodes, list):
                 continue
@@ -778,7 +785,7 @@ def _tvtime_expand(data: Any, path: str) -> list[tuple[str, Mapping[str, Any], s
                             **dict(ep),
                             "type": "episode",
                             "season": season_number,
-                            "episode": ep.get("number") or ep.get("episode"),
+                            "episode": next((v for v in (ep.get("number"), ep.get("episode")) if v is not None), None),
                             "series_title": show_title,
                             "show_ids": show_ids,
                             "ids": ids_from(ep),
@@ -1293,6 +1300,23 @@ def api_import_options(request: Request = cast(Request, None)) -> dict[str, Any]
     }
 
 
+def _prepare_preview(data: bytes, filename: str, requested: str, cfg: Mapping[str, Any], instance: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    files = _safe_zip_members(data) if zipfile.is_zipfile(io.BytesIO(data)) else [(filename, data)]
+    detected = _detect_source(requested, filename, files)
+    validation = _validate_source_files(detected, files, requested=requested)
+    try:
+        raw_rows = _parse_files(detected, files)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _api_error(ERROR_PARSE_FAILED, detail="Could not parse this export.") from exc
+    if not raw_rows:
+        raise _api_error(ERROR_NO_ROWS, detail="No importable rows were found.")
+
+    rows = _shape_rows(raw_rows, cfg, instance, detected)
+    return detected, validation, rows
+
+
 @router.post("/preview", response_class=JSONResponse)
 async def api_import_preview(
     file: UploadFile = File(...),
@@ -1310,19 +1334,7 @@ async def api_import_preview(
         raise _api_error(ERROR_TARGET_UNAVAILABLE, status_code=403, detail="profile_scope_denied")
     data = await _read_upload(file)
     filename = str(file.filename or "upload").strip()
-    files = _safe_zip_members(data) if zipfile.is_zipfile(io.BytesIO(data)) else [(filename, data)]
-    detected = _detect_source(requested, filename, files)
-    validation = _validate_source_files(detected, files, requested=requested)
-    try:
-        raw_rows = _parse_files(detected, files)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise _api_error(ERROR_PARSE_FAILED, detail="Could not parse this export.") from exc
-    if not raw_rows:
-        raise _api_error(ERROR_NO_ROWS, detail="No importable rows were found.")
-
-    rows = _shape_rows(raw_rows, cfg, instance, detected)
+    detected, validation, rows = await run_in_threadpool(_prepare_preview, data, filename, requested, cfg, instance)
     import_id = hashlib.sha256(f"{time.time_ns()}|{filename}|{len(data)}".encode("utf-8")).hexdigest()[:32]
     _PREVIEWS[import_id] = {
         "created_at": time.time(),
@@ -1402,14 +1414,17 @@ def api_import_commit(payload: ImportCommitRequest = Body(...), request: Request
     wanted_features = {str(f).strip() for f in payload.features if str(f).strip() in FEATURES}
     wanted_media = {str(m).strip() for m in payload.media_types if str(m).strip() in MEDIA_TYPES}
     selected = {str(x).strip() for x in payload.row_ids if str(x).strip()}
+    excluded = set(payload.excluded_row_ids)
 
     rows: list[Mapping[str, Any]] = []
-    for row in preview.get("rows") or []:
+    for row in _filtered_rows(preview.get("rows") or [], features=wanted_features, media_types=wanted_media, status=payload.status, q=payload.q):
         if str(row.get("feature") or "") not in wanted_features:
             continue
         if str(row.get("media_type") or "") not in wanted_media:
             continue
         if payload.mode == "selected" and str(row.get("id") or "") not in selected:
+            continue
+        if str(row.get("id") or "") in excluded:
             continue
         status = str(row.get("status") or "")
         if status != STATUS_READY and not (status == STATUS_EXISTS and payload.include_existing):
@@ -1444,7 +1459,7 @@ def api_import_commit(payload: ImportCommitRequest = Body(...), request: Request
         results[feature] = result
 
     return {
-        "ok": unresolved_total == 0,
+        "ok": unresolved_total == 0 and all(result.get("ok", True) for result in results.values()),
         "import_id": payload.import_id,
         "target_instance": instance,
         "applied": applied,

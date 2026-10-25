@@ -122,7 +122,7 @@ def test_lost_alter_race_does_not_break_the_connect() -> None:
     serialises the real thing, so a threaded test passes with or without the
     guard and proves nothing.
     """
-    from cw_platform.local_db.schema import _add_missing_columns
+    from cw_platform.local_db.schema import _ensure_column
 
     class _RaceConn:
         """Reports the column missing, then fails the ALTER as a rival would."""
@@ -133,18 +133,21 @@ def test_lost_alter_race_does_not_break_the_connect() -> None:
 
         def execute(self, sql: str):
             if sql.startswith("PRAGMA table_info"):
-                return [(0, "event_id", "TEXT", 0, None, 1)]
+                return self
             self.altered += 1
             raise sqlite3.OperationalError(self.error)
 
+        def fetchall(self):
+            return [(0, "event_id", "TEXT", 0, None, 1)]
+
     conn = _RaceConn("duplicate column name: account_id")
-    _add_missing_columns(conn, "activity_events", {"account_id": "TEXT"})  # must not raise
+    _ensure_column(conn, "activity_events", "account_id", "TEXT")  # must not raise
     assert conn.altered == 1
 
     # Any other failure is a real problem and must still surface.
     hard = _RaceConn("no such table: activity_events")
     try:
-        _add_missing_columns(hard, "activity_events", {"account_id": "TEXT"})
+        _ensure_column(hard, "activity_events", "account_id", "TEXT")
     except sqlite3.OperationalError as e:
         assert "no such table" in str(e)
     else:
@@ -196,72 +199,15 @@ def test_single_entry_payload_is_unaffected() -> None:
 
 def test_flat_watcher_alert_keeps_the_resolved_identifiers() -> None:
     """A flat Plex alert has no PlaySessionStateNotification, but the watcher
-    resolved the account from /status/sessions. Without stamping, that identity
-    never reaches the activity row and an id:-scoped profile loses the event."""
-    from providers.scrobble.plex.watch import WatchService
-
-    raw: dict = {"_type": "playing", "sessionKey": "5"}
-    ev = SimpleNamespace(raw=raw, session_key="5")
-
-    watcher = object.__new__(WatchService)
-    watcher._resolve_session_identity = lambda _sk: {  # type: ignore[attr-defined]
-        "name": "alice", "account_id": "42", "account_uuid": "abc-123",
-    }
-    WatchService._stamp_account_identity(watcher, ev)  # type: ignore[arg-type]
-
-    assert raw["Account"] == {"id": "42", "uuid": "abc-123"}
+    stamps the identity its session lookup resolved. Without reading it, that
+    identity never reaches the activity row and an id:-scoped profile loses the event."""
+    raw = {"_type": "playing", "_cw_session_identity": {"name": "alice", "account_id": "42", "account_uuid": "ABC-123"}}
     assert account_identifiers(raw) == ("42", "abc-123")
 
 
-def test_stamping_never_overwrites_a_real_account_block() -> None:
-    """Webhook payloads already carry Account; the watcher must not clobber it."""
-    from providers.scrobble.plex.watch import WatchService
-
-    raw: dict = {"Account": {"id": "7", "uuid": "real"}}
-    ev = SimpleNamespace(raw=raw, session_key="5")
-    watcher = object.__new__(WatchService)
-    watcher._resolve_session_identity = lambda _sk: {"account_id": "42"}  # type: ignore[attr-defined]
-    WatchService._stamp_account_identity(watcher, ev)  # type: ignore[arg-type]
-    assert raw["Account"] == {"id": "7", "uuid": "real"}
-
-
-def test_stamping_is_a_noop_without_a_resolved_identity() -> None:
-    from providers.scrobble.plex.watch import WatchService
-
-    raw: dict = {"_type": "playing"}
-    ev = SimpleNamespace(raw=raw, session_key=None)
-    watcher = object.__new__(WatchService)
-    watcher._resolve_session_identity = lambda _sk: None  # type: ignore[attr-defined]
-    WatchService._stamp_account_identity(watcher, ev)  # type: ignore[arg-type]
-    assert "Account" not in raw
-
-
-def test_title_only_account_block_is_filled_not_skipped() -> None:
-    """A flat alert can carry Account={"title": ...} with no identifiers. Bailing
-    on any truthy Account left those rows unattributed."""
-    from providers.scrobble.plex.watch import WatchService
-
-    raw: dict = {"Account": {"title": "alice"}}
-    ev = SimpleNamespace(raw=raw, session_key="5")
-    watcher = object.__new__(WatchService)
-    watcher._resolve_session_identity = lambda _sk: {"account_id": "42", "account_uuid": "abc-123"}  # type: ignore[attr-defined]
-    WatchService._stamp_account_identity(watcher, ev)  # type: ignore[arg-type]
-
-    assert raw["Account"] == {"title": "alice", "id": "42", "uuid": "abc-123"}
+def test_session_identity_gaps_fall_back_to_the_payload() -> None:
+    raw = {"_cw_session_identity": {"account_id": "42"}, "Account": {"uuid": "abc-123"}}
     assert account_identifiers(raw) == ("42", "abc-123")
-
-
-def test_partial_account_block_keeps_its_own_values() -> None:
-    """Whatever the payload already stated wins; only gaps are filled."""
-    from providers.scrobble.plex.watch import WatchService
-
-    raw: dict = {"Account": {"id": "7"}}
-    ev = SimpleNamespace(raw=raw, session_key="5")
-    watcher = object.__new__(WatchService)
-    watcher._resolve_session_identity = lambda _sk: {"account_id": "42", "account_uuid": "abc-123"}  # type: ignore[attr-defined]
-    WatchService._stamp_account_identity(watcher, ev)  # type: ignore[arg-type]
-
-    assert raw["Account"] == {"id": "7", "uuid": "abc-123"}
 
 
 def test_account_block_fills_only_the_identifier_pssn_lacks() -> None:

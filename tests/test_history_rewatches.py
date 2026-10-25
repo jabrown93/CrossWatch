@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from cw_platform.history_events import history_sync_key, minimal_history_item
@@ -44,6 +45,83 @@ class _Ops:
         return {"history": {"rewatches": {"read": self._read, "write": self._write}}}
 
 
+def test_plex_can_source_rewatches_but_not_bidirectional() -> None:
+    from providers.sync import _mod_PLEX
+
+    plex = _mod_PLEX.OPS
+    target = _Ops(True, True)
+
+    assert history_rewatch_pair_enabled("history", {"rewatches": True}, "PLEX", plex, "TARGET", target)
+    assert not history_rewatch_pair_enabled("history", {"rewatches": True}, "PLEX", plex, "TARGET", target, bidirectional=True)
+
+
+def test_emby_and_jellyfin_do_not_source_rewatches() -> None:
+    from providers.sync import _mod_EMBY, _mod_JELLYFIN
+
+    target = _Ops(True, True)
+
+    assert not history_rewatch_pair_enabled("history", {"rewatches": True}, "EMBY", _mod_EMBY.OPS, "TARGET", target)
+    assert not history_rewatch_pair_enabled("history", {"rewatches": True}, "JELLYFIN", _mod_JELLYFIN.OPS, "TARGET", target)
+
+
+def test_event_history_providers_can_source_rewatches() -> None:
+    from providers.sync import _mod_FLICKLIST, _mod_PUNCHPLAY, _mod_TAUTULLI, _mod_TRACEARR
+
+    target = _Ops(True, True)
+
+    for name, ops in (
+        ("FLICKLIST", _mod_FLICKLIST.OPS),
+        ("PUNCHPLAY", _mod_PUNCHPLAY.OPS),
+        ("TAUTULLI", _mod_TAUTULLI.OPS),
+        ("TRACEARR", _mod_TRACEARR.OPS),
+    ):
+        assert history_rewatch_pair_enabled("history", {"rewatches": True}, name, ops, "TARGET", target)
+
+    assert not history_rewatch_pair_enabled(
+        "history",
+        {"rewatches": True},
+        "TAUTULLI",
+        _mod_TAUTULLI.OPS,
+        "TARGET",
+        target,
+        bidirectional=True,
+    )
+
+
+def test_tautulli_rewatch_mode_keeps_each_play_row() -> None:
+    from providers.sync.tautulli import _history
+
+    class Client:
+        def call(self, cmd: str, **_params: Any) -> Mapping[str, Any]:
+            assert cmd == "get_history"
+            return {
+                "data": [
+                    {
+                        "row_id": 7,
+                        "media_type": "movie",
+                        "date": 1704153600,
+                        "title": "Fight Club",
+                        "year": 1999,
+                        "guid": "com.plexapp.agents.themoviedb://550",
+                    },
+                    {
+                        "row_id": 9,
+                        "media_type": "movie",
+                        "date": 1704067200,
+                        "title": "Fight Club",
+                        "year": 1999,
+                        "guid": "com.plexapp.agents.themoviedb://550",
+                    },
+                ],
+                "recordsTotal": 2,
+            }
+
+    idx = _history.build_index(SimpleNamespace(cfg={"_cw_history_rewatches": True}, client=Client()))
+
+    assert sorted(idx) == ["tmdb:550@1704067200", "tmdb:550@1704153600"]
+    assert all(item.get("_cw_rewatch_sync") is True for item in idx.values())
+
+
 def test_history_event_keys_keep_rewatches_separate() -> None:
     a = _episode("2024-01-01T00:00:00Z")
     b = _episode("2024-01-02T00:00:00Z")
@@ -64,6 +142,24 @@ def test_filter_events_and_collapse_latest_preserve_existing_behavior() -> None:
     collapsed = collapse_history_latest(idx)
     assert len(collapsed) == 1
     assert next(iter(collapsed.values()))["watched_at"] == "2024-01-02T00:00:00Z"
+
+
+def test_state_filter_requires_history_timestamp() -> None:
+    item = {
+        "type": "episode",
+        "series_title": "The Show",
+        "season": 1,
+        "episode": 2,
+        "watched": True,
+        "show_ids": {"tmdb": "42"},
+        "ids": {},
+    }
+
+    state = filter_history_events({"tmdb:42#s01e02": item}, event_mode=False)
+    events = filter_history_events({"tmdb:42#s01e02": item}, event_mode=True)
+
+    assert state == {}
+    assert events == {}
 
 
 def test_event_diff_compares_exact_history_identity() -> None:
@@ -88,3 +184,26 @@ def test_rewatch_pair_requires_read_write_capabilities() -> None:
     assert history_rewatch_pair_enabled("history", {"rewatches": True}, "A", _Ops(True, False), "B", _Ops(True, True))
     assert not history_rewatch_pair_enabled("history", {"rewatches": True}, "A", _Ops(True, False), "B", _Ops(True, False))
     assert not history_rewatch_pair_enabled("history", {"rewatches": False}, "A", _Ops(True, True), "B", _Ops(True, True))
+
+
+def test_undated_watched_state_requires_explicit_opt_in():
+    from cw_platform.history_events import has_history_watch
+    from cw_platform.id_map import minimal
+
+    base = {"type": "episode", "show_ids": {"tmdb": "42"}, "season": 1, "episode": 2, "watched": True}
+    for status in (None, "watching", "completed", "on_hold", "dropped"):
+        item = {**base, "watch_status": status}
+        assert not has_history_watch(item)
+        assert filter_history_events({"tmdb:42#s01e02": item}, event_mode=False) == {}
+    marked = {**base, "_cw_watched_state": True}
+    normalized = minimal(marked)
+    assert normalized["_cw_watched_state"] is True
+    assert has_history_watch(normalized)
+    state = filter_history_events({"tmdb:42#s01e02": normalized}, event_mode=False)
+    assert len(state) == 1 and state["tmdb:42#s01e02"]["_cw_watched_state"] is True
+    assert filter_history_events(state, event_mode=True) == {}
+    for invalid in ({"watched": False}, {"type": "show"}, {"type": "season"}, {"_cw_watched_state": "true"}):
+        assert not has_history_watch({**marked, **invalid})
+    dated = {**base, "watched_at": "2026-10-09T12:00:00Z"}
+    assert has_history_watch(dated)
+    assert filter_history_events({"tmdb:42#s01e02": dated}, event_mode=True)

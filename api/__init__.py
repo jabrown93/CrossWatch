@@ -15,6 +15,7 @@ from .manualAPI import router as manual_router
 from .insightAPI import register_insights
 from .watchlistAPI import router as watchlist_router
 from .playlistsAPI import router as playlists_router
+from .publishedListsAPI import public_router as published_public_router, router as published_lists_router
 from .snapshotsAPI import router as snapshots_router
 from .backupsAPI import router as backups_router
 from .schedulingAPI import router as scheduling_router
@@ -29,7 +30,11 @@ from .authenticationAPI import register_auth
 from .wallAPI import register_wall
 from .versionAPI import router as version_router
 from .editorAPI import router as editor_router
+from .interactiveSyncAPI import router as interactive_sync_router
 from .eventsAPI import router as events_router
+from .logsAPI import router as logs_router
+from .mcpAPI import router as mcp_router
+from .assistantAPI import router as assistant_router
 from .providerInstancesAPI import router as provider_instances_router
 from .playbackProgressAPI import router as playback_progress_router
 from .profileAPI import router as profile_router
@@ -43,6 +48,7 @@ from .syncAPI import (
 from services.analyzer import router as analyzer_router
 from services.export import router as export_router
 from services.importer import router as importer_router
+from services.plex_history_recovery import router as plex_recovery_router
 
 __all__ = [
     "config_router",
@@ -56,6 +62,8 @@ __all__ = [
     "manual_router",
     "watchlist_router",
     "playlists_router",
+    "published_lists_router",
+    "published_public_router",
     "snapshots_router",
     "backups_router",
     "scheduling_router",
@@ -96,6 +104,8 @@ def register(
     app.include_router(anime_mapping_router)
     app.include_router(manual_router)
     app.include_router(watchlist_router)
+    app.include_router(published_lists_router)
+    app.include_router(published_public_router)
     app.include_router(playlists_router)
     app.include_router(snapshots_router)
     app.include_router(backups_router)
@@ -109,9 +119,14 @@ def register(
     app.include_router(version_router)
     app.include_router(analyzer_router)
     app.include_router(export_router)
+    app.include_router(plex_recovery_router)
     app.include_router(importer_router)
     app.include_router(editor_router)
+    app.include_router(interactive_sync_router)
     app.include_router(events_router)
+    app.include_router(logs_router)
+    app.include_router(mcp_router)
+    app.include_router(assistant_router)
     app.include_router(provider_instances_router)
     app.include_router(playback_progress_router)
     app.include_router(profile_router)

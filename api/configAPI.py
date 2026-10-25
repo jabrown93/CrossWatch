@@ -7,6 +7,7 @@ from typing import Any
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 from packaging.version import InvalidVersion, Version
@@ -110,8 +111,10 @@ def _log_scrobble_source_state(env: dict[str, Any], cfg: dict[str, Any]) -> None
 
 def _is_sensitive_config_path(path: tuple[str, ...]) -> bool:
     clean = [str(part or "").strip().lower() for part in path if str(part or "").strip()]
+    if len(clean) >= 3 and clean[0] == "security" and clean[1] == "webhook_ids":
+        return True
     if len(clean) >= 3 and clean[0] == "scheduling" and clean[1] == "webhooks":
-        return clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url"}
+        return clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url", "pushover_token", "pushover_user"}
     return False
 
 
@@ -581,7 +584,10 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
 
     def _blank(v: Any) -> bool:
         s = ("" if v is None else str(v)).strip()
-        return s in {"", MASK}
+        return (
+            s in {"", MASK, "********", "**********"}
+            or (len(s) >= 3 and all(ch in {"*", "\u2022"} for ch in s))
+        )
 
     def _is_sensitive_key(key: Any) -> bool:
         k = str(key or "").strip().lower()
@@ -603,6 +609,7 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
             "_pending_request_token",
             "request_token",
             "token",
+            "webhook_url",
             # Webhook URL tokens (security.webhook_ids.*)
             "webhook_ids", "webhook_id",
             "plextrakt", "jellyfintrakt", "embytrakt", "plexwatcher",
@@ -673,23 +680,6 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-    # security.api_key is unrestricted admin, so reject a guessable one at the
-    # point it is set. Only a *changed* key is checked: an unchanged key arrives
-    # masked (restored above) and an env-locked CW_API_KEY is not editable here,
-    # so validating either would wedge every unrelated config save.
-    from api.appAuthAPI import MIN_API_KEY_LENGTH
-
-    _new_api_key = str(((cfg.get("security") or {}).get("api_key")) or "").strip()
-    _old_api_key = str(((current.get("security") or {}).get("api_key")) or "").strip()
-    if _new_api_key and _new_api_key != _old_api_key and len(_new_api_key) < MIN_API_KEY_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"security.api_key: use at least {MIN_API_KEY_LENGTH} characters "
-                "— this key grants unrestricted admin access"
-            ),
-        )
-
     # Scrobble watcher: ensure routes exist when legacy fields are used
     try:
         from providers.scrobble.routes import ensure_routes
@@ -735,6 +725,103 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
             result["watcher_reload_error"] = "watcher_reload_failed"
             WATCH_LOG.error(f"watcher runtime refresh failed: {type(e).__name__}: {e}")
     return result
+
+PROTECTED_CONFIG_ROOTS = {"app_auth"}
+_CONFIG_INDEX_RE = re.compile(r"^\[(\d+)\]$")
+
+
+def _split_config_path(raw: Any) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    parts: list[str] = []
+    for chunk in text.replace("/", ".").split("."):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = re.fullmatch(r"([^\[\]]*)((?:\[\d+\])*)", chunk)
+        if match is None:
+            parts.append(chunk)
+            continue
+        head, indexes = match.group(1), match.group(2)
+        if head:
+            parts.append(head)
+        for pos in re.findall(r"\[(\d+)\]", indexes):
+            parts.append(f"[{pos}]")
+    return parts
+
+
+def _delete_config_path(cfg: dict[str, Any], parts: list[str]) -> bool:
+    node: Any = cfg
+    for part in parts[:-1]:
+        index = _CONFIG_INDEX_RE.match(part)
+        if index is not None:
+            if not isinstance(node, list):
+                return False
+            pos = int(index.group(1))
+            if pos >= len(node):
+                return False
+            node = node[pos]
+            continue
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    last = parts[-1]
+    index = _CONFIG_INDEX_RE.match(last)
+    if index is not None:
+        if not isinstance(node, list):
+            return False
+        pos = int(index.group(1))
+        if pos >= len(node):
+            return False
+        node.pop(pos)
+        return True
+    if not isinstance(node, dict) or last not in node:
+        return False
+    node.pop(last, None)
+    return True
+
+
+@router.post("/config/unset")
+def api_config_unset(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    raw_paths = payload.get("paths")
+    if not isinstance(raw_paths, list):
+        raw_paths = [payload.get("path")] if payload.get("path") else []
+
+    requested = [str(p or "").strip() for p in raw_paths if str(p or "").strip()]
+    if not requested:
+        return {"ok": False, "error": "no_paths"}
+
+    env = _env()
+    cfg = dict(env["load"]() or {})
+    removed: list[str] = []
+    missing: list[str] = []
+
+    for raw in requested:
+        parts = _split_config_path(raw)
+        if not parts:
+            missing.append(raw)
+            continue
+        if parts[0] in PROTECTED_CONFIG_ROOTS:
+            return {"ok": False, "error": "protected_path", "path": raw}
+        if _delete_config_path(cfg, parts):
+            removed.append(raw)
+        else:
+            missing.append(raw)
+
+    if not removed:
+        return {"ok": False, "error": "not_found", "missing": missing}
+
+    try:
+        env["prune"](cfg)
+        env["ensure"](cfg)
+    except Exception:
+        pass
+
+    env["save"](cfg)
+    _after_config_save(env, cfg)
+    return {"ok": True, "removed": removed, "missing": missing}
+
 
 @router.post("/config/migrate")
 def api_config_migrate() -> dict[str, Any]:

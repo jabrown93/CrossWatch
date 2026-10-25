@@ -3,10 +3,12 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform.app_version import user_agent as http_user_agent
+import hashlib
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ._log import log as cw_log
 from ._mod_common import build_session, make_snapshot_progress, parse_rate_limit, request_with_retries
@@ -17,8 +19,7 @@ except Exception:
     ctx = None  # type: ignore[assignment]
 
 __VERSION__ = "1.0"
-os.environ.setdefault("CW_TMDB_VERSION", __VERSION__)
-os.environ.setdefault("CW_TMDB_UA", f"CrossWatch/{__VERSION__} (TMDB)")
+os.environ.setdefault("CW_TMDB_UA", http_user_agent("TMDB", override_env="CW_TMDB_UA"))
 __all__ = ["get_manifest", "TMDBModule", "OPS"]
 
 
@@ -71,6 +72,12 @@ except Exception as e:
     feat_ratings = None
 
 try:
+    from .tmdb import _playlists as feat_playlists
+except Exception as e:
+    _warn("feature_import_failed", import_feature="playlists", error=f"{type(e).__name__}: {e}")
+    feat_playlists = None
+
+try:
     from .tmdb._common import key_of as _tmdb_key_of_impl
 except Exception:
     _tmdb_key_of_impl = None
@@ -92,7 +99,7 @@ def _features_flags() -> dict[str, bool]:
         "watchlist": bool(feat_watchlist),
         "ratings": bool(feat_ratings),
         "history": False,
-        "playlists": False,
+        "playlists": bool(feat_playlists),
     }
 
 
@@ -115,9 +122,21 @@ def get_manifest() -> Mapping[str, Any]:
                 "remove": True,
             },
             "ratings": {
+                "step": 0.5,
                 "types": {"movies": True, "shows": True, "seasons": False, "episodes": True},
                 "add": True,
                 "remove": True,
+            },
+            "playlists": {
+                "read": True,
+                "write": True,
+                "create": True,
+                "remove": True,
+                "reorder": False,
+                "requires_v4": True,
+                "types": {"movies": True, "shows": True, "seasons": False, "episodes": False},
+                "accepted_ids": ["tmdb", "imdb", "tvdb"],
+                "batch_size": 100,
             },
         },
         "auth": {
@@ -126,6 +145,7 @@ def get_manifest() -> Mapping[str, Any]:
                 {"key": "tmdb_sync.api_key", "label": "API Key", "type": "secret"},
                 {"key": "tmdb_sync.session_id", "label": "Session ID", "type": "secret"},
                 {"key": "tmdb_sync.account_id", "label": "Account ID", "type": "text", "optional": True},
+                {"key": "tmdb_sync.read_token", "label": "API Read Access Token", "type": "secret", "optional": True},
             ],
         },
     }
@@ -138,6 +158,8 @@ class TMDBConfig:
     account_id: str
     timeout: float = 15.0
     max_retries: int = 3
+    access_token: str = ""
+    account_object_id: str = ""
 
 
 class TMDBError(RuntimeError):
@@ -148,8 +170,34 @@ class TMDBAuthError(TMDBError):
     pass
 
 
+class TMDBListsAuthError(TMDBAuthError):
+    pass
+
+
+LISTS_RECONNECT_MESSAGE = "TMDb lists need the v4 login. Add your API Read Access Token and reconnect TMDb in Connections."
+
+
+def session_ref(session_id: Any) -> str:
+    sess = str(session_id or "").strip()
+    if not sess:
+        return ""
+    return hashlib.sha256(f"tmdb-v4:{sess}".encode("utf-8")).hexdigest()[:32]
+
+
+def lists_ready(block: Mapping[str, Any] | None) -> bool:
+    m: Mapping[str, Any] = block if isinstance(block, Mapping) else {}
+    ref = session_ref(m.get("session_id"))
+    return bool(
+        str(m.get("access_token") or "").strip()
+        and str(m.get("account_object_id") or "").strip()
+        and ref
+        and str(m.get("v4_session_ref") or "").strip() == ref
+    )
+
+
 class TMDBClient:
     BASE = "https://api.themoviedb.org/3"
+    BASE_V4 = "https://api.themoviedb.org/4"
 
     def __init__(self, cfg: TMDBConfig) -> None:
         self.cfg = cfg
@@ -164,7 +212,7 @@ class TMDBClient:
             pass
         try:
             self.session.headers.setdefault("Accept", "application/json")
-            self.session.headers.setdefault("User-Agent", os.environ.get("CW_TMDB_UA") or f"CrossWatch/{__VERSION__} (TMDB)")
+            self.session.headers["User-Agent"] = os.environ.get("CW_TMDB_UA") or http_user_agent("TMDB", override_env="CW_TMDB_UA")
         except Exception:
             pass
         return self
@@ -249,6 +297,33 @@ class TMDBClient:
     def find_by_external(self, external_id: str, external_source: str) -> Mapping[str, Any]:
         return self.get_json(f"/find/{external_id}", params={"external_source": external_source}, user=False)
 
+    def account_object_id(self) -> str:
+        if not self.cfg.access_token or not self.cfg.account_object_id:
+            raise TMDBListsAuthError(LISTS_RECONNECT_MESSAGE)
+        return self.cfg.account_object_id
+
+    def v4(self, method: str, path: str, *, params: Mapping[str, Any] | None = None, json_body: Any | None = None, timeout: float | None = None):
+        if not self.cfg.access_token:
+            raise TMDBListsAuthError(LISTS_RECONNECT_MESSAGE)
+        p = str(path or "")
+        if not p.startswith("/"):
+            p = "/" + p
+        kw: dict[str, Any] = {
+            "headers": {"Authorization": f"Bearer {self.cfg.access_token}", "Content-Type": "application/json;charset=utf-8"},
+        }
+        if params:
+            kw["params"] = dict(params)
+        if json_body is not None:
+            kw["json"] = json_body
+        return request_with_retries(
+            self.session,
+            str(method).upper(),
+            self.BASE_V4 + p,
+            timeout=float(timeout if timeout is not None else self.cfg.timeout),
+            max_retries=int(self.cfg.max_retries),
+            **kw,
+        )
+
 
 _FEATURES: dict[str, Any] = {}
 if feat_watchlist:
@@ -299,7 +374,8 @@ def _confirmed_items(
 
 
 class TMDBModule:
-    def __init__(self, cfg: Mapping[str, Any]) -> None:
+    def __init__(self, cfg: Mapping[str, Any], *, instance_id: str | None = None) -> None:
+        self.instance_id = str(instance_id or "default")
         raw = (cfg or {}).get("tmdb_sync")
         m: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
 
@@ -309,7 +385,15 @@ class TMDBModule:
         timeout = float(m.get("timeout", 15.0) or 15.0)
         max_retries = int(m.get("max_retries", 3) or 3)
 
-        self.cfg = TMDBConfig(api_key=api_key, session_id=session_id, account_id=account_id, timeout=timeout, max_retries=max_retries)
+        self.cfg = TMDBConfig(
+            api_key=api_key,
+            session_id=session_id,
+            account_id=account_id,
+            timeout=timeout,
+            max_retries=max_retries,
+            access_token=str(m.get("access_token") or "").strip() if lists_ready(m) else "",
+            account_object_id=str(m.get("account_object_id") or "").strip() if lists_ready(m) else "",
+        )
 
         if m.get("debug") in (True, "1", 1):
             os.environ.setdefault("CW_TMDB_DEBUG", "1")
@@ -415,6 +499,33 @@ class TMDBModule:
             _health("error", False, latency_ms, rate_limit={})
             return {"ok": False, "status": "error", "latency_ms": latency_ms, "error": str(e)}
 
+    def _playlists(self) -> Any:
+        if feat_playlists is None:
+            raise TMDBError("TMDb playlists unavailable")
+        return feat_playlists
+
+    def list_playlist_resources(self) -> Sequence[Any]:
+        return self._playlists().list_resources(self)
+
+    def get_playlist_snapshot(self, playlist_id: str) -> Any:
+        return self._playlists().get_snapshot(self, playlist_id)
+
+    def create_playlist(self, name: str, *, media_type: str | None = None, items: Sequence[Mapping[str, Any]] | None = None, dry_run: bool = False) -> Any:
+        return self._playlists().create(self, name, media_type=media_type, items=items, dry_run=dry_run)
+
+    def add_playlist_items(self, playlist_id: str, items: Sequence[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
+        if dry_run:
+            return {"ok": True, "count": len(list(items or [])), "dry_run": True}
+        return self._playlists().add(self, playlist_id, items)
+
+    def remove_playlist_items(self, playlist_id: str, items: Sequence[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:
+        if dry_run:
+            return {"ok": True, "count": len(list(items or [])), "dry_run": True}
+        return self._playlists().remove(self, playlist_id, items)
+
+    def reorder_playlist_items(self, playlist_id: str, ordered_keys: Sequence[str], *, dry_run: bool = False) -> dict[str, Any]:
+        return self._playlists().reorder(self, playlist_id, ordered_keys)
+
 
 class _TMDBOPS:
     def name(self) -> str:
@@ -439,8 +550,11 @@ class _TMDBOPS:
         session_id = str(m.get("session_id") or "").strip()
         return bool(api_key and session_id)
 
-    def _adapter(self, cfg: Mapping[str, Any]) -> TMDBModule:
-        return TMDBModule(cfg)
+    def playlists_configured(self, cfg: Mapping[str, Any]) -> bool:
+        return self.is_configured(cfg) and lists_ready((cfg or {}).get("tmdb_sync"))
+
+    def _adapter(self, cfg: Mapping[str, Any], instance: str | None = None) -> TMDBModule:
+        return TMDBModule(cfg, instance_id=instance)
 
     def build_index(self, cfg: Mapping[str, Any], *, feature: str) -> Mapping[str, dict[str, Any]]:
         return self._adapter(cfg).build_index(feature)
@@ -453,6 +567,24 @@ class _TMDBOPS:
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
+
+    def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None) -> Sequence[Any]:
+        return self._adapter(cfg, instance).list_playlist_resources()
+
+    def get_playlist_snapshot(self, cfg: Mapping[str, Any], playlist_id: str, *, instance: str | None = None) -> Any:
+        return self._adapter(cfg, instance).get_playlist_snapshot(playlist_id)
+
+    def create_playlist(self, cfg: Mapping[str, Any], name: str, *, media_type: str | None = None, instance: str | None = None, dry_run: bool = False) -> Any:
+        return self._adapter(cfg, instance).create_playlist(name, media_type=media_type, dry_run=dry_run)
+
+    def add_playlist_items(self, cfg: Mapping[str, Any], playlist_id: str, items: Sequence[Mapping[str, Any]], *, instance: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+        return self._adapter(cfg, instance).add_playlist_items(playlist_id, items, dry_run=dry_run)
+
+    def remove_playlist_items(self, cfg: Mapping[str, Any], playlist_id: str, items: Sequence[Mapping[str, Any]], *, instance: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+        return self._adapter(cfg, instance).remove_playlist_items(playlist_id, items, dry_run=dry_run)
+
+    def reorder_playlist_items(self, cfg: Mapping[str, Any], playlist_id: str, ordered_keys: Sequence[str], *, instance: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+        return self._adapter(cfg, instance).reorder_playlist_items(playlist_id, ordered_keys, dry_run=dry_run)
 
 
 OPS = _TMDBOPS()

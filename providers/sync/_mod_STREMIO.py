@@ -15,9 +15,9 @@ from providers.sync.stremio import _history as feat_history
 from providers.sync.stremio import _progress as feat_progress
 from providers.sync.stremio import _ratings as feat_ratings
 from providers.sync.stremio import _watchlist as feat_watchlist
-from providers.sync.stremio._common import DEFAULT_STREMIO_PROFILE_ID, datastore_meta, is_configured
+from providers.sync.stremio._common import DEFAULT_STREMIO_PROFILE_ID, datastore_meta, is_capture_mode, is_configured, read_drop_unresolved_items
 
-__VERSION__ = "0.1"
+__VERSION__ = "0.3"
 __all__ = ["get_manifest", "STREMIOModule", "OPS", "feat_history", "feat_progress", "feat_ratings", "feat_watchlist"]
 
 if "ctx" not in globals():
@@ -84,7 +84,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "upsert": True,
                 "remove": True,
                 "observed_deletes": True,
-                "requires_ids": ["imdb"],
+                "requires_ids": ["imdb", "tmdb", "tvdb"],
             },
             "watchlist": {
                 "read": True,
@@ -93,7 +93,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "upsert": True,
                 "remove": True,
                 "observed_deletes": True,
-                "requires_ids": ["imdb"],
+                "requires_ids": ["imdb", "tmdb", "tvdb"],
                 "custom_lists": False,
             },
             "ratings": {
@@ -116,7 +116,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "upsert": True,
                 "remove": True,
                 "observed_deletes": True,
-                "requires_ids": ["imdb"],
+                "requires_ids": ["imdb", "tmdb", "tvdb"],
                 "requires_duration": True,
                 "completion_policy": {"progress_write": {"mode": "none"}},
             },
@@ -127,7 +127,7 @@ def get_manifest() -> Mapping[str, Any]:
 class STREMIOModule:
     def __init__(self, cfg: Mapping[str, Any]):
         self.config = cfg or {}
-        self.instance_id = _current_instance_id()
+        self.instance_id = normalize_instance_id(self.config["_cw_provider_instance"]) if "_cw_provider_instance" in self.config else _current_instance_id()
         self.stremio_profile_id = DEFAULT_STREMIO_PROFILE_ID
         session = build_session("STREMIO", ctx)
         try:
@@ -214,12 +214,93 @@ class _STREMIOOPS:
 
     def _adapter(self, cfg: Mapping[str, Any]) -> STREMIOModule:
         return STREMIOModule(cfg)
+    # Fix #930 - keep a baseline of history items to avoid re-reading them as unresolved in future syncs
+    def _inject_history_baseline(self, adapter: STREMIOModule) -> None:
+        if isinstance(getattr(adapter, "_stremio_history_baseline", None), Mapping):
+            return
+        try:
+            store = getattr(ctx, "state_store", None)
+            load = getattr(store, "load_state_features", None)
+            if not callable(load):
+                return
+            state = load({"history"}) or {}
+            providers = state.get("providers") if isinstance(state, Mapping) else None
+            providers = providers if isinstance(providers, Mapping) else {}
+            stremio = providers.get("STREMIO") or providers.get("stremio")
+            if not isinstance(stremio, Mapping):
+                return
+
+            def _baseline_items(node: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+                history = node.get("history") if isinstance(node, Mapping) else None
+                history = history if isinstance(history, Mapping) else {}
+                baseline = history.get("baseline") if isinstance(history, Mapping) else None
+                baseline = baseline if isinstance(baseline, Mapping) else {}
+                items = baseline.get("items") if isinstance(baseline, Mapping) else None
+                if not isinstance(items, Mapping):
+                    return {}
+                return {str(k): dict(v) for k, v in items.items() if isinstance(v, Mapping)}
+
+            instance_id = normalize_instance_id(getattr(adapter, "instance_id", "default"))
+            nodes: list[Mapping[str, Any]] = []
+            instances = stremio.get("instances")
+            if isinstance(instances, Mapping):
+                node = instances.get(instance_id) or instances.get(str(instance_id))
+                if not isinstance(node, Mapping):
+                    for raw_inst, raw_node in instances.items():
+                        if normalize_instance_id(raw_inst) == instance_id and isinstance(raw_node, Mapping):
+                            node = raw_node
+                            break
+                if isinstance(node, Mapping):
+                    nodes.append(node)
+            if instance_id == "default":
+                nodes.append(stremio)
+
+            for node in nodes:
+                items = _baseline_items(node)
+                if items:
+                    setattr(adapter, "_stremio_history_baseline", items)
+                    return
+        except Exception:
+            return
+        #end of _inject_history_baseline
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
 
     def build_index(self, cfg: Mapping[str, Any], *, feature: str) -> Mapping[str, dict[str, Any]]:
-        return self._adapter(cfg).build_index(feature)
+        adapter = self._adapter(cfg)
+        if str(feature or "").strip().lower() == "history":
+            self._inject_history_baseline(adapter)
+        index = adapter.build_index(feature)
+        self._record_read_unresolved(feature, adapter)
+        return index
+
+    def _record_read_unresolved(self, feature: str, adapter: STREMIOModule) -> None:
+        if is_capture_mode():
+            return
+        try:
+            from cw_platform.orchestrator._scope import pair_scope
+
+            if pair_scope() is None:
+                return
+            from cw_platform.orchestrator._unresolved import clear_unresolved, load_unresolved_map, record_unresolved
+
+            from cw_platform.id_map import canonical_key, minimal as id_minimal
+
+            items = read_drop_unresolved_items(adapter, feature)
+            fresh = {canonical_key(id_minimal(it)) for it in items}
+            prior = load_unresolved_map("STREMIO", feature, cross_features=False) or {}
+            stale = [
+                key
+                for key, meta in prior.items()
+                if str((meta or {}).get("reason") or "").startswith("stremio_read:") and key not in fresh
+            ]
+            if stale:
+                clear_unresolved("STREMIO", feature, stale)
+            if items:
+                record_unresolved("STREMIO", feature, items, hint="stremio_read:unsupported_stremio_id")
+        except Exception:
+            return
 
     def add(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]], *, feature: str, dry_run: bool = False) -> dict[str, Any]:
         return self._adapter(cfg).add(feature, items, dry_run=dry_run)

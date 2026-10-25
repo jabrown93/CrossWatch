@@ -6,16 +6,17 @@ const _cwJSONHeaders = { "Content-Type": "application/json" };
 const _cwSecretIds = [
   "plex_home_pin", "simkl_client_id", "simkl_client_secret",
   "trakt_client_id", "trakt_client_secret", "anilist_client_id", "anilist_client_secret",
-  "tmdb_api_key", "tmdb_sync_api_key", "tmdb_sync_session_id", "mdblist_key", "publicmetadb_key", "tautulli_key", "floppy_token",
-  "scrob_key", "scrob_password", "kodi_password", "app_auth_oidc_client_secret", "security_api_key"
+    "tmdb_api_key", "tmdb_sync_api_key", "tmdb_sync_session_id", "mdblist_key", "publicmetadb_key", "tautulli_key", "tracearr_key", "floppy_token",
+    "scrob_key", "scrob_password", "kodi_password", "app_auth_oidc_client_secret"
 ];
 const _cwTouchedIds = [
   ..._cwSecretIds,
   "tautulli_server", "tautulli_user_id",
+  "tracearr_server", "tracearr_user_id",
   "floppy_server", "floppy_verify_ssl",
   "scrob_server", "scrob_username", "scrob_verify_ssl", "scrob_totp",
   "cw_tracker_label", "cw_tracker_retention_days", "cw_tracker_auto_snapshot", "cw_tracker_max_snapshots",
-  "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress"
+  "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress", "cw_tracker_restore_collection"
 ];
 
 function _cwEl(id) { return document.getElementById(id); }
@@ -296,7 +297,10 @@ function _cwWireAuthPair() {
 function _cwReadSecret(id, previousValue) {
   const el = _cwEl(id);
   if (!el) return { changed: false };
-  const raw = _cwNorm(el.value), masked = el.dataset?.masked === "1" || raw.startsWith("•");
+  const overlay = _cwEl("cw-auth-connection-overlay");
+  const form = _cwEl("cw-auth-provider-form");
+  if (overlay && !overlay.classList.contains("hidden") && form && !form.classList.contains("hidden") && !form.contains(el)) return { changed: false };
+  const raw = _cwNorm(el.value), masked = el.dataset?.masked === "1" || /^[*•]+$/.test(raw) || raw.startsWith("•");
   if (el.dataset?.clear === "1") return { changed: true, clear: true };
   if (el.dataset?.loaded === "0" || !el.dataset?.touched || masked) return { changed: false };
   if (!raw) return previousValue ? { changed: true, clear: true } : { changed: false };
@@ -314,6 +318,17 @@ function _cwProviderAuthError(provider, code) {
     if (key === "validation_bad_response") return "Tautulli validation returned an unexpected response";
     if (key.startsWith("validation_http_")) return "Tautulli validation failed";
     return "Saving Tautulli failed";
+  }
+  if (provider === "tracearr") {
+    if (key === "server_url_required") return "Enter Tracearr server URL";
+    if (key === "api_key_required") return "Enter your Tracearr API key";
+    if (key === "invalid_api_key") return "Invalid Tracearr API key";
+    if (key === "api_v2_unavailable") return "Tracearr 2.0 or later is required";
+    if (key === "validation_timeout") return "Tracearr validation timed out";
+    if (key === "validation_failed") return "Could not connect to Tracearr";
+    if (key === "validation_bad_response") return "Tracearr validation returned an unexpected response";
+    if (key.startsWith("validation_http_")) return "Tracearr validation failed";
+    return "Saving Tracearr failed";
   }
   if (provider === "floppy") {
     if (key === "server_url_required") return "Enter Floppy server URL";
@@ -412,6 +427,22 @@ async function _cwValidateTautulliSecret(inst, payload) {
   const body = await _cwReadBody(resp);
   if (!resp?.ok || body?.ok === false) {
     _cwAbortSave(_cwProviderAuthError("tautulli", body?.error || body?.detail || `http_${resp?.status || 0}`));
+  }
+}
+
+async function _cwValidateTracearrSecret(inst, payload) {
+  const server = _cwNorm(payload?.server_url);
+  const apiKey = _cwNorm(payload?.api_key);
+  if (!server && !apiKey) return;
+  const url = `/api/tracearr/save?instance=${encodeURIComponent(_cwNormInst(inst))}`;
+  const resp = await _cwRequest(url, {
+    method: "POST",
+    headers: _cwJSONHeaders,
+    body: JSON.stringify(payload || {})
+  }, 15000);
+  const body = await _cwReadBody(resp);
+  if (!resp?.ok || body?.ok === false) {
+    _cwAbortSave(_cwProviderAuthError("tracearr", body?.error || body?.detail || `http_${resp?.status || 0}`));
   }
 }
 
@@ -555,11 +586,11 @@ async function saveSettings() {
       return false;
     }
   };
-  const schedulingSaveError = (message) => {
+  const schedulingSaveError = (message, tab = "advanced") => {
     const msg = _cwNorm(message) || "Fix the scheduling errors before saving.";
     try {
       window.cwSettingsSelect?.("scheduling");
-      window.cwSchedSettingsSelect?.("advanced");
+      window.cwSchedSettingsSelect?.(tab);
       const sec = document.getElementById("sec-scheduling");
       if (sec && !sec.classList.contains("open")) window.toggleSection?.("sec-scheduling");
       sec?.scrollIntoView?.({ behavior: "smooth", block: "start" });
@@ -663,12 +694,6 @@ async function saveSettings() {
         Object.assign(cfg.app_auth.oidc, oidc);
         mark();
       }
-
-      const apiKey = _cwReadSecret("security_api_key", _cwNorm(serverCfg?.security?.api_key));
-      if (apiKey.changed) {
-        _cwApplySecret(ensureObj(cfg, "security"), "api_key", apiKey, "");
-        mark();
-      }
     } catch (e) {
       console.warn("saveSettings: oidc merge failed", e);
     }
@@ -744,6 +769,7 @@ async function saveSettings() {
       recent_syncs_display: normalizeUiDisplay(serverCfg?.ui?.recent_syncs_display, Number(serverCfg?.ui?.recent_syncs_limit)),
       show_quick_add_desktop: typeof serverCfg?.ui?.show_quick_add_desktop === "boolean" ? !!serverCfg.ui.show_quick_add_desktop : true,
       show_quick_add_mobile: typeof serverCfg?.ui?.show_quick_add_mobile === "boolean" ? !!serverCfg.ui.show_quick_add_mobile : true,
+      media_card: serverCfg?.ui?.media_card === "compact" ? "compact" : "full",
       theme: (() => {
         const theme = _cwNorm(serverCfg?.ui?.theme).toLowerCase();
         return theme === "flat-light" || theme === "original" ? theme : "flat-dark";
@@ -782,6 +808,15 @@ async function saveSettings() {
       }
     }
 
+    const mediaCardEl = _cwEl("ui_media_card");
+    if (mediaCardEl) {
+      const next = mediaCardEl.value === "compact" ? "compact" : "full";
+      if (next !== prevUi.media_card) {
+        ensureObj(cfg, "ui").media_card = next;
+        mark();
+      }
+    }
+
     const protoEl = _cwEl("ui_protocol");
     if (protoEl) {
       const nextProto = _cwNorm(protoEl.value).toLowerCase() === "https" ? "https" : "http";
@@ -796,7 +831,7 @@ async function saveSettings() {
       const trackerLabelEl = _cwEl("cw_tracker_label");
       const trackerFieldIds = [
         "cw_tracker_label", "cw_tracker_retention_days", "cw_tracker_auto_snapshot", "cw_tracker_max_snapshots",
-        "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress"
+        "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress", "cw_tracker_restore_collection"
       ];
       const trackerTouched = trackerFieldIds.some((id) => _cwTouched(id));
       if (trackerLabelEl && trackerTouched) {
@@ -824,7 +859,7 @@ async function saveSettings() {
         if (_cwTouched("cw_tracker_retention_days")) set("retention_days", intOr("cw_tracker_retention_days", Number(prevBlock?.retention_days), 30), Number.isFinite(prevBlock?.retention_days) ? Number(prevBlock.retention_days) : 30);
         if (_cwTouched("cw_tracker_auto_snapshot")) set("auto_snapshot", _cwTruthy(_cwEl("cw_tracker_auto_snapshot")?.value), prevBlock?.auto_snapshot !== false);
         if (_cwTouched("cw_tracker_max_snapshots")) set("max_snapshots", intOr("cw_tracker_max_snapshots", Number(prevBlock?.max_snapshots), 64), Number.isFinite(prevBlock?.max_snapshots) ? Number(prevBlock.max_snapshots) : 64);
-        ["watchlist", "history", "ratings", "progress"].forEach((key) => {
+        ["watchlist", "history", "ratings", "progress", "collection"].forEach((key) => {
           const el = _cwEl(`cw_tracker_restore_${key}`);
           if (!el || !_cwTouched(`cw_tracker_restore_${key}`)) return;
           const next = _cwNorm(el.value) || "latest";
@@ -894,6 +929,34 @@ async function saveSettings() {
         if (tautulliUserTouched) {
           ttarget.history = ttarget.history && typeof ttarget.history === "object" ? ttarget.history : {};
           ttarget.history.user_id = tautulliUser;
+        }
+        mark();
+      }
+
+      const tracearrInst = _cwSelectedInst("tracearr", "cw.ui.tracearr.auth.instance.v1");
+      const tracearrPrev = _cwInstBlock(serverCfg?.tracearr, tracearrInst);
+      const tracearrServer = _cwNorm(_cwEl("tracearr_server")?.value || "");
+      const tracearrServerTouched = _cwTouched("tracearr_server");
+      const tracearrKey = _cwReadSecret("tracearr_key", _cwNorm(tracearrPrev?.api_key));
+      const tracearrUserEl = _cwEl("tracearr_user_id");
+      const tracearrUser = _cwNorm(tracearrUserEl?.value || "");
+      const tracearrUserTouched = !!tracearrUserEl?.dataset?.touched;
+      const tracearrPayload = {};
+      const tracearrServerChanged = tracearrServerTouched && !!tracearrServer && tracearrServer !== _cwNorm(tracearrPrev?.server_url);
+      if (tracearrServer && (tracearrServerChanged || (tracearrKey.changed && tracearrKey.set))) tracearrPayload.server_url = tracearrServer;
+      if (tracearrKey.changed && tracearrKey.set) tracearrPayload.api_key = tracearrKey.set;
+      if (tracearrUserTouched) tracearrPayload.user_id = tracearrUser;
+      if (tracearrServerChanged || (tracearrKey.changed && tracearrKey.set)) {
+        await _cwValidateTracearrSecret(tracearrInst, tracearrPayload);
+      }
+      if (tracearrServerChanged || tracearrKey.changed || tracearrUserTouched) {
+        cfg.tracearr = cfg.tracearr && typeof cfg.tracearr === "object" ? cfg.tracearr : {};
+        const trtarget = _cwEnsureInstBlock(cfg.tracearr, tracearrInst);
+        if (tracearrServerChanged) trtarget.server_url = tracearrServer;
+        if (tracearrKey.changed) _cwApplySecret(trtarget, "api_key", tracearrKey);
+        if (tracearrUserTouched) {
+          trtarget.history = trtarget.history && typeof trtarget.history === "object" ? trtarget.history : {};
+          trtarget.history.user_id = tracearrUser;
         }
         mark();
       }
@@ -986,10 +1049,18 @@ async function saveSettings() {
     }
 
     try {
-      const inst = _cwNormInst(_cwEl("emby_instance")?.value || "");
+      const inst = _cwSelectedInst("emby", "cw.ui.emby.auth.instance.v1");
       const prev = _cwInstBlock(serverCfg?.emby, inst);
       cfg.emby = cfg.emby && typeof cfg.emby === "object" ? cfg.emby : {};
       const next = _cwEnsureInstBlock(cfg.emby, inst);
+      const server = _cwReadFirst("emby_server_url", "emby_server");
+      const username = _cwReadFirst("emby_username", "emby_user");
+      const userId = _cwReadFirst("emby_user_id");
+      const verifySsl = _cwEl("emby_verify_ssl") || _cwEl("emby_verify_ssl_dup");
+      if (server && server !== _cwNorm(prev?.server)) { next.server = server; mark(); }
+      if (username && (username !== _cwNorm(prev?.username) || username !== _cwNorm(prev?.user))) { next.username = next.user = username; mark(); }
+      if (userId && userId !== _cwNorm(prev?.user_id)) { next.user_id = userId; mark(); }
+      if (verifySsl && !!verifySsl.checked !== !!prev?.verify_ssl) { next.verify_ssl = !!verifySsl.checked; mark(); }
       const src = _cwHydrated("emby", "sec-emby", window.__embyHydrated === true) ? _cwReadLibrarySource("emby") : null;
       if (_cwApplyLibraryConfig(next, prev, src)) mark();
     } catch (e) {
@@ -1084,7 +1155,8 @@ async function saveSettings() {
           const validation = _cwFn("getSchedulingValidation", window)?.() || {};
           const issues = Array.isArray(validation.issues) ? validation.issues.filter(Boolean) : [];
           if (issues.length) {
-            if (schedulingPaneActive()) schedulingSaveError(issues[0]);
+            const webhookIssues = Array.isArray(validation.webhookIssues) ? validation.webhookIssues : [];
+            if (schedulingPaneActive()) schedulingSaveError(issues[0], webhookIssues.includes(issues[0]) ? "webhooks" : "advanced");
             console.warn("saveSettings: scheduling has validation issues; preserving existing scheduling config", issues[0]);
             sched = serverCfg?.scheduling || sched;
           } else {
@@ -1101,6 +1173,11 @@ async function saveSettings() {
         console.warn("saveSettings: scheduling merge failed", e);
       }
     }
+
+    const beforeCollect = JSON.stringify(cfg);
+    if (typeof window.__emitSettingsCollect === "function") window.__emitSettingsCollect(cfg);
+    else document.dispatchEvent(new CustomEvent("settings-collect", { detail: { cfg } }));
+    if (JSON.stringify(cfg) !== beforeCollect) mark();
 
     if (changed) {
       await _cwSaveConfig(cfg);
@@ -1133,7 +1210,7 @@ async function saveSettings() {
     try {
       const cached = _cwFn("loadStatusCache")?.();
       if (cached?.providers) _cwFn("renderConnectorStatus")?.(cached.providers, { stale: true });
-      _cwLater(() => _cwFn("refreshStatus")?.(true));
+      _cwLater(() => _cwFn("refreshStatus")?.(true, false));
     } catch {}
 
     ["updateTmdbHint", "updateSimklState", "updateJellyfinState", "updateTraktHint", "updatePreviewVisibility"].forEach((name) => {

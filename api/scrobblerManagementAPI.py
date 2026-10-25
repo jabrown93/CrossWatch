@@ -17,13 +17,16 @@ from cw_platform.user_profile_resources import webhook_assigned_profile_id, webh
 from cw_platform.provider_usage import WEBHOOK_SOURCE_PROVIDERS, provider_label, webhook_source_enabled
 from providers.auth import runtime as auth_runtime
 from providers.scrobble.routes import (
+    ROUTE_MEDIA_SINKS,
     ROUTE_PROVIDERS,
     ROUTE_SINKS,
     normalize_route,
     normalize_route_options,
     normalize_routes,
     route_needs_account_filter,
+    same_scrobble_endpoint,
 )
+from providers.scrobble.plex.ratings_sync import RATING_SINKS
 from providers.scrobble.sources import legacy_mode_for_sources, scrobble_sources
 from providers.webhooks.config import (
     media_source_connected,
@@ -40,7 +43,7 @@ from .scrobbleAPI import _ensure_media_profile_webhook_ids, _ensure_route_rating
 router = APIRouter(prefix="/api/scrobbler", tags=["scrobbler-management"])
 
 SOURCE_PROVIDERS = tuple(WEBHOOK_SOURCE_PROVIDERS)
-WATCHER_SOURCE_PROVIDERS = ("plex", "jellyfin", "emby", "kodi", "scrob")
+WATCHER_SOURCE_PROVIDERS = ("plex", "jellyfin", "emby", "kodi", "scrob", "stremio")
 SINK_PROVIDERS = tuple(sorted(ROUTE_SINKS))
 ALLOWED_FILTER_KEYS = {
     "username_whitelist",
@@ -48,6 +51,12 @@ ALLOWED_FILTER_KEYS = {
     "server_uuid_whitelist",
     "server_uuid_blacklist",
     "ignore_live_tv_dvr",
+    "ignore_agregarr_trailers",
+    "ignore_specials",
+    "ignored_path_prefixes",
+    "ignored_filename_patterns",
+    "ignored_editions",
+    "ignored_marker_files",
 }
 WEBHOOK_SETTING_KEYS = {
     "enabled",
@@ -62,8 +71,19 @@ WEBHOOK_SETTING_KEYS = {
     "plex_crosswatch_ratings",
     "plex_floppy_ratings",
     "plex_punchplay_ratings",
+    "plex_flicklist_ratings",
+    "plex_wetrakr_ratings",
+    "plex_anilist_ratings",
+    "plex_kitsu_ratings",
+    "plex_myanimelist_ratings",
+    "plex_scrob_ratings",
     "pause_debounce_seconds",
     "suppress_start_at",
+    "anime_mapping_crosswatch",
+    "anime_mapping_simkl",
+    "simkl_rewatches",
+    "destination_libraries",
+    "update_all_copies",
 }
 
 
@@ -127,11 +147,16 @@ def _profile_exists(cfg: Mapping[str, Any], provider: str, instance: str) -> boo
 def _scrobble_source_connected(cfg: Mapping[str, Any], provider: str, instance: str) -> bool:
     key = str(provider or "").strip().lower()
     if key == "kodi":
-        block = get_provider_block(_dict(cfg), "kodi", normalize_instance_id(instance))
-        return bool(str(block.get("server") or "").strip() and block.get("connection_verified") is True)
+        from providers.scrobble.kodi.addon import source_ready as kodi_source_ready
+
+        return kodi_source_ready(cfg, instance)
     if key == "scrob":
         block = get_provider_block(_dict(cfg), "scrob", normalize_instance_id(instance))
         return auth_runtime.is_configured("scrob", block)
+    if key == "stremio":
+        from providers.scrobble.stremio.addon import source_ready as stremio_source_ready
+
+        return stremio_source_ready(cfg, instance)
     return media_source_connected(cfg, key, instance)
 
 
@@ -247,6 +272,33 @@ def _normalize_filters(value: Any, provider: str, field: str = "filters") -> dic
         out["server_uuid_blacklist"] = _as_list(value.get("server_uuid_blacklist"))
     if provider == "plex" and "ignore_live_tv_dvr" in value:
         out["ignore_live_tv_dvr"] = bool(value.get("ignore_live_tv_dvr"))
+    if "ignore_agregarr_trailers" in value:
+        out["ignore_agregarr_trailers"] = bool(value.get("ignore_agregarr_trailers"))
+    if "ignore_specials" in value:
+        out["ignore_specials"] = bool(value.get("ignore_specials"))
+    for key in ("ignored_path_prefixes", "ignored_filename_patterns", "ignored_editions", "ignored_marker_files"):
+        if key in value:
+            out[key] = _as_list(value.get(key))
+    return out
+
+
+def _library_list(value: Any) -> list[str]:
+    out: list[str] = []
+    for item in value if isinstance(value, list) else []:
+        text = str(item if item is not None else "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _webhook_sink_map(value: Any, field: str, convert: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValidationFailure([_err(field, "invalid_structure", "Value must be an object keyed by destination")])
+    out: dict[str, Any] = {}
+    for sink, item in value.items():
+        key = _sink_provider(sink, f"{field}.{sink}")
+        if key in ROUTE_MEDIA_SINKS:
+            out[key] = convert(item)
     return out
 
 
@@ -256,6 +308,7 @@ def _normalize_webhook_settings(cfg: Mapping[str, Any], provider: str, body: Map
     unknown = sorted(set(str(k) for k in body.keys()) - allowed - {"provider", "provider_instance", "regenerate"})
     if unknown:
         raise ValidationFailure([_err("settings", "unsupported_setting", "Unsupported setting: " + ", ".join(unknown))])
+    current_sinks = list(webhook_sinks(cfg, provider, body.get("provider_instance")))
     if "enabled" in body:
         out["enabled"] = bool(body.get("enabled"))
     if "sinks" in body:
@@ -283,9 +336,20 @@ def _normalize_webhook_settings(cfg: Mapping[str, Any], provider: str, body: Map
         if key in body:
             out[key] = _normalize_filters(body.get(key), provider, key)
     if provider == "plex":
-        for key in ("plex_trakt_ratings", "plex_simkl_ratings", "plex_mdblist_ratings", "plex_crosswatch_ratings", "plex_floppy_ratings", "plex_punchplay_ratings"):
+        for key in ("plex_trakt_ratings", "plex_simkl_ratings", "plex_mdblist_ratings", "plex_crosswatch_ratings", "plex_floppy_ratings", "plex_punchplay_ratings", "plex_flicklist_ratings", "plex_wetrakr_ratings", "plex_anilist_ratings", "plex_kitsu_ratings", "plex_myanimelist_ratings", "plex_scrob_ratings"):
             if key in body:
                 out[key] = bool(body.get(key))
+    selected_sinks = [str(s or "").strip().lower() for s in (out.get("sinks") or _as_list(body.get("sinks")) or current_sinks)]
+    if "simkl_rewatches" in body:
+        out["simkl_rewatches"] = body.get("simkl_rewatches") is True and "simkl" in selected_sinks
+    for sink in ("crosswatch", "simkl"):
+        key = f"anime_mapping_{sink}"
+        if key in body:
+            out[key] = bool(body.get(key)) if sink in selected_sinks else False
+    if "destination_libraries" in body:
+        out["destination_libraries"] = _webhook_sink_map(body.get("destination_libraries"), "destination_libraries", _library_list)
+    if "update_all_copies" in body:
+        out["update_all_copies"] = _webhook_sink_map(body.get("update_all_copies"), "update_all_copies", lambda value: value is not False)
     for key in ("pause_debounce_seconds", "suppress_start_at"):
         if key in body:
             val = _coerce_int(body.get(key), key)
@@ -457,9 +521,9 @@ def _runtime_status(request: Request, cfg: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalized_routes(cfg: dict[str, Any], request: Request) -> list[dict[str, Any]]:
+def _normalized_routes(cfg: dict[str, Any], request: Request, runtime: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     _ensure_route_ratings_webhook_ids(cfg)
-    runtime = _runtime_status(request, cfg)
+    runtime = runtime if isinstance(runtime, Mapping) else _runtime_status(request, cfg)
     running_by_id = {
         str((r or {}).get("id") or ""): bool((r or {}).get("running"))
         for r in runtime.get("routes", [])
@@ -513,19 +577,20 @@ def build_overview(cfg: dict[str, Any], request: Request) -> dict[str, Any]:
         _sync_derived_sources(cfg)
     sources = scrobble_sources(cfg)
     webhooks = _webhook_cards(cfg, request)
-    routes = _normalized_routes(cfg, request)
+    runtime = _runtime_status(request, cfg)
+    routes = _normalized_routes(cfg, request, runtime)
     user = request_user(request)
     if isinstance(user, Mapping) and not bool(user.get("is_admin")):
         pid = managed_profile_id(user)
         webhooks = [row for row in webhooks if pid and webhook_effective_profile_id(cfg, row) == pid]
         routes = [row for row in routes if _user_can_access_route(cfg, user, row)]
-    runtime = _runtime_status(request, cfg)
     sc = _dict(cfg.get("scrobble"))
     watch = _dict(sc.get("watch"))
     wh = _dict(sc.get("webhook"))
     trakt_policy = _dict(sc.get("trakt"))
     global_settings = {
         "enabled": bool(sc.get("enabled")),
+        "global_anime_mapping_enabled": bool(_dict(cfg.get("anime_mapping")).get("enabled")),
         "sources": {
             "webhook": bool(sources.get("webhook")),
             "watcher": bool(sources.get("watcher")),
@@ -553,6 +618,12 @@ def build_overview(cfg: dict[str, Any], request: Request) -> dict[str, Any]:
             "crosswatch": bool(watch.get("plex_crosswatch_ratings")),
             "floppy": bool(watch.get("plex_floppy_ratings")),
             "punchplay": bool(watch.get("plex_punchplay_ratings")),
+            "flicklist": bool(watch.get("plex_flicklist_ratings")),
+            "wetrakr": bool(watch.get("plex_wetrakr_ratings")),
+            "anilist": bool(watch.get("plex_anilist_ratings")),
+            "kitsu": bool(watch.get("plex_kitsu_ratings")),
+            "myanimelist": bool(watch.get("plex_myanimelist_ratings")),
+            "scrob": bool(watch.get("plex_scrob_ratings")),
             "endpoint_url": _global_plex_ratings_url(request, cfg),
         },
     }
@@ -647,6 +718,18 @@ def _normalize_route_profile_id(cfg: Mapping[str, Any], value: Any) -> str:
     return ""
 
 
+def _require_simkl_rewatches(cfg: Mapping[str, Any], instance: Any, field: str) -> None:
+    from providers.scrobble.simkl import rewatches
+    from providers.scrobble.simkl.sink import _merged_provider_block, _post
+
+    projected = dict(cfg)
+    projected["simkl"] = _merged_provider_block(cfg, "simkl", instance)
+    plan, _ = rewatches.account(projected, _post)
+    if plan not in {"pro", "vip"}:
+        message = "Could not verify the SIMKL plan. Try again later." if plan == "unknown" else "Track rewatches requires SIMKL Pro or VIP."
+        raise ValidationFailure([_err(field, "simkl_rewatch_plan", message)])
+
+
 def _validate_route(cfg: Mapping[str, Any], route: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_route(route, str(route.get("id") or "R1"))
     provider = str(normalized.get("provider") or "").strip().lower()
@@ -655,10 +738,14 @@ def _validate_route(cfg: Mapping[str, Any], route: dict[str, Any]) -> dict[str, 
         raise ValidationFailure([_err("provider", "unsupported_provider", "Unsupported source provider")])
     if sink not in ROUTE_SINKS:
         raise ValidationFailure([_err("sink", "unsupported_provider", "Unsupported destination provider")])
+    if same_scrobble_endpoint(provider, normalized.get("provider_instance"), sink, normalized.get("sink_instance")):
+        raise ValidationFailure([_err("sink_instance", "same_source_destination", "Source and destination must use different providers or profiles")])
     _require_source_profile(cfg, provider, str(normalized.get("provider_instance") or "default"))
     _require_sink_profile(cfg, sink, str(normalized.get("sink_instance") or "default"))
     normalized["filters"] = _normalize_filters(normalized.get("filters"), provider, "filters")
     normalized["options"] = normalize_route_options(normalized.get("options"))
+    if sink == "simkl" and normalized["options"]["watch"].get("simkl_rewatches") is True:
+        _require_simkl_rewatches(cfg, normalized.get("sink_instance"), "options.watch.simkl_rewatches")
     profile_id = _normalize_route_profile_id(cfg, route.get("profile_id") or route.get("profileId") or normalized.get("profile_id"))
     if profile_id:
         normalized["profile_id"] = profile_id
@@ -674,6 +761,20 @@ def _validate_route(cfg: Mapping[str, Any], route: dict[str, Any]) -> dict[str, 
         for target in targets:
             _require_sink_profile(cfg, target, str(normalized.get("sink_instance") or "default"), f"options.ratings.targets.{target}")
     return normalized
+
+
+def _set_plex_unresolved_user_fallback_default(route: dict[str, Any], value: bool) -> None:
+    if str((route or {}).get("provider") or "").strip().lower() != "plex":
+        return
+    options = route.setdefault("options", {})
+    if not isinstance(options, dict):
+        options = {}
+        route["options"] = options
+    watch = options.setdefault("watch", {})
+    if not isinstance(watch, dict):
+        watch = {}
+        options["watch"] = watch
+    watch.setdefault("unresolved_user_fallback", bool(value))
 
 
 def _validate_routes_unique(routes: list[dict[str, Any]]) -> None:
@@ -718,6 +819,9 @@ def api_profile_webhook_save(request: Request, payload: dict[str, Any] = Body(..
         instance = normalize_instance_id(payload.get("provider_instance"))
         _require_source_profile(after, provider, instance)
         settings = _normalize_webhook_settings(after, provider, payload)
+        if settings.get("simkl_rewatches") is True:
+            effective = {**webhook_settings(after, provider, instance), **settings}
+            _require_simkl_rewatches(after, webhook_sink_instance(effective, "simkl"), "simkl_rewatches")
         node = _profile_override_node(after, provider, instance)
         add_sinks = settings.pop("sinks", None)
         add_insts = settings.pop("sink_instances", None)
@@ -736,7 +840,24 @@ def api_profile_webhook_save(request: Request, payload: dict[str, Any] = Body(..
                 insts_now[k] = v
             node["sinks"] = sinks_now
             node["sink_instances"] = {k: v for k, v in insts_now.items() if k in sinks_now}
+            if prev_sink in {"crosswatch", "simkl"} and prev_sink not in sinks_now:
+                node.pop(f"anime_mapping_{prev_sink}", None)
+            if prev_sink == "simkl" and prev_sink not in sinks_now:
+                node.pop("simkl_rewatches", None)
+            if prev_sink and prev_sink not in sinks_now:
+                for key in ("destination_libraries", "update_all_copies"):
+                    if isinstance(node.get(key), dict):
+                        node[key].pop(prev_sink, None)
+        for key in ("destination_libraries", "update_all_copies"):
+            if key in settings:
+                node[key] = {**_dict(node.get(key)), **settings.pop(key)}
         node.update(settings)
+        effective = webhook_settings(after, provider, instance)
+        for sink in webhook_sinks(after, provider, instance):
+            if same_scrobble_endpoint(provider, instance, sink, webhook_sink_instance(effective, sink)):
+                raise ValidationFailure([_err(f"sink_instances.{sink}", "same_source_destination", "Source and destination must use different providers or profiles")])
+        if any(k in settings for k in ("anime_mapping_crosswatch", "anime_mapping_simkl")):
+            node.pop("anime_mapping", None)
         if "enabled" not in node:
             node["enabled"] = True
         _ensure_media_profile_webhook_ids(after, regenerate=bool(payload.get("regenerate")))
@@ -761,6 +882,8 @@ def api_profile_webhook_disable(request: Request, payload: dict[str, Any] = Body
                     node = _profile_override_node(after, provider, instance)
                     node["sinks"] = remaining
                     node["sink_instances"] = {s: webhook_sink_instance(settings, s) for s in remaining}
+                    if sink in {"crosswatch", "simkl"}:
+                        node.pop(f"anime_mapping_{sink}", None)
                 else:
                     _profile_override_remove(after, provider, instance)
                     if webhook_sinks(after, provider, instance):
@@ -828,6 +951,7 @@ def api_route_create(request: Request, payload: dict[str, Any] = Body(...)) -> J
         routes = _routes_node(after)
         route_body = dict(payload or {})
         route_body["id"] = str(route_body.get("id") or _next_route_id(routes)).strip()
+        _set_plex_unresolved_user_fallback_default(route_body, False)
         route = _validate_route(after, route_body)
         next_routes = [normalize_route(r, f"R{i + 1}") for i, r in enumerate(routes) if isinstance(r, dict)]
         next_routes.append(route)
@@ -921,7 +1045,7 @@ def api_scrobbler_settings(request: Request, payload: dict[str, Any] = Body(...)
             watch["autostart"] = bool(payload.get("watch_autostart"))
         ratings_raw = payload.get("global_plex_ratings")
         if isinstance(ratings_raw, Mapping):
-            for sink in ("trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay"):
+            for sink in RATING_SINKS:
                 watch[f"plex_{sink}_ratings"] = bool(ratings_raw.get(sink))
         if bool(payload.get("regenerate_global_plex_ratings_webhook")):
             sec = after.setdefault("security", {})

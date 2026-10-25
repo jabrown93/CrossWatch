@@ -9,14 +9,15 @@ from typing import Any, cast
 import requests
 from requests.auth import HTTPBasicAuth
 
-from cw_platform.provider_instances import ensure_instance_block, get_provider_block, normalize_instance_id
+from cw_platform.app_version import user_agent as http_user_agent
+from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
 from cw_platform.url_validation import guarded_request
 
 from ._auth_base import AuthManifest, AuthProvider, AuthStatus
 
 __VERSION__ = "0.1"
 
-UA = "CrossWatch/1.0 (Kodi)"
+UA = http_user_agent("Kodi", override_env="CW_KODI_UA")
 MIN_KODI_VERSION = (21, 0, 0)
 MIN_JSONRPC_VERSION = (13, 5, 0)
 
@@ -252,7 +253,7 @@ def verify_connection(
 
 
 def _block(cfg: Mapping[str, Any], instance_id: Any = None) -> dict[str, Any]:
-    return get_provider_block(cfg or {}, "kodi", instance_id)
+    return resolve_provider_block(cfg or {}, "kodi", instance_id)
 
 
 class KodiAuth(AuthProvider):
@@ -360,6 +361,41 @@ def html() -> str:
     #sec-kodi .msg.hidden{display:none}
     #sec-kodi .btn.danger{background:#a8182e;border-color:rgba(255,107,107,.4)}
     #sec-kodi #kodi_connect{background:linear-gradient(135deg,#17b5d1,#1496c8);border-color:rgba(23,181,209,.45);box-shadow:0 0 14px rgba(23,181,209,.32);color:#fff}
+    #sec-kodi .kodi-method-row[hidden],#sec-kodi #kodi_addon_block[hidden],#sec-kodi #kodi_addon_block [hidden]{display:none !important}
+    #sec-kodi .kodi-method-row{margin-top:14px}
+    #sec-kodi .kodi-methods{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+    #sec-kodi .kodi-method{
+      appearance:none;cursor:pointer;padding:10px 12px;border-radius:10px;
+      border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.03);
+      color:inherit;font:inherit;display:flex;align-items:center;justify-content:center;gap:8px;
+      transition:border-color .15s ease, background .15s ease;
+    }
+    #sec-kodi .kodi-method:hover{border-color:rgba(23,181,209,.5)}
+    #sec-kodi .kodi-method.active{
+      border-color:rgba(23,181,209,.7);
+      background:linear-gradient(135deg,rgba(23,181,209,.16),rgba(20,150,200,.10));
+      box-shadow:0 0 12px rgba(23,181,209,.20);
+    }
+    #sec-kodi .kodi-method .badge{
+      display:inline-flex;align-items:center;line-height:1;
+      font-size:.72em;text-transform:uppercase;letter-spacing:.05em;padding:3px 7px;border-radius:999px;
+      background:rgba(23,181,209,.22);border:1px solid rgba(23,181,209,.45);color:#9be7f5;
+    }
+    #sec-kodi .cw-subpanel[data-kodi-method="addon"]>:is(.grid2,.inline),
+    #page-settings #auth-providers #sec-kodi .cw-subpanel[data-kodi-method="addon"]>:is(.grid2,.inline){display:none !important}
+    #sec-kodi .cw-subpanel[data-kodi-method="jsonrpc"]>#kodi_addon_block{display:none !important}
+    #sec-kodi .kodi-addon{margin-top:12px;display:flex;flex-direction:column;gap:14px}
+    #sec-kodi .kodi-qc{padding:14px;border-radius:12px;border:1px solid rgba(23,181,209,.35);background:rgba(23,181,209,.06)}
+    #sec-kodi .kodi-qc-codewrap{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap}
+    #sec-kodi .kodi-qc-code{
+      font-size:2em;font-weight:700;letter-spacing:.24em;padding:6px 0 6px .24em;color:#9be7f5;
+      text-align:center;text-transform:uppercase;font-variant-numeric:tabular-nums;min-width:7em;
+    }
+    #sec-kodi .kodi-addon-primary{background:linear-gradient(135deg,#17b5d1,#1496c8);border-color:rgba(23,181,209,.45);box-shadow:0 0 14px rgba(23,181,209,.32);color:#fff;min-width:160px}
+    #sec-kodi .kodi-qc-meta{display:flex;justify-content:space-between;gap:12px;margin-top:6px;flex-wrap:wrap}
+    #sec-kodi .kodi-addon-status{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    #sec-kodi .kodi-addon summary{cursor:pointer}
+    #sec-kodi .kodi-addon-alt{margin-top:10px}
   </style>
 
   <div class="head" data-toggle-section="sec-kodi">
@@ -383,6 +419,17 @@ def html() -> str:
 
         <div class="cw-subpanels">
           <div class="cw-subpanel active" data-sub="auth">
+            <div class="kodi-method-row" hidden>
+              <div class="kodi-methods" role="tablist" aria-label="Connection method">
+                <button type="button" class="kodi-method active" data-method="jsonrpc" role="tab" aria-selected="true">
+                  JSON-RPC
+                </button>
+                <button type="button" class="kodi-method" data-method="addon" role="tab" aria-selected="false">
+                  Add-on <span class="badge">Scrobbling</span>
+                </button>
+              </div>
+            </div>
+            <div id="kodi_addon_block" hidden></div>
             <div class="grid2">
               <div style="grid-column:1 / -1">
                 <label for="kodi_server">Server URL</label>
@@ -422,6 +469,7 @@ def html() -> str:
             <select id="kodi_lib_history" data-cfg-path="kodi.history.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
             <select id="kodi_lib_ratings" data-cfg-path="kodi.ratings.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
             <select id="kodi_lib_progress" data-cfg-path="kodi.progress.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
+            <select id="kodi_lib_collection" data-cfg-path="kodi.collection.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
             <select id="kodi_lib_scrobble" data-cfg-path="kodi.scrobble.libraries" data-cfg-instance-root="kodi" class="lm-hidden" multiple></select>
           </div>
         </div>

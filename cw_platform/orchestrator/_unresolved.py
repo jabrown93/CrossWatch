@@ -10,6 +10,9 @@ import json
 import logging
 import time
 
+from ..history_events import history_epoch_from_item, history_event_key, is_history_event_key
+from ..id_map import migrate_media_key, migrate_media_records
+
 __all__ = [
     "load_unresolved_keys",
     "load_unresolved_map",
@@ -17,6 +20,9 @@ __all__ = [
     "load_unresolved_pending",
     "record_unresolved",
     "clear_unresolved",
+    "clear_matched_history_retries",
+    "is_remove_retry_reason",
+    "is_remove_retry",
 ]
 
 STATE_DIR = Path("/config/.cw_state")
@@ -41,9 +47,32 @@ def _read_json(path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
         data = json.loads(path.read_text("utf-8"))
-        return data if isinstance(data, dict) else {}
+        return _migrate_media_keys(data) if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _migrate_media_keys(data: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(data.get("keys"), list) or isinstance(data.get("items"), Mapping):
+        items = data.get("items")
+        items = items if isinstance(items, Mapping) else {}
+        aliases = {str(key): migrate_media_key(str(key), item)
+                   for key, item in items.items() if isinstance(item, Mapping)}
+        out = dict(data)
+        if isinstance(data.get("keys"), list):
+            out["keys"] = list(dict.fromkeys(aliases.get(str(key), str(key)) for key in data["keys"]))
+        for bucket in ("items", "hints"):
+            rows = data.get(bucket)
+            if not isinstance(rows, Mapping):
+                continue
+            migrated: dict[str, Any] = {}
+            for key, value in rows.items():
+                current = aliases.get(str(key), str(key))
+                if current not in migrated or current == str(key):
+                    migrated[current] = value
+            out[bucket] = migrated
+        return out
+    return migrate_media_records(data, "item", "hint")
 
 
 def _atomic_write(path: Path, data: Mapping[str, Any]) -> tuple[bool, str | None]:
@@ -62,29 +91,41 @@ def _atomic_write(path: Path, data: Mapping[str, Any]) -> tuple[bool, str | None
         return False, error
 
 
-def _blocking_path(dst: str, feature: str) -> Path:
+def _blocking_path(dst: str, feature: str, instance: str | None = None) -> Path:
     dst_lower = str(dst).strip().lower()
     feat_lower = str(feature).strip().lower()
-    return scoped_file(STATE_DIR, f"{dst_lower}_{feat_lower}.unresolved.json")
+    return scoped_file(STATE_DIR, f"{dst_lower}_{feat_lower}.unresolved.json", instance=instance)
 
 
-def _pending_path(dst: str, feature: str) -> Path:
+def _pending_path(dst: str, feature: str, instance: str | None = None) -> Path:
     dst_lower = str(dst).strip().lower()
     feat_lower = str(feature).strip().lower()
-    return scoped_file(STATE_DIR, f"{dst_lower}_{feat_lower}.unresolved.pending.json")
+    return scoped_file(STATE_DIR, f"{dst_lower}_{feat_lower}.unresolved.pending.json", instance=instance)
 
 
-def _iter_unresolved_files(dst: str) -> Iterable[tuple[Path, bool]]:
-    """Yield ``(path, is_pending)`` for every unresolved-state file belonging to ``dst`` in STATE_DIR.
+# Blocking
+def load_unresolved_keys(
+    dst: str,
+    feature: str | None = None,
+    *,
+    cross_features: bool = True,
+    instance: str | None = None,
+) -> set[str]:
+    keys: set[str] = set()
+    if not dst:
+        return keys
 
-    Legacy (unscoped) filenames are migrated to their scope-qualified equivalent
-    on the fly via ``scoped_file``. Callers are responsible for reading each path.
-    """
+    dst_lower = str(dst).strip().lower()
+    scope = scope_safe(instance=instance)
+
+    if feature and not cross_features:
+        p = _blocking_path(dst_lower, feature, instance=instance)
+        if p.exists():
+            keys |= set(_read_json(p).keys())
+        return keys
+
     if not STATE_DIR.exists():
-        return
-
-    dst_lower = str(dst).strip().lower()
-    scope = scope_safe()
+        return keys
 
     prefix = f"{dst_lower}_"
     suffix = ".unresolved.json"
@@ -94,58 +135,34 @@ def _iter_unresolved_files(dst: str) -> Iterable[tuple[Path, bool]]:
     scopedp1 = f".unresolved.pending.{scope}.json"
     scopedp2 = f".{scope}.unresolved.pending.json"
     for p in STATE_DIR.iterdir():
-        if not p.is_file():
-            continue
-        name = p.name
-        if not name.startswith(prefix):
-            continue
-        is_blocking = (name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(suffix))
-        is_pending = (name.endswith(scopedp1) or name.endswith(scopedp2) or name.endswith(pending_suffix))
-        if not (is_blocking or is_pending):
-            continue
+        if p.is_file():
+            name = p.name
+            if not name.startswith(prefix):
+                continue
+            is_blocking = (name.endswith(scoped1) or name.endswith(scoped2) or (instance is None and name.endswith(suffix)))
+            is_pending = (name.endswith(scopedp1) or name.endswith(scopedp2) or (instance is None and name.endswith(pending_suffix)))
+            if not (is_blocking or is_pending):
+                continue
 
-        # Migrate legacy (unscoped) files to scoped when needed.
-        rp = p
-        if (name.endswith(suffix) or name.endswith(pending_suffix)) and not (
-            name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(scopedp1) or name.endswith(scopedp2)
-        ):
-            rp = scoped_file(STATE_DIR, name)
+            # Migrate legacy (unscoped) files to scoped when needed.
+            rp = p
+            if (name.endswith(suffix) or (instance is None and name.endswith(pending_suffix))) and not (
+                name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(scopedp1) or name.endswith(scopedp2)
+            ):
+                rp = scoped_file(STATE_DIR, name, instance=instance)
 
-        yield rp, is_pending
+            data = _read_json(rp)
 
-
-# Blocking
-def load_unresolved_keys(
-    dst: str,
-    feature: str | None = None,
-    *,
-    cross_features: bool = True,
-) -> set[str]:
-    keys: set[str] = set()
-    if not dst:
-        return keys
-
-    dst_lower = str(dst).strip().lower()
-
-    if feature and not cross_features:
-        p = _blocking_path(dst_lower, feature)
-        if p.exists():
-            keys |= set(_read_json(p).keys())
-        return keys
-
-    for rp, is_pending in _iter_unresolved_files(dst_lower):
-        data = _read_json(rp)
-
-        if is_pending and isinstance(data, dict):
-            lst = data.get("keys")
-            if isinstance(lst, list):
-                keys |= {str(x) for x in lst if x}
+            if is_pending and isinstance(data, dict):
+                lst = data.get("keys")
+                if isinstance(lst, list):
+                    keys |= {str(x) for x in lst if x}
+                else:
+                    im = data.get("items")
+                    if isinstance(im, dict):
+                        keys |= {str(k) for k in im.keys()}
             else:
-                im = data.get("items")
-                if isinstance(im, dict):
-                    keys |= {str(k) for k in im.keys()}
-        else:
-            keys |= {str(k) for k in (data or {}).keys()}
+                keys |= {str(k) for k in (data or {}).keys()}
     return keys
 
 
@@ -154,19 +171,21 @@ def load_unresolved_map(
     feature: str | None = None,
     *,
     cross_features: bool = True,
+    instance: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     if not dst:
         return out
 
     dst_lower = str(dst).strip().lower()
+    scope = scope_safe(instance=instance)
 
     if feature and not cross_features:
-        blocking = _read_json(_blocking_path(dst_lower, feature))
+        blocking = _read_json(_blocking_path(dst_lower, feature, instance=instance))
         for k, v in blocking.items():
             out[str(k)] = v if isinstance(v, dict) else {}
 
-        pending = _read_json(_pending_path(dst_lower, feature))
+        pending = _read_json(_pending_path(dst_lower, feature, instance=instance))
         raw_hints = pending.get("hints") if isinstance(pending, dict) else None
         hints = raw_hints if isinstance(raw_hints, dict) else {}
         raw_keys = pending.get("keys") if isinstance(pending, dict) else None
@@ -178,21 +197,46 @@ def load_unresolved_map(
             out[str(k)] = v if isinstance(v, dict) else {}
         return out
 
-    for rp, is_pending in _iter_unresolved_files(dst_lower):
-        data = _read_json(rp)
-        if is_pending and isinstance(data, dict):
-            raw_hints = data.get("hints")
-            hints = raw_hints if isinstance(raw_hints, dict) else {}
-            raw_keys = data.get("keys")
-            keys = raw_keys if isinstance(raw_keys, list) else []
-            for k in keys:
-                if not k:
-                    continue
-                v = (hints or {}).get(k) or {}
-                out[str(k)] = v if isinstance(v, dict) else {}
-        else:
-            for k, v in (data or {}).items():
-                out[str(k)] = v if isinstance(v, dict) else {}
+    if not STATE_DIR.exists():
+        return out
+
+    prefix = f"{dst_lower}_"
+    suffix = ".unresolved.json"
+    pending_suffix = ".unresolved.pending.json"
+    scoped1 = f".unresolved.{scope}.json"
+    scoped2 = f".{scope}.unresolved.json"
+    scopedp1 = f".unresolved.pending.{scope}.json"
+    scopedp2 = f".{scope}.unresolved.pending.json"
+    for p in STATE_DIR.iterdir():
+        if p.is_file():
+            name = p.name
+            if not name.startswith(prefix):
+                continue
+            is_blocking = (name.endswith(scoped1) or name.endswith(scoped2) or (instance is None and name.endswith(suffix)))
+            is_pending = (name.endswith(scopedp1) or name.endswith(scopedp2) or (instance is None and name.endswith(pending_suffix)))
+            if not (is_blocking or is_pending):
+                continue
+
+            rp = p
+            if (name.endswith(suffix) or (instance is None and name.endswith(pending_suffix))) and not (
+                name.endswith(scoped1) or name.endswith(scoped2) or name.endswith(scopedp1) or name.endswith(scopedp2)
+            ):
+                rp = scoped_file(STATE_DIR, name, instance=instance)
+
+            data = _read_json(rp)
+            if is_pending and isinstance(data, dict):
+                raw_hints = data.get("hints")
+                hints = raw_hints if isinstance(raw_hints, dict) else {}
+                raw_keys = data.get("keys")
+                keys = raw_keys if isinstance(raw_keys, list) else []
+                for k in keys:
+                    if not k:
+                        continue
+                    v = (hints or {}).get(k) or {}
+                    out[str(k)] = v if isinstance(v, dict) else {}
+            else:
+                for k, v in (data or {}).items():
+                    out[str(k)] = v if isinstance(v, dict) else {}
     return out
 
 
@@ -242,10 +286,10 @@ def load_unresolved_items(dst: str | None = None) -> list[dict[str, Any]]:
     return list(out.values())
 
 
-def load_unresolved_pending(dst: str, feature: str) -> list[dict[str, Any]]:
+def load_unresolved_pending(dst: str, feature: str, instance: str | None = None) -> list[dict[str, Any]]:
     if not dst or not feature:
         return []
-    data = _read_json(_pending_path(dst, feature))
+    data = _read_json(_pending_path(dst, feature, instance=instance))
     if not isinstance(data, dict):
         return []
     raw_items = data.get("items")
@@ -318,8 +362,9 @@ def record_unresolved(
     items: Iterable[str | Mapping[str, Any]],
     *,
     hint: str = "provider_down",
+    instance: str | None = None,
 ) -> dict[str, Any]:
-    path = _pending_path(dst, feature)
+    path = _pending_path(dst, feature, instance=instance)
     now = int(time.time())
 
     data: dict[str, Any] = {"keys": [], "items": {}, "hints": {}}
@@ -370,10 +415,69 @@ def record_unresolved(
     return {"ok": ok, "count": added if ok else 0, "path": str(path), **({"error": error} if error else {})}
 
 
+def is_remove_retry_reason(reason: Any) -> bool:
+    r = str(reason or "").strip().lower()
+    return r.startswith("apply:remove") or r.startswith("two:apply:remove") or r.startswith("provider_down:remove")
+
+
+def is_remove_retry(record: Mapping[str, Any] | None) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if str(record.get("action") or "").strip().lower() == "remove":
+        return True
+    reasons = [record.get(field) for field in ("reason", "hint", "error")]
+    if isinstance(record.get("reasons"), list):
+        reasons.extend(record["reasons"])
+    for reason in reasons:
+        if is_remove_retry_reason(reason):
+            return True
+        # Providers also emit codes such as simkl_remove_not_confirmed and
+        # trakt_history_remove_unconfirmed instead of orchestrator prefixes.
+        if "remove" in str(reason or "").strip().lower().replace(":", "_").split("_"):
+            return True
+    return False
+
+
+def clear_matched_history_retries(dst: str, matched_keys: Iterable[str], instance: str | None = None) -> dict[str, str]:
+    """Clear add failures already confirmed by a pair's history comparison.
+
+    A present watch does not confirm a pending deletion. Keep those failures,
+    and never broaden an event key into a title-wide retry cleanup.
+    Return retry keys mapped to confirmed event keys so callers can retain
+    the correct item metadata when recording resolutions.
+    """
+    records = load_unresolved_map(dst, "history", cross_features=False, instance=instance)
+    # Pending hints can shadow a provider's blocking row in the merged map.
+    blocking = _read_json(_blocking_path(dst, "history", instance=instance))
+    matched = set(matched_keys)
+    pending_items = {row["key"]: row.get("item") for row in load_unresolved_pending(dst, "history", instance=instance)}
+    resolved: dict[str, str] = {}
+    for key, record in records.items():
+        if not isinstance(record, Mapping):
+            continue
+        if is_remove_retry(record) or is_remove_retry(blocking.get(key)):
+            continue
+        event_key = str(key)
+        if not is_history_event_key(event_key):
+            # Base-keyed retries retain the watch timestamp in the payload.
+            # Resolve only that specific viewing.
+            item = record.get("item") or pending_items.get(key)
+            if not isinstance(item, Mapping) or history_epoch_from_item(item) is None:
+                continue
+            event_key = history_event_key(item, key)
+        if event_key not in matched:
+            continue
+        resolved[str(key)] = event_key
+    if resolved:
+        clear_unresolved(dst, "history", resolved, instance=instance)
+    return resolved
+
+
 def clear_unresolved(
     dst: str,
     feature: str,
     keys: Iterable[str],
+    instance: str | None = None,
 ) -> dict[str, Any]:
     key_set = {str(k) for k in (keys or []) if k}
     if not dst or not key_set:
@@ -381,7 +485,7 @@ def clear_unresolved(
 
     removed = 0
 
-    pend = _pending_path(dst, feature)
+    pend = _pending_path(dst, feature, instance=instance)
     pdata = _read_json(pend)
     if pdata:
         pchanged = False
@@ -401,7 +505,7 @@ def clear_unresolved(
         if pchanged:
             _atomic_write(pend, pdata)
 
-    blk = _blocking_path(dst, feature)
+    blk = _blocking_path(dst, feature, instance=instance)
     bdata = _read_json(blk)
     if bdata:
         bchanged = False
@@ -412,4 +516,40 @@ def clear_unresolved(
         if bchanged:
             _atomic_write(blk, bdata)
 
+    return {"ok": True, "count": removed}
+
+
+def clear_unresolved_all_scopes(dst: str, feature: str, keys: Iterable[str]) -> dict[str, Any]:
+    key_set = {str(k) for k in (keys or []) if k}
+    if not dst or not feature or not key_set or not STATE_DIR.exists():
+        return {"ok": True, "count": 0}
+    prefix = f"{str(dst).strip().lower()}_{str(feature).strip().lower()}."
+    removed = 0
+    for path in STATE_DIR.iterdir():
+        name = path.name
+        if not (path.is_file() and name.startswith(prefix) and ".unresolved" in name and name.endswith(".json")):
+            continue
+        data = _read_json(path)
+        if not data:
+            continue
+        changed = False
+        if isinstance(data.get("keys"), list):
+            kept = [k for k in data["keys"] if str(k) not in key_set]
+            if len(kept) != len(data["keys"]):
+                removed += len(data["keys"]) - len(kept)
+                data["keys"] = kept
+                changed = True
+            for bucket in ("items", "hints"):
+                sub = data.get(bucket)
+                if isinstance(sub, dict):
+                    for k in [k for k in sub if str(k) in key_set]:
+                        sub.pop(k, None)
+                        changed = True
+        else:
+            for k in [k for k in data if str(k) in key_set]:
+                data.pop(k, None)
+                removed += 1
+                changed = True
+        if changed:
+            _atomic_write(path, data)
     return {"ok": True, "count": removed}

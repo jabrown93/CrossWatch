@@ -60,6 +60,17 @@ class FakePlaylist:
             idx = self._items.index(after)
             self._items.insert(idx + 1, obj)
 
+    def editTitle(self, title: str) -> None:
+        self.calls.append(("rename", title))
+        self.title = title
+
+    def delete(self) -> None:
+        self.calls.append(("delete",))
+
+    def reload(self) -> "FakePlaylist":
+        self.calls.append(("reload",))
+        return self
+
 
 class FakeCollection:
     def __init__(
@@ -126,6 +137,15 @@ class FakeServer:
     def playlists(self) -> list[FakePlaylist]:
         return list(self._playlists)
 
+    def fetchItem(self, rating_key: int) -> Any:
+        for obj in self.items_library:
+            if int(getattr(obj, "ratingKey", -1)) == int(rating_key):
+                return obj
+        for playlist in self._playlists:
+            if int(getattr(playlist, "ratingKey", -1)) == int(rating_key):
+                return playlist
+        raise KeyError(rating_key)
+
     def createPlaylist(self, name: str, items: Any = None) -> FakePlaylist:
         pl = FakePlaylist(name, 999, items or [])
         self.created.append(pl)
@@ -155,9 +175,21 @@ def _fake_resolve(srv: FakeServer, guids: list[str], allow: set, accept: set) ->
     return None
 
 
+def _fake_find_rating_key_by_guid(srv: FakeServer, guids: list[str]) -> str | None:
+    wanted = {str(g) for g in guids}
+    for obj in srv.items_library:
+        candidates = {str(getattr(obj, "guid", "") or "")}
+        candidates.update(str(getattr(g, "id", "") or getattr(g, "guid", "") or g) for g in (getattr(obj, "guids", []) or []))
+        if candidates & wanted:
+            return str(getattr(obj, "ratingKey", "") or "")
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _patch_resolve(monkeypatch):
-    monkeypatch.setattr(plpl, "resolve_obj_by_guids", _fake_resolve)
+    monkeypatch.setattr(plpl, "resolve_obj_by_guids", _fake_resolve, raising=False)
+    monkeypatch.setattr(plpl, "server_find_rating_key_by_guid", _fake_find_rating_key_by_guid)
+    monkeypatch.setattr(plpl, "plex_feature_library_ids", lambda *_a, **_k: set())
 
 
 def _media(tmdb: int, title: str) -> dict[str, Any]:
@@ -234,7 +266,7 @@ def test_collection_snapshot_and_writes_use_scoped_ids():
     other = FObj(2, "B Other", section_id=2)
     coll = FakeCollection("Movies", 30, [a], subtype="movie", section_id=1)
     sections = [FakeSection("Movies", 1, "movie", [coll])]
-    ad = FakeAdapter(FakeServer([], [a, other, b], sections))
+    ad = FakeAdapter(FakeServer([], [a, b, other], sections))
     collection_id = f"{plpl.COLLECTION_PREFIX}1:30"
 
     snap = plpl.get_snapshot(ad, collection_id)
@@ -289,7 +321,7 @@ def test_missing_library_media_is_unresolved():
     res = plpl.add(ad, "10", [_media(999, "Ghost")])
     assert res["count"] == 0
     assert res["confirmed_keys"] == []
-    assert res["unresolved"] and res["unresolved"][0]["hint"] == "not_found"
+    assert res["unresolved"] and res["unresolved"][0]["hint"] == "not_in_library"
 
 
 def test_smart_playlist_writes_rejected():
@@ -320,6 +352,36 @@ def test_add_remove_basic():
     assert rm_res["confirmed_keys"] == ["tmdb:1"]
 
 
+def test_rename_and_delete_regular_playlist():
+    a = FObj(1, "A", plid=101)
+    regular = FakePlaylist("Weekend", 10, [a], smart=False)
+    ad = FakeAdapter(FakeServer([regular], [a]))
+
+    renamed = plpl.rename(ad, "10", "Renamed")
+    deleted = plpl.delete(ad, "10")
+
+    assert renamed.id == "10"
+    assert renamed.name == "Renamed"
+    assert ("rename", "Renamed") in regular.calls
+    assert ("delete",) in regular.calls
+    assert deleted["ok"] is True
+
+
+def test_rename_delete_blocked_for_smart_watchlist_and_collections():
+    a = FObj(1, "A", plid=101, section_id=1)
+    smart = FakePlaylist("Smart", 20, [a], smart=True)
+    coll = FakeCollection("Movies", 30, [a], subtype="movie", section_id=1)
+    sections = [FakeSection("Movies", 1, "movie", [coll])]
+    ad = FakeAdapter(FakeServer([smart], [a], sections))
+
+    with pytest.raises(plpl.SmartPlaylistError):
+        plpl.rename(ad, "20", "Nope")
+    with pytest.raises(plpl.PlaylistUnsupported):
+        plpl.rename(ad, plpl.WATCHLIST_ID, "Nope")
+    with pytest.raises(plpl.PlaylistUnsupported):
+        plpl.delete(ad, f"{plpl.COLLECTION_PREFIX}1:30")
+
+
 def test_snapshot_ordered():
     a = FObj(1, "A", plid=101)
     b = FObj(2, "B", plid=102)
@@ -343,3 +405,32 @@ def test_reorder_minimal_moves_and_idempotent():
 
     res2 = plpl.reorder(ad, "10", ["tmdb:3", "tmdb:1", "tmdb:2"])
     assert res2["reordered"] == 0
+
+
+def test_interactive_membership_writes_use_captured_native_ids(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from cw_platform.interactive_reads import ReviewReads, use_review_reads
+
+    a, b = FObj(1, "A", plid=101), FObj(2, "B", plid=102)
+    playlist = FakePlaylist("Weekend", 10, [a, b])
+    server = FakeServer([playlist], [a, b])
+    adapter = FakeAdapter(server)
+    server.query = Mock()
+    server._session = SimpleNamespace(delete=object(), put=object())
+    reads = ReviewReads()
+    try:
+        with use_review_reads(reads, collecting=True):
+            snapshot = plpl.get_snapshot(adapter, "10")
+        monkeypatch.setattr(playlist, "items", Mock(side_effect=AssertionError("unexpected reread")))
+        monkeypatch.setattr(server, "playlists", Mock(side_effect=AssertionError("unexpected reread")))
+        with use_review_reads(reads):
+            result = plpl.reorder(adapter, "10", ["tmdb:2", "tmdb:1"])
+            assert result["ok"] and result["reordered"] == 1
+            result = plpl.remove(adapter, "10", [snapshot.items[0].item])
+            assert result["ok"] and result["count"] == 1
+            assert plpl.reorder(adapter, "10", ["tmdb:3"])["ok"] is False
+        assert [call.args[0] for call in server.query.call_args_list] == [
+            "/playlists/10/items/102/move", "/playlists/10/items/101"]
+    finally:
+        reads.close()

@@ -3,9 +3,13 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from .._path_matching import path_fallback
+from cw_platform.interactive_reads import replaying
+
 import os
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 
 from cw_platform.id_map import canonical_key, ids_from_guid, ids_from, minimal as id_minimal
@@ -15,10 +19,12 @@ from providers.sync._progress_policy import decide_progress_write, select_progre
 from ._common import (
     active_pms_token,
     episode_rating_key_from_show,
+    guid_lookup_scope,
     has_external_ids,
     home_scope_enter,
     home_scope_exit,
     item_guid_candidates,
+    ids_from_obj,
     plex_cfg_get,
     plex_feature_cfg,
     plex_feature_library_ids,
@@ -33,6 +39,7 @@ from ._common import (
 from ._history import (
     _build_guid_index as _hist_build_guid_index,
     _pms_find_in_guid_index as _hist_find_in_guid_index,
+    _index_cache_context,
 )
 
 
@@ -93,8 +100,6 @@ def _iso(v: Any) -> str | None:
         return None
     if isinstance(v, datetime):
         try:
-            if v.tzinfo is None:
-                v = v.replace(tzinfo=timezone.utc)
             return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         except Exception:
             return None
@@ -135,15 +140,33 @@ def _same_plex_endpoint() -> bool:
     return src == dst == "PLEX" and src_instance == dst_instance
 
 
+def _session_row(elem: Any) -> SimpleNamespace:
+    user = elem.find("User")
+    title = user.get("title") if user is not None else None
+    return SimpleNamespace(ratingKey=elem.get("ratingKey"), usernames=[title] if title else [], user=None)
+
+
 def _currently_playing(
     srv: Any,
     rating_key: str,
     *,
     account_id: int | None = None,
     username: str | None = None,
+    fail_on_error: bool = False,
+    token: str | None = None,
 ) -> bool:
     try:
-        for session in srv.sessions() or []:  # type: ignore[attr-defined]
+        if token:
+            data = srv.query("/status/sessions", headers={"X-Plex-Token": token})
+            sessions = [_session_row(elem) for elem in data] if data is not None else []
+        else:
+            sessions = srv.sessions()  # type: ignore[attr-defined]
+    except Exception as exc:
+        if fail_on_error and not str(exc).startswith(("(401)", "(403)")):
+            raise
+        return False
+    try:
+        for session in sessions or []:
             if str(getattr(session, "ratingKey", "") or "") != str(rating_key):
                 continue
             if account_id is not None:
@@ -161,7 +184,8 @@ def _currently_playing(
                     continue
             return True
     except Exception:
-        pass
+        if fail_on_error:
+            raise
     return False
 
 
@@ -209,10 +233,6 @@ def _truthy_attr(obj: Any, name: str) -> bool:
         return False
 
 
-def _fetch_resume_rating_keys(srv: Any, *, limit: int = 100) -> set[str]:
-    return set(_fetch_resume_items(srv, page_size=limit))
-
-
 def _library_id(value: Any) -> str | None:
     source = getattr(value, "attrib", None) if not isinstance(value, Mapping) else value
     source = source if isinstance(source, Mapping) else {}
@@ -225,7 +245,8 @@ def _library_id(value: Any) -> str | None:
 
 def _page_total(root: Any) -> int | None:
     attributes = getattr(root, "attrib", {}) or {}
-    return _to_int(attributes.get("totalSize") or attributes.get("totalRecordCount"))
+    value = attributes.get("totalSize")
+    return _to_int(value if value is not None else attributes.get("totalRecordCount"))
 
 
 def _library_sort_key(section: tuple[str, int]) -> tuple[int, str]:
@@ -235,6 +256,8 @@ def _library_sort_key(section: tuple[str, int]) -> tuple[int, str]:
 
 def _progress_sections(srv: Any, allowed: set[str]) -> list[tuple[str, int]]:
     root = srv.query("/library/sections")  # type: ignore[attr-defined]
+    if root is None or getattr(root, "tag", None) != "MediaContainer":
+        raise RuntimeError("plex_progress_invalid_libraries_response")
     rows = list(root) if root is not None else []
     sections: list[tuple[str, int]] = []
     found: set[str] = set()
@@ -250,7 +273,9 @@ def _progress_sections(srv: Any, allowed: set[str]) -> list[tuple[str, int]]:
         sections.append((library_id, 1 if library_type == "movie" else 4))
     missing = sorted(allowed - found)
     if missing:
-        raise RuntimeError(f"plex_progress_libraries_not_found:{','.join(missing)}")
+        _warn("progress_libraries_unavailable", library_ids=missing)
+        if not sections:
+            raise RuntimeError(f"plex_progress_libraries_not_found:{','.join(missing)}")
     return sorted(sections, key=_library_sort_key)
 
 
@@ -309,20 +334,24 @@ def _fetch_resume_items(
                     "includeGuids": 1,
                 },
             )
+            if root is None or getattr(root, "tag", None) != "MediaContainer":
+                raise RuntimeError("plex_progress_invalid_page")
             rows = list(root) if root is not None else []
+            total = _page_total(root)
+            if not rows and total is not None and start < total:
+                raise RuntimeError("plex_progress_incomplete_page")
             signature = tuple(
                 str((getattr(el, "attrib", {}) or {}).get("ratingKey") or (getattr(el, "attrib", {}) or {}).get("key") or "")
                 for el in rows
             )
             if rows and signature in seen_pages:
-                _warn("pagination_repeated_page", source=path, library_id=library_id, start_index=start)
-                break
+                raise RuntimeError("plex_progress_repeated_page")
             seen_pages.add(signature)
             for el in rows:
                 a = getattr(el, "attrib", {}) or {}
                 rk = a.get("ratingKey") or a.get("key")
                 if not rk:
-                    continue
+                    raise RuntimeError("plex_progress_missing_rating_key")
                 progress_ms = _to_int(a.get("viewOffset"))
                 if progress_ms is None or progress_ms <= 0:
                     continue
@@ -334,7 +363,7 @@ def _fetch_resume_items(
                 items[key_id] = (row, ids)
             start += len(rows)
             total = _page_total(root)
-            if not rows or len(rows) < page_size or (total is not None and start >= total):
+            if not rows or (len(rows) < page_size and total is None) or (total is not None and start >= total):
                 break
 
     for library_id, plex_type in sections:
@@ -404,7 +433,7 @@ def build_index(adapter: Any, **_kwargs: Any) -> Mapping[str, dict[str, Any]]:
 
             if typ == "episode":
                 base["series_title"] = a.get("grandparentTitle")
-                base["season"] = _to_int(a.get("parentIndex") or a.get("seasonNumber"))
+                base["season"] = _to_int(next((v for v in (a.get("parentIndex"), a.get("seasonNumber")) if v is not None), None))
                 base["episode"] = _to_int(a.get("index"))
                 show_ids: dict[str, str] = {}
                 gp = a.get("grandparentGuid")
@@ -464,7 +493,46 @@ def build_index(adapter: Any, **_kwargs: Any) -> Mapping[str, dict[str, Any]]:
         home_scope_exit(adapter, did_switch)
 
 
+@path_fallback("PLEX", "progress")
 def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
+    allowed = plex_feature_library_ids(adapter, "progress")
+    key, _ = _index_cache_context(adapter, allowed, "progress")
+    with guid_lookup_scope(key):
+        return _resolve_rating_key_in_scope(adapter, it)
+
+
+def _native_progress_identity_matches(obj: Any, item: Mapping[str, Any], ids: Mapping[str, Any]) -> bool:
+    kind = str(item.get("type") or "movie").lower()
+    kind = "episode" if kind == "anime" else kind
+    if str(getattr(obj, "type", "") or "").lower() != kind:
+        return False
+    namespaces = ("tmdb", "imdb", "tvdb", "mal", "anilist")
+
+    def matches(requested: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+        for key in namespaces:
+            want = str(requested.get(key) or "").strip().lower()
+            have = str(current.get(key) or "").strip().lower()
+            if want and have and (want == have or (want.isdigit() and have.isdigit() and int(want) == int(have))):
+                return True
+        return False
+
+    try:
+        if any(ids.get(key) for key in namespaces):
+            return matches(ids, ids_from_obj(obj))
+        if kind == "episode":
+            show_ids = item.get("show_ids") or {}
+            if any(show_ids.get(key) for key in namespaces):
+                if not matches(show_ids, ids_from_obj(obj.show())):
+                    return False
+            for field, attr in (("season", "parentIndex"), ("episode", "index")):
+                if item.get(field) is not None and int(getattr(obj, attr, -1)) != int(item[field]):
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_rating_key_in_scope(adapter: Any, it: Mapping[str, Any]) -> str | None:
     setattr(adapter, "_plex_progress_last_resolve_hint", None)
     allowed = plex_feature_library_ids(adapter, "progress")
     outside_scope_seen = False
@@ -494,7 +562,9 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
             direct_obj = srv0.fetchItem(int(base_rk)) if srv0 else None  # type: ignore[attr-defined]
         except Exception:
             direct_obj = None
-        if direct_obj is not None and _allowed_obj(direct_obj, "direct_plex_rating_key"):
+        if (direct_obj is not None and str(getattr(direct_obj, "ratingKey", "")) == base_rk
+                and _native_progress_identity_matches(direct_obj, it, ids)
+                and _allowed_obj(direct_obj, "direct_plex_rating_key")):
             return base_rk
 
     srv = getattr(getattr(adapter, "client", None), "server", None)
@@ -592,7 +662,7 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
     if guid_candidates:
         rk_idx = None
         try:
-            _hist_build_guid_index(adapter, allowed)
+            _hist_build_guid_index(adapter, allowed, feature="progress")
             rk_idx = _hist_find_in_guid_index("show" if is_episode else "movie", guid_candidates)
         except Exception:
             rk_idx = None
@@ -729,6 +799,7 @@ def _resolve_rating_key(adapter: Any, it: Mapping[str, Any]) -> str | None:
 
 
 def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+    instance = (getattr(adapter, "config", None) or {}).get("_cw_provider_instance") or os.getenv("CW_PAIR_DST_INSTANCE") or "default"
     srv = getattr(getattr(adapter, "client", None), "server", None)
     if not srv:
         return 0, [{"item": dict(x), "hint": "not_configured"} for x in (items or [])]
@@ -775,7 +846,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                     or int(getattr(obj, "viewCount", 0) or 0) > 0
                 )
                 source_timestamp = it0.get("progress_at") or it0.get("lastViewedAt")
-                target_timestamp = getattr(obj, "lastViewedAt", None) or getattr(obj, "viewedAt", None) or getattr(obj, "updatedAt", None)
+                target_timestamp = _iso(getattr(obj, "lastViewedAt", None) or getattr(obj, "viewedAt", None))
                 target_progress = _to_int(getattr(obj, "viewOffset", None))
                 duration = _to_int(getattr(obj, "duration", None)) or _to_int(it0.get("duration_ms")) or 0
                 ms_i = _progress_ms_for_write(it0, duration)
@@ -801,7 +872,8 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                     timestamp_tolerance_seconds=drift,
                 )
                 context = {
-                    "provider": "plex", "provider_instance": os.getenv("CW_PAIR_DST_INSTANCE") or "default",
+                    "provider": "plex", "provider_instance": instance,
+                    "key": str(canonical_key(id_minimal(it0)) or ""),
                     "remote_item_id": str(rk), "library_id": _library_id(obj) or it0.get("library_id"),
                     "source_timestamp": source_timestamp, "target_timestamp": target_timestamp,
                     "source_progress": ms_i, "target_progress": target_progress, "reason": decision.reason,
@@ -834,6 +906,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
 
 
 def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+    instance = (getattr(adapter, "config", None) or {}).get("_cw_provider_instance") or os.getenv("CW_PAIR_DST_INSTANCE") or "default"
     srv = getattr(getattr(adapter, "client", None), "server", None)
     if not srv:
         return 0, [{"item": dict(x), "hint": "not_configured"} for x in (items or [])]
@@ -870,15 +943,17 @@ def remove(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[
                 else:
                     srv.query("/:/unscrobble", params={"key": str(rk), "identifier": "com.plexapp.plugins.library"})  # type: ignore[attr-defined]
 
-                try:
-                    verify_obj = srv.fetchItem(int(rk))  # type: ignore[attr-defined]
-                    remaining = _to_int(getattr(verify_obj, "viewOffset", None))
-                except Exception:
-                    remaining = _to_int(getattr(obj, "viewOffset", None))
-
+                if replaying():
+                    remaining = None
+                else:
+                    try:
+                        verify_obj = srv.fetchItem(int(rk))  # type: ignore[attr-defined]
+                        remaining = _to_int(getattr(verify_obj, "viewOffset", None))
+                    except Exception:
+                        remaining = _to_int(getattr(obj, "viewOffset", None))
                 context = {
                     "provider": "plex",
-                    "provider_instance": os.getenv("CW_PAIR_DST_INSTANCE") or "default",
+                    "provider_instance": instance,
                     "remote_item_id": str(rk),
                     "library_id": library_id,
                     "source_progress": 0,
