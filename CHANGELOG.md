@@ -1,3 +1,10 @@
+## [1.3.29](https://github.com/jabrown93/CrossWatch/compare/v1.3.28...v1.3.29) (2026-11-02)
+
+
+### Bug Fixes
+
+* **local-db:** keep direct connect(":memory:") private ([#145](https://github.com/jabrown93/CrossWatch/issues/145)) ([bb7e4ad](https://github.com/jabrown93/CrossWatch/commit/bb7e4ada5618598003319e13c9cac7df0c17c1db)), closes [#144](https://github.com/jabrown93/CrossWatch/issues/144)
+
 ## [1.3.28](https://github.com/jabrown93/CrossWatch/compare/v1.3.27...v1.3.28) (2026-10-26)
 
 ## [1.3.27](https://github.com/jabrown93/CrossWatch/compare/v1.3.26...v1.3.27) (2026-10-24)
