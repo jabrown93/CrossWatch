@@ -19,6 +19,10 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      # This repo is a fork; without GH_REPO, gh resolves issue/pr commands to
+      # the upstream parent (cenodude/CrossWatch) and files issues there.
+      GH_REPO: ${{ github.repository }}
     steps:
       # App token, not GITHUB_TOKEN: PRs opened with GITHUB_TOKEN do not trigger
       # CI, so the required `test (3.14)` check would never report.
