@@ -52,11 +52,13 @@ restore_fork_owned() {
 }
 
 start() {
-  local ref=${1:-upstream/main} last target short branch base
+  local ref=${1:-upstream/main} last target short branch base out conflicts f
   require_clean
   fetch
-  [[ -s $MARKER ]] || die "$MARKER missing"
-  last=$(tr -d '[:space:]' < "$MARKER")
+  # From the fetched origin/main, not the checkout: a stale local main would graft an
+  # older parent and replay upstream changes a merged sync already integrated.
+  last=$(git show origin/main:"$MARKER" 2>/dev/null | tr -d '[:space:]') || die "$MARKER missing on origin/main"
+  [[ -n $last ]] || die "$MARKER empty on origin/main"
   target=$(git rev-parse --verify "$ref^{commit}")
   if git merge-base --is-ancestor "$target" "$last"; then
     echo "Already synced through $(git rev-parse --short "$last")."
@@ -70,40 +72,68 @@ start() {
   git reset -q --hard "$base"
   printf '%s\n' "$target" > "$STATE_FILE"
 
-  if git -c merge.conflictStyle=zdiff3 merge --no-commit --no-ff "$target" >/dev/null 2>&1; then
+  if out=$(git -c merge.conflictStyle=zdiff3 merge --no-commit --no-ff "$target" 2>&1); then
     restore_fork_owned
     echo "Merged cleanly. Review, run the tests, then: scripts/sync-upstream.sh --finish"
     return 0
   fi
+  # A merge that never started (an untracked file in upstream's way, say) leaves no
+  # MERGE_HEAD. Treating it as a conflict would let --finish advance the marker
+  # without upstream's changes, dropping them from every later sync.
+  if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    rm -f "$STATE_FILE"
+    die "merge did not start:
+$out"
+  fi
   restore_fork_owned
+  conflicts=$(git diff --name-only --diff-filter=U 2>/dev/null)
+  if [[ -z $conflicts ]]; then
+    echo "Merged cleanly; conflicts were only in fork-owned paths. Review, run the tests, then: scripts/sync-upstream.sh --finish"
+    return 0
+  fi
   echo "Conflicts in:"
-  git diff --name-only --diff-filter=U | sed 's/^/  /'
+  while IFS= read -r f; do echo "  $f"; done <<< "$conflicts"
   echo "Resolve per FORK.md, git add, then: scripts/sync-upstream.sh --finish"
   return 1
 }
 
 finish() {
-  local target prev tree msg commit
+  local target base prev tree msg commit
   [[ -s $STATE_FILE ]] || die "no sync in progress"
   target=$(cat "$STATE_FILE")
+  # A `git merge --abort` keeps the state file and grafted HEAD but drops MERGE_HEAD;
+  # finishing then would commit the unmerged tree and advance the marker past it.
+  [[ "$(git rev-parse -q --verify MERGE_HEAD || true)" == "$target" ]] \
+    || die "no merge of $(git rev-parse --short "$target") in progress (aborted?); re-run the sync"
   [[ -z "$(git diff --name-only --diff-filter=U)" ]] || die "unresolved conflicts remain"
-  prev=$(git show origin/main:"$MARKER" 2>/dev/null | tr -d '[:space:]' || true)
+  # HEAD is the grafted base; its first parent is the origin/main this sync started
+  # from. origin/main may have moved since, and parenting on the newer commit with a
+  # tree built from the older one would silently revert whatever landed in between.
+  git rev-parse -q --verify HEAD^2 >/dev/null || die "HEAD is not a sync base"
+  base=$(git rev-parse HEAD^1)
+  prev=$(git show "$base:$MARKER" 2>/dev/null | tr -d '[:space:]' || true)
   printf '%s\n' "$target" > "$MARKER"
-  git add -A
+  # Tracked files only: the merge already staged upstream's additions, and -A would
+  # sweep unrelated untracked files (an un-ignored .env, say) into the sync commit.
+  git add -u
+  git add -- "$MARKER"
   tree=$(git write-tree)
   msg="chore(sync): merge upstream cenodude/CrossWatch through $(git rev-parse --short "$target")
 
 Upstream range: ${prev:-unknown}..$target"
   # Sign when a key is configured; CI branches are squash-merged (and signed) by GitHub.
   if [[ -n "$(git config user.signingkey || true)" ]]; then
-    commit=$(git commit-tree -S -p origin/main -m "$msg" "$tree")
+    commit=$(git commit-tree -S -p "$base" -m "$msg" "$tree")
   else
-    commit=$(git commit-tree -p origin/main -m "$msg" "$tree")
+    commit=$(git commit-tree -p "$base" -m "$msg" "$tree")
   fi
   git merge --quit 2>/dev/null || true
   git reset -q "$commit"
   rm -f "$STATE_FILE"
-  echo "Committed $(git rev-parse --short "$commit") on $(git branch --show-current) (parent: origin/main only)."
+  echo "Committed $(git rev-parse --short "$commit") on $(git branch --show-current) (parent: $(git rev-parse --short "$base"), the origin/main this sync started from)."
+  if [[ "$base" != "$(git rev-parse origin/main)" ]]; then
+    echo "origin/main has moved since; rebase or re-run the sync before opening the PR."
+  fi
 }
 
 case "${1:-}" in
