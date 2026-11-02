@@ -181,6 +181,7 @@ def connect(
     path: str | os.PathLike[str] | None = None,
     *,
     base_path: str | os.PathLike[str] | None = None,
+    shared_memory: bool = False,
 ) -> sqlite3.Connection:
     p = Path(path) if path is not None else crosswatch_db_path(base_path)
     if str(p) != ":memory:":
@@ -193,9 +194,14 @@ def connect(
         except Exception as exc:
             raise LocalDatabaseError(f"cannot create db dir {p.parent}: {exc}") from exc
     if str(p) == ":memory:":
-        # Fork: connections are per thread, so a plain ":memory:" would give each
-        # thread its own empty database; shared cache keeps it one database.
-        conn = sqlite3.connect(_MEMORY_URI, timeout=5.0, check_same_thread=False, uri=True, factory=_TrackedConnection)
+        # Fork: get_conn() hands each thread its own connection, so a plain
+        # ":memory:" would give every thread an empty database; shared cache keeps
+        # it one database. Direct connect(":memory:") callers keep a private
+        # database, as upstream, so an unclosed one cannot leak into the next.
+        if shared_memory:
+            conn = sqlite3.connect(_MEMORY_URI, timeout=5.0, check_same_thread=False, uri=True, factory=_TrackedConnection)
+        else:
+            conn = sqlite3.connect(":memory:", timeout=5.0, check_same_thread=False, factory=_TrackedConnection)
     else:
         conn = sqlite3.connect(str(p), timeout=5.0, check_same_thread=False, factory=_TrackedConnection)
     conn.row_factory = sqlite3.Row
@@ -276,7 +282,7 @@ def get_conn(base_path: str | os.PathLike[str] | None = None) -> sqlite3.Connect
     # registry lock while waiting: that worker may need get_conn() to finish.
     for _ in range(3):
         try:
-            conn = connect(want, base_path=base_path)
+            conn = connect(want, base_path=base_path, shared_memory=True)
         except Exception as exc:
             note = _holder_note() if "locked" in str(exc) else ""
             _warn(want, f"local database unavailable: {exc}{note}")

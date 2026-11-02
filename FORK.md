@@ -46,7 +46,7 @@ one regenerated each sync from the pristine upstream failures.
 | SSRF | Outbound requests to user-supplied servers and IdP avatar URLs go through `guarded_request`, re-validating every redirect hop. | `cw_platform/url_validation.py` |
 | Sync writes | Non-idempotent writes are attempted once (429 excepted): a timed-out write may have landed, and replaying duplicates history entries. | `_applier._retry`, `_mod_common.request_with_retries` |
 | Mass delete | `drop_guard` on and `allow_mass_delete` off by default; guard errors block rather than allow. | `_pairs_oneway.py`, `_pairs_twoway.py`, `_pairs_massdelete.py` |
-| Local DB | `suspended()` around restores/rebuilds, `SCHEMA_LOCK` around schema setup, shared-cache `:memory:`. | `cw_platform/local_db/db.py` |
+| Local DB | `suspended()` around restores/rebuilds, `SCHEMA_LOCK` around schema setup, shared-cache `:memory:` for `get_conn()` only (direct `connect(":memory:")` stays private, as upstream). | `cw_platform/local_db/db.py` |
 | Scheduler | A failing tick is logged and retried instead of ending the scheduler thread. | `services/scheduling.py` |
 | SSE | Summary stream resumes from `Last-Event-ID` instead of replaying the buffer. | `api/syncAPI.py` |
 | Logging | Trakt refresh failures log status plus allowlisted OAuth error. | `providers/auth/_auth_TRAKT.py` |
