@@ -1,3 +1,10 @@
+## [1.3.30](https://github.com/jabrown93/CrossWatch/compare/v1.3.29...v1.3.30) (2026-11-02)
+
+
+### Bug Fixes
+
+* **sync:** harden sync-upstream.sh (marker source, aborted/unstarted merges, parent, staging) ([#147](https://github.com/jabrown93/CrossWatch/issues/147)) ([d23080e](https://github.com/jabrown93/CrossWatch/commit/d23080e8793c0e56a46df922b1b6edc2737ab8f0))
+
 ## [1.3.29](https://github.com/jabrown93/CrossWatch/compare/v1.3.28...v1.3.29) (2026-11-02)
 
 
