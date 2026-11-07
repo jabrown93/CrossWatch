@@ -9,7 +9,7 @@ python-multipart==0.0.33
 packaging==26.3
 cryptography==50.0.2
 defusedxml==0.7.1
-authlib==1.9.3
+authlib==1.9.4
 qrcode==8.2
 rich==15.0.0
 typer==0.27.3
