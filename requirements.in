@@ -12,4 +12,4 @@ defusedxml==0.7.1
 authlib==1.9.5
 qrcode==8.2
 rich==15.0.0
-typer==0.29.0
+typer==0.29.1
