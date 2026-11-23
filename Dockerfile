@@ -42,7 +42,7 @@ RUN printf '%s' "${APP_VERSION}" > /VERSION && chmod 0444 /VERSION
 # runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
 # -- no RUN. Dependencies and data are brought in from the builder.
 # =====================================================================
-FROM dhi.io/python:3.15.2-alpine@sha256:333296df53864ce65a73e3d2a4f9e6ffe15263eacbce4ad9b2e67f55dfd1323a
+FROM dhi.io/python:3.15.2-alpine@sha256:ce66329c25342ca42462e41f77f3a4488099cd0477729a7167c01033f992670e
 
 # Section 11 of the CrossWatch Source Available License forbids implying that a
 # modified version is endorsed by the Copyright Holder, so the description says
