@@ -5,7 +5,7 @@
 # runs as root, so we use it only to install dependencies. Nothing from
 # this stage ships except the venv and a few data files copied below.
 # =====================================================================
-FROM dhi.io/python:3.15.2-alpine-dev@sha256:2a8699c683f16af7f1b6fc27d618f09d63807f17945a1e7c77aab4ff54219a4f AS builder
+FROM dhi.io/python:3.15.2-alpine-dev@sha256:401d12afd3e91850b7fdf41000db1ad1394a641e009d6f3c4cd41644a9a84e06 AS builder
 
 USER root
 
@@ -42,7 +42,7 @@ RUN printf '%s' "${APP_VERSION}" > /VERSION && chmod 0444 /VERSION
 # runs as a fixed nonroot user. Only COPY/ENV/metadata are possible here
 # -- no RUN. Dependencies and data are brought in from the builder.
 # =====================================================================
-FROM dhi.io/python:3.15.2-alpine@sha256:2a415785157acc69d255324843d863be9fcc190a9a05de17ab7c4f7f404f4a5b
+FROM dhi.io/python:3.15.2-alpine@sha256:381a276eaccec2055d0b25a66cc1a41010fba559a121f157d2a23112a2147cda
 
 # Section 11 of the CrossWatch Source Available License forbids implying that a
 # modified version is endorsed by the Copyright Holder, so the description says
